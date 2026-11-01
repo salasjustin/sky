@@ -5,12 +5,21 @@ import type { Io } from "./cli.js";
 import { type Output, UsageError } from "./output.js";
 import { resolveEnvId } from "./secret.js";
 
-type Values = { prompt?: string; timeout?: string; reason?: string };
+type Values = {
+  prompt?: string;
+  timeout?: string;
+  reason?: string;
+  yes?: boolean;
+};
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;
 
 export interface AgentCommand {
-  options: { [K in keyof Values]?: { type: "string" } };
+  options: {
+    [K in keyof Values]?: {
+      type: NonNullable<Values[K]> extends boolean ? "boolean" : "string";
+    };
+  };
   prepare(positionals: string[], values: Values): Action;
 }
 

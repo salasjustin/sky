@@ -35,6 +35,14 @@ export const ApiRun = z
   .loose();
 export type ApiRun = z.infer<typeof ApiRun>;
 
+/** Not loose, unlike the others: parsing strips every field but name and kind, so no value can reach output. */
+const SecretList = z.object({
+  data: z.array(
+    z.object({ name: z.string(), kind: z.enum(["value", "connector"]) }),
+  ),
+});
+export type SecretSummary = z.infer<typeof SecretList>["data"][number];
+
 const Launched = z.object({
   agent: z.object({ id: z.string() }),
   run: z.object({ id: z.string() }),
@@ -124,6 +132,9 @@ export function createApi(config: Config) {
   const agentPath = (id: string, rest: string) =>
     `/v1/agents/${encodeURIComponent(id)}/${rest}`;
 
+  const secretPath = (envId: string, name: string) =>
+    `/v1/environments/${encodeURIComponent(envId)}/secrets/${encodeURIComponent(name)}`;
+
   const launched = (status: number, json: unknown) => {
     const parsed = Launched.safeParse(json);
     if (!parsed.success) {
@@ -196,7 +207,10 @@ export function createApi(config: Config) {
       );
       return json;
     },
-    async listEnvironments(): Promise<ApiEnvironment[]> {
+    async listEnvironments(): Promise<{
+      raw: unknown;
+      envs: ApiEnvironment[];
+    }> {
       const { status, json } = await request("GET", "/v1/environments");
       const data = (json as { data?: unknown } | null)?.data;
       if (!Array.isArray(data)) {
@@ -206,7 +220,7 @@ export function createApi(config: Config) {
           "the API returned an environment list this CLI can't read",
         );
       }
-      return data.map((item) => env(status, item).env);
+      return { raw: json, envs: data.map((item) => env(status, item).env) };
     },
     async getEnvironment(id: string) {
       const { status, json } = await request(
@@ -227,6 +241,10 @@ export function createApi(config: Config) {
       );
       return env(status, json);
     },
+    /** Destroys the env's sprite, then its agents, runs and events; 409 while a run is active or it is provisioning. */
+    async deleteEnvironment(id: string): Promise<void> {
+      await request("DELETE", `/v1/environments/${encodeURIComponent(id)}`);
+    },
     /** Reruns provisioning on a failed env; 409 `not_failed` otherwise. */
     async retryEnvironment(id: string) {
       const { status, json } = await request(
@@ -235,13 +253,27 @@ export function createApi(config: Config) {
       );
       return env(status, json);
     },
-    async putSecret(envId: string, name: string, body: unknown) {
-      const { json } = await request(
-        "PUT",
-        `/v1/environments/${encodeURIComponent(envId)}/secrets/${encodeURIComponent(name)}`,
-        body,
+    async listSecrets(envId: string): Promise<SecretSummary[]> {
+      const { status, json } = await request(
+        "GET",
+        `/v1/environments/${encodeURIComponent(envId)}/secrets`,
       );
+      const parsed = SecretList.safeParse(json);
+      if (!parsed.success) {
+        throw new ApiError(
+          status,
+          "bad_response",
+          "the API returned a secret list this CLI can't read",
+        );
+      }
+      return parsed.data.data;
+    },
+    async putSecret(envId: string, name: string, body: unknown) {
+      const { json } = await request("PUT", secretPath(envId, name), body);
       return json;
+    },
+    async deleteSecret(envId: string, name: string): Promise<void> {
+      await request("DELETE", secretPath(envId, name));
     },
   };
 }

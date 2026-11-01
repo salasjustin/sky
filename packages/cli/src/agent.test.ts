@@ -80,6 +80,7 @@ const noKeyLeak = (r: Captured) => {
 
 test("agent start launches on an env id and prints the agent and run ids", async () => {
   server.use(
+    envList,
     post("/v1/agents", 202, { agent, run: run({ status: "starting" }) }),
   );
   const r = await runCli(["agent", "start", "env_1", "--prompt=fix the bug"]);
@@ -106,7 +107,7 @@ test("agent start resolves an env name and reads an @file prompt", async () => {
 
 test("agent start --json prints the API's object", async () => {
   const body = { agent, run: run({ status: "starting" }) };
-  server.use(post("/v1/agents", 202, body));
+  server.use(envList, post("/v1/agents", 202, body));
   const r = await runCli(["agent", "start", "env_1", "--prompt=x", "--json"]);
   expect(r.code).toBe(0);
   expect(JSON.parse(r.stdout)).toEqual(body);

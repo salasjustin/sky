@@ -91,6 +91,18 @@ sky secret set web NPM_TOKEN < token.txt
 Stores a secret on an environment; on a terminal it prompts without echo. `sky --help` lists the options, the config file location, and exit codes.
 
 ```
+sky secret list web             # names and kinds; values are never printed
+sky secret delete web NPM_TOKEN
+sky env list                    # id, status, repo and name per environment
+sky env show web                # one env; a failed one shows its step and stderr
+sky env retry web               # provision a failed env again
+sky env delete web              # destroy its sandbox, agents, runs and events; asks first
+sky env delete web --yes        # the same without asking; required off a terminal and with --json
+```
+
+`<env>` is an environment's name or id.
+
+```
 sky agent start web --prompt=@task.md
 sky wait <agent>      # until it needs an answer or approval, or ends
 sky inbox <agent>     # the pending question or approval
