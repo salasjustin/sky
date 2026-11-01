@@ -144,7 +144,7 @@ async function findEnv(
       if (!(err instanceof ApiError && err.status === 404)) throw err;
     }
   }
-  const envs = await api.listEnvironments();
+  const { envs } = await api.listEnvironments();
   const env = envs.find((e) => e.name === name);
   return env === undefined ? undefined : { raw: env, env };
 }

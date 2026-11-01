@@ -53,6 +53,9 @@ export async function runCli(
       promptHidden: async () => {
         throw new Error("unexpected prompt");
       },
+      prompt: async () => {
+        throw new Error("unexpected prompt");
+      },
       ...opts.stdin,
     },
     sleep: async (ms) => {

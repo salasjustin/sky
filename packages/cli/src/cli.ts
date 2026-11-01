@@ -1,10 +1,11 @@
 import { parseArgs } from "node:util";
-import { agentCommands } from "./agent.js";
-import { ApiError, createApi } from "./api.js";
+import { type AgentCommand, agentCommands } from "./agent.js";
+import { type Api, ApiError, createApi } from "./api.js";
 import { apply } from "./apply.js";
 import { type Config, configPath, type Env, resolveConfig } from "./config.js";
+import { env } from "./env.js";
 import { createOutput, type Output, UsageError } from "./output.js";
-import { secretSet } from "./secret.js";
+import { secretDelete, secretList, secretSet } from "./secret.js";
 import { version } from "./version.js";
 
 export interface Io {
@@ -19,6 +20,8 @@ export interface Io {
     readAll(): Promise<string>;
     /** Reads one line from the terminal without echoing it; the prompt goes to stderr. */
     promptHidden(prompt: string): Promise<string>;
+    /** Reads one echoed line from the terminal, "" at end of input; the prompt goes to stderr. */
+    prompt(prompt: string): Promise<string>;
   };
   sleep(ms: number): Promise<void>;
   now(): number;
@@ -34,6 +37,24 @@ const help = (io: Io) => `Usage:
       Store a secret on an environment (<env> is its id or name). The value
       is read from stdin, or prompted for without echo on a terminal. With
       --connector, agents get the Sprites connection id as $NAME instead.
+  sky secret list <env> [options]
+      Print "<NAME> <kind>" per secret, kind being value or connector.
+      Values are never printed.
+  sky secret delete <env> <NAME> [options]
+      Remove a secret from an environment.
+  sky env list [options]
+      Print "<id> <status> <repo> <name>" per environment.
+  sky env show <env> [options]
+      Print the same line for one environment (<env> is its id or name);
+      a failed one adds the step it failed at and that step's stderr.
+  sky env delete <env> [--yes] [options]
+      Destroy the environment's sandbox and delete it with all its agents,
+      runs and events. Refused while a run is active or it is provisioning.
+      Asks to confirm on a terminal; anywhere else, or with --json, it
+      needs --yes.
+  sky env retry <env> [options]
+      Provision a failed environment again. Prints its line, now
+      provisioning; sky env show reports when it's ready.
   sky agent start <env> --prompt=<text|@file> [options]
   sky agent follow-up <agent> --prompt=<text|@file> [options]
       Start an agent on an environment (<env> is its id or name), or start
@@ -66,7 +87,9 @@ Options:
   --url=<url>            API URL
   --api-key-env=<VAR>    read the API key from environment variable VAR
   --json                 print the API's object on stdout (inbox, wait and
-                         status: the newest run)
+                         status: the newest run; secret list: only each
+                         name and kind; env delete and secret delete:
+                         {"id"|"name": …, "deleted": true})
   -h, --help             show this help
   -v, --version          print the version (on its own: sky --version)
 
@@ -112,8 +135,8 @@ export async function run(io: Io): Promise<number> {
       case "secret":
         return await runSecret(rest, io);
       default:
-        if (Object.hasOwn(agentCommands, command)) {
-          return await runAgent(command, rest, io);
+        if (Object.hasOwn(commands, command)) {
+          return await runCommand(command, rest, io);
         }
         throw new UsageError(`unknown command '${command}'`, true);
     }
@@ -148,14 +171,25 @@ function parse<
   }
 }
 
-function connect(values: { url?: string; "api-key-env"?: string }, io: Io) {
+/** Resolves config, runs the command, and turns an API error into its exit status. */
+async function withApi(
+  values: { url?: string; "api-key-env"?: string; json?: boolean },
+  io: Io,
+  action: (api: Api, out: Output) => Promise<number>,
+): Promise<number> {
+  const out = createOutput(values.json ?? false, io.stdout, io.stderr);
   const resolved = resolveConfig(
     { url: values.url, apiKeyEnv: values["api-key-env"] },
     io.env,
     io.home,
   );
   if (!resolved.ok) throw new UsageError(resolved.error);
-  return { api: createApi(resolved.config), config: resolved.config };
+  try {
+    return await action(createApi(resolved.config), out);
+  } catch (err) {
+    if (err instanceof ApiError) return failApi(err, resolved.config, out);
+    throw err;
+  }
 }
 
 async function runApply(args: string[], io: Io): Promise<number> {
@@ -167,15 +201,8 @@ async function runApply(args: string[], io: Io): Promise<number> {
   if (positionals.length !== 1) {
     throw new UsageError("apply takes one argument, the env.yaml path", true);
   }
-  const out = createOutput(values.json ?? false, io.stdout, io.stderr);
   const file = positionals[0] as string;
-  const { api, config } = connect(values, io);
-  try {
-    return await apply(file, api, io, out);
-  } catch (err) {
-    if (err instanceof ApiError) return failApi(err, config, out);
-    throw err;
-  }
+  return await withApi(values, io, (api, out) => apply(file, api, io, out));
 }
 
 async function runSecret(args: string[], io: Io): Promise<number> {
@@ -188,12 +215,31 @@ async function runSecret(args: string[], io: Io): Promise<number> {
     return 0;
   }
   const [sub, envRef, name, ...extra] = positionals;
-  if (sub !== "set") {
+  if (sub !== "set" && sub !== "list" && sub !== "delete") {
     throw new UsageError(
       sub === undefined
-        ? "secret needs a subcommand: set"
+        ? "secret needs a subcommand: set, list or delete"
         : `unknown secret subcommand '${sub}'`,
       true,
+    );
+  }
+  if (sub !== "set" && values.connector !== undefined) {
+    throw new UsageError("--connector only goes with secret set", true);
+  }
+  if (sub === "list") {
+    if (envRef === undefined || name !== undefined) {
+      throw new UsageError("secret list takes one argument, <env>", true);
+    }
+    return await withApi(values, io, (api, out) =>
+      secretList(envRef, api, out),
+    );
+  }
+  if (sub === "delete") {
+    if (envRef === undefined || name === undefined || extra.length > 0) {
+      throw new UsageError("secret delete takes <env> <NAME>", true);
+    }
+    return await withApi(values, io, (api, out) =>
+      secretDelete(envRef, name, api, out),
     );
   }
   if (envRef === undefined || name === undefined || extra.length > 0) {
@@ -203,22 +249,19 @@ async function runSecret(args: string[], io: Io): Promise<number> {
       true,
     );
   }
-  const out = createOutput(values.json ?? false, io.stdout, io.stderr);
-  const { api, config } = connect(values, io);
-  try {
-    return await secretSet(envRef, name, values.connector, api, io, out);
-  } catch (err) {
-    if (err instanceof ApiError) return failApi(err, config, out);
-    throw err;
-  }
+  return await withApi(values, io, (api, out) =>
+    secretSet(envRef, name, values.connector, api, io, out),
+  );
 }
 
-async function runAgent(
+const commands: Record<string, AgentCommand> = { ...agentCommands, env };
+
+async function runCommand(
   command: string,
   args: string[],
   io: Io,
 ): Promise<number> {
-  const spec = agentCommands[command] as (typeof agentCommands)[string];
+  const spec = commands[command] as AgentCommand;
   const { values, positionals } = parse(
     args,
     { ...commonOptions, ...spec.options },
@@ -230,22 +273,16 @@ async function runAgent(
     io.stdout(help(io));
     return 0;
   }
-  // every agent option is a string; parseArgs types a spread option set as string | boolean
+  // parseArgs types a spread option set as string | boolean
   const text = (v: string | boolean | undefined) =>
     typeof v === "string" ? v : undefined;
   const action = spec.prepare(positionals, {
     prompt: text(values.prompt),
     timeout: text(values.timeout),
     reason: text(values.reason),
+    yes: values.yes === true,
   });
-  const out = createOutput(values.json ?? false, io.stdout, io.stderr);
-  const { api, config } = connect(values, io);
-  try {
-    return await action(api, io, out);
-  } catch (err) {
-    if (err instanceof ApiError) return failApi(err, config, out);
-    throw err;
-  }
+  return await withApi(values, io, (api, out) => action(api, io, out));
 }
 
 /** A rejected key is a config error (2): retrying with the same key can't succeed. */

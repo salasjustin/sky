@@ -42,11 +42,15 @@ beforeAll(async () => {
     req.on("end", () => {
       received.push({ url: req.url ?? "", body });
       res.setHeader("content-type", "application/json");
+      const answers: Record<string, unknown> = {
+        "/v1/environments": {
+          data: [{ ...provisioningEnv, id: "env_1", status: "ready" }],
+        },
+        "/v1/environments/env_slow": provisioningEnv,
+      };
       res.end(
         JSON.stringify(
-          req.url === "/v1/environments/env_slow"
-            ? provisioningEnv
-            : { name: "TOKEN", kind: "value" },
+          answers[req.url ?? ""] ?? { name: "TOKEN", kind: "value" },
         ),
       );
     });

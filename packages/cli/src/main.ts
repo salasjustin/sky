@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { homedir } from "node:os";
+import { createInterface } from "node:readline";
 import { text } from "node:stream/consumers";
 import { setTimeout as sleep } from "node:timers/promises";
 import { run } from "./cli.js";
@@ -46,6 +47,26 @@ function promptHidden(prompt: string): Promise<string> {
   });
 }
 
+/** `question()` never settles at end of input, so a close resolves "" instead. */
+function prompt(text: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  return new Promise((resolve) => {
+    const onClose = () => resolve("");
+    rl.once("close", onClose);
+    // readline holds the terminal in raw mode and takes Ctrl-C; raise it so the shell sees an interrupt
+    rl.once("SIGINT", () => {
+      rl.off("close", onClose);
+      rl.close();
+      process.kill(process.pid, "SIGINT");
+    });
+    rl.question(text, (answer) => {
+      rl.off("close", onClose);
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
+
 try {
   process.exitCode = await run({
     argv: process.argv.slice(2),
@@ -58,6 +79,7 @@ try {
       isTTY: process.stdin.isTTY === true,
       readAll: () => text(process.stdin),
       promptHidden,
+      prompt,
     },
     sleep: (ms) => sleep(ms),
     now: () => Date.now(),
