@@ -4,7 +4,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { holdSprite } from "./keepalive.js";
 
 let dir: string;
@@ -137,12 +137,101 @@ test("a refused refresh is one warning per failure, and the hold keeps trying", 
     runId: "run_1",
     socketPath,
     refreshMs: 20,
+    firstRetryMs: 5,
+    firstAttempts: 2,
     warn: (m) => warnings.push(m),
   });
+  await expect(hold.ready).resolves.toBe(false);
   await sleep(70);
   await hold.release();
   const puts = calls.filter((c) => c.method === "PUT").length;
-  expect(puts).toBeGreaterThanOrEqual(2);
-  expect(warnings.length).toBe(calls.length);
+  expect(puts).toBeGreaterThanOrEqual(3);
+  // one line per failed call, and one saying the quick first retries ran out
+  expect(warnings.filter((w) => /failed: HTTP 500/.test(w))).toHaveLength(
+    calls.length,
+  );
+  expect(warnings.filter((w) => /not held/.test(w))).toHaveLength(1);
   expect(warnings[0]).toMatch(/HTTP 500/);
+});
+
+test("a socket that refuses at first is retried quickly, and ready says once the hold lands", async () => {
+  let refusals = 2;
+  const calls: string[] = [];
+  api = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      calls.push(req.method ?? "");
+      res.writeHead(refusals-- > 0 ? 503 : 200).end();
+    });
+  });
+  const socketPath = join(dir, "api.sock");
+  api.listen(socketPath);
+  await once(api, "listening");
+  const warnings: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 60_000,
+    firstRetryMs: 5,
+    warn: (m) => warnings.push(m),
+  });
+  await expect(hold.ready).resolves.toBe(true);
+  // the third PUT held the sprite, long before the minute-long refresh would have tried again
+  expect(calls).toEqual(["PUT", "PUT", "PUT"]);
+  expect(warnings.some((w) => /not held/.test(w))).toBe(false);
+  await hold.release();
+});
+
+test("a stop during the first-hold retries settles ready unheld at once and puts no more", async () => {
+  const { calls, socketPath } = await spriteApi(500);
+  const stop = new AbortController();
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 60_000,
+    firstRetryMs: 1_000,
+    signal: stop.signal,
+    warn: () => {},
+  });
+  // the first PUT has failed, so the loop is in its retry sleep
+  await vi.waitFor(() => expect(calls).toHaveLength(1));
+  const stopped = Date.now();
+  stop.abort("SIGTERM");
+  await expect(hold.ready).resolves.toBe(false);
+  expect(Date.now() - stopped).toBeLessThan(250);
+  await hold.release();
+  expect(calls.map((c) => c.method)).toEqual(["PUT", "DELETE"]);
+});
+
+test("a stop abandons a first PUT the sprite API is stalling on", async () => {
+  let puts = 0;
+  api = createServer((req) => {
+    // never answers, as a sprite API that accepts and then stalls
+    req.resume();
+    puts++;
+  });
+  const socketPath = join(dir, "api.sock");
+  api.listen(socketPath);
+  await once(api, "listening");
+  const stop = new AbortController();
+  const warnings: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 60_000,
+    signal: stop.signal,
+    warn: (m) => warnings.push(m),
+  });
+  await vi.waitFor(() => expect(puts).toBe(1));
+  const stopped = Date.now();
+  stop.abort("SIGTERM");
+  await expect(hold.ready).resolves.toBe(false);
+  expect(Date.now() - stopped).toBeLessThan(250);
+  expect(puts).toBe(1);
+  expect(warnings.some((w) => /aborted/i.test(w))).toBe(false);
+  // gone, so release's DELETE fails at once rather than stalling for its timeout
+  api.closeAllConnections();
+  api.close();
+  api = undefined;
+  await hold.release();
 });

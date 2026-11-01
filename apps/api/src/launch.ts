@@ -194,16 +194,30 @@ export function createLauncher({
       : profile;
   }
 
+  /** Runs one launch step, logging how long it took, so a stuck launch shows where it stopped. */
+  async function step<T>(
+    launch: Launch,
+    name: string,
+    task: () => Promise<T>,
+  ): Promise<T> {
+    const started = Date.now();
+    log(`launching ${launch.runId}: ${name} started`);
+    const result = await task();
+    log(`launching ${launch.runId}: ${name} ok in ${Date.now() - started}ms`);
+    return result;
+  }
+
   async function run(launch: Launch, agentToken: string): Promise<void> {
     const known = [agentToken];
-    await ensureBundle(launch.spriteName, launch.runId);
+    await step(launch, "bundle", () =>
+      ensureBundle(launch.spriteName, launch.runId),
+    );
     const promptFile = `/workspace/runs/${launch.runId}.prompt`;
-    await writeSpriteFile(
-      sprites,
-      launch.spriteName,
-      promptFile,
-      launch.prompt,
-      { op: "write-prompt", known },
+    await step(launch, "prompt file", () =>
+      writeSpriteFile(sprites, launch.spriteName, promptFile, launch.prompt, {
+        op: "write-prompt",
+        known,
+      }),
     );
     // a stop that landed mid-launch found no runner to signal
     const current = db
@@ -241,62 +255,66 @@ export function createLauncher({
       .where(eq(runs.id, launch.runId))
       .run();
     const envFilePath = `/workspace/runs/${launch.runId}.env`;
-    await writeSpriteFile(
-      sprites,
-      launch.spriteName,
-      envFilePath,
-      envFile([
-        ...envSecrets,
-        ...envVars,
-        // after the secrets, so no secret points the runner at another store or other checks than the
-        // env's base profile; without the connector it has nothing to sync a store through
-        ...runEnv(
-          profileFor(
-            launch.envId,
-            hasConnectorSecret(db, launch.envId, "GITHUB_CONNECTOR"),
-          ),
-        ),
-        ["CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken],
-        ["AGENT_TOKEN", agentToken],
-      ]),
-      { op: "write-env-file", mode: 0o600, known },
-    );
-    await startDetached(
-      sprites,
-      launch.spriteName,
-      ["bash", "-c", RUNNER_COMMAND],
-      {
-        cwd: REPO_DIR,
-        env: {
-          AGENT_ID: launch.agentId,
-          RUN_ID: launch.runId,
-          API_BASE_URL: config.publicBaseUrl,
-          ENV_FILE: envFilePath,
-          PROMPT_FILE: promptFile,
-          REPO_DIR,
-          WORKTREES_DIR,
-          APPROVAL_POLICY: JSON.stringify(launch.approvalPolicy),
-          AUTO_APPROVE: JSON.stringify(launch.autoApprove),
-          WAIT_TIMEOUT_MINUTES: String(config.waitTimeoutMs / 60_000),
-          ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
-        },
-        watchMs,
-        op: "start-runner",
-        known,
-      },
-    ).catch(async (err: unknown) => {
-      // the runner never started, so nothing else deletes the file its secrets sit in
-      await execInSprite(
+    await step(launch, "env file", () =>
+      writeSpriteFile(
         sprites,
         launch.spriteName,
-        ["rm", "-f", envFilePath],
+        envFilePath,
+        envFile([
+          ...envSecrets,
+          ...envVars,
+          // after the secrets, so no secret points the runner at another store or other checks than the
+          // env's base profile; without the connector it has nothing to sync a store through
+          ...runEnv(
+            profileFor(
+              launch.envId,
+              hasConnectorSecret(db, launch.envId, "GITHUB_CONNECTOR"),
+            ),
+          ),
+          ["CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken],
+          ["AGENT_TOKEN", agentToken],
+        ]),
+        { op: "write-env-file", mode: 0o600, known },
+      ),
+    );
+    await step(launch, "start runner", () =>
+      startDetached(
+        sprites,
+        launch.spriteName,
+        ["bash", "-c", RUNNER_COMMAND],
         {
-          op: "rm-env-file",
+          cwd: REPO_DIR,
+          env: {
+            AGENT_ID: launch.agentId,
+            RUN_ID: launch.runId,
+            API_BASE_URL: config.publicBaseUrl,
+            ENV_FILE: envFilePath,
+            PROMPT_FILE: promptFile,
+            REPO_DIR,
+            WORKTREES_DIR,
+            APPROVAL_POLICY: JSON.stringify(launch.approvalPolicy),
+            AUTO_APPROVE: JSON.stringify(launch.autoApprove),
+            WAIT_TIMEOUT_MINUTES: String(config.waitTimeoutMs / 60_000),
+            ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
+          },
+          watchMs,
+          op: "start-runner",
           known,
         },
-      ).catch(() => {});
-      throw err;
-    });
+      ).catch(async (err: unknown) => {
+        // the runner never started, so nothing else deletes the file its secrets sit in
+        await execInSprite(
+          sprites,
+          launch.spriteName,
+          ["rm", "-f", envFilePath],
+          {
+            op: "rm-env-file",
+            known,
+          },
+        ).catch(() => {});
+        throw err;
+      }),
+    );
   }
 
   /**

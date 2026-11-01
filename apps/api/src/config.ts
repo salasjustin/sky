@@ -33,6 +33,11 @@ const configSchema = z.object({
   CLI_BUNDLE_PATH: z.string().min(1).default(bundledCli),
   /** A run with no event for this long is failed with `runner_timeout`. */
   RUN_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
+  /**
+   * A run still starting with no event this long after it was created is failed with `launch_timeout`.
+   * Past the runner's longest startup: a store lock wait (10 minutes) and the plugin refresh.
+   */
+  LAUNCH_DEADLINE_MINUTES: z.coerce.number().positive().default(15),
   /** How long a runner waits on a question or approval before giving up; the runner gets it at launch. */
   WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
   /** The bound on a sprite's clone, installs, setup script, store steps and checkpoint. */
@@ -59,6 +64,7 @@ export type Config = {
   runnerBundlePath: string;
   cliBundlePath: string;
   runTimeoutMs: number;
+  launchDeadlineMs: number;
   waitTimeoutMs: number;
   spritesLongTimeoutMs: number;
   baseProfiles: BaseProfiles;
@@ -102,6 +108,7 @@ export function loadConfig(
         runnerBundlePath: e.RUNNER_BUNDLE_PATH,
         cliBundlePath: e.CLI_BUNDLE_PATH,
         runTimeoutMs: e.RUN_TIMEOUT_MINUTES * 60_000,
+        launchDeadlineMs: e.LAUNCH_DEADLINE_MINUTES * 60_000,
         waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
         spritesLongTimeoutMs: e.SPRITES_LONG_TIMEOUT_MINUTES * 60_000,
         baseProfiles: e.SKY_BASE_PROFILES,

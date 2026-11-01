@@ -5,21 +5,25 @@ import { type Db, migrate, openDb } from "@sky/db";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { createDispatcher } from "./deliveries.js";
+import { signalRunner } from "./launch.js";
 import { failInterruptedProvisioning } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
 import {
   failAbandonedWaits,
   failStaleRuns,
+  failUnlaunchedRuns,
   pruneClaudeEvents,
 } from "./runs.js";
 import { purgeExpiredEnvVars } from "./secrets.js";
+import { SPRITES_TIMEOUT_MS, type SpriteOps } from "./sprites.js";
 
 const SWEEP_EVERY_MS = 60_000;
 
 /**
  * Opens and migrates the one DB handle the app reuses for its lifetime, fails provisioning a previous
  * process left unfinished, and fails silent runs and abandoned waits now and every minute after. Runs
- * outlive a restart: their runners keep posting, so only silence fails one. The same sweep deletes
+ * outlive a restart: their runners keep posting, so only silence fails one. A run failed for missing its
+ * launch deadline has its runner signalled too, without waiting on the sprite. The same sweep deletes
  * run envVars past their TTL and `claude.*` events past 7 days. Webhook deliveries left pending resume at once.
  */
 export function boot(config: Config, log: (line: string) => void) {
@@ -33,13 +37,28 @@ export function boot(config: Config, log: (line: string) => void) {
   });
   // the app redacts with it; the sweep drops each envVar it purges
   const secrets = KnownSecrets.fromConfig(config);
+  const sprites = new SpritesClient(config.spritesToken);
+  const spriteOps: SpriteOps = {
+    client: sprites,
+    log,
+    secrets,
+    timeoutMs: SPRITES_TIMEOUT_MS,
+    longTimeoutMs: config.spritesLongTimeoutMs,
+  };
   const sweep = () => {
     purgeExpiredEnvVars(db, secrets, new Date());
+    const late = failUnlaunchedRuns(db, config.launchDeadlineMs);
+    for (const { runId, spriteName } of late) {
+      log(`run ${runId} failed: launch_timeout`);
+      // a runner that started after all would hold the agent's sprite against its follow-up;
+      // not awaited, so one slow sprite never holds up the sweep (signalRunner logs, never throws)
+      void signalRunner(spriteOps, spriteName, runId, log);
+    }
     const stale = failStaleRuns(db, config.runTimeoutMs);
     for (const id of stale) log(`run ${id} failed: runner_timeout`);
     const abandoned = failAbandonedWaits(db, config.waitTimeoutMs);
     for (const id of abandoned) log(`run ${id} failed: waiting_timeout`);
-    if (stale.length + abandoned.length > 0) dispatcher.nudge();
+    if (late.length + stale.length + abandoned.length > 0) dispatcher.nudge();
     const pruned = pruneClaudeEvents(db);
     if (pruned > 0) log(`pruned ${pruned} claude.* events older than 7 days`);
   };
@@ -55,7 +74,6 @@ export function boot(config: Config, log: (line: string) => void) {
     Math.min(SWEEP_EVERY_MS, config.runTimeoutMs),
   );
   sweeper.unref();
-  const sprites = new SpritesClient(config.spritesToken);
   dispatcher.start();
   const closing = new AbortController();
   // one listener per open stream or parked poll; past 10, Node would warn of a leak that isn't one

@@ -17,6 +17,7 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   runnerBundlePath: "/unused/runner.mjs",
   cliBundlePath: "/unused/sky.mjs",
   runTimeoutMs: 30 * 60_000,
+  launchDeadlineMs: 15 * 60_000,
   spritesLongTimeoutMs: 30 * 60_000,
   waitTimeoutMs: 120 * 60_000,
   baseProfiles: {},

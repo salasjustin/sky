@@ -20,7 +20,7 @@ import { createApp } from "./app.js";
 import { BASE_ENV_NAMES } from "./base-profile.js";
 import type { Config } from "./config.js";
 import { envSecretAad, seal } from "./crypto.js";
-import { failStaleRuns } from "./runs.js";
+import { failStaleRuns, failUnlaunchedRuns } from "./runs.js";
 import { spriteNameFor } from "./sprites.js";
 import {
   envFileOf,
@@ -1571,6 +1571,41 @@ test("a run silent past the timeout is failed with runner_timeout, freeing its c
   ).toBe(401);
   await launched(envId);
   await sessionOpened(2);
+});
+
+test("a run that never reports in is failed with launch_timeout past the launch deadline, freeing the agent", async () => {
+  const envId = readyEnv({ concurrency: 1 });
+  const { agent, run } = await runningRun(envId);
+  const deadline = config.launchDeadlineMs;
+  expect(
+    failUnlaunchedRuns(db, deadline, Date.now() + deadline - 1000),
+  ).toEqual([]);
+  expect(
+    failUnlaunchedRuns(db, deadline, Date.now() + deadline + 1000),
+  ).toEqual([{ runId: run.id, spriteName: spriteNameFor(envId) }]);
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    status: "failed",
+    error: "launch_timeout",
+  });
+  await launched(envId);
+  await sessionOpened(2);
+});
+
+test("the launch deadline leaves a run alone once its runner has reported in", async () => {
+  const envId = readyEnv({ concurrency: 1 });
+  const { agent, run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const deadline = config.launchDeadlineMs;
+  expect(
+    failUnlaunchedRuns(db, deadline, Date.now() + deadline + 1000),
+  ).toEqual([]);
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    status: "running",
+  });
 });
 
 const followUp = (agentId: string, body: unknown) =>

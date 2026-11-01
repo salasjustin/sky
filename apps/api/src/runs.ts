@@ -1,6 +1,7 @@
 import {
   agents,
   type Db,
+  environments,
   events,
   runRequests,
   runs,
@@ -185,6 +186,40 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
         .map((r) => r.id);
       for (const id of stale) failRun(tx, id, "runner_timeout");
       return stale;
+    },
+    { behavior: "immediate" },
+  );
+}
+
+/**
+ * Fails, with `launch_timeout`, every run still `starting` that was created over `deadlineMs` ago
+ * and has no event: its runner never reported in (a launch stuck on the sprite, or a sprite that paused
+ * before the runner held it), so the agent frees up for a follow-up instead of waiting out
+ * `runner_timeout`. Returns each run it failed with the sprite its runner may still be on.
+ */
+export function failUnlaunchedRuns(
+  db: Db,
+  deadlineMs: number,
+  now = Date.now(),
+): { runId: RunId; spriteName: string }[] {
+  const cutoff = new Date(now - deadlineMs).toISOString();
+  return db.transaction(
+    (tx) => {
+      const late = tx
+        .select({ runId: runs.id, spriteName: environments.spriteName })
+        .from(runs)
+        .innerJoin(agents, eq(runs.agentId, agents.id))
+        .innerJoin(environments, eq(agents.envId, environments.id))
+        .where(
+          and(
+            eq(runs.status, "starting"),
+            lt(runs.createdAt, cutoff),
+            sql`not exists (select 1 from ${events} where ${events.runId} = ${runs.id})`,
+          ),
+        )
+        .all();
+      for (const { runId } of late) failRun(tx, runId, "launch_timeout");
+      return late;
     },
     { behavior: "immediate" },
   );

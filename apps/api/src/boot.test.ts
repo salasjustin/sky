@@ -23,7 +23,8 @@ import { server } from "../../../test/msw.js";
 import { mintAgentToken } from "./agent-token.js";
 import { boot, shutdown } from "./boot.js";
 import { runEnvVarAad, seal } from "./crypto.js";
-import { testConfig } from "./testing/sprites.js";
+import { runnerPattern } from "./launch.js";
+import { stubSprites, testConfig } from "./testing/sprites.js";
 
 let dir: string;
 let db: Db | undefined;
@@ -178,6 +179,33 @@ test("boot fails runs a previous process left silent past the timeout; fresh one
   expect(
     db.$client.prepare("select status from agents where id = 'agt_old'").get(),
   ).toEqual({ status: "idle" });
+});
+
+test("boot fails a run that never reported in past the launch deadline and signals its runner", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-env_a");
+  const first = booted().db;
+  first.$client.exec(`
+    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a');
+    insert into agents (id, env_id, branch, status) values ('agt_late', 'env_a', 'claude/agt_late', 'running');
+    insert into runs (id, agent_id, status, created_at) values ('run_late', 'agt_late', 'starting', '2026-01-01T00:00:00.000Z');
+  `);
+  first.$client.close();
+
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
+  expect(db.$client.prepare("select type, payload from events").all()).toEqual([
+    { type: "run.failed", payload: '{"error":"launch_timeout"}' },
+  ]);
+  await expect
+    .poll(() => wire.calls)
+    .toContain(
+      `exec sky-env_a - pkill -TERM -f ${runnerPattern("run_late" as RunId)}`,
+    );
+  // settled before teardown closes the DB and resets the handlers
+  await expect
+    .poll(() => lines.some((l) => l.startsWith("sprite sky-env_a pkill: ok")))
+    .toBe(true);
 });
 
 test("a webhook delivery a previous process left pending is sent after boot", async () => {

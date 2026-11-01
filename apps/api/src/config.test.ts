@@ -28,6 +28,7 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       runnerBundlePath: expect.stringMatching(/\/runner\.mjs$/),
       cliBundlePath: expect.stringMatching(/\/sky\.mjs$/),
       runTimeoutMs: 30 * 60_000,
+      launchDeadlineMs: 15 * 60_000,
       waitTimeoutMs: 120 * 60_000,
       baseProfiles: {},
       spritesLongTimeoutMs: 30 * 60_000,
@@ -37,11 +38,12 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
   });
 });
 
-test("RUNNER_BUNDLE_PATH, RUN_TIMEOUT_MINUTES, WAIT_TIMEOUT_MINUTES and SPRITES_LONG_TIMEOUT_MINUTES override their defaults", () => {
+test("RUNNER_BUNDLE_PATH, RUN_TIMEOUT_MINUTES, LAUNCH_DEADLINE_MINUTES, WAIT_TIMEOUT_MINUTES and SPRITES_LONG_TIMEOUT_MINUTES override their defaults", () => {
   const result = loadConfig({
     ...required,
     RUNNER_BUNDLE_PATH: "/opt/api/runner.mjs",
     RUN_TIMEOUT_MINUTES: "5",
+    LAUNCH_DEADLINE_MINUTES: "3",
     WAIT_TIMEOUT_MINUTES: "15",
     SPRITES_LONG_TIMEOUT_MINUTES: "45",
   });
@@ -50,6 +52,7 @@ test("RUNNER_BUNDLE_PATH, RUN_TIMEOUT_MINUTES, WAIT_TIMEOUT_MINUTES and SPRITES_
     config: {
       runnerBundlePath: "/opt/api/runner.mjs",
       runTimeoutMs: 300_000,
+      launchDeadlineMs: 180_000,
       waitTimeoutMs: 900_000,
       spritesLongTimeoutMs: 2_700_000,
     },
