@@ -942,7 +942,17 @@ test("--branch after the local history was amended force-updates the named branc
   });
   writeFileSync(join(work, "a.txt"), "first, amended\n");
   git(work, "add", "--all");
-  git(work, "commit", "-q", "--amend", "--no-edit");
+  git(
+    work,
+    "-c",
+    "user.name=Claude",
+    "-c",
+    "user.email=noreply@anthropic.com",
+    "commit",
+    "-q",
+    "--amend",
+    "--no-edit",
+  );
 
   await run({ branch: "feature/widgets" });
 
