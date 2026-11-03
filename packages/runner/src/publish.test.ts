@@ -966,6 +966,10 @@ test("--branch must be a valid branch name other than the base, refused before a
   for (const [branch, message] of refused) {
     await expect(run({ branch })).rejects.toThrow(message);
   }
+  // the default branch stays off limits when --base names another
+  await expect(run({ branch: "main", base: "develop" })).rejects.toThrow(
+    "main is the base branch",
+  );
   expect(gh.authorization).toEqual([]);
   expect(gh.blobs).toEqual([]);
   expect(gh.commits).toEqual([]);

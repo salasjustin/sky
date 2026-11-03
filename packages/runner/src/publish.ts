@@ -101,9 +101,8 @@ const TRAILER = /^\s*[\w-]+:\s/;
 
 /**
  * Drops the "Generated with Claude Code" footer and every `Co-authored-by` trailer (whoever the
- * co-author), with the blank lines they leave. Only the
- * trailing run of trailer, footer and blank lines is searched; the same line anywhere above it, a
- * fenced example included, is kept.
+ * co-author), with the blank lines they leave. Only the trailing run of trailer, footer and blank
+ * lines is searched; the same line anywhere above it, a fenced example included, is kept.
  */
 export function stripAttribution(text: string): string {
   const all = text.split("\n");
@@ -375,10 +374,11 @@ async function sitsOn(
 }
 
 /**
- * Publishes the worktree's branch through the GitHub gateway, which carries no git push: each
- * commit past the base is recreated with GitHub's git data API (blobs, a tree on its parent's tree,
- * the commit with its own message and identities), then the branch ref is created or moved
- * and a pull request into the base opened, or the open one given the new title and body. Claude
+ * Publishes the worktree's branch, or `options.branch`, through the GitHub gateway, which carries
+ * no git push: each commit past the base is recreated with GitHub's git data API (blobs, a tree on
+ * its parent's tree, the commit with its own message and identities), then the branch ref is
+ * created or moved and a pull request into the base opened, or the open one given the new title
+ * and body. Claude
  * Code's attribution is stripped from each commit message and the pull request's body, never its
  * title. The base is first refreshed to GitHub's current head, with the branch's commits rebased
  * onto it when it moved (`refreshBase`). That rebase flattens a merge: the merge commit is dropped
@@ -445,7 +445,13 @@ export async function publish(options: {
     (await git(cwd, "rev-parse", "--abbrev-ref", "origin/HEAD"))
       .trim()
       .replace(/^origin\//, "");
-  if (remoteBranch === base) {
+  // `--base` can name another branch, which would leave the default branch open to a fast-forward
+  const defaultBranch = (
+    await git(cwd, "rev-parse", "--abbrev-ref", "origin/HEAD").catch(() => "")
+  )
+    .trim()
+    .replace(/^origin\//, "");
+  if (remoteBranch === base || remoteBranch === defaultBranch) {
     throw new PublishError(
       `${remoteBranch} is the base branch; publish to a branch of its own`,
     );
