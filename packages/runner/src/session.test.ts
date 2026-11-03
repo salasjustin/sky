@@ -22,7 +22,7 @@ import { server } from "../../../test/msw.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
 import { createDecisionWaiter } from "./requests.js";
-import { type QueryFn, runSession } from "./session.js";
+import { type QueryFn, runSession, sessionGitIdentity } from "./session.js";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -615,7 +615,26 @@ test("runs the session in the agent worktree, resuming the stored session, witho
   }
 });
 
+const HOST_GIT_IDENTITY = [
+  "GIT_AUTHOR_NAME",
+  "GIT_AUTHOR_EMAIL",
+  "GIT_COMMITTER_NAME",
+  "GIT_COMMITTER_EMAIL",
+] as const;
+
+// the host running the tests may carry a git identity of its own; unstubEnvs() puts it back
+const stubHostGitIdentity = (identity: Record<string, string> = {}) => {
+  for (const key of HOST_GIT_IDENTITY) {
+    vi.stubEnv(key, identity[key]);
+  }
+};
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 test("the session commits as Claude through its env, so nothing writes the clone's git config", async () => {
+  stubHostGitIdentity();
   const query = scripted([init, success]);
   await runSession(config, {
     query,
@@ -632,49 +651,42 @@ test("the session commits as Claude through its env, so nothing writes the clone
 });
 
 test("a git author set in the runner's env replaces Claude in the session env, the committer defaulting to it", async () => {
-  const envOf = async () => {
-    const query = scripted([init, success]);
-    await runSession(config, {
-      query,
-      post: recorder().post,
-      signal: new AbortController().signal,
-      awaitDecision: noDecision,
-    });
-    return query.calls[0]?.options.env;
-  };
-  // the host running the tests may carry a committer of its own
-  const held = [
-    process.env.GIT_COMMITTER_NAME,
-    process.env.GIT_COMMITTER_EMAIL,
-  ];
-  delete process.env.GIT_COMMITTER_NAME;
-  delete process.env.GIT_COMMITTER_EMAIL;
-  process.env.GIT_AUTHOR_NAME = "Dev Person";
-  process.env.GIT_AUTHOR_EMAIL = "dev@example.com";
-  try {
-    expect(await envOf()).toMatchObject({
+  stubHostGitIdentity({
+    GIT_AUTHOR_NAME: "Dev Person",
+    GIT_AUTHOR_EMAIL: "dev@example.com",
+  });
+  const query = scripted([init, success]);
+  await runSession(config, {
+    query,
+    post: recorder().post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(query.calls[0]?.options.env).toMatchObject({
+    GIT_AUTHOR_NAME: "Dev Person",
+    GIT_AUTHOR_EMAIL: "dev@example.com",
+    GIT_COMMITTER_NAME: "Dev Person",
+    GIT_COMMITTER_EMAIL: "dev@example.com",
+  });
+});
+
+test("sessionGitIdentity: a committer field overrides the author's alone, and half an author is ignored", () => {
+  expect(
+    sessionGitIdentity({
       GIT_AUTHOR_NAME: "Dev Person",
       GIT_AUTHOR_EMAIL: "dev@example.com",
-      GIT_COMMITTER_NAME: "Dev Person",
-      GIT_COMMITTER_EMAIL: "dev@example.com",
-    });
-    process.env.GIT_COMMITTER_EMAIL = "ci@example.com";
-    expect(await envOf()).toMatchObject({
-      GIT_COMMITTER_NAME: "Dev Person",
       GIT_COMMITTER_EMAIL: "ci@example.com",
-    });
-    delete process.env.GIT_AUTHOR_EMAIL;
-    expect(await envOf()).toMatchObject({
-      GIT_AUTHOR_NAME: "Claude",
-      GIT_AUTHOR_EMAIL: "noreply@anthropic.com",
-    });
-  } finally {
-    delete process.env.GIT_AUTHOR_NAME;
-    delete process.env.GIT_AUTHOR_EMAIL;
-    delete process.env.GIT_COMMITTER_EMAIL;
-    if (held[0] !== undefined) process.env.GIT_COMMITTER_NAME = held[0];
-    if (held[1] !== undefined) process.env.GIT_COMMITTER_EMAIL = held[1];
-  }
+    }),
+  ).toEqual({
+    GIT_AUTHOR_NAME: "Dev Person",
+    GIT_AUTHOR_EMAIL: "dev@example.com",
+    GIT_COMMITTER_NAME: "Dev Person",
+    GIT_COMMITTER_EMAIL: "ci@example.com",
+  });
+  expect(sessionGitIdentity({ GIT_AUTHOR_NAME: "Dev Person" })).toMatchObject({
+    GIT_AUTHOR_NAME: "Claude",
+    GIT_AUTHOR_EMAIL: "noreply@anthropic.com",
+  });
 });
 
 test("the session turns Claude Code's commit and pull request attribution off", async () => {

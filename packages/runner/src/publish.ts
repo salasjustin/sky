@@ -419,8 +419,12 @@ export async function publish(options: {
   // the GitHub branch published to; the worktree's own branch keeps its name and its reflog
   const remoteBranch = options.branch ?? branch;
   if (options.branch !== undefined) {
+    // check-ref-format passes these under refs/heads/, but git refuses HEAD as a branch, and a
+    // ref path or remote prefix would be taken literally as part of the GitHub branch's name
     const valid =
       !options.branch.startsWith("-") &&
+      options.branch !== "HEAD" &&
+      !/^(refs|origin)\//.test(options.branch) &&
       (await git(cwd, "check-ref-format", `refs/heads/${options.branch}`).then(
         () => true,
         () => false,
@@ -729,7 +733,9 @@ export const BRANCH_ENV = "SKY_PUBLISH_BRANCH";
 /**
  * The identity commits are sent under: `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` (environment
  * secrets) for the author, the `GIT_COMMITTER_*` pair for the committer, defaulting to the author.
- * Undefined unless both author vars are set; the commits then keep the identities they were made with.
+ * Undefined unless both author vars are set, and the commits then keep the identities they were
+ * made with; inside a session both are always set, to Claude when the environment doesn't set both
+ * (`sessionGitIdentity` in session.ts), so there every commit sent is rewritten.
  */
 export function configuredIdentity(env: NodeJS.ProcessEnv) {
   const name = env.GIT_AUTHOR_NAME;

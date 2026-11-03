@@ -30,6 +30,20 @@ let root: string;
 let work: string;
 let baseSha: string;
 
+// the host's own git identity must not override the -c identity below
+const withoutHostIdentity = () => {
+  const env = { ...process.env };
+  for (const key of [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+  ]) {
+    delete env[key];
+  }
+  return env;
+};
+
 const commit = (message: string, date = "2026-10-30T12:00:00+02:00") => {
   git(work, "add", "--all");
   execFileSync(
@@ -45,7 +59,11 @@ const commit = (message: string, date = "2026-10-30T12:00:00+02:00") => {
     ],
     {
       cwd: work,
-      env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
+      env: {
+        ...withoutHostIdentity(),
+        GIT_AUTHOR_DATE: date,
+        GIT_COMMITTER_DATE: date,
+      },
     },
   );
   return git(work, "rev-parse", "HEAD");
@@ -934,39 +952,105 @@ test("--branch after the local history was amended force-updates the named branc
   });
 });
 
-test("--branch must be a valid branch name other than the base", async () => {
-  fakeGitHub();
+test("--branch must be a valid branch name other than the base, refused before anything reaches GitHub", async () => {
+  const gh = fakeGitHub();
   writeFileSync(join(work, "a.txt"), "first\n");
   commit("Add a");
-  for (const branch of ["main", "bad name", "a..b", "-x", "ends.lock"]) {
-    await expect(run({ branch })).rejects.toThrow(/branch/);
+  const refused = [
+    ["main", "main is the base branch; publish to a branch of its own"],
+    ["bad name", "bad name is not a valid branch name"],
+    ["a..b", "a..b is not a valid branch name"],
+    ["-x", "-x is not a valid branch name"],
+    ["ends.lock", "ends.lock is not a valid branch name"],
+  ] as const;
+  for (const [branch, message] of refused) {
+    await expect(run({ branch })).rejects.toThrow(message);
   }
+  expect(gh.authorization).toEqual([]);
+  expect(gh.blobs).toEqual([]);
+  expect(gh.commits).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+  expect(gh.pullCreates).toEqual([]);
 });
 
-test("SKY_PUBLISH_BRANCH is the command's default branch, and --branch outranks it", async () => {
+test("--branch refuses HEAD and a ref path or remote prefix, before anything reaches GitHub", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  for (const branch of [
+    "HEAD",
+    "refs/heads/feature",
+    "refs/feature",
+    "origin/feature",
+  ]) {
+    await expect(run({ branch })).rejects.toThrow(
+      `${branch} is not a valid branch name`,
+    );
+  }
+  expect(gh.authorization).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+  expect(gh.pullCreates).toEqual([]);
+});
+
+const publishEnv = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
+
+const publishMainWith = async (args: string[], env: Record<string, string>) => {
+  let stderr = "";
+  const status = await publishMain(
+    args,
+    { ...publishEnv, ...env },
+    {
+      cwd: work,
+      stdout: () => {},
+      stderr: (s) => {
+        stderr += s;
+      },
+    },
+  );
+  return { status, stderr };
+};
+
+test("SKY_PUBLISH_BRANCH is the command's default branch", async () => {
   const gh = fakeGitHub({ branch: "from/env" });
   writeFileSync(join(work, "a.txt"), "first\n");
   commit("Add a");
-  const io = { cwd: work, stdout: () => {}, stderr: () => {} };
-  const env = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
 
-  expect(
-    await publishMain(
-      ["--title", "T"],
-      { ...env, SKY_PUBLISH_BRANCH: "from/env" },
-      io,
-    ),
-  ).toBe(0);
+  const { status } = await publishMainWith(["--title", "T"], {
+    SKY_PUBLISH_BRANCH: "from/env",
+  });
+
+  expect(status).toBe(0);
   expect(gh.pullCreates).toMatchObject([{ head: "from/env" }]);
+});
 
-  // --branch main names the base, which is refused
-  expect(
-    await publishMain(
-      ["--title", "T", "--branch", "main"],
-      { ...env, SKY_PUBLISH_BRANCH: "from/env" },
-      io,
-    ),
-  ).toBe(1);
+test("--branch outranks SKY_PUBLISH_BRANCH", async () => {
+  const gh = fakeGitHub({ branch: "cli/branch" });
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const { status } = await publishMainWith(
+    ["--title", "T", "--branch", "cli/branch"],
+    { SKY_PUBLISH_BRANCH: "from/env" },
+  );
+
+  expect(status).toBe(0);
+  expect(gh.refWrites).toMatchObject([
+    { body: { ref: "refs/heads/cli/branch" } },
+  ]);
+  expect(gh.pullCreates).toMatchObject([{ head: "cli/branch" }]);
+});
+
+test("an empty SKY_PUBLISH_BRANCH falls back to the worktree's branch", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const { status } = await publishMainWith(["--title", "T"], {
+    SKY_PUBLISH_BRANCH: "",
+  });
+
+  expect(status).toBe(0);
+  expect(gh.pullCreates).toMatchObject([{ head: "claude/agt_1" }]);
 });
 
 test("a configured author replaces the identity on every recreated commit, the committer defaulting to it and the dates kept", async () => {
@@ -1020,23 +1104,73 @@ test("a configured committer differs from the author when GIT_COMMITTER_* are se
   });
 });
 
-test("with no configured identity, or only half of one, commits keep the identities they were made with", async () => {
-  const gh = fakeGitHub();
-  writeFileSync(join(work, "a.txt"), "first\n");
-  commit("Add a");
-  const io = { cwd: work, stdout: () => {}, stderr: () => {} };
+const CLAUDE = { name: "Claude", email: "noreply@anthropic.com" };
 
-  await publishMain(
-    ["--title", "T"],
-    {
-      GITHUB_CONNECTOR: CONNECTOR,
-      GITHUB_GATEWAY_URL: GATEWAY,
-      GIT_AUTHOR_NAME: "Dev Person",
+const identityCases: {
+  name: string;
+  env: Record<string, string>;
+  author: { name: string; email: string };
+  committer: { name: string; email: string };
+}[] = [
+  {
+    name: "no identity variables at all",
+    env: {},
+    author: CLAUDE,
+    committer: CLAUDE,
+  },
+  {
+    name: "an author name without an email",
+    env: { GIT_AUTHOR_NAME: "Dev Person" },
+    author: CLAUDE,
+    committer: CLAUDE,
+  },
+  {
+    name: "an author email without a name",
+    env: { GIT_AUTHOR_EMAIL: "dev@example.com" },
+    author: CLAUDE,
+    committer: CLAUDE,
+  },
+  {
+    name: "a committer without any author",
+    env: { GIT_COMMITTER_NAME: "C", GIT_COMMITTER_EMAIL: "c@example.com" },
+    author: CLAUDE,
+    committer: CLAUDE,
+  },
+  {
+    name: "an author and only a committer name",
+    env: {
+      GIT_AUTHOR_NAME: "A",
+      GIT_AUTHOR_EMAIL: "a@example.com",
+      GIT_COMMITTER_NAME: "C",
     },
-    io,
-  );
+    author: { name: "A", email: "a@example.com" },
+    committer: { name: "C", email: "a@example.com" },
+  },
+  {
+    name: "an author and only a committer email",
+    env: {
+      GIT_AUTHOR_NAME: "A",
+      GIT_AUTHOR_EMAIL: "a@example.com",
+      GIT_COMMITTER_EMAIL: "c@example.com",
+    },
+    author: { name: "A", email: "a@example.com" },
+    committer: { name: "A", email: "c@example.com" },
+  },
+];
 
-  expect(gh.commits[0]).toMatchObject({
-    author: { name: "Claude", email: "noreply@anthropic.com" },
-  });
-});
+test.each(identityCases)(
+  "identity: $name",
+  async ({ env, author, committer }) => {
+    const gh = fakeGitHub();
+    writeFileSync(join(work, "a.txt"), "first\n");
+    commit("Add a");
+
+    const { status } = await publishMainWith(["--title", "T"], env);
+
+    expect(status).toBe(0);
+    expect(gh.commits[0]).toMatchObject({
+      author: { ...author, date: "2026-10-30T10:00:00Z" },
+      committer: { ...committer, date: "2026-10-30T10:00:00Z" },
+    });
+  },
+);
