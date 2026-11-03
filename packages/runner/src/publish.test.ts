@@ -16,7 +16,7 @@ import {
   GatewayError,
   publish,
   publishMain,
-  stripClaudeAttribution,
+  stripAttribution,
 } from "./publish.js";
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
@@ -29,6 +29,20 @@ const git = (cwd: string, ...args: string[]) =>
 let root: string;
 let work: string;
 let baseSha: string;
+
+// the host's own git identity must not override the -c identity below
+const withoutHostIdentity = () => {
+  const env = { ...process.env };
+  for (const key of [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+  ]) {
+    delete env[key];
+  }
+  return env;
+};
 
 const commit = (message: string, date = "2026-10-30T12:00:00+02:00") => {
   git(work, "add", "--all");
@@ -45,7 +59,11 @@ const commit = (message: string, date = "2026-10-30T12:00:00+02:00") => {
     ],
     {
       cwd: work,
-      env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
+      env: {
+        ...withoutHostIdentity(),
+        GIT_AUTHOR_DATE: date,
+        GIT_COMMITTER_DATE: date,
+      },
     },
   );
   return git(work, "rev-parse", "HEAD");
@@ -97,8 +115,11 @@ function fakeGitHub(
     commitParents?: Record<string, string[]>;
     /** Whether a PATCH to a pull is expected; otherwise GitHub refuses it and the test fails. */
     allowPullUpdates?: boolean;
+    /** The GitHub branch published to; the worktree's own, claude/agt_1, unless given. */
+    branch?: string;
   } = {},
 ) {
+  const remoteBranch = options.branch ?? "claude/agt_1";
   const state = {
     ref: options.ref,
     allowPullUpdates: options.allowPullUpdates ?? false,
@@ -172,11 +193,11 @@ function fakeGitHub(
         { status: 201 },
       );
     }),
-    http.get(`${REPO}/git/ref/heads/claude/agt_1`, ({ request }) => {
+    http.get(`${REPO}/git/ref/heads/${remoteBranch}`, ({ request }) => {
       seen(request);
       return state.ref
         ? HttpResponse.json({
-            ref: "refs/heads/claude/agt_1",
+            ref: `refs/heads/${remoteBranch}`,
             object: { sha: state.ref, type: "commit" },
           })
         : HttpResponse.json({ message: "Not Found" }, { status: 404 });
@@ -188,13 +209,16 @@ function fakeGitHub(
       state.ref = body.sha;
       return HttpResponse.json({ object: { sha: body.sha } }, { status: 201 });
     }),
-    http.patch(`${REPO}/git/refs/heads/claude/agt_1`, async ({ request }) => {
-      seen(request);
-      const body = (await request.json()) as { sha: string };
-      state.refWrites.push({ method: "PATCH", body });
-      state.ref = body.sha;
-      return HttpResponse.json({ object: { sha: body.sha } });
-    }),
+    http.patch(
+      `${REPO}/git/refs/heads/${remoteBranch}`,
+      async ({ request }) => {
+        seen(request);
+        const body = (await request.json()) as { sha: string };
+        state.refWrites.push({ method: "PATCH", body });
+        state.ref = body.sha;
+        return HttpResponse.json({ object: { sha: body.sha } });
+      },
+    ),
     http.get(`${REPO}/pulls`, ({ request }) => {
       seen(request);
       const url = new URL(request.url);
@@ -234,7 +258,7 @@ function fakeGitHub(
   return state;
 }
 
-const run = (extra: { title?: string; body?: string } = {}) =>
+const run = (extra: Partial<Parameters<typeof publish>[0]> = {}) =>
   publish({
     cwd: work,
     gatewayUrl: GATEWAY,
@@ -524,24 +548,19 @@ test("Claude Code's footer and Co-Authored-By trailers are stripped from PR bodi
   expect(gh.pullCreates).toMatchObject([{ body: "## Summary\n\nWhy.\n" }]);
 });
 
-test("a human co-author named Claude keeps their trailer", async () => {
+test("every co-author trailer is stripped from commit messages and PR bodies, whoever the co-author", async () => {
   const gh = fakeGitHub();
   writeFileSync(join(work, "a.txt"), "first\n");
-  commit("Add a\n\nCo-Authored-By: Claude Shannon <claude@example.com>\n");
+  commit(
+    "Add a\n\nSigned-off-by: Ada <ada@example.com>\nco-authored-by: Ada <ada@example.com>\nCo-Authored-By: Claude Shannon <claude@example.com>\n",
+  );
 
-  await run();
+  await run({ body: "Why.\n\nCo-authored-by: Grace <grace@example.com>\n" });
 
   expect(gh.commits[0]?.message).toBe(
-    "Add a\n\nCo-Authored-By: Claude Shannon <claude@example.com>\n",
+    "Add a\n\nSigned-off-by: Ada <ada@example.com>\n",
   );
-});
-
-test("stripClaudeAttribution keeps a trailer whose address isn't Anthropic's, whatever the name or case", () => {
-  const text = "Fix\n\nCo-authored-by: Ada <ada@example.com>\n";
-  expect(stripClaudeAttribution(text)).toBe(text);
-  expect(stripClaudeAttribution("Fix\n\nco-authored-by: Claude <a@b.c>")).toBe(
-    "Fix\n\nco-authored-by: Claude <a@b.c>",
-  );
+  expect(gh.pullCreates).toMatchObject([{ body: "Why.\n" }]);
 });
 
 test("attribution quoted in a fenced block or mid-text is left in PR bodies and commit messages", async () => {
@@ -559,17 +578,19 @@ test("attribution quoted in a fenced block or mid-text is left in PR bodies and 
   expect(gh.pullCreates).toMatchObject([{ body: fenced }]);
 });
 
-test("an Anthropic co-author is stripped whatever the name", () => {
+test("stripAttribution drops co-authors and the footer from the trailing block only", () => {
   expect(
-    stripClaudeAttribution(
+    stripAttribution(
       "Fix\n\nSigned-off-by: Ada <ada@example.com>\nco-authored-by: Fable 2 <noreply@anthropic.com>\n",
     ),
   ).toBe("Fix\n\nSigned-off-by: Ada <ada@example.com>\n");
   expect(
-    stripClaudeAttribution(
+    stripAttribution(
       "Fix\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Ada <ada@example.com>\n",
     ),
-  ).toBe("Fix\n\nCo-Authored-By: Ada <ada@example.com>\n");
+  ).toBe("Fix\n");
+  const prose = "Co-authored-by: Ada <a@b.c>\n\nThen prose.";
+  expect(stripAttribution(prose)).toBe(prose);
 });
 
 test("a deleted file is a tree entry with a null sha", async () => {
@@ -865,3 +886,305 @@ test("a rate-limit pause GitHub asks for is waited out, then the call goes on", 
   expect(refused).toBe(1);
   expect(gh.blobs).toEqual([{ content: b64("first\n"), encoding: "base64" }]);
 });
+
+test("--branch sends the commits to the named GitHub branch and opens the PR from it, while the worktree keeps its own branch", async () => {
+  const gh = fakeGitHub({ branch: "feature/widgets" });
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const result = await run({ branch: "feature/widgets" });
+
+  expect(gh.refWrites).toEqual([
+    {
+      method: "POST",
+      body: { ref: "refs/heads/feature/widgets", sha: "commit1" },
+    },
+  ]);
+  expect(gh.pullCreates).toMatchObject([
+    { head: "feature/widgets", base: "main" },
+  ]);
+  expect(result.branch).toBe("feature/widgets");
+  expect(git(work, "symbolic-ref", "--short", "HEAD")).toBe("claude/agt_1");
+});
+
+test("--branch finds the open PR for the named branch and updates it instead of opening another", async () => {
+  const gh = fakeGitHub({
+    branch: "feature/widgets",
+    allowPullUpdates: true,
+    pulls: [
+      {
+        number: 3,
+        html_url: "https://github.com/acme/widgets/pull/3",
+        head: "feature/widgets",
+        base: "main",
+      },
+    ],
+  });
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const result = await run({ branch: "feature/widgets", title: "Renamed" });
+
+  expect(gh.pullCreates).toEqual([]);
+  expect(gh.pullUpdates).toMatchObject([
+    { number: "3", body: { title: "Renamed" } },
+  ]);
+  expect(result).toMatchObject({ created: false, updated: true });
+});
+
+test("--branch after the local history was amended force-updates the named branch", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const old = commit("Add a");
+  const gh = fakeGitHub({
+    branch: "feature/widgets",
+    ref: old,
+    commitTrees: { [old]: git(work, "rev-parse", `${old}^{tree}`) },
+  });
+  writeFileSync(join(work, "a.txt"), "first, amended\n");
+  git(work, "add", "--all");
+  git(
+    work,
+    "-c",
+    "user.name=Claude",
+    "-c",
+    "user.email=noreply@anthropic.com",
+    "commit",
+    "-q",
+    "--amend",
+    "--no-edit",
+  );
+
+  await run({ branch: "feature/widgets" });
+
+  expect(gh.refWrites.at(-1)).toMatchObject({
+    method: "PATCH",
+    body: { force: true },
+  });
+});
+
+test("--branch must be a valid branch name other than the base, refused before anything reaches GitHub", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const refused = [
+    ["main", "main is the base branch; publish to a branch of its own"],
+    ["bad name", "bad name is not a valid branch name"],
+    ["a..b", "a..b is not a valid branch name"],
+    ["-x", "-x is not a valid branch name"],
+    ["ends.lock", "ends.lock is not a valid branch name"],
+  ] as const;
+  for (const [branch, message] of refused) {
+    await expect(run({ branch })).rejects.toThrow(message);
+  }
+  // the default branch stays off limits when --base names another
+  await expect(run({ branch: "main", base: "develop" })).rejects.toThrow(
+    "main is the base branch",
+  );
+  expect(gh.authorization).toEqual([]);
+  expect(gh.blobs).toEqual([]);
+  expect(gh.commits).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+  expect(gh.pullCreates).toEqual([]);
+});
+
+test("--branch refuses HEAD and a ref path or remote prefix, before anything reaches GitHub", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  for (const branch of [
+    "HEAD",
+    "refs/heads/feature",
+    "refs/feature",
+    "origin/feature",
+  ]) {
+    await expect(run({ branch })).rejects.toThrow(
+      `${branch} is not a valid branch name`,
+    );
+  }
+  expect(gh.authorization).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+  expect(gh.pullCreates).toEqual([]);
+});
+
+const publishEnv = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
+
+const publishMainWith = async (args: string[], env: Record<string, string>) => {
+  let stderr = "";
+  const status = await publishMain(
+    args,
+    { ...publishEnv, ...env },
+    {
+      cwd: work,
+      stdout: () => {},
+      stderr: (s) => {
+        stderr += s;
+      },
+    },
+  );
+  return { status, stderr };
+};
+
+test("SKY_PUBLISH_BRANCH is the command's default branch", async () => {
+  const gh = fakeGitHub({ branch: "from/env" });
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const { status } = await publishMainWith(["--title", "T"], {
+    SKY_PUBLISH_BRANCH: "from/env",
+  });
+
+  expect(status).toBe(0);
+  expect(gh.pullCreates).toMatchObject([{ head: "from/env" }]);
+});
+
+test("--branch outranks SKY_PUBLISH_BRANCH", async () => {
+  const gh = fakeGitHub({ branch: "cli/branch" });
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const { status } = await publishMainWith(
+    ["--title", "T", "--branch", "cli/branch"],
+    { SKY_PUBLISH_BRANCH: "from/env" },
+  );
+
+  expect(status).toBe(0);
+  expect(gh.refWrites).toMatchObject([
+    { body: { ref: "refs/heads/cli/branch" } },
+  ]);
+  expect(gh.pullCreates).toMatchObject([{ head: "cli/branch" }]);
+});
+
+test("an empty SKY_PUBLISH_BRANCH falls back to the worktree's branch", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const { status } = await publishMainWith(["--title", "T"], {
+    SKY_PUBLISH_BRANCH: "",
+  });
+
+  expect(status).toBe(0);
+  expect(gh.pullCreates).toMatchObject([{ head: "claude/agt_1" }]);
+});
+
+test("a configured author replaces the identity on every recreated commit, the committer defaulting to it and the dates kept", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const io = { cwd: work, stdout: () => {}, stderr: () => {} };
+
+  const status = await publishMain(
+    ["--title", "T"],
+    {
+      GITHUB_CONNECTOR: CONNECTOR,
+      GITHUB_GATEWAY_URL: GATEWAY,
+      GIT_AUTHOR_NAME: "Dev Person",
+      GIT_AUTHOR_EMAIL: "dev@example.com",
+    },
+    io,
+  );
+
+  expect(status).toBe(0);
+  const dev = {
+    name: "Dev Person",
+    email: "dev@example.com",
+    date: "2026-10-30T10:00:00Z",
+  };
+  expect(gh.commits).toMatchObject([{ author: dev, committer: dev }]);
+});
+
+test("a configured committer differs from the author when GIT_COMMITTER_* are set", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const io = { cwd: work, stdout: () => {}, stderr: () => {} };
+
+  await publishMain(
+    ["--title", "T"],
+    {
+      GITHUB_CONNECTOR: CONNECTOR,
+      GITHUB_GATEWAY_URL: GATEWAY,
+      GIT_AUTHOR_NAME: "A",
+      GIT_AUTHOR_EMAIL: "a@example.com",
+      GIT_COMMITTER_NAME: "C",
+      GIT_COMMITTER_EMAIL: "c@example.com",
+    },
+    io,
+  );
+
+  expect(gh.commits[0]).toMatchObject({
+    author: { name: "A", email: "a@example.com" },
+    committer: { name: "C", email: "c@example.com" },
+  });
+});
+
+const CLAUDE = { name: "Claude", email: "noreply@anthropic.com" };
+
+const identityCases: {
+  name: string;
+  env: Record<string, string>;
+  author: { name: string; email: string };
+  committer: { name: string; email: string };
+}[] = [
+  {
+    name: "no identity variables at all",
+    env: {},
+    author: CLAUDE,
+    committer: CLAUDE,
+  },
+  {
+    name: "an author name without an email",
+    env: { GIT_AUTHOR_NAME: "Dev Person" },
+    author: CLAUDE,
+    committer: CLAUDE,
+  },
+  {
+    name: "an author email without a name",
+    env: { GIT_AUTHOR_EMAIL: "dev@example.com" },
+    author: CLAUDE,
+    committer: CLAUDE,
+  },
+  {
+    name: "a committer without any author",
+    env: { GIT_COMMITTER_NAME: "C", GIT_COMMITTER_EMAIL: "c@example.com" },
+    author: CLAUDE,
+    committer: CLAUDE,
+  },
+  {
+    name: "an author and only a committer name",
+    env: {
+      GIT_AUTHOR_NAME: "A",
+      GIT_AUTHOR_EMAIL: "a@example.com",
+      GIT_COMMITTER_NAME: "C",
+    },
+    author: { name: "A", email: "a@example.com" },
+    committer: { name: "C", email: "a@example.com" },
+  },
+  {
+    name: "an author and only a committer email",
+    env: {
+      GIT_AUTHOR_NAME: "A",
+      GIT_AUTHOR_EMAIL: "a@example.com",
+      GIT_COMMITTER_EMAIL: "c@example.com",
+    },
+    author: { name: "A", email: "a@example.com" },
+    committer: { name: "A", email: "c@example.com" },
+  },
+];
+
+test.each(identityCases)(
+  "identity: $name",
+  async ({ env, author, committer }) => {
+    const gh = fakeGitHub();
+    writeFileSync(join(work, "a.txt"), "first\n");
+    commit("Add a");
+
+    const { status } = await publishMainWith(["--title", "T"], env);
+
+    expect(status).toBe(0);
+    expect(gh.commits[0]).toMatchObject({
+      author: { ...author, date: "2026-10-30T10:00:00Z" },
+      committer: { ...committer, date: "2026-10-30T10:00:00Z" },
+    });
+  },
+);

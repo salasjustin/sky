@@ -44,13 +44,29 @@ export type QueryFn = (params: {
  */
 const gateTimeoutS = (waitTimeoutMs: number) =>
   Math.max(86_400, Math.ceil((10 * waitTimeoutMs) / 1000));
-/** Who the session's own commits are by; in the env, so a commit never needs `git config`. */
-const SESSION_GIT_IDENTITY = {
-  GIT_AUTHOR_NAME: "Claude",
-  GIT_AUTHOR_EMAIL: "noreply@anthropic.com",
-  GIT_COMMITTER_NAME: "Claude",
-  GIT_COMMITTER_EMAIL: "noreply@anthropic.com",
-};
+/**
+ * Who the session's own commits are by; in the env, so a commit never needs `git config`. An
+ * author set in the environment (`GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL`, as environment secrets)
+ * is used instead, its committer defaulting to the same; Claude only when they aren't both set.
+ */
+export function sessionGitIdentity(env: NodeJS.ProcessEnv) {
+  const name = env.GIT_AUTHOR_NAME;
+  const email = env.GIT_AUTHOR_EMAIL;
+  if (!name || !email) {
+    return {
+      GIT_AUTHOR_NAME: "Claude",
+      GIT_AUTHOR_EMAIL: "noreply@anthropic.com",
+      GIT_COMMITTER_NAME: "Claude",
+      GIT_COMMITTER_EMAIL: "noreply@anthropic.com",
+    };
+  }
+  return {
+    GIT_AUTHOR_NAME: name,
+    GIT_AUTHOR_EMAIL: email,
+    GIT_COMMITTER_NAME: env.GIT_COMMITTER_NAME || name,
+    GIT_COMMITTER_EMAIL: env.GIT_COMMITTER_EMAIL || email,
+  };
+}
 
 /**
  * Config the session's git commands take from the env, which outranks every config file. A
@@ -101,9 +117,11 @@ function sessionOptions(
     resume: config.sessionId,
     abortController,
     env: withGitConfig(
-      { ...env, ...SESSION_GIT_IDENTITY, ...config.sessionEnv },
+      { ...env, ...sessionGitIdentity(env), ...config.sessionEnv },
       SESSION_GIT_CONFIG,
     ),
+    // Claude Code's own commit trailer and pull request footer are off, for hosting that rejects them
+    settings: { attribution: { commit: "", pr: "" } },
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
@@ -131,6 +149,7 @@ const publishInstructions = () =>
     "To publish your branch and open a pull request, commit your work, then run",
     `\`${process.execPath} ${process.argv[1]} ${PUBLISH_USAGE}\``,
     "instead of `git push` or `gh pr create`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and prints its URL. Run it again after more commits to update the same pull request.",
+    "`--branch <name>` publishes to a GitHub branch of that name instead of your worktree's branch, and the pull request's head is that branch; pass the same name each time. Commits go out under the git author configured for this environment, with every `Co-authored-by` trailer removed.",
     "Once commits are published, add new commits rather than amending or rebasing them: a rewritten branch can't be published again.",
     "Pass a multi-line body from a quoted heredoc, `--body \"$(cat <<'EOF'` … `EOF` `)\"`, so the shell leaves its backticks and `$` alone. A large branch can take minutes to send, so give the Bash call a 10-minute timeout.",
   ].join("\n");

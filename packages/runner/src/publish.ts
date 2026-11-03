@@ -75,7 +75,8 @@ function parseOrigin(url: string): { owner: string; repo: string } {
   return { owner: match[1], repo: match[2] };
 }
 
-type Identity = { name: string; email: string; date: string };
+type PersonName = { name: string; email: string };
+type Identity = PersonName & { date: string };
 
 /**
  * A git identity line's `Name <email> <unix seconds> <+hhmm>`, its date in UTC: the
@@ -89,22 +90,21 @@ function parseIdentity(line: string): Identity {
   return { name, email, date };
 }
 
-const CLAUDE_ATTRIBUTION = [
+const ATTRIBUTION = [
   /^\s*🤖\s*Generated with .*Claude Code.*$/i,
-  // keyed on the address, not the name: a person named Claude keeps their credit
-  /^\s*Co-Authored-By:.*<noreply@anthropic\.com>\s*$/i,
+  // any co-author, not only Claude: some hosting rejects commits that carry one
+  /^\s*Co-Authored-By:/i,
 ];
 const isAttribution = (line: string) =>
-  CLAUDE_ATTRIBUTION.some((pattern) => pattern.test(line));
+  ATTRIBUTION.some((pattern) => pattern.test(line));
 const TRAILER = /^\s*[\w-]+:\s/;
 
 /**
- * Drops the lines Claude Code appends on its own, the "Generated with Claude Code" footer and
- * `Co-Authored-By: … <noreply@anthropic.com>` trailers, with the blank lines they leave. Only the
- * trailing run of trailer, footer and blank lines is searched; the same line anywhere above it, a
- * fenced example included, is kept.
+ * Drops the "Generated with Claude Code" footer and every `Co-authored-by` trailer (whoever the
+ * co-author), with the blank lines they leave. Only the trailing run of trailer, footer and blank
+ * lines is searched; the same line anywhere above it, a fenced example included, is kept.
  */
-export function stripClaudeAttribution(text: string): string {
+export function stripAttribution(text: string): string {
   const all = text.split("\n");
   let start = all.length;
   while (start > 0) {
@@ -122,8 +122,12 @@ export function stripClaudeAttribution(text: string): string {
   return text.endsWith("\n") && body ? `${body}\n` : body;
 }
 
-/** A commit's author and committer as git stores them; its message less Claude's attribution. */
-async function readCommit(cwd: string, sha: string) {
+/** A commit's author and committer as git stores them; its message less its footer and co-author trailers. */
+async function readCommit(
+  cwd: string,
+  sha: string,
+  identity?: { author: PersonName; committer: PersonName },
+) {
   const raw = await git(cwd, "cat-file", "commit", sha);
   const split = raw.indexOf("\n\n");
   const headers = lines(split === -1 ? raw : raw.slice(0, split));
@@ -133,9 +137,9 @@ async function readCommit(cwd: string, sha: string) {
     return parseIdentity(line.slice(key.length + 1));
   };
   return {
-    message: stripClaudeAttribution(split === -1 ? "" : raw.slice(split + 2)),
-    author: header("author"),
-    committer: header("committer"),
+    message: stripAttribution(split === -1 ? "" : raw.slice(split + 2)),
+    author: { ...header("author"), ...identity?.author },
+    committer: { ...header("committer"), ...identity?.committer },
   };
 }
 
@@ -370,10 +374,11 @@ async function sitsOn(
 }
 
 /**
- * Publishes the worktree's branch through the GitHub gateway, which carries no git push: each
- * commit past the base is recreated with GitHub's git data API (blobs, a tree on its parent's tree,
- * the commit with its own message and identities), then the branch ref is created or moved
- * and a pull request into the base opened, or the open one given the new title and body. Claude
+ * Publishes the worktree's branch, or `options.branch`, through the GitHub gateway, which carries
+ * no git push: each commit past the base is recreated with GitHub's git data API (blobs, a tree on
+ * its parent's tree, the commit with its own message and identities), then the branch ref is
+ * created or moved and a pull request into the base opened, or the open one given the new title
+ * and body. Claude
  * Code's attribution is stripped from each commit message and the pull request's body, never its
  * title. The base is first refreshed to GitHub's current head, with the branch's commits rebased
  * onto it when it moved (`refreshBase`). That rebase flattens a merge: the merge commit is dropped
@@ -394,6 +399,10 @@ export async function publish(options: {
   body?: string;
   /** Defaults to the branch `origin/HEAD` names. */
   base?: string;
+  /** The GitHub branch to publish to and open the pull request from; defaults to the worktree's own. */
+  branch?: string;
+  /** Replaces the author and committer of each commit sent; their dates stay. */
+  identity?: { author: PersonName; committer: PersonName };
 }): Promise<PublishResult> {
   const { cwd } = options;
   const rebasing = await rebaseInProgress(cwd);
@@ -407,6 +416,25 @@ export async function publish(options: {
     await git(cwd, "symbolic-ref", "--quiet", "--short", "HEAD").catch(() => "")
   ).trim();
   if (!branch) throw new PublishError("HEAD is detached; check out a branch");
+  // the GitHub branch published to; the worktree's own branch keeps its name and its reflog
+  const remoteBranch = options.branch ?? branch;
+  if (options.branch !== undefined) {
+    // check-ref-format passes these under refs/heads/, but git refuses HEAD as a branch, and a
+    // ref path or remote prefix would be taken literally as part of the GitHub branch's name
+    const valid =
+      !options.branch.startsWith("-") &&
+      options.branch !== "HEAD" &&
+      !/^(refs|origin)\//.test(options.branch) &&
+      (await git(cwd, "check-ref-format", `refs/heads/${options.branch}`).then(
+        () => true,
+        () => false,
+      ));
+    if (!valid) {
+      throw new PublishError(
+        `${options.branch} is not a valid branch name; see \`git check-ref-format\``,
+      );
+    }
+  }
   if ((await git(cwd, "status", "--porcelain")).trim()) {
     throw new PublishError(
       "the worktree has uncommitted changes; commit them first, publish sends commits only",
@@ -417,6 +445,17 @@ export async function publish(options: {
     (await git(cwd, "rev-parse", "--abbrev-ref", "origin/HEAD"))
       .trim()
       .replace(/^origin\//, "");
+  // `--base` can name another branch, which would leave the default branch open to a fast-forward
+  const defaultBranch = (
+    await git(cwd, "rev-parse", "--abbrev-ref", "origin/HEAD").catch(() => "")
+  )
+    .trim()
+    .replace(/^origin\//, "");
+  if (remoteBranch === base || remoteBranch === defaultBranch) {
+    throw new PublishError(
+      `${remoteBranch} is the base branch; publish to a branch of its own`,
+    );
+  }
   const { owner, repo } = parseOrigin(
     (await git(cwd, "remote", "get-url", "origin")).trim(),
   );
@@ -482,7 +521,7 @@ export async function publish(options: {
   // before the base is refreshed, so a missing title leaves the branch and the clone as they were
   const [existing] = await call<{ number: number; html_url: string }[]>(
     "GET",
-    `/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`,
+    `/pulls?state=open&head=${encodeURIComponent(`${owner}:${remoteBranch}`)}`,
   );
   if (!existing && !options.title) {
     throw new PublishError("a title is needed to open the pull request");
@@ -499,7 +538,7 @@ export async function publish(options: {
       `the changes on ${branch} are already on ${base} on GitHub, so there is nothing left to publish`,
     );
   }
-  const refPath = `heads/${branch.split("/").map(encodeURIComponent).join("/")}`;
+  const refPath = `heads/${remoteBranch.split("/").map(encodeURIComponent).join("/")}`;
   const treeOf = async (sha: string) =>
     (await git(cwd, "rev-parse", `${sha}^{tree}`)).trim();
 
@@ -605,7 +644,7 @@ export async function publish(options: {
         })
       ).sha;
     }
-    const local = await readCommit(cwd, sha);
+    const local = await readCommit(cwd, sha, options.identity);
     parent = (
       await call<{ sha: string }>("POST", "/git/commits", {
         message: local.message,
@@ -620,7 +659,7 @@ export async function publish(options: {
 
   if (remote === null) {
     await call("POST", "/git/refs", {
-      ref: `refs/heads/${branch}`,
+      ref: `refs/heads/${remoteBranch}`,
       sha: parent,
     });
   } else if (rewritten) {
@@ -632,7 +671,7 @@ export async function publish(options: {
     );
     if (now.object.sha !== remote) {
       throw new PublishError(
-        `${branch} moved on GitHub to ${now.object.sha} while this publish ran; nothing was overwritten, publish again`,
+        `${remoteBranch} moved on GitHub to ${now.object.sha} while this publish ran; nothing was overwritten, publish again`,
       );
     }
     await call("PATCH", `/git/refs/${refPath}`, { sha: parent, force: true });
@@ -643,7 +682,7 @@ export async function publish(options: {
     }).catch((error: unknown) => {
       if (error instanceof GatewayError && error.status === 422) {
         throw new PublishError(
-          `${branch} on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten (${error.message})`,
+          `${remoteBranch} on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten (${error.message})`,
         );
       }
       throw error;
@@ -655,13 +694,13 @@ export async function publish(options: {
     const update = {
       ...(options.title && { title: options.title }),
       ...(options.body !== undefined && {
-        body: stripClaudeAttribution(options.body),
+        body: stripAttribution(options.body),
       }),
     };
     const updated = Object.keys(update).length > 0;
     if (updated) await call("PATCH", `/pulls/${existing.number}`, update);
     return {
-      branch,
+      branch: remoteBranch,
       base,
       sha: parent,
       created: false,
@@ -675,14 +714,14 @@ export async function publish(options: {
     {
       title: options.title as string,
       ...(options.body !== undefined && {
-        body: stripClaudeAttribution(options.body),
+        body: stripAttribution(options.body),
       }),
-      head: branch,
+      head: remoteBranch,
       base,
     },
   );
   return {
-    branch,
+    branch: remoteBranch,
     base,
     sha: parent,
     created: true,
@@ -692,7 +731,31 @@ export async function publish(options: {
 }
 
 export const PUBLISH_USAGE =
-  "publish --title <title> [--body <text>] [--base <branch>]";
+  "publish --title <title> [--body <text>] [--base <branch>] [--branch <name>]";
+
+/** The env var naming the GitHub branch to publish to when `--branch` isn't given. */
+export const BRANCH_ENV = "SKY_PUBLISH_BRANCH";
+
+/**
+ * The identity commits are sent under: `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` (environment
+ * secrets) for the author, the `GIT_COMMITTER_*` pair for the committer, defaulting to the author.
+ * Undefined unless both author vars are set, and the commits then keep the identities they were
+ * made with; inside a session both are always set, to Claude when the environment doesn't set both
+ * (`sessionGitIdentity` in session.ts), so there every commit sent is rewritten.
+ */
+export function configuredIdentity(env: NodeJS.ProcessEnv) {
+  const name = env.GIT_AUTHOR_NAME;
+  const email = env.GIT_AUTHOR_EMAIL;
+  if (!name || !email) return undefined;
+  const author = { name, email };
+  return {
+    author,
+    committer: {
+      name: env.GIT_COMMITTER_NAME || name,
+      email: env.GIT_COMMITTER_EMAIL || email,
+    },
+  };
+}
 
 /**
  * `runner.mjs publish …`, run by the agent from its worktree: prints the pull request's URL on
@@ -703,7 +766,13 @@ export async function publishMain(
   env: NodeJS.ProcessEnv,
   io: { cwd: string; stdout: (s: string) => void; stderr: (s: string) => void },
 ): Promise<number> {
-  let values: { title?: string; body?: string; base?: string; help?: boolean };
+  let values: {
+    title?: string;
+    body?: string;
+    base?: string;
+    branch?: string;
+    help?: boolean;
+  };
   try {
     ({ values } = parseArgs({
       args: argv,
@@ -711,6 +780,7 @@ export async function publishMain(
         title: { type: "string" },
         body: { type: "string" },
         base: { type: "string" },
+        branch: { type: "string" },
         help: { type: "boolean", short: "h" },
       },
     }));
@@ -737,6 +807,8 @@ export async function publishMain(
       gatewayUrl: env[GATEWAY_URL_ENV] || DEFAULT_GATEWAY_URL,
       connectorId,
       ...values,
+      branch: values.branch ?? (env[BRANCH_ENV] || undefined),
+      identity: configuredIdentity(env),
     });
     io.stderr(
       result.created

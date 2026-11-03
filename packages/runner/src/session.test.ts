@@ -22,7 +22,7 @@ import { server } from "../../../test/msw.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
 import { createDecisionWaiter } from "./requests.js";
-import { type QueryFn, runSession } from "./session.js";
+import { type QueryFn, runSession, sessionGitIdentity } from "./session.js";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -615,7 +615,26 @@ test("runs the session in the agent worktree, resuming the stored session, witho
   }
 });
 
+const HOST_GIT_IDENTITY = [
+  "GIT_AUTHOR_NAME",
+  "GIT_AUTHOR_EMAIL",
+  "GIT_COMMITTER_NAME",
+  "GIT_COMMITTER_EMAIL",
+] as const;
+
+// the host running the tests may carry a git identity of its own; unstubEnvs() puts it back
+const stubHostGitIdentity = (identity: Record<string, string> = {}) => {
+  for (const key of HOST_GIT_IDENTITY) {
+    vi.stubEnv(key, identity[key]);
+  }
+};
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 test("the session commits as Claude through its env, so nothing writes the clone's git config", async () => {
+  stubHostGitIdentity();
   const query = scripted([init, success]);
   await runSession(config, {
     query,
@@ -628,6 +647,58 @@ test("the session commits as Claude through its env, so nothing writes the clone
     GIT_AUTHOR_EMAIL: "noreply@anthropic.com",
     GIT_COMMITTER_NAME: "Claude",
     GIT_COMMITTER_EMAIL: "noreply@anthropic.com",
+  });
+});
+
+test("a git author set in the runner's env replaces Claude in the session env, the committer defaulting to it", async () => {
+  stubHostGitIdentity({
+    GIT_AUTHOR_NAME: "Dev Person",
+    GIT_AUTHOR_EMAIL: "dev@example.com",
+  });
+  const query = scripted([init, success]);
+  await runSession(config, {
+    query,
+    post: recorder().post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(query.calls[0]?.options.env).toMatchObject({
+    GIT_AUTHOR_NAME: "Dev Person",
+    GIT_AUTHOR_EMAIL: "dev@example.com",
+    GIT_COMMITTER_NAME: "Dev Person",
+    GIT_COMMITTER_EMAIL: "dev@example.com",
+  });
+});
+
+test("sessionGitIdentity: a committer field overrides the author's alone, and half an author is ignored", () => {
+  expect(
+    sessionGitIdentity({
+      GIT_AUTHOR_NAME: "Dev Person",
+      GIT_AUTHOR_EMAIL: "dev@example.com",
+      GIT_COMMITTER_EMAIL: "ci@example.com",
+    }),
+  ).toEqual({
+    GIT_AUTHOR_NAME: "Dev Person",
+    GIT_AUTHOR_EMAIL: "dev@example.com",
+    GIT_COMMITTER_NAME: "Dev Person",
+    GIT_COMMITTER_EMAIL: "ci@example.com",
+  });
+  expect(sessionGitIdentity({ GIT_AUTHOR_NAME: "Dev Person" })).toMatchObject({
+    GIT_AUTHOR_NAME: "Claude",
+    GIT_AUTHOR_EMAIL: "noreply@anthropic.com",
+  });
+});
+
+test("the session turns Claude Code's commit and pull request attribution off", async () => {
+  const query = scripted([init, success]);
+  await runSession(config, {
+    query,
+    post: recorder().post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(query.calls[0]?.options.settings).toEqual({
+    attribution: { commit: "", pr: "" },
   });
 });
 

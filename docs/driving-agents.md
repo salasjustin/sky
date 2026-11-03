@@ -119,7 +119,7 @@ summary: Fixed the flaky login test and opened a pull request: https://github.co
 compare: https://github.com/acme/web/compare/3f2a…...claude/agt_…
 ```
 
-`summary` is Claude's final message; an agent whose environment has a GitHub connector publishes its branch and names the pull request there. `compare` links the branch's changes on GitHub. A failed run shows `error:` instead.
+`summary` is Claude's final message; an agent whose environment has a GitHub connector publishes its branch and names the pull request there. It publishes as `Claude <noreply@anthropic.com>` unless the environment has the secrets `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` (`sky secret set <env> GIT_AUTHOR_EMAIL`), and never leaves a `Co-authored-by` trailer. To have it publish to a branch of your choosing, tell it to run `publish --branch <name>` (or set the secret `SKY_PUBLISH_BRANCH`); the pull request's head is then `<name>`, and `compare` still shows the worktree's `claude/agt_…` branch name, which may not exist on GitHub. `compare` links the branch's changes on GitHub. A failed run shows `error:` instead.
 
 ## 6. Follow up
 
