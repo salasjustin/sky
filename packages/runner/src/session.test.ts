@@ -631,6 +631,65 @@ test("the session commits as Claude through its env, so nothing writes the clone
   });
 });
 
+test("a git author set in the runner's env replaces Claude in the session env, the committer defaulting to it", async () => {
+  const envOf = async () => {
+    const query = scripted([init, success]);
+    await runSession(config, {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    });
+    return query.calls[0]?.options.env;
+  };
+  // the host running the tests may carry a committer of its own
+  const held = [
+    process.env.GIT_COMMITTER_NAME,
+    process.env.GIT_COMMITTER_EMAIL,
+  ];
+  delete process.env.GIT_COMMITTER_NAME;
+  delete process.env.GIT_COMMITTER_EMAIL;
+  process.env.GIT_AUTHOR_NAME = "Dev Person";
+  process.env.GIT_AUTHOR_EMAIL = "dev@example.com";
+  try {
+    expect(await envOf()).toMatchObject({
+      GIT_AUTHOR_NAME: "Dev Person",
+      GIT_AUTHOR_EMAIL: "dev@example.com",
+      GIT_COMMITTER_NAME: "Dev Person",
+      GIT_COMMITTER_EMAIL: "dev@example.com",
+    });
+    process.env.GIT_COMMITTER_EMAIL = "ci@example.com";
+    expect(await envOf()).toMatchObject({
+      GIT_COMMITTER_NAME: "Dev Person",
+      GIT_COMMITTER_EMAIL: "ci@example.com",
+    });
+    delete process.env.GIT_AUTHOR_EMAIL;
+    expect(await envOf()).toMatchObject({
+      GIT_AUTHOR_NAME: "Claude",
+      GIT_AUTHOR_EMAIL: "noreply@anthropic.com",
+    });
+  } finally {
+    delete process.env.GIT_AUTHOR_NAME;
+    delete process.env.GIT_AUTHOR_EMAIL;
+    delete process.env.GIT_COMMITTER_EMAIL;
+    if (held[0] !== undefined) process.env.GIT_COMMITTER_NAME = held[0];
+    if (held[1] !== undefined) process.env.GIT_COMMITTER_EMAIL = held[1];
+  }
+});
+
+test("the session turns Claude Code's commit and pull request attribution off", async () => {
+  const query = scripted([init, success]);
+  await runSession(config, {
+    query,
+    post: recorder().post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(query.calls[0]?.options.settings).toEqual({
+    attribution: { commit: "", pr: "" },
+  });
+});
+
 const sessionEnvOf = async () => {
   const query = scripted([init, success]);
   await runSession(config, {
