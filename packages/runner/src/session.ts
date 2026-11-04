@@ -25,6 +25,7 @@ import {
 } from "@sky/shared";
 import type { Config } from "./config.js";
 import { type PostEvent, RunEndedError } from "./events.js";
+import { createHeartbeat } from "./heartbeat.js";
 import { policyOutcome } from "./policy.js";
 import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
@@ -154,7 +155,7 @@ const publishInstructions = () =>
   [
     "This sandbox has no git transport and no GitHub credential: `git fetch`, `git pull` and `git push` fail here, and so does `gh`.",
     "The runner refreshed this repo from GitHub when this run started; what that changed, if anything, is in the notes at the end.",
-    `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` command: its other subcommands are the Sky API's, and run with none it starts a new run.`,
+    `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` command: its other subcommands are the Sky API's, and run with none it refuses: only the Sky API starts a run.`,
     "To publish your branch and open a pull request, commit your work, then run",
     `\`${process.execPath} ${process.argv[1]} ${PUBLISH_USAGE}\``,
     "instead of `git push` or `gh pr create`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and prints its URL. Run it again after more commits to update the same pull request.",
@@ -194,6 +195,9 @@ function sessionHooks(
       input: PreToolUseHookInput,
       signal: AbortSignal,
     ) => Promise<SyncHookJSONOutput>;
+    /** A tool call is running: it passed `gate`. */
+    toolStarted: (toolUseId: string, toolName: string) => void;
+    toolEnded: (toolUseId: string) => void;
   },
 ): Options["hooks"] {
   const matcher = <E extends HookEvent>(
@@ -235,11 +239,22 @@ function sessionHooks(
     ...(input.teammate_name && { teammateName: input.teammate_name }),
   });
   return {
-    PreToolUse: matcher<"PreToolUse">((input, signal) => {
+    PreToolUse: matcher<"PreToolUse">(async (input, signal) => {
       on.event({ type: "claude.PreToolUse", payload: tool(input) });
-      return on.gate(input, signal);
+      const output = await on.gate(input, signal);
+      // a call the gate denied or stopped never runs, so there is nothing to beat for; nor for
+      // Claude's question, which the SDK holds in canUseTool for a person's answer: a wait, not a
+      // tool running, and one declined may never fire PostToolUse to end it
+      const denied =
+        output.continue === false ||
+        (output.hookSpecificOutput?.hookEventName === "PreToolUse" &&
+          output.hookSpecificOutput.permissionDecision === "deny");
+      if (!denied && input.tool_name !== "AskUserQuestion")
+        on.toolStarted(input.tool_use_id, input.tool_name);
+      return output;
     }, gateTimeout),
     PostToolUse: matcher<"PostToolUse">((input) => {
+      on.toolEnded(input.tool_use_id);
       const response = input.tool_response;
       on.event({
         type: "claude.PostToolUse",
@@ -257,6 +272,7 @@ function sessionHooks(
       });
     }),
     PostToolUseFailure: matcher<"PostToolUseFailure">((input) => {
+      on.toolEnded(input.tool_use_id);
       on.event({
         type: "claude.PostToolUseFailure",
         payload: {
@@ -340,6 +356,8 @@ export async function runSession(
     awaitDecision: AwaitDecision;
     signal: AbortSignal;
     warn?: (line: string) => void;
+    /** How often a tool call in flight is reported; `HEARTBEAT_INTERVAL_MS` when absent. */
+    heartbeatMs?: number;
   },
 ): Promise<0 | 1> {
   const { runId } = config;
@@ -560,6 +578,18 @@ export async function runSession(
   // Claude's activity stops retrying once the session stops, so the ending event isn't queued behind
   // its backoff; each event still gets its one attempt
   const progress = { giveUp: abortController.signal };
+  // a tool call running for minutes with nothing else to report: a heartbeating run isn't probed as
+  // silent, and a timeout names the tool; heartbeats aren't progress, so RUN_TIMEOUT_MINUTES still
+  // fails the run. One attempt each: they ride the serial queue, so their retries in an outage
+  // would hold up the ending event
+  const heartbeat = createHeartbeat({
+    beat: (beat) =>
+      void post(
+        { type: "runner.heartbeat", payload: beat },
+        { ...progress, maxAttempts: 1 },
+      ).catch(() => {}),
+    intervalMs: deps.heartbeatMs,
+  });
   const hooks = sessionHooks(gateTimeoutS(config.waitTimeoutMs), {
     // a failed post must not fail the tool call that triggered it
     event: (event) => void post(event, progress).catch(() => {}),
@@ -567,6 +597,8 @@ export async function runSession(
       stopMessage = lastMessage || stopMessage;
     },
     gate,
+    toolStarted: heartbeat.started,
+    toolEnded: heartbeat.ended,
   });
   try {
     const stream = deps.query({
@@ -608,6 +640,7 @@ export async function runSession(
       : messageOf(error);
   } finally {
     deps.signal.removeEventListener("abort", forward);
+    heartbeat.stop();
   }
 
   let commitError: string | undefined;

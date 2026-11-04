@@ -50,6 +50,9 @@ export const EventType = z.enum([
   "run.finished",
   "run.failed",
   "run.stopped",
+  "run.probed",
+  "runner.warning",
+  "runner.heartbeat",
   "claude.PreToolUse",
   "claude.PostToolUse",
   "claude.PostToolUseFailure",
@@ -186,18 +189,45 @@ const resumedPayload = z.object({
   decision: z.enum(["answered", "approved", "denied"]),
 });
 
+/**
+ * Recorded by the API when its sweep woke a silent run's sprite and found the runner alive:
+ * the sprite probed and how long the run had been silent.
+ */
+const probedPayload = z.object({
+  spriteName: z.string().min(1),
+  silentMs: z.number().int().nonnegative(),
+});
+
+/** How often the runner posts a `runner.heartbeat` while a tool call is in flight. */
+export const HEARTBEAT_INTERVAL_MS = 60_000;
+
+const runnerPayloads = (textMax: number) => ({
+  /** A problem the runner hit that doesn't end the run, e.g. a sprite hold that failed. */
+  "runner.warning": z.object({ message: z.string().min(1).max(textMax) }),
+  /** A tool call still running: the longest-running one in flight, and how long it has run. */
+  "runner.heartbeat": z.object({
+    // bounded on both sides: a heartbeat is not trimmed like claude.* text, and one is stored every minute
+    toolName: z.string().min(1).max(256),
+    toolUseId: z.string().min(1).max(256),
+    elapsedMs: z.number().int().nonnegative(),
+  }),
+});
+
 const postPayloads = {
   ...runPayloads,
   "run.waiting": z.object({
     request: pendingRequest(z.string().min(1).max(RUNNER_TEXT_MAX)),
   }),
+  ...runnerPayloads(RUNNER_TEXT_MAX),
   ...claudePayloads(RUNNER_TEXT_MAX),
-} satisfies Record<Exclude<EventType, "run.resumed">, z.ZodType>;
+} satisfies Record<Exclude<EventType, "run.resumed" | "run.probed">, z.ZodType>;
 
 /** the extra 64 admits `truncationMarker` after a trimmed field */
 const storedPayloads = {
   ...runPayloads,
   "run.resumed": resumedPayload,
+  "run.probed": probedPayload,
+  ...runnerPayloads(EVENT_TEXT_MAX + 64),
   ...claudePayloads(EVENT_TEXT_MAX + 64),
 } satisfies Record<EventType, z.ZodType>;
 
@@ -215,6 +245,8 @@ export const RunnerEventPost = z.discriminatedUnion("type", [
   posted("run.finished"),
   posted("run.failed"),
   posted("run.stopped"),
+  posted("runner.warning"),
+  posted("runner.heartbeat"),
   posted("claude.PreToolUse"),
   posted("claude.PostToolUse"),
   posted("claude.PostToolUseFailure"),
@@ -246,6 +278,9 @@ export const Event = z.discriminatedUnion("type", [
   stored("run.finished"),
   stored("run.failed"),
   stored("run.stopped"),
+  stored("run.probed"),
+  stored("runner.warning"),
+  stored("runner.heartbeat"),
   stored("claude.PreToolUse"),
   stored("claude.PostToolUse"),
   stored("claude.PostToolUseFailure"),

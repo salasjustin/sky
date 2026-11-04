@@ -170,6 +170,59 @@ test("runner posts an event without id or timestamp; the API assigns those", () 
   ).toBe(false);
 });
 
+test("runner.warning is posted by the runner with a message; run.probed is the API's own and can't be posted", () => {
+  const warning = {
+    runId: "run_1",
+    type: "runner.warning",
+    payload: { message: "runner: sprite task PUT failed: HTTP 503" },
+  };
+  expect(RunnerEventPost.parse(warning)).toEqual(warning);
+  expect(RunnerEventPost.safeParse({ ...warning, payload: {} }).success).toBe(
+    false,
+  );
+  expect(
+    RunnerEventPost.safeParse({
+      runId: "run_1",
+      type: "run.probed",
+      payload: { spriteName: "s", silentMs: 1 },
+    }).success,
+  ).toBe(false);
+
+  const probed = {
+    ...meta,
+    type: "run.probed",
+    payload: { spriteName: "sky-env-1", silentMs: 300_000 },
+  };
+  expect(Event.parse(probed)).toEqual(probed);
+  expect(Event.safeParse({ ...probed, payload: {} }).success).toBe(false);
+  expect(Event.parse({ ...meta, ...warning, runId: "run_1" })).toMatchObject({
+    type: "runner.warning",
+  });
+});
+
+test("runner.heartbeat names the tool call in flight and how long it has run", () => {
+  const heartbeat = {
+    runId: "run_1",
+    type: "runner.heartbeat",
+    payload: { toolName: "Bash", toolUseId: "toolu_1", elapsedMs: 61_000 },
+  };
+  expect(RunnerEventPost.parse(heartbeat)).toEqual(heartbeat);
+  expect(Event.parse({ ...meta, ...heartbeat })).toMatchObject({
+    type: "runner.heartbeat",
+  });
+  for (const payload of [
+    { toolName: "Bash", toolUseId: "toolu_1" },
+    { toolName: "", toolUseId: "toolu_1", elapsedMs: 1 },
+    { toolName: "Bash", toolUseId: "toolu_1", elapsedMs: -1 },
+    { toolName: "x".repeat(257), toolUseId: "toolu_1", elapsedMs: 1 },
+    { toolName: "Bash", toolUseId: "x".repeat(257), elapsedMs: 1 },
+  ]) {
+    expect(RunnerEventPost.safeParse({ ...heartbeat, payload }).success).toBe(
+      false,
+    );
+  }
+});
+
 const sha = (c: string) => c.repeat(40);
 const rollup = {
   base: sha("a"),

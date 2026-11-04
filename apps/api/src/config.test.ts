@@ -28,6 +28,7 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       runnerBundlePath: expect.stringMatching(/\/runner\.mjs$/),
       cliBundlePath: expect.stringMatching(/\/sky\.mjs$/),
       runTimeoutMs: 30 * 60_000,
+      runProbeMs: 5 * 60_000,
       launchDeadlineMs: 15 * 60_000,
       waitTimeoutMs: 120 * 60_000,
       baseProfiles: {},
@@ -56,6 +57,42 @@ test("RUNNER_BUNDLE_PATH, RUN_TIMEOUT_MINUTES, LAUNCH_DEADLINE_MINUTES, WAIT_TIM
       waitTimeoutMs: 900_000,
       spritesLongTimeoutMs: 2_700_000,
     },
+  });
+});
+
+test("RUN_PROBE_MINUTES overrides its default, and a short RUN_TIMEOUT_MINUTES shortens the default", () => {
+  expect(loadConfig({ ...required, RUN_PROBE_MINUTES: "2" })).toMatchObject({
+    ok: true,
+    config: { runProbeMs: 120_000 },
+  });
+  expect(loadConfig({ ...required, RUN_TIMEOUT_MINUTES: "4" })).toMatchObject({
+    ok: true,
+    config: { runTimeoutMs: 240_000, runProbeMs: 120_000 },
+  });
+});
+
+test.each(["30", "45"])(
+  "a RUN_PROBE_MINUTES of %s, not below the 30-minute run timeout, is rejected",
+  (minutes) => {
+    expect(loadConfig({ ...required, RUN_PROBE_MINUTES: minutes })).toEqual({
+      ok: false,
+      message: expect.stringContaining(
+        "RUN_PROBE_MINUTES is invalid: must be below RUN_TIMEOUT_MINUTES",
+      ),
+    });
+  },
+);
+
+test("a RUN_PROBE_MINUTES past 30 is accepted below a longer RUN_TIMEOUT_MINUTES", () => {
+  expect(
+    loadConfig({
+      ...required,
+      RUN_TIMEOUT_MINUTES: "60",
+      RUN_PROBE_MINUTES: "45",
+    }),
+  ).toMatchObject({
+    ok: true,
+    config: { runTimeoutMs: 3_600_000, runProbeMs: 2_700_000 },
   });
 });
 

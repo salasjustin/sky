@@ -36,7 +36,7 @@ import {
 
 // the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
 // then deleted, and the prompt in PROMPT_FILE, which a query param is too short for;
-// the run id in argv is what `runnerPattern` matches; the runner itself ignores it
+// the run id in argv is what `runnerPattern` matches; the runner refuses to start unless it equals RUN_ID
 const RUNNER_COMMAND = `${WITH_PACKAGE_MANAGERS} && set -a && . "$ENV_FILE" && set +a && rm -f "$ENV_FILE" && PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
 
 /**
@@ -71,6 +71,28 @@ export async function signalRunner(
   } catch (err) {
     log(`signalling the runner of ${runId} failed: ${err}`);
   }
+}
+
+/**
+ * Whether the run's runner is alive on its sprite. The exec wakes a sleeping sprite, which is the
+ * point: a run silent for minutes may have been frozen by a pause. Throws when the sprite can't answer,
+ * which says nothing of the runner.
+ */
+export async function isRunnerAlive(
+  sprites: SpriteOps,
+  spriteName: string,
+  runId: RunId,
+): Promise<boolean> {
+  const out = await execInSprite(
+    sprites,
+    spriteName,
+    ["pgrep", "-f", runnerPattern(runId)],
+    { op: "pgrep" },
+  );
+  // pgrep exits 1 when nothing matched, 2 or more on its own errors
+  if (out.exitCode === 0) return true;
+  if (out.exitCode === 1) return false;
+  throw new Error(`pgrep exit ${out.exitCode}: ${out.stderr.trim()}`);
 }
 
 // exit 0 once nothing matches, 1 while a runner still does after 30 s; pgrep's own errors exit 2.

@@ -2,19 +2,22 @@ import { appendFileSync } from "node:fs";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { writeClaudeCredentials } from "./credentials.js";
-import { createPoster } from "./events.js";
-import { holdSprite } from "./keepalive.js";
+import { createPoster, warningReporter } from "./events.js";
+import { holdSprite, spriteApiFrom } from "./keepalive.js";
 import { refreshPlugins } from "./plugins.js";
 import { publishMain } from "./publish.js";
 import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
+import { claimRunLog } from "./runlog.js";
 import { runSession } from "./session.js";
 import { storeSyncMain, syncStoreQuietly } from "./store.js";
 import { branchCheckMain } from "./sync.js";
 
 // the runner's stderr is the exec session's terminal, gone once the API detaches, so every line also
-// lands in a log file beside the run's prompt: what a stuck launch was doing is readable on the sprite
-const logFile = process.env.PROMPT_FILE?.replace(/\.prompt$/, ".log");
+// lands in a log file beside the run's prompt: what a stuck launch was doing is readable on the sprite.
+// Set only once this process has been checked to be the run's runner and holds its lock (`claimRunLog`):
+// the agent's shell inherits PROMPT_FILE, so any `runner.mjs` it starts could otherwise write here
+let logFile: string | undefined;
 const warn = (message: string) => {
   const line = `${new Date().toISOString()} ${message}\n`;
   process.stderr.write(line);
@@ -23,6 +26,15 @@ const warn = (message: string) => {
       appendFileSync(logFile, line);
     } catch {}
 };
+
+/** Refuses to start as a run, saying why on stderr alone: the run's log is not this process's to write. */
+function refuse(message: string): void {
+  process.stderr.write(`${new Date().toISOString()} runner: ${message}\n`);
+  process.exitCode = 2;
+}
+
+const NOT_A_RUN =
+  "only the Sky API starts a run (an agent's own command is `runner.mjs publish`)";
 
 async function step<T>(name: string, task: () => Promise<T>): Promise<T> {
   const started = Date.now();
@@ -40,27 +52,60 @@ async function main(): Promise<void> {
     config = loadConfig(process.env);
   } catch (error) {
     if (!(error instanceof ConfigError)) throw error;
-    warn(`runner: ${error.message}`);
-    process.exitCode = 2;
+    refuse(`${error.message}; ${NOT_A_RUN}`);
     return;
+  }
+  // the launcher passes the run's id as the argument; anything else is not the launcher
+  if (process.argv[2] !== config.runId) {
+    refuse(
+      `${process.argv[2] ? `unknown command ${JSON.stringify(process.argv[2])}` : "no command"}; ${NOT_A_RUN}`,
+    );
+    return;
+  }
+  const claim = process.env.PROMPT_FILE
+    ? claimRunLog(process.env.PROMPT_FILE)
+    : undefined;
+  if (claim && !claim.ok) {
+    refuse(`${claim.reason}; not starting a second runner for ${config.runId}`);
+    return;
+  }
+  const release = claim?.release ?? (() => {});
+  if (claim) {
+    logFile = claim.logFile;
+    // a normal end; death by a signal fires no 'exit', so `dieBy` releases first. A lock left
+    // behind is only ever from a process killed outright (SIGKILL, a crash of Node itself)
+    process.on("exit", release);
   }
 
   // the first SIGTERM/SIGINT/SIGHUP aborts the session and lets the run report and commit; a second one kills at once
   const controller = new AbortController();
   let caught: NodeJS.Signals | undefined;
+  // a hangup from the exec session that started the runner is a stop, not a death
+  const STOPS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
+  const stopListening = () => {
+    for (const stop of STOPS) process.off(stop, onSignal);
+  };
+  // so the caller sees the process was stopped, not that it failed
+  const dieBy = (signal: NodeJS.Signals) => {
+    stopListening();
+    release();
+    process.kill(process.pid, signal);
+  };
   const onSignal = (signal: NodeJS.Signals) => {
+    if (caught) return dieBy(signal);
     caught = signal;
     controller.abort(signal);
   };
-  process.once("SIGTERM", onSignal);
-  process.once("SIGINT", onSignal);
-  // a hangup from the exec session that started the runner is a stop, not a death
-  process.once("SIGHUP", onSignal);
+  for (const stop of STOPS) process.on(stop, onSignal);
   // first, so the sprite can't pause and freeze the run before it is held; held through waits for a
   // decision too: a paused sprite drops the long-poll and the event posts
+  const post = createPoster({ ...config, warn });
   const hold = holdSprite({
     runId: config.runId,
     warn,
+    // the local log is unreadable once the sprite sleeps, so a hold that fails also reaches the run's events
+    report: warningReporter(post, config.runId),
+    ...spriteApiFrom(process.env),
     signal: controller.signal,
   });
   await step("sprite hold", () => hold.ready);
@@ -70,20 +115,17 @@ async function main(): Promise<void> {
   try {
     process.exitCode = await runSession(config, {
       query,
-      post: createPoster({ ...config, warn }),
+      post,
       awaitDecision: createDecisionWaiter(config),
       signal: controller.signal,
       warn,
     });
   } finally {
     await syncStoreQuietly("push", process.env, warn);
-    process.off("SIGTERM", onSignal);
-    process.off("SIGINT", onSignal);
-    process.off("SIGHUP", onSignal);
     await hold.release();
   }
-  // die by the signal so the caller sees the process was stopped, not that it failed
-  if (caught) process.kill(process.pid, caught);
+  if (caught) dieBy(caught);
+  else stopListening();
 }
 
 async function setUpSession(signal: AbortSignal): Promise<void> {

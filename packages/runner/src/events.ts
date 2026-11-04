@@ -1,4 +1,4 @@
-import { RunnerEventPost } from "@sky/shared";
+import { type RunId, RunnerEventPost } from "@sky/shared";
 import { isTransient, RetryError, type RetryTiming, retry } from "./retry.js";
 
 const TIMEOUT_MS = 10_000;
@@ -23,6 +23,8 @@ export type PostEvent = (
     signal?: AbortSignal;
     /** A stop that ends retrying, not sending: once aborted, the post gets one short attempt, then is dropped. */
     giveUp?: AbortSignal;
+    /** The attempts this post gets, in place of its event type's budget; still ended by the deadline. */
+    maxAttempts?: number;
   },
 ) => Promise<void>;
 
@@ -42,7 +44,7 @@ export function createPoster(
 ): PostEvent {
   const url = new URL("/internal/events", options.apiBaseUrl);
   const now = options.now ?? Date.now;
-  return async (event, { deadline, signal, giveUp } = {}) => {
+  return async (event, { deadline, signal, giveUp, maxAttempts } = {}) => {
     const body = JSON.stringify(RunnerEventPost.parse(event));
     const waiting = event.type === "run.waiting";
     let landed: "stored" | "run_ended" | undefined;
@@ -84,6 +86,7 @@ export function createPoster(
           attemptTimeoutMs: giveUp?.aborted ? GIVEN_UP_TIMEOUT_MS : TIMEOUT_MS,
           ...(!waiting &&
             !RIDES_OUT.has(event.type) && { maxAttempts: PROGRESS_ATTEMPTS }),
+          ...(maxAttempts !== undefined && { maxAttempts }),
           signal,
           giveUp,
         },
@@ -100,6 +103,19 @@ export function createPoster(
     if (landed === "run_ended") throw new RunEndedError();
   };
 }
+
+/**
+ * A callback that posts its message as the run's `runner.warning` event, for problems the runner
+ * survives but the API should know of. Never throws or rejects; a post that doesn't land is already
+ * a line on the poster's `warn`.
+ */
+export const warningReporter =
+  (post: PostEvent, runId: RunId) =>
+  (message: string): void => {
+    post({ runId, type: "runner.warning", payload: { message } }).catch(
+      () => {},
+    );
+  };
 
 /** A `run.waiting` the API refused because it already stopped or failed the run, and recorded how. */
 export class RunEndedError extends Error {

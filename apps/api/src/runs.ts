@@ -11,12 +11,13 @@ import {
   type AgentId,
   type AgentStatus,
   type EventType,
+  HEARTBEAT_INTERVAL_MS,
   type RunId,
   RunStatus,
   runTransitions,
   type Usage,
 } from "@sky/shared";
-import { and, count, eq, inArray, isNull, lt, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, lt, sql } from "drizzle-orm";
 import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { enqueueDeliveries } from "./deliveries.js";
 import { runEvents } from "./run-events.js";
@@ -161,12 +162,84 @@ export function stopActiveRun(tx: Tx, agentId: AgentId): RunRow | undefined {
 }
 
 /**
+ * When the run last had an event, else when it was created; events of the `excluding` types don't count.
+ */
+const lastEventAt = (excluding: EventType[] = []) =>
+  sql<string>`coalesce((select max(${events.ts}) from ${events} where ${events.runId} = ${runs.id}${
+    excluding.length > 0
+      ? sql` and ${events.type} not in (${sql.join(
+          excluding.map((t) => sql`${t}`),
+          sql`, `,
+        )})`
+      : sql``
+  }), ${runs.createdAt})`;
+
+// a heartbeat older than this says the runner stopped reporting, not that the tool is still running
+const HEARTBEAT_FRESH_MS = 3 * HEARTBEAT_INTERVAL_MS;
+
+type ToolInFlight = { toolName: string; ranMs: number; beatFresh: boolean };
+
+/**
+ * The tool call the run's latest `runner.heartbeat` reports, when that heartbeat came after every
+ * event but a `run.probed` or `runner.warning` (so no result has been seen since), and how long it
+ * has run: up to now while the heartbeat is fresh, else up to that heartbeat.
+ */
+function toolInFlight(
+  tx: Tx,
+  runId: RunId,
+  now: number,
+): ToolInFlight | undefined {
+  const beat = tx
+    .select({ ts: events.ts, payload: events.payload })
+    .from(events)
+    .where(
+      and(
+        eq(events.runId, runId),
+        eq(events.type, "runner.heartbeat"),
+        sql`${events.id} > coalesce((select max(e.id) from ${events} e where e.run_id = ${runId} and e.type not in ('runner.heartbeat', 'run.probed', 'runner.warning')), 0)`,
+      ),
+    )
+    .orderBy(desc(events.id))
+    .get();
+  if (!beat) return undefined;
+  const { toolName, elapsedMs } = beat.payload as {
+    toolName: string;
+    elapsedMs: number;
+  };
+  const sinceBeat = now - Date.parse(beat.ts);
+  const beatFresh = sinceBeat <= HEARTBEAT_FRESH_MS;
+  return {
+    toolName,
+    ranMs: elapsedMs + (beatFresh ? sinceBeat : 0),
+    beatFresh,
+  };
+}
+
+const duration = (ms: number) =>
+  ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)}m`;
+
+const timeoutError = (tool: ToolInFlight | undefined, timeoutMs: number) => {
+  if (!tool) return "runner_timeout";
+  return tool.beatFresh
+    ? `runner_timeout: ${tool.toolName} was still running after ${duration(tool.ranMs)} with no result, past the ${duration(timeoutMs)} limit`
+    : `runner_timeout: the runner went quiet during ${tool.toolName} after it had run ${duration(tool.ranMs)}`;
+};
+
+/**
  * Fails every active run but a waiting one with no event (or, before its first, no launch) since
- * `timeoutMs` ago, so a runner that died can't hold a concurrency slot. Returns the ids it failed.
+ * `timeoutMs` ago, so a runner that died can't hold a concurrency slot. A `run.probed`, a
+ * `runner.heartbeat` or a `runner.warning` doesn't count as an event: a runner that is alive but
+ * wedged, a tool call that never returns, or a sprite hold that keeps failing, still times out. A
+ * run that went quiet with a tool call in flight is failed naming it and how long it ran. Returns
+ * the ids it failed.
  */
 export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
   const cutoff = new Date(now - timeoutMs).toISOString();
-  const lastActivity = sql<string>`coalesce((select max(${events.ts}) from ${events} where ${events.runId} = ${runs.id}), ${runs.createdAt})`;
+  const lastActivity = lastEventAt([
+    "run.probed",
+    "runner.heartbeat",
+    "runner.warning",
+  ]);
   // one write transaction, so an event landing mid-sweep can't be overtaken by a stale read
   return db.transaction(
     (tx) => {
@@ -184,7 +257,9 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
         )
         .all()
         .map((r) => r.id);
-      for (const id of stale) failRun(tx, id, "runner_timeout");
+      for (const id of stale) {
+        failRun(tx, id, timeoutError(toolInFlight(tx, id, now), timeoutMs));
+      }
       return stale;
     },
     { behavior: "immediate" },
@@ -193,9 +268,10 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
 
 /**
  * Fails, with `launch_timeout`, every run still `starting` that was created over `deadlineMs` ago
- * and has no event: its runner never reported in (a launch stuck on the sprite, or a sprite that paused
- * before the runner held it), so the agent frees up for a follow-up instead of waiting out
- * `runner_timeout`. Returns each run it failed with the sprite its runner may still be on.
+ * and has no event but a `runner.warning` or `runner.heartbeat`, neither of which proves the launch
+ * worked: its runner never reported in (a launch stuck on the sprite, or a sprite that paused before
+ * the runner held it), so the agent frees up for a follow-up instead of waiting out `runner_timeout`.
+ * Returns each run it failed with the sprite its runner may still be on.
  */
 export function failUnlaunchedRuns(
   db: Db,
@@ -214,12 +290,111 @@ export function failUnlaunchedRuns(
           and(
             eq(runs.status, "starting"),
             lt(runs.createdAt, cutoff),
-            sql`not exists (select 1 from ${events} where ${events.runId} = ${runs.id})`,
+            sql`not exists (select 1 from ${events} where ${events.runId} = ${runs.id} and ${events.type} not in ('runner.warning', 'runner.heartbeat'))`,
           ),
         )
         .all();
       for (const { runId } of late) failRun(tx, runId, "launch_timeout");
       return late;
+    },
+    { behavior: "immediate" },
+  );
+}
+
+/**
+ * The `running` runs with no event of any kind (a `run.probed` included, so a probed run is next
+ * due a window later) since `silentMs` ago, each with the sprite its runner is on and the id of its
+ * latest event (0 when it has none), which `failLostRun` judges the run by.
+ */
+export function silentRuns(
+  db: Db,
+  silentMs: number,
+  now = Date.now(),
+): {
+  runId: RunId;
+  spriteName: string;
+  silentMs: number;
+  lastEventId: number;
+}[] {
+  const cutoff = new Date(now - silentMs).toISOString();
+  const last = lastEventAt();
+  const lastId = sql<number>`coalesce((select max(${events.id}) from ${events} where ${events.runId} = ${runs.id}), 0)`;
+  return db
+    .select({
+      runId: runs.id,
+      spriteName: environments.spriteName,
+      lastAt: last,
+      lastEventId: lastId.mapWith(Number),
+    })
+    .from(runs)
+    .innerJoin(agents, eq(runs.agentId, agents.id))
+    .innerJoin(environments, eq(agents.envId, environments.id))
+    .where(and(eq(runs.status, "running"), sql`${last} < ${cutoff}`))
+    .all()
+    .map(({ runId, spriteName, lastAt, lastEventId }) => ({
+      runId,
+      spriteName,
+      silentMs: now - Date.parse(lastAt),
+      lastEventId,
+    }));
+}
+
+/**
+ * Records a `run.probed` on a run that is still `running`; false when it ended meanwhile.
+ * The caller nudges the dispatcher when this returns true.
+ */
+export function recordProbe(
+  db: Db,
+  runId: RunId,
+  payload: { spriteName: string; silentMs: number },
+): boolean {
+  return db.transaction(
+    (tx) => {
+      const run = tx.select().from(runs).where(eq(runs.id, runId)).get();
+      if (run?.status !== "running") return false;
+      recordEvent(tx, runId, "run.probed", payload);
+      return true;
+    },
+    { behavior: "immediate" },
+  );
+}
+
+/**
+ * Fails, with `runner_lost` naming the sprite, a run that is still `running` and has no event past
+ * `lastEventId`, the latest it had when the probe began: the probe found its runner gone. A later
+ * event means the runner spoke meanwhile, and the sweep's next window judges it. Event ids, not
+ * clock times: a fast host can stamp the last event and the probe's start in the same millisecond.
+ * False when the run was left alone.
+ */
+export function failLostRun(
+  db: Db,
+  runId: RunId,
+  spriteName: string,
+  lastEventId: number,
+): boolean {
+  return db.transaction(
+    (tx) => {
+      // in the where clause, not the select list: on a single-table select Drizzle drops the table
+      // name from a column in a selected expression, and `runs.id` inside would read `events.id`
+      // (`silentRuns` selects its subquery safely only because its joins keep the qualifier)
+      const silent = tx
+        .select({ id: runs.id })
+        .from(runs)
+        .where(
+          and(
+            eq(runs.id, runId),
+            eq(runs.status, "running"),
+            sql`not exists (select 1 from ${events} where ${events.runId} = ${runs.id} and ${events.id} > ${lastEventId})`,
+          ),
+        )
+        .get();
+      if (!silent) return false;
+      failRun(
+        tx,
+        runId,
+        `runner_lost: its runner is gone from sprite ${spriteName}`,
+      );
+      return true;
     },
     { behavior: "immediate" },
   );
@@ -263,27 +438,33 @@ export function failAbandonedWaits(
 const CLAUDE_EVENT_TTL_MS = 7 * 86_400_000;
 
 /**
- * Deletes `claude.*` events older than 7 days and their webhook deliveries; `run.*` events are kept.
+ * Deletes `claude.*` and `runner.heartbeat` events older than 7 days and their webhook deliveries;
+ * `run.*` events are kept.
  * Returns how many events it deleted.
  */
 export function pruneClaudeEvents(db: Db, now = Date.now()) {
   const cutoff = new Date(now - CLAUDE_EVENT_TTL_MS).toISOString();
-  // the literal pattern, not LIKE or a bound parameter: only then does the planner use events_claude_ts
-  const expired = and(
-    sql`${events.type} glob 'claude.*'`,
-    lt(events.ts, cutoff),
-  );
+  // the literal patterns, not LIKE or a bound parameter: only then does the planner use the partial
+  // indexes events_claude_ts and events_heartbeat_ts
+  const expired = [
+    and(sql`${events.type} glob 'claude.*'`, lt(events.ts, cutoff)),
+    and(sql`${events.type} = 'runner.heartbeat'`, lt(events.ts, cutoff)),
+  ];
   return db.transaction(
     (tx) => {
-      tx.delete(webhookDeliveries)
-        .where(
-          inArray(
-            webhookDeliveries.eventId,
-            tx.select({ id: events.id }).from(events).where(expired),
-          ),
-        )
-        .run();
-      return tx.delete(events).where(expired).run().changes;
+      let pruned = 0;
+      for (const where of expired) {
+        tx.delete(webhookDeliveries)
+          .where(
+            inArray(
+              webhookDeliveries.eventId,
+              tx.select({ id: events.id }).from(events).where(where),
+            ),
+          )
+          .run();
+        pruned += tx.delete(events).where(where).run().changes;
+      }
+      return pruned;
     },
     { behavior: "immediate" },
   );

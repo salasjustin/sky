@@ -6,6 +6,7 @@ import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { createDispatcher } from "./deliveries.js";
 import { signalRunner } from "./launch.js";
+import { createRunProber } from "./probe.js";
 import { failInterruptedProvisioning } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
 import {
@@ -23,8 +24,10 @@ const SWEEP_EVERY_MS = 60_000;
  * Opens and migrates the one DB handle the app reuses for its lifetime, fails provisioning a previous
  * process left unfinished, and fails silent runs and abandoned waits now and every minute after. Runs
  * outlive a restart: their runners keep posting, so only silence fails one. A run failed for missing its
- * launch deadline has its runner signalled too, without waiting on the sprite. The same sweep deletes
- * run envVars past their TTL and `claude.*` events past 7 days. Webhook deliveries left pending resume at once.
+ * launch deadline has its runner signalled too, without waiting on the sprite. A `running` run silent
+ * past the probe window has its runner looked for on its sprite, also unawaited (see
+ * `createRunProber`). The same sweep deletes run envVars past their TTL and `claude.*` and
+ * `runner.heartbeat` events past 7 days. Webhook deliveries left pending resume at once.
  */
 export function boot(config: Config, log: (line: string) => void) {
   const db = openDb(join(config.dataDir, "sky.db"));
@@ -45,6 +48,13 @@ export function boot(config: Config, log: (line: string) => void) {
     timeoutMs: SPRITES_TIMEOUT_MS,
     longTimeoutMs: config.spritesLongTimeoutMs,
   };
+  const prober = createRunProber({
+    db,
+    sprites: spriteOps,
+    probeMs: config.runProbeMs,
+    log,
+    nudgeDeliveries: dispatcher.nudge,
+  });
   const sweep = () => {
     purgeExpiredEnvVars(db, secrets, new Date());
     const late = failUnlaunchedRuns(db, config.launchDeadlineMs);
@@ -56,11 +66,18 @@ export function boot(config: Config, log: (line: string) => void) {
     }
     const stale = failStaleRuns(db, config.runTimeoutMs);
     for (const id of stale) log(`run ${id} failed: runner_timeout`);
+    // after the timeout sweep, so a run it just failed isn't probed; not awaited, so a sprite
+    // that is slow to wake never holds up the sweep (the prober logs, never throws)
+    void prober.sweep();
     const abandoned = failAbandonedWaits(db, config.waitTimeoutMs);
     for (const id of abandoned) log(`run ${id} failed: waiting_timeout`);
     if (late.length + stale.length + abandoned.length > 0) dispatcher.nudge();
     const pruned = pruneClaudeEvents(db);
-    if (pruned > 0) log(`pruned ${pruned} claude.* events older than 7 days`);
+    if (pruned > 0) {
+      log(
+        `pruned ${pruned} claude.* and runner.heartbeat events older than 7 days`,
+      );
+    }
   };
   sweep();
   const sweeper = setInterval(

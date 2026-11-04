@@ -198,9 +198,14 @@ export const events = sqliteTable(
     index("events_claude_ts")
       .on(t.ts)
       .where(sql`${c(t.type)} glob 'claude.*'`),
+    // the heartbeat prune: the query must spell `type = 'runner.heartbeat'` as a literal, not a bound parameter
+    index("events_heartbeat_ts")
+      .on(t.ts)
+      .where(sql`${c(t.type)} = 'runner.heartbeat'`),
     check(
       "events_type",
       sql`${c(t.type)} in ('run.started', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped', 'run.resumed',
+        'run.probed', 'runner.warning', 'runner.heartbeat',
         'claude.PreToolUse', 'claude.PostToolUse', 'claude.PostToolUseFailure', 'claude.SubagentStart', 'claude.SubagentStop',
         'claude.TaskCreated', 'claude.TaskCompleted', 'claude.Notification', 'claude.PreCompact', 'claude.FileChanged', 'claude.Message')`,
     ),

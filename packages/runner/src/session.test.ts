@@ -842,7 +842,7 @@ test("with a GitHub connector in its env, the session is told to publish through
       "The runner refreshed this repo from GitHub when this run started; what that changed, if anything, is in the notes at the end.",
     );
     expect(append).toContain(
-      `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` command: its other subcommands are the Sky API's, and run with none it starts a new run.`,
+      `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` command: its other subcommands are the Sky API's, and run with none it refuses: only the Sky API starts a run.`,
     );
   } finally {
     vi.unstubAllEnvs();
@@ -2277,4 +2277,243 @@ test("a rollup that can't be computed is left off with one warning; the run stil
   expect(warnings).toEqual([
     expect.stringMatching(/^runner: rollup skipped: /),
   ]);
+});
+
+const pause =
+  (ms: number): Step =>
+  () =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+/** A step that waits for `check` to pass, however slow the machine; the heartbeat tests pace on it, not on a clock. */
+const until =
+  (check: () => void): Step =>
+  () =>
+    vi.waitFor(check, { timeout: 10_000, interval: 5 });
+const bash = (id: string) => ({
+  tool_name: "Bash",
+  tool_input: { command: "pnpm build" },
+  tool_use_id: id,
+});
+const beatsIn = (posted: RunnerEventPost[]) =>
+  posted.flatMap((e) => (e.type === "runner.heartbeat" ? [e.payload] : []));
+/** Long against the 25 ms beat: a heartbeat that should be silent has had several chances to post. */
+const QUIET_MS = 200;
+
+test("a tool call in flight is reported as runner.heartbeat with its name and how long it has run, and stops when it returns", async () => {
+  const { posted, post } = recorder();
+  const query = scripted([
+    init,
+    hook("PreToolUse", bash("t1")),
+    until(() => expect(beatsIn(posted).length).toBeGreaterThanOrEqual(3)),
+    hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
+    pause(QUIET_MS),
+    success,
+  ]);
+  const code = await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    heartbeatMs: 25,
+  });
+  expect(code).toBe(0);
+  const beats = posted.filter((e) => e.type === "runner.heartbeat");
+  for (const beat of beats) {
+    expect(beat).toEqual({
+      runId: "run_1",
+      type: "runner.heartbeat",
+      payload: {
+        toolName: "Bash",
+        toolUseId: "t1",
+        elapsedMs: expect.any(Number),
+      },
+    });
+  }
+  const elapsed = beatsIn(posted).map((b) => b.elapsedMs);
+  expect(elapsed).toEqual([...elapsed].sort((a, b) => a - b));
+  expect(elapsed.at(-1)).toBeGreaterThan(elapsed[0] ?? 0);
+  // none after the call returned: its PostToolUse is the last thing before the quiet pause
+  const types = posted.map((e) => e.type);
+  const returned = types.indexOf("claude.PostToolUse");
+  expect(types.slice(returned)).not.toContain("runner.heartbeat");
+});
+
+test("with several tool calls in flight the heartbeat names the longest-running; with none, it is silent", async () => {
+  const { posted, post } = recorder();
+  let secondStarted = 0;
+  const query = scripted([
+    init,
+    pause(QUIET_MS),
+    hook("PreToolUse", bash("t1")),
+    until(() => expect(beatsIn(posted).length).toBeGreaterThanOrEqual(1)),
+    hook("PreToolUse", bash("t2")),
+    async () => {
+      secondStarted = beatsIn(posted).length;
+    },
+    until(() =>
+      expect(beatsIn(posted).length).toBeGreaterThanOrEqual(secondStarted + 3),
+    ),
+    hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
+    hook("PostToolUseFailure", { ...bash("t2"), error: "x" }),
+    pause(QUIET_MS),
+    success,
+  ]);
+  await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    heartbeatMs: 25,
+  });
+  const types = posted.map((e) => e.type);
+  // silent before any call ran
+  expect(types.slice(0, types.indexOf("claude.PreToolUse"))).not.toContain(
+    "runner.heartbeat",
+  );
+  // t2 started after t1, so every beat, those with both in flight included, names t1
+  expect(new Set(beatsIn(posted).map((b) => b.toolUseId))).toEqual(
+    new Set(["t1"]),
+  );
+  expect(types.slice(types.indexOf("claude.PostToolUseFailure"))).not.toContain(
+    "runner.heartbeat",
+  );
+});
+
+test("a call held for approval is not beaten for until it is approved and runs", async () => {
+  const { posted, post } = recorder();
+  let approve: (() => void) | undefined;
+  let beatsWhileHeld: unknown[] | undefined;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      const gated = fire(options, "PreToolUse", bash("t1"));
+      await vi.waitFor(() => expect(approve).toBeDefined());
+      await pause(QUIET_MS)(options);
+      beatsWhileHeld = beatsIn(posted);
+      approve?.();
+      expect(await gated).toEqual([{ continue: true }]);
+    },
+    until(() => expect(beatsIn(posted).length).toBeGreaterThanOrEqual(2)),
+    hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    {
+      query,
+      post,
+      signal: new AbortController().signal,
+      awaitDecision: () =>
+        new Promise((resolve) => {
+          approve = () =>
+            resolve({
+              kind: "decided",
+              decision: { requestId: "req_x", decision: "approve" },
+            });
+        }),
+      heartbeatMs: 25,
+    },
+  );
+  expect(code).toBe(0);
+  expect(beatsWhileHeld).toEqual([]);
+  expect(posted.map((e) => e.type)).toContain("runner.heartbeat");
+});
+
+test("a denied call is never beaten for", async () => {
+  const { posted, post } = recorder();
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      await fire(options, "PreToolUse", bash("t1"));
+      await pause(QUIET_MS)(options);
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    {
+      query,
+      post,
+      signal: new AbortController().signal,
+      awaitDecision: async () => ({
+        kind: "decided",
+        decision: { requestId: "req_x", decision: "deny" },
+      }),
+      heartbeatMs: 25,
+    },
+  );
+  expect(posted.map((e) => e.type)).toContain("run.waiting");
+  expect(posted.map((e) => e.type)).not.toContain("runner.heartbeat");
+});
+
+test("Claude's question is a wait for a person, not a tool running: it is never beaten for", async () => {
+  const { posted, post } = recorder();
+  const query = scripted([
+    init,
+    hook("PreToolUse", {
+      tool_name: "AskUserQuestion",
+      tool_input: { questions },
+      tool_use_id: "q1",
+    }),
+    // the SDK holds the call in canUseTool for the answer, and a declined one may never fire PostToolUse
+    pause(QUIET_MS),
+    hook("PreToolUse", bash("t1")),
+    until(() => expect(beatsIn(posted).length).toBeGreaterThanOrEqual(1)),
+    hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
+    success,
+  ]);
+  await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    heartbeatMs: 25,
+  });
+  // a later call's beats name that call, not the question left in flight
+  expect(new Set(beatsIn(posted).map((b) => b.toolUseId))).toEqual(
+    new Set(["t1"]),
+  );
+  const types = posted.map((e) => e.type);
+  expect(types.slice(0, types.lastIndexOf("claude.PreToolUse"))).not.toContain(
+    "runner.heartbeat",
+  );
+});
+
+test("a heartbeat the API refuses gets one attempt, so an outage never queues its retries ahead of run.finished", async () => {
+  const beats: number[] = [];
+  const sent: string[] = [];
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      const event = (await request.json()) as RunnerEventPost;
+      if (event.type !== "runner.heartbeat") {
+        sent.push(event.type);
+        return new HttpResponse(null, { status: 204 });
+      }
+      beats.push(event.payload.elapsedMs);
+      return new HttpResponse(null, { status: 503 });
+    }),
+  );
+  const post = createPoster({
+    apiBaseUrl: "https://api.test",
+    agentToken: "agent-secret",
+    warn: () => {},
+    sleep: async () => {},
+  });
+  const query = scripted([
+    init,
+    hook("PreToolUse", bash("t1")),
+    until(() => expect(beats.length).toBeGreaterThanOrEqual(3)),
+    hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
+    success,
+  ]);
+  const code = await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    heartbeatMs: 25,
+  });
+  expect(code).toBe(0);
+  // a retry would resend the same beat, its elapsedMs repeated
+  expect(new Set(beats).size).toBe(beats.length);
+  expect(sent.at(-1)).toBe("run.finished");
 });

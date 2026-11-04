@@ -203,7 +203,7 @@ Some repos reject commits by unverified authors, or commits with a `Co-authored-
 
 ### Fetching from GitHub
 
-Sandboxes have no git transport, so `git fetch`, `git pull` and `git push` fail there. The runner fetches through the same connector instead, at the start of every run. Agents run `runner.mjs` only for `publish`; a bare `runner.mjs` starts a run. Without a connector in the environment nothing is fetched and the sandbox keeps the commit it was provisioned with.
+Sandboxes have no git transport, so `git fetch`, `git pull` and `git push` fail there. The runner fetches through the same connector instead, at the start of every run. Agents run `runner.mjs` only for `publish`; the API alone starts a run, and a `runner.mjs` run any other way refuses. Without a connector in the environment nothing is fetched and the sandbox keeps the commit it was provisioned with.
 
 - **Default branch.** Every run refreshes `origin/<default branch>` first, so a new worktree starts from GitHub's current code. A clean worktree from an earlier run is rebased onto it. A worktree with uncommitted changes, one whose rebase conflicts, and one already published (rewriting it would break its pull request) are left alone, and the agent's prompt says how many commits it is behind. A default branch more than 100 commits ahead is not fetched; the prompt says so.
 - **Start from a branch.** `sky agent start <env> --branch=<name>` (REST: `branch` on `POST /v1/agents`; MCP: the `branch` parameter) starts the agent from an existing branch on GitHub, such as an open pull request's. The agent works on a local `claude/<agentId>` branch, and `publish` updates `<name>` and its open pull request, without rebasing it onto the default branch. The start fails with `404 branch_not_found` if the branch doesn't exist, `422 branch_is_default` for the default branch, and `422 branch_needs_connector` when the environment has no connector.
@@ -246,6 +246,29 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 | `agents_exist`    | repo or setup can't change while unarchived agents exist                     |
 | `already_decided` | the request was already decided differently; that decision stands            |
 
+### Run errors
+
+A run the API fails ends with `run.failed`, and its `error` is one of:
+
+| error             | means                                                                                                                                                                      |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `launch_failed`   | the runner couldn't be started on the sprite; the detail follows the colon                                                                                                 |
+| `launch_timeout`  | the runner never reported in within `LAUNCH_DEADLINE_MINUTES` (default 15); a `runner.warning` or heartbeat doesn't count as reporting in                                  |
+| `runner_lost`     | the run went quiet, the API woke its sprite, and the runner was no longer running there; the error names the sprite                                                        |
+| `runner_timeout`  | no event for `RUN_TIMEOUT_MINUTES` (default 30), though the runner was still running (or its sprite couldn't be reached to tell); names the tool call when one was running |
+| `waiting_timeout` | the run waited on an answer or approval past its limit and its runner is gone                                                                                              |
+
+**The probe.** A sprite can go to sleep under a run and lose its runner. Once a `running` run has had no event for `RUN_PROBE_MINUTES` (default 5, and always below `RUN_TIMEOUT_MINUTES`; when the timeout is under 10 minutes the default is half of it), the API wakes its sprite and looks for the run's runner:
+
+- **Heartbeats arriving:** while a tool call runs, the runner posts `runner.heartbeat` about every 60 seconds with the tool's name and how long it has run. A heartbeating run is alive, so it isn't probed, however long the call takes. A heartbeat isn't progress: a tool call still running past `RUN_TIMEOUT_MINUTES` fails with `runner_timeout: <tool> was still running after <time> with no result, past the <limit> limit`, or with `runner_timeout: the runner went quiet during <tool> after it had run <time>` when the heartbeats stopped. A `runner.warning` isn't progress either.
+- **Runner alive:** the API records a `run.probed` event and the run carries on. A probe is not runner activity, so a runner that is alive but wedged still fails with `runner_timeout`.
+- **Runner gone:** the run fails at once with `runner_lost`, instead of waiting out `runner_timeout`. The agent is free for a follow-up, which resumes the session and worktree as any follow-up does.
+- **Sprite can't answer:** the API logs it and leaves the run alone; `runner_timeout` is the backstop. If the sprite no longer exists, the run fails at once with `runner_lost`.
+
+A run is probed at most once per window, and a slow sprite never holds up the API's sweep. Only `running` runs are probed; a run waiting on a request has its own deadline.
+
+**The run log.** On the sprite, `/workspace/runs/<runId>.log` is written only by the run's own runner, which holds `<runId>.lock` while it runs. The runner starts only when the API launches it with the run's id as its argument. Started any other way, by hand or from an agent's shell (which inherits the log's location), it refuses with one line on stderr and never touches the log. An agent's own command is `node /opt/sky/runner.mjs publish`.
+
 ## MCP
 
 `POST /mcp` (streamable HTTP, same bearer key) exposes `create_env`, `launch`, `followup`, `status`, `answer`, `approve`, `stop`, `archive` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents.
@@ -261,13 +284,16 @@ What an agent does arrives as events, each with `agentId` and `runId`:
 | `run.started`, `run.finished`, `run.failed`, `run.stopped`             | the run's lifecycle                                                   |
 | `run.waiting`                                                          | the agent needs an `answer` or an approval                            |
 | `run.resumed`                                                          | a question was answered or a tool call approved or denied             |
+| `run.probed`                                                           | a silent run's runner was checked on its sprite and found alive       |
+| `runner.warning`                                                       | the runner hit a problem that didn't end the run, with its message    |
+| `runner.heartbeat`                                                     | a tool call is still running: its name and how long, about every 60 s |
 | `claude.Message`                                                       | Claude, or a subagent (with `parentToolUseId`), wrote a message       |
 | `claude.PreToolUse`, `claude.PostToolUse`, `claude.PostToolUseFailure` | a tool call starts, finishes or fails, with its input and output      |
 | `claude.SubagentStart`, `claude.SubagentStop`                          | a subagent starts or finishes                                         |
 | `claude.TaskCreated`, `claude.TaskCompleted`                           | a todo item is added or finished                                      |
 | `claude.Notification`, `claude.PreCompact`, `claude.FileChanged`       | Claude Code's notifications, context compaction, watched-file changes |
 
-The `claude.*` names are Claude Code's own hook names. Each text field is redacted (registered secrets and tokens) and then cut to 4,096 characters. `claude.*` events are kept for 7 days; `run.*` events are kept.
+The `claude.*` names are Claude Code's own hook names. Each text field is redacted (registered secrets and tokens) and then cut to 4,096 characters (`runner.warning` included). `claude.*` and `runner.heartbeat` events are kept for 7 days; `run.*` and `runner.warning` events are kept.
 
 Three ways to receive them:
 
