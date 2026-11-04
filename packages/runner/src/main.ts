@@ -69,23 +69,34 @@ async function main(): Promise<void> {
     refuse(`${claim.reason}; not starting a second runner for ${config.runId}`);
     return;
   }
+  const release = claim?.release ?? (() => {});
   if (claim) {
     logFile = claim.logFile;
-    // however the runner ends, so a lock left behind is only ever from a process killed outright
-    process.on("exit", claim.release);
+    // a normal end; death by a signal fires no 'exit', so `dieBy` releases first. A lock left
+    // behind is only ever from a process killed outright (SIGKILL, a crash of Node itself)
+    process.on("exit", release);
   }
 
   // the first SIGTERM/SIGINT/SIGHUP aborts the session and lets the run report and commit; a second one kills at once
   const controller = new AbortController();
   let caught: NodeJS.Signals | undefined;
+  // a hangup from the exec session that started the runner is a stop, not a death
+  const STOPS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
+  const stopListening = () => {
+    for (const stop of STOPS) process.off(stop, onSignal);
+  };
+  // so the caller sees the process was stopped, not that it failed
+  const dieBy = (signal: NodeJS.Signals) => {
+    stopListening();
+    release();
+    process.kill(process.pid, signal);
+  };
   const onSignal = (signal: NodeJS.Signals) => {
+    if (caught) return dieBy(signal);
     caught = signal;
     controller.abort(signal);
   };
-  process.once("SIGTERM", onSignal);
-  process.once("SIGINT", onSignal);
-  // a hangup from the exec session that started the runner is a stop, not a death
-  process.once("SIGHUP", onSignal);
+  for (const stop of STOPS) process.on(stop, onSignal);
   // first, so the sprite can't pause and freeze the run before it is held; held through waits for a
   // decision too: a paused sprite drops the long-poll and the event posts
   const post = createPoster({ ...config, warn });
@@ -110,13 +121,10 @@ async function main(): Promise<void> {
     });
   } finally {
     await syncStoreQuietly("push", process.env, warn);
-    process.off("SIGTERM", onSignal);
-    process.off("SIGINT", onSignal);
-    process.off("SIGHUP", onSignal);
     await hold.release();
   }
-  // die by the signal so the caller sees the process was stopped, not that it failed
-  if (caught) process.kill(process.pid, caught);
+  if (caught) dieBy(caught);
+  else stopListening();
 }
 
 async function setUpSession(signal: AbortSignal): Promise<void> {

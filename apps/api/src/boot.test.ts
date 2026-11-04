@@ -208,6 +208,91 @@ test("boot fails a run that never reported in past the launch deadline and signa
     .toBe(true);
 });
 
+/** Seeds, through a first boot whose DB it returns, a `running` run with no event since `minutesAgo` on sprite `sky-env_a`. */
+const seedSilentRun = (minutesAgo: number) => {
+  const first = booted().db;
+  first.$client
+    .prepare(
+      `insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a')`,
+    )
+    .run();
+  first.$client
+    .prepare(
+      `insert into agents (id, env_id, branch, status) values ('agt_a', 'env_a', 'claude/agt_a', 'running')`,
+    )
+    .run();
+  first.$client
+    .prepare(
+      `insert into runs (id, agent_id, status, created_at) values ('run_a', 'agt_a', 'running', ?)`,
+    )
+    .run(new Date(Date.now() - minutesAgo * 60_000).toISOString());
+  return first;
+};
+
+// the default 30 m run timeout, not `config()`'s 60 s, so the silent run is probed rather than timed out
+const bootWithProbe = (log: (line: string) => void) => {
+  const b = boot(testConfig({ dataDir: dir }), log);
+  stops.push(b.stopSweeping, b.stopDelivering);
+  return b;
+};
+
+test("boot's sweep probes a running run silent past the probe window, and records its live runner", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-env_a");
+  seedSilentRun(10).$client.close();
+
+  db = bootWithProbe(() => {}).db;
+  await expect
+    .poll(() =>
+      db?.$client
+        .prepare("select type from events where run_id = 'run_a'")
+        .all(),
+    )
+    .toEqual([{ type: "run.probed" }]);
+  expect(wire.calls).toContain(
+    `exec sky-env_a - pgrep -f ${runnerPattern("run_a" as RunId)}`,
+  );
+  expect(
+    db.$client.prepare("select status from runs where id = 'run_a'").get(),
+  ).toEqual({ status: "running" });
+});
+
+test("boot's sweep carries on past a probe whose sprite hangs, without waiting on it", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-env_a");
+  wire.hangs = (call) => call.includes(" pgrep ");
+  wire.hangMs = 300;
+  const first = seedSilentRun(10);
+  // for the prune, a step of the sweep that runs after the probe starts; on an earlier run, as an
+  // event on run_a would make it stale rather than silent
+  first.$client.exec(
+    `insert into runs (id, agent_id, status) values ('run_old', 'agt_a', 'finished')`,
+  );
+  first.$client
+    .prepare(
+      `insert into events (run_id, ts, type, payload) values ('run_old', ?, 'claude.Message', '{"text":"old"}')`,
+    )
+    .run(new Date(Date.now() - 8 * 86_400_000).toISOString());
+  first.$client.close();
+
+  const lines: string[] = [];
+  db = bootWithProbe((line) => lines.push(line)).db;
+  expect(lines).toContain(
+    "pruned 1 claude.* and runner.heartbeat events older than 7 days",
+  );
+  expect(lines.some((l) => l.includes("probing the runner of run_a"))).toBe(
+    false,
+  );
+  await expect
+    .poll(() => wire.calls.some((c) => c.includes(" pgrep ")))
+    .toBe(true);
+  // settled before teardown closes the DB and resets the handlers
+  await wire.hangsSettled();
+  await expect
+    .poll(() => lines.some((l) => l.includes("probing the runner of run_a")))
+    .toBe(true);
+});
+
 test("a webhook delivery a previous process left pending is sent after boot", async () => {
   const first = booted();
   const envId = "env_boot" as EnvironmentId;
@@ -389,7 +474,7 @@ test("the sweep prunes claude.* events past 7 days with their deliveries; younge
       .all(),
   ).toEqual([{ event_id: young }, { event_id: finished }]);
   expect(lines.filter((l) => l.includes("pruned"))).toEqual([
-    "pruned 1 claude.* events older than 7 days",
+    "pruned 1 claude.* and runner.heartbeat events older than 7 days",
   ]);
 });
 

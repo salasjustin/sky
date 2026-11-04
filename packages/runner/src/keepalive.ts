@@ -33,8 +33,9 @@ const taskNameFor = (runId: string) =>
  * interval (a task lives an hour at most), and deletes it on `release`. Never throws: with no
  * socket (tests, local runs) it says so once on `warn`; a failed call is one line on `warn`.
  * `report` carries the failures that leave the sprite free to pause to the API, where the runner's
- * local log can't be read once the sprite is asleep: the first failure of each streak of failed
- * PUTs, and the first hold giving up. It never throws.
+ * local log can't be read once the sprite is asleep: a missing socket, the first hold giving up
+ * on its quick retries, and, once a hold has landed, the first failure of each streak of failed
+ * refreshes. It never throws.
  */
 export function holdSprite(options: {
   runId: string;
@@ -87,7 +88,9 @@ export function holdSprite(options: {
       }
       const message = `runner: sprite task ${method} failed: ${error instanceof Error ? error.message : String(error)}`;
       options.warn(message);
-      if (method === "PUT" && !failing) report(message);
+      // before the first hold lands a refused PUT is a cold sprite's API still starting, which
+      // the quick retries exist for; only giving up on them is reported
+      if (method === "PUT" && held && !failing) report(message);
       if (method === "PUT") failing = true;
       return true;
     }

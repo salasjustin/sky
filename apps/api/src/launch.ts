@@ -36,7 +36,7 @@ import {
 
 // the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
 // then deleted, and the prompt in PROMPT_FILE, which a query param is too short for;
-// the run id in argv is what `runnerPattern` matches; the runner itself ignores it
+// the run id in argv is what `runnerPattern` matches; the runner refuses to start unless it equals RUN_ID
 const RUNNER_COMMAND = `${WITH_PACKAGE_MANAGERS} && set -a && . "$ENV_FILE" && set +a && rm -f "$ENV_FILE" && PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
 
 /**

@@ -23,6 +23,8 @@ export type PostEvent = (
     signal?: AbortSignal;
     /** A stop that ends retrying, not sending: once aborted, the post gets one short attempt, then is dropped. */
     giveUp?: AbortSignal;
+    /** The attempts this post gets, in place of its event type's budget; still ended by the deadline. */
+    maxAttempts?: number;
   },
 ) => Promise<void>;
 
@@ -42,7 +44,7 @@ export function createPoster(
 ): PostEvent {
   const url = new URL("/internal/events", options.apiBaseUrl);
   const now = options.now ?? Date.now;
-  return async (event, { deadline, signal, giveUp } = {}) => {
+  return async (event, { deadline, signal, giveUp, maxAttempts } = {}) => {
     const body = JSON.stringify(RunnerEventPost.parse(event));
     const waiting = event.type === "run.waiting";
     let landed: "stored" | "run_ended" | undefined;
@@ -84,6 +86,7 @@ export function createPoster(
           attemptTimeoutMs: giveUp?.aborted ? GIVEN_UP_TIMEOUT_MS : TIMEOUT_MS,
           ...(!waiting &&
             !RIDES_OUT.has(event.type) && { maxAttempts: PROGRESS_ATTEMPTS }),
+          ...(maxAttempts !== undefined && { maxAttempts }),
           signal,
           giveUp,
         },

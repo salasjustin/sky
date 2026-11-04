@@ -1638,6 +1638,30 @@ test("the launch deadline leaves a run alone once its runner has reported in", a
   });
 });
 
+test("a runner.warning or runner.heartbeat before run.started doesn't prove the launch: the run still fails launch_timeout", async () => {
+  const { agent, run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "runner.warning",
+    payload: { message: "holding the sprite failed" },
+  });
+  await postEvent(token, {
+    runId: run.id,
+    type: "runner.heartbeat",
+    payload: { toolName: "Bash", toolUseId: "t1", elapsedMs: 61_000 },
+  });
+  const deadline = config.launchDeadlineMs;
+  expect(
+    failUnlaunchedRuns(db, deadline, Date.now() + deadline + 1000).map(
+      (r) => r.runId,
+    ),
+  ).toEqual([run.id]);
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    status: "failed",
+    error: "launch_timeout",
+  });
+});
+
 /** A prober over the stub sprites; `nudges` counts its dispatcher nudges. */
 function proberOver() {
   const nudges = { count: 0 };
@@ -1716,6 +1740,25 @@ test("a run.probed doesn't count as the runner's activity: a runner alive but we
       `insert into events (run_id, ts, type, payload) values (?, ?, 'run.probed', '{"spriteName":"s","silentMs":1}')`,
     )
     .run(run.id, probedAt);
+  expect(
+    failStaleRuns(
+      db,
+      config.runTimeoutMs,
+      silentFor(config.runTimeoutMs + 1000),
+    ),
+  ).toEqual([run.id]);
+});
+
+test("a runner.warning doesn't count as the runner's activity: a flapping sprite hold can't keep a wedged run alive", async () => {
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  insertEvent(run.id, "runner.warning", silentFor(20 * 60_000), {
+    message: "holding the sprite failed",
+  });
   expect(
     failStaleRuns(
       db,
@@ -1856,6 +1899,77 @@ test("a slow sprite is probed once while it wakes, and the sweep that started th
   await prober.sweep(now + 60_000);
   expect(pgreps()).toHaveLength(1);
   await slow;
+});
+
+test("a sweep whose lookup of silent runs fails logs it and resolves instead of throwing", async () => {
+  const busy = vi.spyOn(db, "select").mockImplementationOnce(() => {
+    throw new Error("SQLITE_BUSY: database is locked");
+  });
+  try {
+    const { prober } = proberOver();
+    let swept: Promise<void> | undefined;
+    expect(() => {
+      swept = prober.sweep(silentFor(config.runProbeMs + 1000));
+    }).not.toThrow();
+    await expect(swept).resolves.toBeUndefined();
+  } finally {
+    busy.mockRestore();
+  }
+  expect(logs).toContain(
+    "finding the silent runs to probe failed: Error: SQLITE_BUSY: database is locked",
+  );
+});
+
+test("a probe on a sprite that no longer exists fails the run at once with runner_lost, freeing the agent", async () => {
+  const envId = readyEnv({ concurrency: 1 });
+  const { agent, run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const sprite = spriteNameFor(envId);
+  wire.sprites.delete(sprite);
+  const { prober, nudges } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  expect(runStatus(run.id)).toEqual({ status: "failed" });
+  expect(runFailure(run.id)).toBe(
+    `runner_lost: its runner is gone from sprite ${sprite}`,
+  );
+  expect(
+    db.$client.prepare("select status from agents where id = ?").get(agent.id),
+  ).toEqual({ status: "idle" });
+  expect(nudges.count).toBe(1);
+  expect(logs).toContain(
+    `run ${run.id} failed: runner_lost on sprite ${sprite}`,
+  );
+});
+
+test("a probe that fails while the sprite lookup also fails is logged and leaves the run running", async () => {
+  const { agent, run, token, envId } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(2);
+  server.use(
+    http.get("https://api.sprites.dev/v1/sprites/:name", () =>
+      HttpResponse.json({ error: "upstream unavailable" }, { status: 503 }),
+    ),
+  );
+  const { prober, nudges } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+  expect((await getRun(agent.id, run.id)).body.status).toBe("running");
+  expect(nudges.count).toBe(0);
+  expect(
+    logs.some((l) =>
+      l.startsWith(
+        `checking whether sprite ${spriteNameFor(envId)} exists after probing ${run.id} failed: `,
+      ),
+    ),
+  ).toBe(true);
 });
 
 test("a runner that spoke while the probe was running is not failed as lost", async () => {
@@ -2913,18 +3027,77 @@ test("a run whose heartbeats are arriving is alive: it is not probed, however lo
 test("a tool call that outlives the run timeout fails the run as runner_timeout naming the tool and how long it ran, though heartbeats kept arriving", async () => {
   const { agent, run } = await startedRun();
   const limit = config.runTimeoutMs;
-  const now = Date.now() + limit + 60_000;
+  const now = Date.now() + limit + 120_000;
   insertEvent(run.id, "claude.PreToolUse", Date.now() + 1, {
     toolName: "Bash",
     toolUseId: "t1",
     input: "{}",
   });
-  // a beat 30 s before the sweep, from a call 30 minutes in
-  insertEvent(run.id, "runner.heartbeat", now - 30_000, beat("Bash", limit));
+  // a beat 20 s before the sweep, from a call 31 minutes in
+  insertEvent(
+    run.id,
+    "runner.heartbeat",
+    now - 20_000,
+    beat("Bash", limit + 60_000),
+  );
   expect(failStaleRuns(db, limit, now)).toEqual([run.id]);
   const { error } = (await getRun(agent.id, run.id)).body;
   expect(error).toBe(
     "runner_timeout: Bash was still running after 31m with no result, past the 30m limit",
+  );
+});
+
+test.each([
+  ["runner.warning", { message: "holding the sprite failed" }],
+  ["run.probed", { spriteName: "s", silentMs: 1 }],
+])(
+  "a %s after the last heartbeat still leaves the tool in flight named in the runner_timeout",
+  async (type, payload) => {
+    const { agent, run } = await startedRun();
+    const limit = config.runTimeoutMs;
+    const now = Date.now() + limit + 120_000;
+    insertEvent(run.id, "claude.PreToolUse", Date.now() + 1, {
+      toolName: "Bash",
+      toolUseId: "t1",
+      input: "{}",
+    });
+    insertEvent(
+      run.id,
+      "runner.heartbeat",
+      now - 20_000,
+      beat("Bash", limit + 60_000),
+    );
+    insertEvent(run.id, type, now - 10_000, payload);
+    expect(failStaleRuns(db, limit, now)).toEqual([run.id]);
+    expect((await getRun(agent.id, run.id)).body.error).toBe(
+      "runner_timeout: Bash was still running after 31m with no result, past the 30m limit",
+    );
+  },
+);
+
+test("a run whose heartbeats stopped mid tool call fails as runner_timeout saying the runner went quiet, not that the tool ran on", async () => {
+  const { agent, run } = await startedRun();
+  insertEvent(run.id, "claude.PreToolUse", Date.now() + 1, {
+    toolName: "Bash",
+    toolUseId: "t1",
+    input: "{}",
+  });
+  // the last beat, 5 minutes into the call, is long past fresh by the sweep
+  insertEvent(
+    run.id,
+    "runner.heartbeat",
+    Date.now() + 2,
+    beat("Bash", 300_000),
+  );
+  expect(
+    failStaleRuns(
+      db,
+      config.runTimeoutMs,
+      silentFor(config.runTimeoutMs + 1000),
+    ),
+  ).toEqual([run.id]);
+  expect((await getRun(agent.id, run.id)).body.error).toBe(
+    "runner_timeout: the runner went quiet during Bash after it had run 5m",
   );
 });
 
@@ -2949,16 +3122,39 @@ test("a run quiet past the timeout with no tool call in flight is a bare runner_
 test("heartbeats older than 7 days are pruned with their deliveries; newer ones and run events stay", async () => {
   const { run } = await startedRun();
   const day = 86_400_000;
-  insertEvent(
+  const old = insertEvent(
     run.id,
     "runner.heartbeat",
     Date.now() - 8 * day,
     beat("Bash", 1),
+  ).lastInsertRowid;
+  const young = insertEvent(
+    run.id,
+    "runner.heartbeat",
+    Date.now() - day,
+    beat("Bash", 2),
+  ).lastInsertRowid;
+  db.$client
+    .prepare(
+      "insert into webhooks (id, url, event_types) values ('whk_beat', 'https://hooks.example.com/beat', '[\"runner.heartbeat\"]')",
+    )
+    .run();
+  const deliver = db.$client.prepare(
+    "insert into webhook_deliveries (webhook_id, event_id, status, next_attempt_at) values ('whk_beat', ?, 'delivered', ?)",
   );
-  insertEvent(run.id, "runner.heartbeat", Date.now() - day, beat("Bash", 2));
+  for (const eventId of [old, young]) {
+    deliver.run(eventId, new Date(Date.now() - 8 * day).toISOString());
+  }
   expect(pruneClaudeEvents(db)).toBe(1);
   expect(eventsOf(run.id).map((e) => e.type)).toEqual([
     "run.started",
     "runner.heartbeat",
   ]);
+  expect(
+    db.$client
+      .prepare(
+        "select event_id from webhook_deliveries where webhook_id = 'whk_beat'",
+      )
+      .all(),
+  ).toEqual([{ event_id: young }]);
 });

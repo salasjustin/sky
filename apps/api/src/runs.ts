@@ -177,15 +177,18 @@ const lastEventAt = (excluding: EventType[] = []) =>
 // a heartbeat later than this ago says the runner stopped reporting too, not that the tool is running on
 const HEARTBEAT_FRESH_MS = 3 * HEARTBEAT_INTERVAL_MS;
 
+type ToolInFlight = { toolName: string; ranMs: number; beatFresh: boolean };
+
 /**
  * The tool call the run's latest `runner.heartbeat` reports, when that heartbeat came after every
- * other event (so no result has been seen since), and how long it has run.
+ * event but a `run.probed` or `runner.warning` (so no result has been seen since), and how long it
+ * has run: up to now while the heartbeat is fresh, else up to that heartbeat.
  */
 function toolInFlight(
   tx: Tx,
   runId: RunId,
   now: number,
-): { toolName: string; ranMs: number } | undefined {
+): ToolInFlight | undefined {
   const beat = tx
     .select({ ts: events.ts, payload: events.payload })
     .from(events)
@@ -193,7 +196,7 @@ function toolInFlight(
       and(
         eq(events.runId, runId),
         eq(events.type, "runner.heartbeat"),
-        sql`${events.id} > coalesce((select max(e.id) from ${events} e where e.run_id = ${runId} and e.type not in ('runner.heartbeat', 'run.probed')), 0)`,
+        sql`${events.id} > coalesce((select max(e.id) from ${events} e where e.run_id = ${runId} and e.type not in ('runner.heartbeat', 'run.probed', 'runner.warning')), 0)`,
       ),
     )
     .orderBy(desc(events.id))
@@ -204,33 +207,39 @@ function toolInFlight(
     elapsedMs: number;
   };
   const sinceBeat = now - Date.parse(beat.ts);
+  const beatFresh = sinceBeat <= HEARTBEAT_FRESH_MS;
   return {
     toolName,
-    ranMs: elapsedMs + (sinceBeat <= HEARTBEAT_FRESH_MS ? sinceBeat : 0),
+    ranMs: elapsedMs + (beatFresh ? sinceBeat : 0),
+    beatFresh,
   };
 }
 
 const duration = (ms: number) =>
   ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)}m`;
 
-const timeoutError = (
-  tool: { toolName: string; ranMs: number } | undefined,
-  timeoutMs: number,
-) =>
-  tool
+const timeoutError = (tool: ToolInFlight | undefined, timeoutMs: number) => {
+  if (!tool) return "runner_timeout";
+  return tool.beatFresh
     ? `runner_timeout: ${tool.toolName} was still running after ${duration(tool.ranMs)} with no result, past the ${duration(timeoutMs)} limit`
-    : "runner_timeout";
+    : `runner_timeout: the runner went quiet during ${tool.toolName} after it had run ${duration(tool.ranMs)}`;
+};
 
 /**
  * Fails every active run but a waiting one with no event (or, before its first, no launch) since
- * `timeoutMs` ago, so a runner that died can't hold a concurrency slot. A `run.probed` or a
- * `runner.heartbeat` doesn't count as an event: a runner that is alive but wedged, or a tool call
- * that never returns, still times out. A run that went quiet with a tool call in flight is failed
- * naming it and how long it ran. Returns the ids it failed.
+ * `timeoutMs` ago, so a runner that died can't hold a concurrency slot. A `run.probed`, a
+ * `runner.heartbeat` or a `runner.warning` doesn't count as an event: a runner that is alive but
+ * wedged, a tool call that never returns, or a sprite hold that keeps failing, still times out. A
+ * run that went quiet with a tool call in flight is failed naming it and how long it ran. Returns
+ * the ids it failed.
  */
 export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
   const cutoff = new Date(now - timeoutMs).toISOString();
-  const lastActivity = lastEventAt(["run.probed", "runner.heartbeat"]);
+  const lastActivity = lastEventAt([
+    "run.probed",
+    "runner.heartbeat",
+    "runner.warning",
+  ]);
   // one write transaction, so an event landing mid-sweep can't be overtaken by a stale read
   return db.transaction(
     (tx) => {
@@ -259,9 +268,10 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
 
 /**
  * Fails, with `launch_timeout`, every run still `starting` that was created over `deadlineMs` ago
- * and has no event: its runner never reported in (a launch stuck on the sprite, or a sprite that paused
- * before the runner held it), so the agent frees up for a follow-up instead of waiting out
- * `runner_timeout`. Returns each run it failed with the sprite its runner may still be on.
+ * and has no event but a `runner.warning` or `runner.heartbeat`, neither of which proves the launch
+ * worked: its runner never reported in (a launch stuck on the sprite, or a sprite that paused before
+ * the runner held it), so the agent frees up for a follow-up instead of waiting out `runner_timeout`.
+ * Returns each run it failed with the sprite its runner may still be on.
  */
 export function failUnlaunchedRuns(
   db: Db,
@@ -280,7 +290,7 @@ export function failUnlaunchedRuns(
           and(
             eq(runs.status, "starting"),
             lt(runs.createdAt, cutoff),
-            sql`not exists (select 1 from ${events} where ${events.runId} = ${runs.id})`,
+            sql`not exists (select 1 from ${events} where ${events.runId} = ${runs.id} and ${events.type} not in ('runner.warning', 'runner.heartbeat'))`,
           ),
         )
         .all();

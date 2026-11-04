@@ -192,6 +192,36 @@ test("progress keeps the short budget through an outage", async () => {
   expect(clock.slept).toEqual([250, 500]);
 });
 
+test("a post given one attempt makes only that one, then drops the event with one warning", async () => {
+  const clock = virtualClock();
+  let calls = 0;
+  server.use(
+    http.post(url, () => {
+      calls++;
+      return new HttpResponse(null, { status: 503 });
+    }),
+  );
+  const warnings: string[] = [];
+  const post = createPoster({
+    ...options,
+    ...timing(clock),
+    warn: (m) => warnings.push(m),
+  });
+  await post(
+    {
+      runId: "run_1",
+      type: "runner.heartbeat",
+      payload: { toolName: "Bash", toolUseId: "t1", elapsedMs: 1 },
+    },
+    { maxAttempts: 1 },
+  );
+  expect(calls).toBe(1);
+  expect(clock.slept).toEqual([]);
+  expect(warnings).toEqual([
+    expect.stringMatching(/runner\.heartbeat after 1 attempts: HTTP 503/),
+  ]);
+});
+
 test("claude.PreToolUse rides out a minute-long API restart instead of being dropped", async () => {
   const clock = virtualClock();
   const landedAt: number[] = [];

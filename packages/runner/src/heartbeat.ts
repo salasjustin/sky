@@ -3,9 +3,10 @@ import { HEARTBEAT_INTERVAL_MS } from "@sky/shared";
 type InFlight = { toolName: string; startedAt: number };
 
 /**
- * Tells the API a tool call is still running, so a long build or test run isn't mistaken for a dead
- * runner: while any call is in flight, `beat` runs every `intervalMs` for the one that has run the
- * longest, with how long that is. Nothing is sent while no call runs, nor for one held for approval,
+ * Tells the API a tool call is still running, so a long build or test run isn't probed as a silent
+ * run, and a timeout names the tool. Heartbeats are not progress: the API still fails the run at
+ * RUN_TIMEOUT_MINUTES. While any call is in flight, `beat` runs every `intervalMs` for the one that
+ * has run the longest, with how long that is. Nothing is sent while no call runs, nor for one held for approval,
  * which isn't `started` until it is let go.
  */
 export function createHeartbeat(options: {

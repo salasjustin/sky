@@ -5,7 +5,6 @@ import {
   Event,
   EventCursor,
   EventType,
-  HEARTBEAT_INTERVAL_MS,
   PendingRequest,
   Rollup,
   RUNNER_TEXT_MAX,
@@ -215,12 +214,13 @@ test("runner.heartbeat names the tool call in flight and how long it has run", (
     { toolName: "Bash", toolUseId: "toolu_1" },
     { toolName: "", toolUseId: "toolu_1", elapsedMs: 1 },
     { toolName: "Bash", toolUseId: "toolu_1", elapsedMs: -1 },
+    { toolName: "x".repeat(257), toolUseId: "toolu_1", elapsedMs: 1 },
+    { toolName: "Bash", toolUseId: "x".repeat(257), elapsedMs: 1 },
   ]) {
     expect(RunnerEventPost.safeParse({ ...heartbeat, payload }).success).toBe(
       false,
     );
   }
-  expect(HEARTBEAT_INTERVAL_MS).toBe(60_000);
 });
 
 const sha = (c: string) => c.repeat(40);

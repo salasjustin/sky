@@ -83,6 +83,19 @@ test.each(["30", "45"])(
   },
 );
 
+test("a RUN_PROBE_MINUTES past 30 is accepted below a longer RUN_TIMEOUT_MINUTES", () => {
+  expect(
+    loadConfig({
+      ...required,
+      RUN_TIMEOUT_MINUTES: "60",
+      RUN_PROBE_MINUTES: "45",
+    }),
+  ).toMatchObject({
+    ok: true,
+    config: { runTimeoutMs: 3_600_000, runProbeMs: 2_700_000 },
+  });
+});
+
 test("a SPRITES_LONG_TIMEOUT_MINUTES that isn't a positive number is rejected", () => {
   const result = loadConfig({ ...required, SPRITES_LONG_TIMEOUT_MINUTES: "0" });
   expect(result).toEqual({

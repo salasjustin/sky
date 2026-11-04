@@ -206,8 +206,9 @@ const runnerPayloads = (textMax: number) => ({
   "runner.warning": z.object({ message: z.string().min(1).max(textMax) }),
   /** A tool call still running: the longest-running one in flight, and how long it has run. */
   "runner.heartbeat": z.object({
-    toolName: z.string().min(1),
-    toolUseId: z.string().min(1),
+    // bounded on both sides: a heartbeat is not trimmed like claude.* text, and one is stored a minute
+    toolName: z.string().min(1).max(256),
+    toolUseId: z.string().min(1).max(256),
     elapsedMs: z.number().int().nonnegative(),
   }),
 });

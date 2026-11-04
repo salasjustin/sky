@@ -26,7 +26,7 @@ const SWEEP_EVERY_MS = 60_000;
  * outlive a restart: their runners keep posting, so only silence fails one. A run failed for missing its
  * launch deadline has its runner signalled too, without waiting on the sprite. A `running` run silent past
  * the probe window has its runner looked for on its sprite, also unawaited (see `createRunProber`). The same sweep deletes
- * run envVars past their TTL and `claude.*` events past 7 days. Webhook deliveries left pending resume at once.
+ * run envVars past their TTL and `claude.*` and `runner.heartbeat` events past 7 days. Webhook deliveries left pending resume at once.
  */
 export function boot(config: Config, log: (line: string) => void) {
   const db = openDb(join(config.dataDir, "sky.db"));
@@ -72,7 +72,11 @@ export function boot(config: Config, log: (line: string) => void) {
     for (const id of abandoned) log(`run ${id} failed: waiting_timeout`);
     if (late.length + stale.length + abandoned.length > 0) dispatcher.nudge();
     const pruned = pruneClaudeEvents(db);
-    if (pruned > 0) log(`pruned ${pruned} claude.* events older than 7 days`);
+    if (pruned > 0) {
+      log(
+        `pruned ${pruned} claude.* and runner.heartbeat events older than 7 days`,
+      );
+    }
   };
   sweep();
   const sweeper = setInterval(

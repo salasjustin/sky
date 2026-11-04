@@ -21,7 +21,14 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-type Call = { method?: string; url?: string; host?: string; body: string };
+type Call = {
+  method?: string;
+  url?: string;
+  host?: string;
+  body: string;
+  /** What the stand-in answered. */
+  status: number;
+};
 
 /** A stand-in for the sprite's management socket that records every Tasks API call. */
 async function spriteApi(initial = 200) {
@@ -33,13 +40,15 @@ async function spriteApi(initial = 200) {
     let body = "";
     req.on("data", (d) => (body += d));
     req.on("end", () => {
+      const answered = named ? status : 400;
       calls.push({
         method: req.method,
         url: req.url,
         host: req.headers.host,
         body,
+        status: answered,
       });
-      res.writeHead(named ? status : 400).end();
+      res.writeHead(answered).end();
     });
   });
   const socketPath = join(dir, "api.sock");
@@ -75,6 +84,7 @@ test("holds a task named for the run, refreshes it, and deletes it on release", 
     url,
     host: "sprite",
     body: JSON.stringify({ expire: "5m" }),
+    status: 200,
   };
   expect(calls.length).toBe(settled);
   expect(calls.at(-1)).toEqual({
@@ -82,6 +92,7 @@ test("holds a task named for the run, refreshes it, and deletes it on release", 
     url,
     host: "sprite",
     body: "",
+    status: 200,
   });
   const puts = calls.slice(0, -1);
   expect(puts.length).toBeGreaterThanOrEqual(2);
@@ -104,7 +115,7 @@ test("a hold that lands and keeps refreshing reports nothing", async () => {
   expect(reports).toEqual([]);
 });
 
-test("a first hold that fails reports the error once, and again when it gives up", async () => {
+test("a first hold that never lands reports only that it gave up", async () => {
   const { socketPath } = await spriteApi(500);
   const reports: string[] = [];
   const warnings: string[] = [];
@@ -118,18 +129,48 @@ test("a first hold that fails reports the error once, and again when it gives up
     report: (m) => reports.push(m),
   });
   await expect(hold.ready).resolves.toBe(false);
-  // failing refreshes after the first retries ran out are the same streak
-  await sleep(50);
+  // refreshes that keep failing after the first retries ran out add nothing: the hold never landed
+  await vi.waitFor(() =>
+    expect(
+      warnings.filter((w) => /failed: HTTP 500/.test(w)).length,
+    ).toBeGreaterThanOrEqual(5),
+  );
   await hold.release();
-  expect(reports).toHaveLength(2);
-  expect(reports[0]).toMatch(/sprite task PUT failed: HTTP 500/);
-  expect(reports[1]).toMatch(/not held/);
-  // each report is also a line in the local log
-  for (const report of reports) expect(warnings).toContain(report);
+  expect(reports).toEqual([
+    "runner: sprite not held after the first retries; it may pause the run",
+  ]);
+  // the failed PUTs are still lines in the local log
+  expect(warnings[0]).toMatch(/sprite task PUT failed: HTTP 500/);
+  expect(warnings).toContain(reports[0]);
+});
+
+test("a first hold that fails, then lands within the quick retries, reports nothing", async () => {
+  let refusals = 2;
+  api = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => res.writeHead(refusals-- > 0 ? 503 : 200).end());
+  });
+  const socketPath = join(dir, "api.sock");
+  api.listen(socketPath);
+  await once(api, "listening");
+  const reports: string[] = [];
+  const warnings: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 60_000,
+    firstRetryMs: 5,
+    warn: (m) => warnings.push(m),
+    report: (m) => reports.push(m),
+  });
+  await expect(hold.ready).resolves.toBe(true);
+  await hold.release();
+  expect(reports).toEqual([]);
+  expect(warnings.filter((w) => /HTTP 503/.test(w))).toHaveLength(2);
 });
 
 test("a refresh that fails after the hold landed is reported, once per streak of failures", async () => {
-  const { socketPath, answer } = await spriteApi();
+  const { calls, socketPath, answer } = await spriteApi();
   const reports: string[] = [];
   const hold = holdSprite({
     runId: "run_1",
@@ -138,18 +179,30 @@ test("a refresh that fails after the hold landed is reported, once per streak of
     warn: () => {},
     report: (m) => reports.push(m),
   });
+  /** Waits until at least `count` PUTs answered `status` have arrived since `from`. */
+  const putsAnswered = (status: number, count: number, from: number) =>
+    vi.waitFor(
+      () =>
+        expect(
+          calls
+            .slice(from)
+            .filter((c) => c.method === "PUT" && c.status === status).length,
+        ).toBeGreaterThanOrEqual(count),
+      { timeout: 5_000 },
+    );
   await expect(hold.ready).resolves.toBe(true);
   expect(reports).toEqual([]);
   answer(503);
-  await vi.waitFor(() => expect(reports).toHaveLength(1));
-  await sleep(50);
-  expect(reports).toHaveLength(1);
+  await vi.waitFor(() => expect(reports).toHaveLength(1), { timeout: 5_000 });
   expect(reports[0]).toMatch(/sprite task PUT failed: HTTP 503/);
+  // refreshes are serial, so by the second further failure the first has been handled: same streak
+  await putsAnswered(503, 2, calls.length);
+  expect(reports).toHaveLength(1);
   // the hold recovers, then fails again: a new streak, reported again
   answer(200);
-  await sleep(50);
+  await putsAnswered(200, 2, calls.length);
   answer(500);
-  await vi.waitFor(() => expect(reports).toHaveLength(2));
+  await vi.waitFor(() => expect(reports).toHaveLength(2), { timeout: 5_000 });
   expect(reports[1]).toMatch(/HTTP 500/);
   await hold.release();
 });
