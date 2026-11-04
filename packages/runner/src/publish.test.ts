@@ -819,6 +819,59 @@ test("a ref GitHub refuses to fast-forward says the history was rewritten", asyn
   );
 });
 
+test("publishes to the start branch and skips the base rebase", async () => {
+  // someone's branch, with their commit, that this agent continues on claude/agt_1
+  git(work, "config", "branch.claude/agt_1.sky-remote-branch", "feature/x");
+  writeFileSync(join(work, "theirs.txt"), "theirs\n");
+  const theirs = commit("Their change");
+  writeFileSync(join(work, "mine.txt"), "mine\n");
+  commit("Agent change");
+  const gh = fakeGitHub({
+    pulls: [
+      {
+        number: 4,
+        html_url: "https://github.com/acme/widgets/pull/4",
+        head: "feature/x",
+        base: "main",
+      },
+    ],
+  });
+  let remoteRef = theirs;
+  const refWrites: unknown[] = [];
+  server.use(
+    // the base moved on GitHub; a rebase onto it would fetch the new head and fail on it here
+    http.get(`${REPO}/git/ref/heads/main`, () =>
+      HttpResponse.json({ object: { sha: "e".repeat(40) } }),
+    ),
+    http.get(`${REPO}/git/ref/heads/feature/x`, () =>
+      HttpResponse.json({ object: { sha: remoteRef } }),
+    ),
+    http.patch(`${REPO}/git/refs/heads/feature/x`, async ({ request }) => {
+      const body = (await request.json()) as { sha: string };
+      refWrites.push(body);
+      remoteRef = body.sha;
+      return HttpResponse.json({ object: { sha: body.sha } });
+    }),
+  );
+
+  const result = await run({ title: undefined });
+
+  expect(gh.commits.map((c) => [c.message, c.parents])).toEqual([
+    ["Agent change\n", [theirs]],
+  ]);
+  expect(refWrites).toEqual([{ sha: "commit1", force: false }]);
+  expect(gh.refWrites).toEqual([]);
+  expect(result).toEqual({
+    branch: "feature/x",
+    base: "main",
+    sha: "commit1",
+    created: false,
+    updated: false,
+    pullRequest: { number: 4, url: "https://github.com/acme/widgets/pull/4" },
+  });
+  expect(git(work, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+});
+
 test("with no open PR and no title, nothing is written", async () => {
   const gh = fakeGitHub();
   writeFileSync(join(work, "a.txt"), "first\n");
@@ -1052,6 +1105,57 @@ test("--branch outranks SKY_PUBLISH_BRANCH", async () => {
     { body: { ref: "refs/heads/cli/branch" } },
   ]);
   expect(gh.pullCreates).toMatchObject([{ head: "cli/branch" }]);
+});
+
+test.each([
+  ["the started-on branch outranks SKY_PUBLISH_BRANCH", [], "cfg/branch"],
+  [
+    "--branch outranks the started-on branch",
+    ["--branch", "cli/branch"],
+    "cli/branch",
+  ],
+])("%s", async (_, flags, expected) => {
+  const gh = fakeGitHub({ branch: expected });
+  git(work, "config", "branch.claude/agt_1.sky-remote-branch", "cfg/branch");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const { status } = await publishMainWith(["--title", "T", ...flags], {
+    SKY_PUBLISH_BRANCH: "from/env",
+  });
+
+  expect(status).toBe(0);
+  expect(gh.pullCreates).toMatchObject([{ head: expected }]);
+});
+
+test("--branch over a continued branch sends every commit onto the base as a new branch, with no base rebase", async () => {
+  git(work, "config", "branch.claude/agt_1.sky-remote-branch", "feature/x");
+  writeFileSync(join(work, "theirs.txt"), "theirs\n");
+  commit("Their change");
+  writeFileSync(join(work, "mine.txt"), "mine\n");
+  commit("Agent change");
+  const gh = fakeGitHub({ branch: "cli/branch" });
+  // the base moved on GitHub; a rebase onto it would fetch this head, which the fake doesn't hold
+  server.use(
+    http.get(`${REPO}/git/ref/heads/main`, () =>
+      HttpResponse.json({ object: { sha: "e".repeat(40) } }),
+    ),
+  );
+
+  const { status } = await publishMainWith(
+    ["--title", "T", "--branch", "cli/branch"],
+    {},
+  );
+
+  expect(status).toBe(0);
+  expect(gh.commits.map((c) => [c.message, c.parents])).toEqual([
+    ["Their change\n", [baseSha]],
+    ["Agent change\n", ["commit1"]],
+  ]);
+  expect(gh.refWrites).toMatchObject([
+    { method: "POST", body: { ref: "refs/heads/cli/branch", sha: "commit2" } },
+  ]);
+  expect(gh.pullCreates).toMatchObject([{ head: "cli/branch", base: "main" }]);
 });
 
 test("an empty SKY_PUBLISH_BRANCH falls back to the worktree's branch", async () => {

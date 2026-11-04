@@ -67,7 +67,7 @@ const gitSaid = (error: unknown) =>
   (error as { stderr?: string }).stderr?.trim() || messageOf(error);
 
 /** `owner/repo` from an https or ssh GitHub remote URL. */
-function parseOrigin(url: string): { owner: string; repo: string } {
+export function parseOrigin(url: string): { owner: string; repo: string } {
   const match = /github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url);
   if (!match?.[1] || !match[2]) {
     throw new PublishError(`origin is not a GitHub repo: ${url}`);
@@ -250,7 +250,14 @@ export function gateway(options: {
  * `origin/<base>` stays where it is: every agent's worktree in the clone reads it, and moving it
  * to a shallow commit would cut every other branch off from its own base.
  */
-const FETCHED_BASES = "refs/sky/bases/";
+export const FETCHED_BASES = "refs/sky/bases/";
+
+/**
+ * The git config key, under `branch.<local branch>.`, naming the GitHub branch the local branch
+ * publishes to when that isn't its own name: the runner sets it for an agent that continues an
+ * existing GitHub branch.
+ */
+export const REMOTE_BRANCH_KEY = "sky-remote-branch";
 
 const resolves = (cwd: string, ref: string) =>
   git(cwd, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`).then(
@@ -263,7 +270,9 @@ const resolves = (cwd: string, ref: string) =>
  * undefined when no rebase is in progress. `rebase-merge` is the merge backend's state directory,
  * `rebase-apply` the apply backend's, and `git am`'s too, marked by an `applying` file.
  */
-async function rebaseInProgress(cwd: string): Promise<string | undefined> {
+export async function rebaseInProgress(
+  cwd: string,
+): Promise<string | undefined> {
   for (const dir of ["rebase-merge", "rebase-apply"]) {
     const path = (
       await git(cwd, "rev-parse", "--path-format=absolute", "--git-path", dir)
@@ -275,6 +284,24 @@ async function rebaseInProgress(cwd: string): Promise<string | undefined> {
     return head.trim().replace(/^refs\/heads\//, "");
   }
   return undefined;
+}
+
+/**
+ * `-c` flags for a git command that moves commits (rebase, cherry-pick): it commits as whoever git
+ * is configured as, and a sandbox may have no identity of its own; the repo's hooks and the user's
+ * signing are no part of moving commits, and either could fail it.
+ */
+export async function movingCommitsConfig(cwd: string): Promise<string[]> {
+  const identity = (await git(cwd, "config", "user.email").catch(() => ""))
+    ? []
+    : ["-c", "user.name=sky-agent", "-c", "user.email=agent@sky.local"];
+  return [
+    ...identity,
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+  ];
 }
 
 /**
@@ -306,19 +333,10 @@ async function refreshBase(
   if (object.sha === mergeBase) return;
   await fetchCommit(repoGit(cwd), call, object.sha);
   await git(cwd, "update-ref", `${FETCHED_BASES}${object.sha}`, object.sha);
-  // the rebase commits as whoever git is configured as; a sandbox may have no identity of its own
-  const identity = (await git(cwd, "config", "user.email").catch(() => ""))
-    ? []
-    : ["-c", "user.name=sky-agent", "-c", "user.email=agent@sky.local"];
   try {
     await git(
       cwd,
-      ...identity,
-      // the repo's hooks and the user's signing are no part of moving commits, and either could fail it
-      "-c",
-      "commit.gpgsign=false",
-      "-c",
-      "core.hooksPath=/dev/null",
+      ...(await movingCommitsConfig(cwd)),
       "rebase",
       "--quiet",
       "--onto",
@@ -386,8 +404,8 @@ async function sitsOn(
  * first-parent history is replayed, so a merge commit arrives as a plain commit with the same
  * content, and a merge from the base shows the base's changes in the pull request's diff as the
  * branch's own. A branch on GitHub whose head this branch held before a rebase or amend here is
- * force-updated to the rewritten history; one holding a commit this branch never had is only ever
- * fast-forwarded.
+ * force-updated to the rewritten history; one holding a commit this branch never had, or the GitHub
+ * branch a continued agent works on, is only ever fast-forwarded.
  */
 export async function publish(options: {
   cwd: string;
@@ -401,6 +419,8 @@ export async function publish(options: {
   base?: string;
   /** The GitHub branch to publish to and open the pull request from; defaults to the worktree's own. */
   branch?: string;
+  /** Used when `branch` isn't given and the worktree continues no GitHub branch of its own. */
+  defaultBranch?: string;
   /** Replaces the author and committer of each commit sent; their dates stay. */
   identity?: { author: PersonName; committer: PersonName };
 }): Promise<PublishResult> {
@@ -412,26 +432,38 @@ export async function publish(options: {
       `a rebase${rebasing ? ` of ${rebasing}` : ""} is in progress here, left by an earlier run that stopped mid-way; run \`git rebase --abort\` to return the branch to where it was, then publish again`,
     );
   }
-  const branch = (
+  const localBranch = (
     await git(cwd, "symbolic-ref", "--quiet", "--short", "HEAD").catch(() => "")
   ).trim();
-  if (!branch) throw new PublishError("HEAD is detached; check out a branch");
-  // the GitHub branch published to; the worktree's own branch keeps its name and its reflog
-  const remoteBranch = options.branch ?? branch;
-  if (options.branch !== undefined) {
+  if (!localBranch)
+    throw new PublishError("HEAD is detached; check out a branch");
+  // set by the runner for an agent that continues an existing GitHub branch
+  const continued = (
+    await git(
+      cwd,
+      "config",
+      "--get",
+      `branch.${localBranch}.${REMOTE_BRANCH_KEY}`,
+    ).catch(() => "")
+  ).trim();
+  // the GitHub branch published to; the worktree's own branch keeps its name and its reflog. The
+  // flag wins, then the branch a continued agent was started on, then the environment's default
+  const chosen = options.branch ?? (continued || options.defaultBranch);
+  const remoteBranch = chosen ?? localBranch;
+  if (chosen !== undefined && chosen !== continued) {
     // check-ref-format passes these under refs/heads/, but git refuses HEAD as a branch, and a
     // ref path or remote prefix would be taken literally as part of the GitHub branch's name
     const valid =
-      !options.branch.startsWith("-") &&
-      options.branch !== "HEAD" &&
-      !/^(refs|origin)\//.test(options.branch) &&
-      (await git(cwd, "check-ref-format", `refs/heads/${options.branch}`).then(
+      !chosen.startsWith("-") &&
+      chosen !== "HEAD" &&
+      !/^(refs|origin)\//.test(chosen) &&
+      (await git(cwd, "check-ref-format", `refs/heads/${chosen}`).then(
         () => true,
         () => false,
       ));
     if (!valid) {
       throw new PublishError(
-        `${options.branch} is not a valid branch name; see \`git check-ref-format\``,
+        `${chosen} is not a valid branch name; see \`git check-ref-format\``,
       );
     }
   }
@@ -479,7 +511,7 @@ export async function publish(options: {
       // commit list would take the others' history as this branch's own
       const [newest] = lines(await git(cwd, "rev-list", "--no-walk", ...found));
       throw new PublishError(
-        `${branch} has more than one merge base with ${base} here, none an ancestor of another (${found.join(", ")}), as after a merge of unrelated histories, so which commits are its own is ambiguous; move them onto a new branch with \`git switch -c ${branch}-on-${base} ${newest}\` and \`git cherry-pick --no-merges ${found.map((sha) => `^${sha}`).join(" ")} ${branch}\`, then publish that`,
+        `${localBranch} has more than one merge base with ${base} here, none an ancestor of another (${found.join(", ")}), as after a merge of unrelated histories, so which commits are its own is ambiguous; move them onto a new branch with \`git switch -c ${localBranch}-on-${base} ${newest}\` and \`git cherry-pick --no-merges ${found.map((sha) => `^${sha}`).join(" ")} ${localBranch}\`, then publish that`,
       );
     }
     const [mergeBase] = found;
@@ -487,7 +519,7 @@ export async function publish(options: {
       // a rebase onto the base would replay the branch's root commit, adding every file, and
       // conflict wherever the base has one too
       throw new PublishError(
-        `${branch} shares no commit here with ${base} or any base a publish fetched, so there is no base to publish it onto; move its commits onto a new branch from ${clonedRef} with \`git switch -c ${branch}-on-${base} ${clonedRef}\` and \`git cherry-pick ${clonedRef}..${branch}\`, then publish that`,
+        `${localBranch} shares no commit here with ${base} or any base a publish fetched, so there is no base to publish it onto; move its commits onto a new branch from ${clonedRef} with \`git switch -c ${localBranch}-on-${base} ${clonedRef}\` and \`git cherry-pick ${clonedRef}..${localBranch}\`, then publish that`,
       );
     }
     const commits = lines(
@@ -504,7 +536,7 @@ export async function publish(options: {
   const local = await pending();
   if (local.commits.length === 0) {
     throw new PublishError(
-      `no commits on ${branch} past ${base}; commit your work first`,
+      `no commits on ${localBranch} past ${base}; commit your work first`,
     );
   }
 
@@ -526,16 +558,19 @@ export async function publish(options: {
   if (!existing && !options.title) {
     throw new PublishError("a title is needed to open the pull request");
   }
-  await refreshBase(cwd, call, {
-    base,
-    branch,
-    mergeBase: local.mergeBase,
-  });
-  const { mergeBase, commits } = await pending();
+  // a continued branch is someone's pull request as they left it, never rebased onto the base
+  if (!continued) {
+    await refreshBase(cwd, call, {
+      base,
+      branch: localBranch,
+      mergeBase: local.mergeBase,
+    });
+  }
+  const { mergeBase, commits } = continued ? local : await pending();
   // the rebase drops a commit whose change the base already holds
   if (commits.length === 0) {
     throw new PublishError(
-      `the changes on ${branch} are already on ${base} on GitHub, so there is nothing left to publish`,
+      `the changes on ${localBranch} are already on ${base} on GitHub, so there is nothing left to publish`,
     );
   }
   const refPath = `heads/${remoteBranch.split("/").map(encodeURIComponent).join("/")}`;
@@ -581,13 +616,20 @@ export async function publish(options: {
           "log",
           "--walk-reflogs",
           "--format=%H %T",
-          `refs/heads/${branch}`,
+          `refs/heads/${localBranch}`,
         ).catch(() => "");
         rewritten = lines(held).some((line) => {
           const [sha, heldTree] = line.split(" ");
           return sha === remote || heldTree === tree.sha;
         });
       }
+    }
+    // a continued branch is someone's pull request: its head is theirs even when it sits in this
+    // branch's reflog, as the head the worktree was made from always does
+    if (at === -1 && continued && remoteBranch === continued) {
+      throw new PublishError(
+        `${remoteBranch} on GitHub is at ${remote}, which this branch doesn't build on (as after an amend or rebase here, or a push there); a branch this agent continues is only ever fast-forwarded, so nothing was sent. Put your work back on top of it: \`git reset --soft ${remote}\` and \`git commit\` keep your files as they are in a new commit on it (when git doesn't know ${remote}, it was pushed during this run, and the next run brings it in), then publish again`,
+      );
     }
     if (at !== -1) {
       start = at;
@@ -807,7 +849,8 @@ export async function publishMain(
       gatewayUrl: env[GATEWAY_URL_ENV] || DEFAULT_GATEWAY_URL,
       connectorId,
       ...values,
-      branch: values.branch ?? (env[BRANCH_ENV] || undefined),
+      ...(values.branch !== undefined && { branch: values.branch }),
+      defaultBranch: env[BRANCH_ENV] || undefined,
       identity: configuredIdentity(env),
     });
     io.stderr(

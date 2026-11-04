@@ -121,6 +121,7 @@ test("POST returns 202 with the agent on claude/<agentId> and a starting run", a
       envId,
       sessionId: null,
       branch: `claude/${body.agent.id}`,
+      remoteBranch: null,
       status: "running",
       createdAt: iso,
       archivedAt: null,
@@ -2051,6 +2052,7 @@ test("GET agent totals usage across its runs; a stopped run adds nothing", async
     envId: expect.any(String),
     sessionId: "s",
     branch: `claude/${agent.id}`,
+    remoteBranch: null,
     status: "idle",
     createdAt: expect.any(String),
     archivedAt: null,
@@ -2198,6 +2200,7 @@ test("an envVar a runner echoes is redacted from the stored event while it is he
 test.each([
   ["a reserved name", { envVars: { PATH: "/evil" } }, "reserved_name"],
   ["a sky name", { envVars: { AGENT_TOKEN: "x" } }, "reserved_name"],
+  ["the start branch", { envVars: { START_BRANCH: "main" } }, "reserved_name"],
   [
     "the env's auto-approve setting",
     { envVars: { AUTO_APPROVE: '{"defaults":true,"commands":["rm"]}' } },
@@ -2240,4 +2243,354 @@ test("a follow-up with a reserved envVar name gets 400 and starts nothing", asyn
   expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
     n: 1,
   });
+});
+
+const isBranchCheck = (argv: string[]) =>
+  argv[0] === "sh" && argv[2]?.includes(" branch-check ") === true;
+
+/** Answers the runner's `branch-check` with `outcome`; every other exec as the stub does. */
+function branchCheckAnswers(outcome: {
+  exitCode: number;
+  stdout?: string;
+  stderr?: string;
+}) {
+  const fallback = wire.exec;
+  const checks: string[][] = [];
+  wire.exec = (argv) => {
+    if (!isBranchCheck(argv)) return fallback(argv);
+    checks.push(argv);
+    return outcome;
+  };
+  return checks;
+}
+
+/** A ready env with a GITHUB_CONNECTOR connector secret. */
+async function connectedEnv() {
+  const envId = readyEnv();
+  expect(
+    (await putSecret(envId, "GITHUB_CONNECTOR", { connector: "VPpb7x" }))
+      .status,
+  ).toBe(200);
+  return envId;
+}
+
+const agentCount = () =>
+  db.$client.prepare("select count(*) n from agents").get();
+
+/** Launches on `branch` and ends the run with `rollup`, as `endedWith` does. */
+async function finishedOnBranch(branch: string, rollup?: unknown) {
+  const envId = await connectedEnv();
+  branchCheckAnswers({ exitCode: 0, stdout: `${sha("c")}\n` });
+  const res = await launch({ envId, prompt: "go", branch });
+  expect(res.status).toBe(202);
+  const { agent, run } = (await res.json()) as Launched;
+  await sessionOpened();
+  const token = envFileOf(wire, wire.sessions[0]).AGENT_TOKEN ?? "";
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.finished",
+    payload: { summary: "done", usage, ...(rollup ? { rollup } : {}) },
+  });
+  return { agent, run, envId };
+}
+
+test("start with a branch records remoteBranch and passes START_BRANCH to the runner", async () => {
+  const envId = await connectedEnv();
+  const checks = branchCheckAnswers({ exitCode: 0, stdout: `${sha("c")}\n` });
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(202);
+  const body = (await res.json()) as Launched;
+  expect(body.agent).toMatchObject({
+    branch: `claude/${body.agent.id}`,
+    remoteBranch: "feature/login",
+  });
+  expect((await getAgent(body.agent.id)).body.remoteBranch).toBe(
+    "feature/login",
+  );
+  expect(checks).toHaveLength(1);
+  await sessionOpened();
+  expect(wire.sessions[0]?.env.START_BRANCH).toBe("feature/login");
+});
+
+test("follow-up runs pass START_BRANCH again", async () => {
+  const { agent } = await finishedOnBranch("feature/login");
+  expect((await followUp(agent.id, { prompt: "more" })).status).toBe(202);
+  await sessionOpened(2);
+  expect(wire.sessions[1]?.env.START_BRANCH).toBe("feature/login");
+});
+
+test("a follow-up can't redirect the start branch through envVars", async () => {
+  const { agent } = await finishedOnBranch("feature/login");
+  const res = await followUp(agent.id, {
+    prompt: "more",
+    envVars: { START_BRANCH: "main" },
+  });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toMatchObject({ error: { code: "reserved_name" } });
+  expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+    n: 1,
+  });
+});
+
+test("start without a branch is unchanged (remoteBranch null, no preflight exec)", async () => {
+  const envId = await connectedEnv();
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const { agent } = await launched(envId);
+  expect(agent).toMatchObject({ remoteBranch: null });
+  await sessionOpened();
+  expect(checks).toEqual([]);
+  expect(wire.sessions[0]?.env).not.toHaveProperty("START_BRANCH");
+});
+
+test("start with a branch that doesn't exist answers 404 branch_not_found and creates no agent", async () => {
+  const envId = await connectedEnv();
+  branchCheckAnswers({ exitCode: 3 });
+  const res = await launch({ envId, prompt: "go", branch: "feature/nope" });
+  expect(res.status).toBe(404);
+  expect(await res.json()).toEqual({
+    error: {
+      code: "branch_not_found",
+      message:
+        "branch feature/nope doesn't exist on GitHub (acme/kru); check the name, or start without --branch",
+    },
+  });
+  expect(agentCount()).toEqual({ n: 0 });
+  expect(wire.sessions).toEqual([]);
+});
+
+test("start with the default branch answers 422 branch_is_default", async () => {
+  const envId = await connectedEnv();
+  branchCheckAnswers({ exitCode: 4 });
+  const res = await launch({ envId, prompt: "go", branch: "main" });
+  expect(res.status).toBe(422);
+  expect(await res.json()).toMatchObject({
+    error: {
+      code: "branch_is_default",
+      message: expect.stringContaining("omit --branch"),
+    },
+  });
+  expect(agentCount()).toEqual({ n: 0 });
+});
+
+test("start with a branch on an env with no connector secret answers 422 branch_needs_connector before any check", async () => {
+  const envId = readyEnv();
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(422);
+  expect(await res.json()).toEqual({
+    error: {
+      code: "branch_needs_connector",
+      message: `starting on a branch needs a GitHub connector secret on the environment; set one with sky secret set ${envId} GITHUB_CONNECTOR --connector=<id>`,
+    },
+  });
+  expect(checks).toEqual([]);
+  expect(agentCount()).toEqual({ n: 0 });
+});
+
+test("a check exiting 2 (a usage or shell error) answers 502 branch_check_failed with its stderr", async () => {
+  const envId = await connectedEnv();
+  branchCheckAnswers({
+    exitCode: 2,
+    stderr: "sh: 1: .: cannot open /tmp/x.env\n",
+  });
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: {
+      code: "branch_check_failed",
+      message: expect.stringContaining("cannot open /tmp/x.env"),
+    },
+  });
+  expect(agentCount()).toEqual({ n: 0 });
+});
+
+test("start with a branch on an unknown or unready env answers as without one, before any check", async () => {
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const unknown = await launch({
+    envId: "env_missing",
+    prompt: "go",
+    branch: "feature/login",
+  });
+  expect(unknown.status).toBe(404);
+  expect(await unknown.json()).toMatchObject({ error: { code: "not_found" } });
+  const unready = await launch({
+    envId: readyEnv({ status: "provisioning" }),
+    prompt: "go",
+    branch: "feature/login",
+  });
+  expect(unready.status).toBe(409);
+  expect(await unready.json()).toMatchObject({
+    error: { code: "env_not_ready" },
+  });
+  expect(checks).toEqual([]);
+});
+
+test("start with a branch on an env at its cap answers 409 concurrency_cap before any check", async () => {
+  const envId = await connectedEnv();
+  db.update(environments)
+    .set({ concurrency: 1 })
+    .where(eq(environments.id, envId))
+    .run();
+  await launched(envId);
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({
+    error: { code: "concurrency_cap", limit: 1 },
+  });
+  expect(checks).toEqual([]);
+  expect(agentCount()).toEqual({ n: 1 });
+  await sessionOpened();
+});
+
+test("a check exiting otherwise answers 502 branch_check_failed with its stderr tail redacted", async () => {
+  const envId = await connectedEnv();
+  const gateway = "https://gateway.example/secret-path-0042";
+  expect(
+    (await putSecret(envId, "GITHUB_GATEWAY_URL", { value: gateway })).status,
+  ).toBe(200);
+  branchCheckAnswers({ exitCode: 1, stderr: `fetch ${gateway} failed\n` });
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(502);
+  const body = (await res.json()) as {
+    error: { code: string; message: string };
+  };
+  expect(body.error.code).toBe("branch_check_failed");
+  expect(body.error.message).toContain("fetch [redacted] failed");
+  expect(JSON.stringify(body) + logs.join("\n")).not.toContain(gateway);
+  expect(agentCount()).toEqual({ n: 0 });
+});
+
+test("a gateway secret that won't decrypt answers 502 branch_check_failed, not 500", async () => {
+  const envId = await connectedEnv();
+  seedLegacySecret(envId, "GITHUB_GATEWAY_URL", "https://gateway.example/x");
+  db.update(secrets)
+    .set({ keyVersion: 99 })
+    .where(eq(secrets.name, "GITHUB_GATEWAY_URL"))
+    .run();
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: {
+      code: "branch_check_failed",
+      message: expect.stringContaining("no key for version 99"),
+    },
+  });
+  expect(checks).toEqual([]);
+  expect(agentCount()).toEqual({ n: 0 });
+});
+
+test("preflight transport failure answers 502 branch_check_failed", async () => {
+  app = createApp({
+    db,
+    config,
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logs.push(line),
+    nudgeDeliveries: () => {},
+    spritesTimeoutMs: 200,
+  });
+  const envId = await connectedEnv();
+  wire.hangs = (call) => call.includes(" branch-check ");
+  try {
+    const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({
+      error: {
+        code: "branch_check_failed",
+        message: expect.stringContaining("branch-check timed out after 200 ms"),
+      },
+    });
+    expect(agentCount()).toEqual({ n: 0 });
+  } finally {
+    // the timed-out exec's mocked socket closes a tick after the 502; left to the next test, undici's
+    // pool fails that test's first request on it with UND_ERR_SOCKET "closed"
+    await new Promise(setImmediate);
+  }
+});
+
+test("invalid branch name answers 400", async () => {
+  const envId = await connectedEnv();
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const res = await launch({ envId, prompt: "go", branch: "a..b" });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toMatchObject({ error: { code: "invalid_body" } });
+  expect(checks).toEqual([]);
+  expect(agentCount()).toEqual({ n: 0 });
+});
+
+test("the preflight env file is removed even when the check fails", async () => {
+  const envId = await connectedEnv();
+  const sprite = spriteNameFor(envId);
+  const fileAtCheck: Record<string, string>[] = [];
+  const checks = branchCheckAnswers({ exitCode: 3 });
+  const answer = wire.exec;
+  wire.exec = (argv) => {
+    if (isBranchCheck(argv)) {
+      fileAtCheck.push(envFileOf(wire, { env: { ENV_FILE: argv[4] ?? "" } }));
+    }
+    return answer(argv);
+  };
+  const res = await launch({ envId, prompt: "go", branch: "feature/nope" });
+  expect(res.status).toBe(404);
+  const [argv] = checks;
+  const path = argv?.[4] ?? "";
+  expect(path).toMatch(/^\/tmp\/sky-branch-check-[0-9a-f-]+\.env$/);
+  expect(argv?.slice(3)).toEqual(["sh", path, "feature/nope"]);
+  expect(fileAtCheck).toEqual([{ GITHUB_CONNECTOR: "VPpb7x" }]);
+  expect(wire.modes.get(path)).toBe("0600");
+  expect(wire.calls.slice(-3)).toEqual([
+    `write ${sprite} ${path}`,
+    expect.stringMatching(
+      `^exec ${sprite} /workspace/repo sh -c .* branch-check "\\$2" sh ${path} feature/nope$`,
+    ),
+    `exec ${sprite} - rm -f ${path}`,
+  ]);
+});
+
+test("compareUrl uses the remote branch", async () => {
+  const { agent } = await finishedOnBranch(
+    "feature/login",
+    rollupWith("fix the flaky test"),
+  );
+  expect((await listRuns(agent.id)).body.data).toEqual([
+    expect.objectContaining({
+      compareUrl: `https://github.com/acme/kru/compare/${sha("b")}...feature/login`,
+    }),
+  ]);
+});
+
+test("compareUrl escapes # and % within a branch segment, keeping its slashes", async () => {
+  const { agent } = await finishedOnBranch(
+    "fix/#12%done",
+    rollupWith("fix the flaky test"),
+  );
+  expect((await listRuns(agent.id)).body.data).toEqual([
+    expect.objectContaining({
+      compareUrl: `https://github.com/acme/kru/compare/${sha("b")}...fix/%2312%25done`,
+    }),
+  ]);
+});
+
+test("an ended run's diff on a remote branch is against the start point the runner pinned, so outside pushes never shrink it", async () => {
+  const { agent, run, envId } = await finishedOnBranch("feature/login");
+  wire.exec = (argv) =>
+    argv[0] === "git" ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+  const { status, body } = await getRun(agent.id, run.id);
+  expect(status).toBe(200);
+  expect(body.diff).toBe(patch);
+  expect(wire.calls.at(-1)).toBe(
+    `exec ${spriteNameFor(envId)} /workspace/repo git diff refs/sky/starts/${agent.id}...claude/${agent.id}`,
+  );
+});
+
+test("a secret named START_BRANCH is refused, so it can't redirect the runner", async () => {
+  const res = await putSecret(readyEnv(), "START_BRANCH", { value: "main" });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toMatchObject({ error: { code: "reserved_name" } });
 });

@@ -8,7 +8,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type AgentId,
   AgentStatus,
+  type EnvironmentId,
   EnvironmentStatus,
   EventType,
   type RequestId,
@@ -20,6 +22,7 @@ import {
 import { migrate as drizzleMigrate } from "drizzle-orm/better-sqlite3/migrator";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import {
+  agents,
   type Db,
   deliveryStatuses,
   migrate,
@@ -813,4 +816,40 @@ test("migrating a 0006 file drops run.progress events and their deliveries, keep
     db.$client.prepare("select event_id from webhook_deliveries").all(),
   ).toEqual([{ event_id: 1 }]);
   expect(insertEvent()).toBeGreaterThan(progress);
+});
+
+test("an agent round-trips with and without a remoteBranch", () => {
+  migrate(db);
+  seedRun();
+  db.insert(agents)
+    .values({
+      id: "agt_2" as AgentId,
+      envId: "env_1" as EnvironmentId,
+      branch: "claude/agt_2",
+      status: "idle",
+      remoteBranch: "feature/login",
+    })
+    .run();
+
+  const remoteBranches = db
+    .select({ id: agents.id, remoteBranch: agents.remoteBranch })
+    .from(agents)
+    .orderBy(agents.id)
+    .all();
+  expect(remoteBranches).toEqual([
+    { id: "agt_1", remoteBranch: null },
+    { id: "agt_2", remoteBranch: "feature/login" },
+  ]);
+});
+
+test("migrating a populated 0008 file adds remote_branch as NULL and keeps every agent and run", () => {
+  migrateThrough("0008_fearless_stardust");
+  seedRun();
+
+  migrate(db);
+
+  expect(
+    db.$client.prepare("select id, remote_branch from agents").all(),
+  ).toEqual([{ id: "agt_1", remote_branch: null }]);
+  expect(count("runs")).toBe(1);
 });

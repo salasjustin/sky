@@ -38,6 +38,7 @@ const reservedNames = new Set<string>([
   "AUTO_APPROVE",
   "WAIT_TIMEOUT_MINUTES",
   "SESSION_ID",
+  "START_BRANCH",
   "PATH",
   "HOME",
   "NODE_OPTIONS",

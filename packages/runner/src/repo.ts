@@ -1,7 +1,17 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  type FileHandle,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import {
   CONNECTOR_ENV,
   DEFAULT_GATEWAY_URL,
@@ -183,6 +193,31 @@ export async function pullRepo(options: {
   return remote;
 }
 
+const INDEX_PREFIX = "sky-pull-index-";
+
+const isRunning = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: it exists, under another user
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+/** Temporary indexes a killed fetch left behind: each is named for its process, gone or not. */
+async function removeAbandonedIndexes(gitDir: string): Promise<void> {
+  const entries = await readdir(gitDir).catch(() => []);
+  await Promise.all(
+    entries
+      .filter((name) => {
+        const match = new RegExp(`^${INDEX_PREFIX}(\\d+)-`).exec(name);
+        return match && !isRunning(Number(match[1]));
+      })
+      .map((name) => rm(join(gitDir, name), { force: true })),
+  );
+}
+
 /**
  * Writes the commit, its tree and every blob into the repo `g` runs in as git objects, so
  * `remote.sha` resolves there; the checkout and refs are the caller's.
@@ -202,7 +237,9 @@ async function writeObjects(
   const entries = tree.filter(
     (item) => item.type === "blob" || item.type === "commit",
   );
-  const index = join(gitDir, "sky-pull-index");
+  await removeAbandonedIndexes(gitDir);
+  // one per call: every worktree shares the git dir, and another agent's fetch may be writing its own
+  const index = join(gitDir, `${INDEX_PREFIX}${process.pid}-${randomUUID()}`);
   const env = { GIT_INDEX_FILE: index };
   try {
     await g(["update-index", "-z", "--add", "--index-info"], {
@@ -254,17 +291,73 @@ export async function fetchCommit(
       () => false,
     );
   const parents = await Promise.all(commit.parents.map((p) => here(p.sha)));
-  if (parents.includes(false)) {
-    const shallow = await g([
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-path",
-      "shallow",
-    ]);
-    const held = existsSync(shallow) ? await readFile(shallow, "utf8") : "";
-    // appended, not rewritten: the file is shared by every worktree, and another agent's fetch may
-    // add its own line between the read and the write; git takes a line twice as once
-    if (!held.split("\n").includes(sha)) await appendFile(shallow, `${sha}\n`);
+  if (parents.includes(false)) await editShallow(g, (held) => held.add(sha));
+}
+
+const shallowPath = (g: ReturnType<typeof git>) =>
+  g(["rev-parse", "--path-format=absolute", "--git-path", "shallow"]);
+
+const linesOf = (text: string) => new Set(text.split("\n").filter(Boolean));
+
+/** The commits `shallow` lists: here, with their parents left on GitHub. */
+export async function shallowCommits(
+  g: ReturnType<typeof git>,
+): Promise<Set<string>> {
+  return linesOf(await readFile(await shallowPath(g), "utf8").catch(() => ""));
+}
+
+const SHALLOW_LOCK_WAIT_MS = 10_000;
+
+/** Creates `lock` exclusively, waiting a while for another holder to let it go. */
+async function takeLock(lock: string): Promise<FileHandle> {
+  const deadline = Date.now() + SHALLOW_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      return await open(lock, "wx");
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code !== "EEXIST" ||
+        Date.now() > deadline
+      ) {
+        throw new Error(
+          `can't take ${lock} (${messageOf(error)}); if no git command or run is using the repo, remove it`,
+        );
+      }
+      await sleep(50);
+    }
+  }
+}
+
+/**
+ * Rewrites `shallow` under `shallow.lock`, git's own lock for it: every worktree shares the file,
+ * and another agent's fetch may be changing it at once. The new list is written to the lock and
+ * renamed into place, so a reader never sees half of it.
+ */
+export async function editShallow(
+  g: ReturnType<typeof git>,
+  edit: (held: Set<string>) => Set<string>,
+): Promise<void> {
+  const path = await shallowPath(g);
+  const lock = `${path}.lock`;
+  const handle = await takeLock(lock);
+  let placed = false;
+  try {
+    const held = linesOf(await readFile(path, "utf8").catch(() => ""));
+    const next = edit(new Set(held));
+    if (next.size === held.size && [...next].every((sha) => held.has(sha))) {
+      return;
+    }
+    if (next.size === 0) {
+      await rm(path, { force: true });
+      return;
+    }
+    await handle.writeFile([...next].map((sha) => `${sha}\n`).join(""));
+    await handle.close();
+    await rename(lock, path);
+    placed = true;
+  } finally {
+    await handle.close().catch(() => {});
+    if (!placed) await rm(lock, { force: true });
   }
 }
 

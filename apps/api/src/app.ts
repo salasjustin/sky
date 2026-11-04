@@ -8,6 +8,7 @@ import { HTTPException } from "hono/http-exception";
 import { logger } from "hono/logger";
 import { accountEventRoutes } from "./account-events.js";
 import { agentRoutes } from "./agents.js";
+import { createBranchChecker } from "./branch-check.js";
 import type { Config } from "./config.js";
 import { environmentRoutes } from "./environments.js";
 import { apiError } from "./errors.js";
@@ -90,6 +91,14 @@ export function createApp({
     nudgeDeliveries,
     watchMs: launchWatchMs,
   });
+  const checkBranch = createBranchChecker({
+    db,
+    secretEncryptionKey: config.secretEncryptionKey,
+    secrets,
+    sprites: spriteOps,
+    ensureBundle,
+    log,
+  });
   const apiKeyGuard = bearerAuth({
     token: config.apiKey,
     noAuthenticationHeader: { message: unauthorized("missing bearer token") },
@@ -108,7 +117,10 @@ export function createApp({
     .createApp()
     .route("/environments", environmentRoutes(provisioner, spriteOps, log))
     .route("/environments", secretRoutes())
-    .route("/agents", agentRoutes(launcher, spriteOps, log, heartbeatMs))
+    .route(
+      "/agents",
+      agentRoutes(launcher, checkBranch, spriteOps, log, heartbeatMs),
+    )
     .route("/webhooks", webhookRoutes())
     .route("/", accountEventRoutes(heartbeatMs, log));
 

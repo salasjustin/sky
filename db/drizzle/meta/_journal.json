@@ -71,6 +71,13 @@
       "when": 1793457834928,
       "tag": "0009_smooth_risque",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1793792397941,
+      "tag": "0010_fixed_gladiator",
+      "breakpoints": true
     }
   ]
 }

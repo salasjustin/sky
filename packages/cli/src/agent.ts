@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import type { RunStatus } from "@sky/shared";
+import { BranchName, type RunStatus } from "@sky/shared";
 import { type Api, ApiError, type ApiRun } from "./api.js";
 import type { Io } from "./cli.js";
 import { type Output, UsageError } from "./output.js";
@@ -10,6 +10,7 @@ type Values = {
   timeout?: string;
   reason?: string;
   yes?: boolean;
+  branch?: string;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;
@@ -61,24 +62,51 @@ function readPrompt(prompt: string | undefined, command: string): string {
   return text;
 }
 
+/** Rejects here what the API's BranchName would reject, so a bad name exits 2 rather than 1. */
+function parseBranch(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const branch = raw.trim();
+  if (branch === "") throw new UsageError("--branch is empty", true);
+  const parsed = BranchName.safeParse(branch);
+  if (!parsed.success) {
+    const rule = parsed.error.issues[0]?.message;
+    throw new UsageError(
+      `--branch '${branch}' is not a branch name: ${rule}`,
+      true,
+    );
+  }
+  return parsed.data;
+}
+
 const agentSub: AgentCommand = {
-  options: { prompt: { type: "string" } },
+  options: { prompt: { type: "string" }, branch: { type: "string" } },
   prepare(positionals, values) {
     const [sub, ref, ...extra] = positionals;
     if (sub === "start" || sub === "follow-up") {
-      const what = sub === "start" ? "<env>" : "<agent>";
+      const what = sub === "start" ? "<env> [--branch=<name>]" : "<agent>";
       if (ref === undefined || extra.length > 0) {
         throw new UsageError(
           `agent ${sub} takes ${what} --prompt=<text|@file>`,
           true,
         );
       }
+      if (values.branch !== undefined && sub === "follow-up") {
+        throw new UsageError(
+          "agent follow-up takes no --branch: a branch can only be chosen when an agent starts",
+          true,
+        );
+      }
+      const branch = parseBranch(values.branch);
       const prompt = readPrompt(values.prompt, `agent ${sub}`);
       return sub === "start"
         ? async (api, _io, out) => {
             const envId = await resolveEnvId(api, ref, out);
             if (envId === undefined) return 1;
-            const r = await api.createAgent({ envId, prompt });
+            const r = await api.createAgent({
+              envId,
+              prompt,
+              ...(branch === undefined ? {} : { branch }),
+            });
             out.result(r.raw, `${r.agentId} ${r.runId}`);
             return 0;
           }

@@ -10,6 +10,7 @@ import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
 import { runSession } from "./session.js";
 import { storeSyncMain, syncStoreQuietly } from "./store.js";
+import { branchCheckMain } from "./sync.js";
 
 // the runner's stderr is the exec session's terminal, gone once the API detaches, so every line also
 // lands in a log file beside the run's prompt: what a stuck launch was doing is readable on the sprite
@@ -107,24 +108,25 @@ const io = {
   stderr: (s: string) => process.stderr.write(s),
 };
 // `runner.mjs publish …` is the agent's own command, run from its worktree; `store-sync` and
-// `repo-pull` are the API's, at provisioning; anything else is a run
-const entry =
-  process.argv[2] === "publish"
-    ? publishMain(process.argv.slice(3), process.env, {
-        cwd: process.cwd(),
-        ...io,
-      }).then((code) => {
-        process.exitCode = code;
-      })
-    : process.argv[2] === "store-sync"
-      ? storeSyncMain(process.argv.slice(3), process.env, io).then((code) => {
-          process.exitCode = code;
-        })
-      : process.argv[2] === "repo-pull"
-        ? repoPullMain(process.argv.slice(3), process.env, io).then((code) => {
-            process.exitCode = code;
-          })
-        : main();
+// `repo-pull` are the API's, at provisioning, and `branch-check` before it starts an agent on an
+// existing branch; anything else is a run
+const commands: Record<
+  string,
+  (argv: string[], env: NodeJS.ProcessEnv) => Promise<number>
+> = {
+  publish: (argv, env) => publishMain(argv, env, { cwd: process.cwd(), ...io }),
+  "store-sync": (argv, env) => storeSyncMain(argv, env, io),
+  "repo-pull": (argv, env) => repoPullMain(argv, env, io),
+  "branch-check": (argv, env) => branchCheckMain(argv, env, io),
+};
+const command = Object.hasOwn(commands, process.argv[2] ?? "")
+  ? commands[process.argv[2] as string]
+  : undefined;
+const entry = command
+  ? command(process.argv.slice(3), process.env).then((code) => {
+      process.exitCode = code;
+    })
+  : main();
 
 entry.catch((error: unknown) => {
   warn(`runner: ${error instanceof Error ? error.message : String(error)}`);

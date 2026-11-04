@@ -39,6 +39,10 @@ const Env = z.object({
   // the env's base profile: variables for the session, and the lines it is told to follow before finishing
   SKY_SESSION_ENV: json.pipe(z.record(z.string(), z.string())).default({}),
   SKY_CHECKS: json.pipe(z.array(z.string().min(1))).default([]),
+  START_BRANCH: z
+    .string()
+    .optional()
+    .transform((s) => s || undefined),
 });
 
 export type Config = {
@@ -60,6 +64,8 @@ export type Config = {
   checks: string[];
   /** How long one wait for an answer or approval may last before the run fails. */
   waitTimeoutMs: number;
+  /** An existing GitHub branch the agent's work continues; `publish` updates it instead of `claude/<agentId>`. */
+  startBranch: string | undefined;
 };
 
 export class ConfigError extends Error {}
@@ -88,5 +94,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     sessionEnv: e.SKY_SESSION_ENV,
     checks: e.SKY_CHECKS,
     waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
+    startBranch: e.START_BRANCH,
   };
 }

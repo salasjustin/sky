@@ -156,6 +156,8 @@ export type Launch = {
   approvalPolicy: string[];
   /** The env's read-only Bash commands that skip the approval policy. */
   autoApprove: AutoApprove;
+  /** The existing GitHub branch the runner starts from and publishes to; null for the agent's own. */
+  remoteBranch: string | null;
 };
 
 /**
@@ -296,6 +298,9 @@ export function createLauncher({
             AUTO_APPROVE: JSON.stringify(launch.autoApprove),
             WAIT_TIMEOUT_MINUTES: String(config.waitTimeoutMs / 60_000),
             ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
+            ...(launch.remoteBranch
+              ? { START_BRANCH: launch.remoteBranch }
+              : {}),
           },
           watchMs,
           op: "start-runner",

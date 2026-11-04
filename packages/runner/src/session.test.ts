@@ -31,6 +31,8 @@ let root: string;
 let config: Config;
 
 beforeEach(() => {
+  // a sandbox host exports its own connector, which would send every run here through a refresh
+  vi.stubEnv("GITHUB_CONNECTOR", undefined);
   root = mkdtempSync(join(tmpdir(), "runner-session-"));
   const origin = join(root, "origin");
   execFileSync("git", ["init", "-q", "-b", "main", origin]);
@@ -61,6 +63,7 @@ beforeEach(() => {
     sessionEnv: {},
     checks: [],
     waitTimeoutMs: 60_000,
+    startBranch: undefined,
   };
 });
 afterEach(() => {
@@ -832,6 +835,15 @@ test("with a GitHub connector in its env, the session is told to publish through
     expect(append).toContain(" publish --title <title>");
     expect(append).toContain(`--body "$(cat <<'EOF'`);
     expect(append).toContain("instead of `git push` or `gh pr create`");
+    expect(append).toContain(
+      "This sandbox has no git transport and no GitHub credential: `git fetch`, `git pull` and `git push` fail here, and so does `gh`.",
+    );
+    expect(append).toContain(
+      "The runner refreshed this repo from GitHub when this run started; what that changed, if anything, is in the notes at the end.",
+    );
+    expect(append).toContain(
+      `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` command: its other subcommands are the Sky API's, and run with none it starts a new run.`,
+    );
   } finally {
     vi.unstubAllEnvs();
   }
@@ -876,7 +888,13 @@ test("with a connector and checks, the publish instructions come first, then the
   vi.stubEnv("GITHUB_CONNECTOR", "conn_123");
   try {
     const append = await appendOf(["update the changelog"]);
-    const paragraphs = append.split("\n\n");
+    // the connector makes the run try to refresh from GitHub, which this test's origin fails, and
+    // that failure is a note of its own
+    const paragraphs = append
+      .split("\n\n")
+      .filter(
+        (paragraph) => !paragraph.startsWith("What the runner's refresh"),
+      );
     expect(paragraphs).toHaveLength(2);
     expect(paragraphs[0]).toContain(" publish --title <title>");
     expect(paragraphs[0]).not.toContain("Before you finish");

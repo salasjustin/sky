@@ -1693,7 +1693,9 @@ test("a re-run finishes a run killed while building its index, and leaves no ind
   fakeGitHub();
   const dir = join(root, "repo");
   await pull(dir);
-  const stale = join(dir, ".git/sky-pull-index");
+  // named for the process that was killed, so no live fetch owns it
+  const { pid } = spawnSync("true");
+  const stale = join(dir, `.git/sky-pull-index-${pid}-killed`);
   execFileSync(
     "git",
     [
@@ -1708,6 +1710,23 @@ test("a re-run finishes a run killed while building its index, and leaves no ind
   expect(await pull(dir)).toEqual({ branch: "trunk", sha: headSha });
   expect(existsSync(stale)).toBe(false);
   expect(git(dir, "status", "--porcelain")).toBe("");
+});
+
+test("a re-run removes the index of a dead fetch and keeps that of one still running", async () => {
+  fakeGitHub();
+  const dir = join(root, "repo");
+  await pull(dir);
+  const { pid: dead } = spawnSync("true");
+  const index = (pid: number | undefined) =>
+    join(dir, `.git/sky-pull-index-${pid}-other-run`);
+  // this process is alive; pid 1 is alive too, under another user or this one
+  const kept = [index(process.pid), index(1)];
+  for (const path of [...kept, index(dead)]) writeFileSync(path, "");
+
+  await pull(dir);
+
+  expect(existsSync(index(dead))).toBe(false);
+  expect(kept.map((path) => existsSync(path))).toEqual([true, true]);
 });
 
 test("a pull that fails onto an existing checkout keeps it, and a later run finishes it", async () => {

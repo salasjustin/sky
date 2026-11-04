@@ -1,0 +1,1 @@
+ALTER TABLE `agents` ADD `remote_branch` text;

@@ -19,11 +19,12 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return stdout.trim();
 }
 
-/** The agent's worktree on `claude/<agentId>`, created from the clone's `origin/HEAD` on first use. */
+/** The agent's worktree on `claude/<agentId>`, created from `from` (the clone's `origin/HEAD` by default) on first use. */
 export async function ensureWorktree(options: {
   repoDir: string;
   worktreesDir: string;
   agentId: AgentId;
+  from?: string;
 }): Promise<string> {
   const branch = agentBranch(options.agentId);
   const path = join(options.worktreesDir, options.agentId);
@@ -47,7 +48,7 @@ export async function ensureWorktree(options: {
       "-b",
       branch,
       path,
-      "origin/HEAD",
+      options.from ?? "origin/HEAD",
     );
   }
   return path;

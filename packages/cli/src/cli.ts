@@ -55,11 +55,18 @@ const help = (io: Io) => `Usage:
   sky env retry <env> [options]
       Provision a failed environment again. Prints its line, now
       provisioning; sky env show reports when it's ready.
-  sky agent start <env> --prompt=<text|@file> [options]
+  sky agent start <env> [--branch=<name>] --prompt=<text|@file> [options]
   sky agent follow-up <agent> --prompt=<text|@file> [options]
       Start an agent on an environment (<env> is its id or name), or start
       an agent's next run once its last one has ended; @file reads the
       prompt from that file. Prints "<agentId> <runId>".
+      --branch starts the agent on an existing GitHub branch, such as an
+      open pull request's; its publishes update that branch. Refused for
+      the repo's default branch and on an environment with no
+      GITHUB_CONNECTOR secret. Sandboxes have no git transport, so the
+      agent can't fetch or push itself: Sky fetches the branch through the
+      connector when each run starts, and the agent runs runner.mjs only
+      for publish.
   sky agent archive <agent> [options]
       Stop any active run and delete the agent's worktree; uncommitted work
       in it is lost.
@@ -281,6 +288,7 @@ async function runCommand(
     timeout: text(values.timeout),
     reason: text(values.reason),
     yes: values.yes === true,
+    branch: text(values.branch),
   });
   return await withApi(values, io, (api, out) => action(api, io, out));
 }
