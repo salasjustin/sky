@@ -34,7 +34,7 @@ let root: string;
 let remote: string;
 let home: string;
 let hub: ReturnType<typeof fakeGitHub>;
-/** Every run of the code under test, so `afterEach` can wait out any a timed-out test left going. */
+/** Every run of the code under test, so `afterEach` can wait out any run a timed-out test left going. */
 const pending: Promise<unknown>[] = [];
 const track =
   <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>

@@ -44,9 +44,10 @@ server.events.on("unhandledException", ({ request, error }) => {
 export const connections = { open: 0 };
 
 /**
- * Waits for every connection to close. An aborted request's mocked socket closes some ticks after
- * the abort, how many depending on load, and the next request on it fails with UND_ERR_SOCKET
- * "closed"; undici's `disconnect` is the signal that it has closed.
+ * Waits for every connection to close, and gives up after `timeoutMs` rather than hold a test on one
+ * that is meant to stay open. An aborted request's mocked socket closes some ticks after the abort,
+ * more of them under load, and a request the next test makes in that window can fail (a branch check
+ * answered 502); undici's `disconnect` says the close has landed.
  */
 export async function connectionsClosed(timeoutMs = 2_000) {
   const giveUp = Date.now() + timeoutMs;
