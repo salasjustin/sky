@@ -214,6 +214,20 @@ function fakeGitHub() {
       const sha = String(params.sha);
       return has(sha) ? HttpResponse.json(apiCommit(sha)) : notFound();
     }),
+    http.get(`${REPO}/commits`, ({ request }) => {
+      seen(request);
+      const url = new URL(request.url);
+      const branch = url.searchParams.get("sha") ?? "";
+      // GitHub's order: newest first
+      const log = bare(
+        "rev-list",
+        `--max-count=${Number(url.searchParams.get("per_page") ?? 30)}`,
+        `refs/heads/${branch}`,
+      )
+        .split("\n")
+        .filter(Boolean);
+      return HttpResponse.json(log.map((sha) => ({ sha })));
+    }),
     http.get(`${REPO}/git/trees/:sha`, ({ request, params }) => {
       seen(request);
       return HttpResponse.json({
@@ -240,29 +254,6 @@ function fakeGitHub() {
       return HttpResponse.json({
         encoding: "base64",
         content: content.toString("base64"),
-      });
-    }),
-    http.get(`${REPO}/compare/*`, ({ request }) => {
-      seen(request);
-      const spec = new URL(request.url).pathname.split("/compare/")[1] ?? "";
-      const [base = "", head = ""] = decodeURIComponent(spec).split("...");
-      const perPage = Number(
-        new URL(request.url).searchParams.get("per_page") ?? 250,
-      );
-      // GitHub's order: oldest first, the commits `head` has that `base` doesn't
-      const ahead = bare(
-        "rev-list",
-        "--reverse",
-        `refs/heads/${base}..refs/heads/${head}`,
-      )
-        .split("\n")
-        .filter(Boolean);
-      return HttpResponse.json({
-        merge_base_commit: {
-          sha: bare("merge-base", `refs/heads/${base}`, `refs/heads/${head}`),
-        },
-        total_commits: ahead.length,
-        commits: ahead.slice(0, perPage).map((sha) => ({ sha })),
       });
     }),
   );
@@ -682,14 +673,58 @@ test("a follow-up of a continued agent writes no config, so another run holding 
   expect(notes).toEqual([START_NOTE]);
 });
 
-test("a start branch with more commits of its own than a run fetches fails, measured by compare", async () => {
+test("a start branch with more commits of its own than a run fetches fails, measured by the walk", async () => {
   const first = pushToGitHub("feature/big", "big.txt", "0\n");
   pushTo("feature/big", emptyCommits(seed, 100, first));
 
   await expect(prepare({ startBranch: "feature/big" })).rejects.toThrow(
-    "the start branch feature/big has 101 commits that trunk doesn't, more than the 100 a run fetches",
+    "the start branch feature/big has more than 100 commits that trunk doesn't, more than the 100 a run fetches",
   );
-  expect(requests.filter((r) => r.startsWith("GET /git/commits/"))).toEqual([]);
+  expect(
+    requests.filter((r) => r.startsWith("GET /git/commits/")),
+  ).toHaveLength(100);
+});
+
+const withDots = () => requests.filter((r) => r.includes(".."));
+
+test("starting on an existing branch asks the gateway for no path containing ..", async () => {
+  const cut = pushToGitHub("trunk", "cut.txt", "1\n");
+  await shallowClone();
+  git(seed, "checkout", "-q", "-B", "fix/sprite-wake", cut);
+  const tip = commitIn(seed, "wake.txt", "1\n", "wake");
+  git(seed, "push", "-q", remote, "fix/sprite-wake:refs/heads/fix/sprite-wake");
+
+  const { cwd, notes } = await prepare({ startBranch: "fix/sprite-wake" });
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(git(repoDir, "rev-parse", `refs/sky/bases/${cut}`)).toBe(cut);
+  expect(notes).toHaveLength(1);
+  expect(requests).toContain("GET /commits?sha=trunk&per_page=100");
+  expect(withDots()).toEqual([]);
+});
+
+test("refreshing the default branch asks the gateway for no path containing ..", async () => {
+  const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
+
+  const { cwd, notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(notes).toEqual([]);
+  expect(requests.length).toBeGreaterThan(0);
+  expect(withDots()).toEqual([]);
+});
+
+test("following up a continued agent asks the gateway for no path containing ..", async () => {
+  pushToGitHub("feature/login", "login.txt", "1\n");
+  const { cwd } = await prepare({ startBranch: "feature/login" });
+  const outside = pushToGitHub("feature/login", "login.txt", "2\n");
+  requests = [];
+
+  await prepare({ startBranch: "feature/login" });
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(outside);
+  expect(requests.length).toBeGreaterThan(0);
+  expect(withDots()).toEqual([]);
 });
 
 test("refs/sky/starts/<agentId> records the start branch's tip once and never moves", async () => {
@@ -1258,6 +1293,7 @@ const raceSetup = async () => {
     branch: "feature/race",
     sha: first,
     previous: null,
+    walked: expect.any(Map),
   });
   const next = pushToGitHub("feature/race", "a.txt", "2\n");
   const newer = pushToGitHub("feature/race", "a.txt", "3\n");
@@ -1293,6 +1329,7 @@ test("a ref another run moved past this tip meanwhile is left at the newer tip",
     branch: "feature/race",
     sha: next,
     previous: first,
+    walked: expect.any(Map),
   });
   expect(originRef("feature/race")).toBe(newer);
 });
