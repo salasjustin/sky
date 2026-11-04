@@ -22,7 +22,7 @@ import * as sync from "./sync.js";
 // these tests run real git against real repositories, which is slow when the whole suite shares a CI runner
 vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
 
-/** Runs of the code under test still going when a test ends (it timed out); `afterEach` waits them out. */
+/** Every run of the code under test, so `afterEach` can wait out any a timed-out test left going. */
 const pending: Promise<unknown>[] = [];
 const track =
   <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
