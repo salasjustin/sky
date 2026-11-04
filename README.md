@@ -199,14 +199,15 @@ Some repos reject commits by unverified authors, or commits with a `Co-authored-
 
 - **Author.** Set `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` as secrets of the environment (`sky secret set web GIT_AUTHOR_EMAIL`, and the same for the name). The agent's commits and the commits `publish` sends to GitHub then carry that author and committer, including commits the agent made before the variables were set; commits an earlier `publish` already sent to the branch stay on GitHub as they were sent. `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL` set a different committer. Unless both author variables are set, commits are by `Claude <noreply@anthropic.com>`; setting only one of them falls back to Claude for both.
 - **Trailers.** Claude Code's own commit and pull request attribution is turned off for the agent's session, though not for the `claude -p` runs it starts, and `publish` strips every `Co-authored-by` trailer, and the "Generated with Claude Code" footer, from commit messages and pull request bodies.
-- **Branch.** `publish --branch <name>` sends the commits to the GitHub branch `<name>` and opens the pull request from it, while the agent's worktree stays on `claude/<agent id>`. Set the secret `SKY_PUBLISH_BRANCH` to make it the default; the flag wins, and so does the branch an agent was started on with `--branch` (see [Fetching from GitHub](#fetching-from-github)). That secret is shared by every agent in the environment, and two agents publishing to one branch collide, so with several agents pass `--branch` per agent. Use a new branch name: a branch that already holds commits this agent never made is not overwritten. The name must be a valid branch name and not the base or default branch. The `compareUrl` an agent reports still names `claude/<agent id>`, unless it was started on a branch, whose name it uses.
+- **Branch.** `publish --branch <name>` sends the commits to the GitHub branch `<name>` and opens the pull request from it, while the agent's worktree stays on `claude/<agent id>`. Set the secret `SKY_PUBLISH_BRANCH` to make it the default. The order is the flag, then the branch the agent was started on with `sky agent start --branch` (see [Fetching from GitHub](#fetching-from-github)), then the secret. That secret is shared by every agent in the environment, and two agents publishing to one branch collide, so with several agents pass `--branch` per agent. Use a new branch name: a branch that already holds commits this agent never made is not overwritten. The name must be a valid branch name and not the base or default branch. The `compareUrl` an agent reports still names `claude/<agent id>`, unless it was started on a branch, whose name it uses.
 
 ### Fetching from GitHub
 
-Sandboxes have no git transport, so `git fetch`, `git pull` and `git push` fail there. The runner fetches through the same connector instead, at the start of every run, and an agent must not run `runner.mjs` itself. `publish` is the one command it is told to run, and a bare `runner.mjs` would start a run. Without a connector in the environment nothing is fetched and the sandbox keeps the commit it was provisioned with.
+Sandboxes have no git transport, so `git fetch`, `git pull` and `git push` fail there. The runner fetches through the same connector instead, at the start of every run. Agents run `runner.mjs` only for `publish`; a bare `runner.mjs` starts a run. Without a connector in the environment nothing is fetched and the sandbox keeps the commit it was provisioned with.
 
 - **Default branch.** Every run refreshes `origin/<default branch>` first, so a new worktree starts from GitHub's current code. A clean worktree from an earlier run is rebased onto it. A worktree with uncommitted changes, one whose rebase conflicts, and one already published (rewriting it would break its pull request) are left alone, and the agent's prompt says how many commits it is behind. A default branch more than 100 commits ahead is not fetched; the prompt says so.
 - **Start from a branch.** `sky agent start <env> --branch=<name>` (REST: `branch` on `POST /v1/agents`; MCP: the `branch` parameter) starts the agent from an existing branch on GitHub, such as an open pull request's. The agent works on a local `claude/<agentId>` branch, and `publish` updates `<name>` and its open pull request, without rebasing it onto the default branch. The start fails with `404 branch_not_found` if the branch doesn't exist, `422 branch_is_default` for the default branch, and `422 branch_needs_connector` when the environment has no connector.
+- **Shared branch.** Two agents may target the same branch, and `publish` refuses to overwrite commits the branch never had.
 - **Commits pushed from outside.** Follow-up runs fetch the agent's GitHub branch first. A clean worktree takes the commits pushed there by someone else (fast-forward, or a cherry-pick when `publish` gave its commits new shas). Diverged histories change nothing; the agent's prompt says what is on GitHub and `publish` refuses to overwrite it.
 
 ## REST API
@@ -220,9 +221,9 @@ POST /v1/agents
 { "envId": "env_abc", "prompt": "Fix the flaky login test" }
 ```
 
-Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from GitHub](#fetching-from-github)); the agent's `remoteBranch` then names it, and is `null` otherwise.
-
 `202 Accepted`, with `Location: /v1/agents/<agentId>/runs/<runId>` and a body of `{ "agent": …, "run": … }`.
+
+Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from GitHub](#fetching-from-github)). The agent's `remoteBranch` then names it; without `branch` it is `null`.
 
 | route                                                                   | what it does                                           |
 | ----------------------------------------------------------------------- | ------------------------------------------------------ |

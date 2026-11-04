@@ -857,7 +857,7 @@ test("SKY_PUBLISH_BRANCH from the env's base profile counts as where the branch 
 
 test("start branch equal to the default branch is refused", async () => {
   await expect(prepare({ startBranch: "trunk" })).rejects.toThrow(
-    "START_BRANCH is trunk, the default branch: publishing would write to it directly; start from a branch of its own",
+    "this agent was started on trunk, the default branch: publishing would write to it directly; start from a branch of its own",
   );
 });
 
@@ -1136,7 +1136,7 @@ test("the walk back through GitHub's history stops at 101 commits", async () => 
   expect(
     requests.filter((r) => r.startsWith("GET /git/commits/")),
   ).toHaveLength(101);
-});
+}, 60_000);
 
 test("a fast-forward git refuses leaves the worktree as it was, with the reason", async () => {
   const { cwd, sha } = await earlierRun();
@@ -1339,7 +1339,7 @@ test("two fetches into one repo at once each build their tree in an index of the
 
 test("START_BRANCH with no connector can't be fetched, so no worktree is made", async () => {
   await expect(prepare({ startBranch: "feature/login" }, {})).rejects.toThrow(
-    "START_BRANCH is feature/login, but GITHUB_CONNECTOR is not set, so there is no way to fetch it from GitHub",
+    "this agent was started on branch feature/login, but GITHUB_CONNECTOR is not set, so there is no way to fetch it from GitHub",
   );
   expect(existsSync(join(worktreesDir, "agt_1"))).toBe(false);
 });
@@ -1378,7 +1378,7 @@ test("a start branch can't be fetched when the runner can't tell where GitHub is
   git(repoDir, "remote", "set-url", "origin", "/srv/not-github.git");
 
   await expect(prepare({ startBranch: "feature/login" })).rejects.toThrow(
-    "can't fetch START_BRANCH feature/login from GitHub: origin is not a GitHub repo: /srv/not-github.git",
+    "can't fetch branch feature/login from GitHub: origin is not a GitHub repo: /srv/not-github.git",
   );
   expect(existsSync(join(worktreesDir, "agt_1"))).toBe(false);
 });

@@ -771,7 +771,7 @@ export async function prepareWorktree(
   if (!connectorId) {
     if (startBranch && isNew) {
       throw new Error(
-        `START_BRANCH is ${startBranch}, but ${CONNECTOR_ENV} is not set, so there is no way to fetch it from GitHub`,
+        `this agent was started on branch ${startBranch}, but ${CONNECTOR_ENV} is not set, so there is no way to fetch it from GitHub`,
       );
     }
     return continueStartBranch(await ensureWorktree(config));
@@ -779,7 +779,7 @@ export async function prepareWorktree(
   const defaultName = await defaultBranchOf(g).catch(() => undefined);
   if (startBranch && startBranch === defaultName) {
     throw new Error(
-      `START_BRANCH is ${startBranch}, the default branch: publishing would write to it directly; start from a branch of its own`,
+      `this agent was started on ${startBranch}, the default branch: publishing would write to it directly; start from a branch of its own`,
     );
   }
   let lastFailure: unknown;
@@ -811,7 +811,7 @@ export async function prepareWorktree(
     // unlike the refresh, the run can't go on without it: there is nothing else to start from
     if (!call || !defaultName) {
       throw new Error(
-        `can't fetch START_BRANCH ${startBranch} from GitHub: ${messageOf(lastFailure)}`,
+        `can't fetch branch ${startBranch} from GitHub: ${messageOf(lastFailure)}`,
       );
     }
     const tip = await fetchStartBranch({

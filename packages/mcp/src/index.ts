@@ -245,7 +245,7 @@ function buildServer(call: Call) {
     "launch",
     {
       description:
-        "Start a new agent, with its own session, in a ready environment. It works on a local claude/<agentId> branch; with branch it starts from and publishes to that GitHub branch, without it it publishes claude/<agentId>. To continue an existing agent, call followup.",
+        "Start a new agent, with its own session, in a ready environment. It works on a local claude/<agentId> branch; with branch it starts from and publishes to that GitHub branch, otherwise it publishes claude/<agentId>. To continue an existing agent, call followup.",
       inputSchema: {
         envId: EnvironmentId,
         prompt: nonEmpty,

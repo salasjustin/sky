@@ -189,7 +189,7 @@ function refuseBranch(
         c,
         502,
         "branch_check_failed",
-        `could not check branch ${branch} in the environment's sprite; retry: ${check.detail}`,
+        `could not check branch ${branch} in the environment's sprite (${check.detail}); retry`,
       );
   }
 }
