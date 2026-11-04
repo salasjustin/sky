@@ -37,6 +37,8 @@ export class BranchNotFoundError extends Error {
 export class TooFarError extends Error {}
 
 const DEFAULT_MAX_COMMITS = 100;
+/** Pages of the default branch's listing `fetchStartBranch` reads before calling a branch too far. */
+const MAX_LISTING_PAGES = 10;
 
 const segments = (branch: string) =>
   branch.split("/").map(encodeURIComponent).join("/");
@@ -109,7 +111,7 @@ function cachingCommits(call: Call): Call {
  * (a base a publish fetched alone, say) counts as here only where it is an ancestor of a sha in
  * `connected`, the history the caller needs to stay joined to; elsewhere it is walked through, and
  * leaves `shallow` once its parents are written. A sha in `stopAt` is fetched but its parents are
- * not walked; `tipOnly` fetches the tip alone, shallow. More than `maxCommits` to fetch throws
+ * not walked; `tipOnly` fetches the tip alone, shallow. More than `maxCommits` to walk throws
  * `TooFarError` before anything is written. Every write converges, so another agent's run fetching
  * the same branch at once does no harm.
  */
@@ -121,18 +123,21 @@ export async function fetchBranch(options: {
   tip?: string;
   stopAt?: string[];
   connected?: string[];
-  /** The only commits whose parents are walked, a set the caller has measured, so `maxCommits` doesn't apply; the rest are fetched shallow. */
-  within?: Set<string>;
   maxCommits?: number;
   tipOnly?: boolean;
-}): Promise<{ branch: string; sha: string; previous: string | null }> {
+}): Promise<{
+  branch: string;
+  sha: string;
+  previous: string | null;
+  /** Each commit the walk met that wasn't here, with its parents; none for one in `stopAt`. */
+  walked: Map<string, string[]>;
+}> {
   const { repoDir, branch } = options;
   const g = git(repoDir);
   const call = cachingCommits(options.call);
   const sha = options.tip ?? (await remoteTip(call, branch));
   const maxCommits = options.maxCommits ?? DEFAULT_MAX_COMMITS;
   const stopAt = new Set(options.stopAt ?? []);
-  const { within } = options;
   const shallow = await shallowCommits(g);
   const connected = options.connected ?? [];
   const here = async (commit: string) => {
@@ -145,24 +150,22 @@ export async function fetchBranch(options: {
   };
 
   const parentsOf = new Map<string, string[]>();
+  let bodies = 0;
   if (!(await here(sha))) {
     const queue = [sha];
     while (queue.length > 0) {
       const next = queue.shift() as string;
       if (parentsOf.has(next) || (await here(next))) continue;
-      if (!within && parentsOf.size >= maxCommits) {
+      if (options.tipOnly || stopAt.has(next)) {
+        parentsOf.set(next, []);
+        continue;
+      }
+      if (bodies >= maxCommits) {
         throw new TooFarError(
           `${branch} on GitHub is more than ${maxCommits} commits past anything this clone has`,
         );
       }
-      if (
-        options.tipOnly ||
-        stopAt.has(next) ||
-        (within && !within.has(next))
-      ) {
-        parentsOf.set(next, []);
-        continue;
-      }
+      bodies++;
       const { parents } = await call<{ parents: { sha: string }[] }>(
         "GET",
         `/git/commits/${next}`,
@@ -191,7 +194,7 @@ export async function fetchBranch(options: {
   const ref = `refs/remotes/origin/${branch}`;
   const previous = (await resolved(g, ref)) || null;
   await moveRef(g, ref, sha, previous);
-  return { branch, sha, previous };
+  return { branch, sha, previous, walked: parentsOf };
 }
 
 /** The walked commits, each after every walked parent of it. */
@@ -610,10 +613,12 @@ export async function syncAgentBranch(options: {
 }
 
 /**
- * Fetches GitHub's `startBranch`: the commits it has that the default branch doesn't, as GitHub's
- * compare lists them, each parent outside that list fetched shallow, so a branch that merged the
- * default branch in never walks down the default branch's history. Records the merge base under
- * `FETCHED_BASES` so publish finds the base it was cut from. Returns the branch's tip.
+ * Fetches GitHub's `startBranch`: the commits it has that the default branch doesn't, each parent
+ * on the default branch fetched alone, so a branch that merged the default branch in never walks
+ * down the default branch's history. Which commits are the default branch's comes from its commit
+ * listing, a page at a time, not from a compare: the gateway refuses `..` in a path. Records the
+ * newest of them the branch was cut from or merged, its merge base, under `FETCHED_BASES` so
+ * publish finds the base it was cut from. Returns the branch's tip.
  */
 async function fetchStartBranch(options: {
   repoDir: string;
@@ -632,30 +637,48 @@ async function fetchStartBranch(options: {
     }
     throw error;
   });
-  const compare = await call<{
-    merge_base_commit: { sha: string };
-    total_commits: number;
-    commits: { sha: string }[];
-  }>(
-    "GET",
-    `/compare/${segments(defaultBranch)}...${segments(startBranch)}?per_page=${DEFAULT_MAX_COMMITS}`,
-  );
-  if (compare.total_commits > compare.commits.length) {
-    throw new TooFarError(
-      `the start branch ${startBranch} has ${commits(compare.total_commits)} that ${defaultBranch} doesn't, more than the ${DEFAULT_MAX_COMMITS} a run fetches`,
-    );
-  }
   const onDefault = await resolved(g, `refs/remotes/origin/${defaultBranch}`);
-  await fetchBranch({
-    repoDir: options.repoDir,
-    call,
-    branch: startBranch,
-    tip,
-    within: new Set(compare.commits.map(({ sha }) => sha)),
-    connected: onDefault ? [onDefault] : [],
-  });
-  const mergeBase = compare.merge_base_commit.sha;
-  await g(["update-ref", `${FETCHED_BASES}${mergeBase}`, mergeBase]);
+  const cached = cachingCommits(call);
+  // newest first. A branch cut further back than the pages read so far walks the default branch's
+  // history as its own until it hits the cap; the listing is then read a page deeper and the walk redone
+  const onDefaultBranch: string[] = [];
+  let walked: Map<string, string[]>;
+  for (let page = 1; ; page++) {
+    const listed = await call<{ sha: string }[]>(
+      "GET",
+      `/commits?sha=${encodeURIComponent(defaultBranch)}&per_page=${DEFAULT_MAX_COMMITS}${page > 1 ? `&page=${page}` : ""}`,
+    );
+    onDefaultBranch.push(...listed.map(({ sha }) => sha));
+    try {
+      ({ walked } = await fetchBranch({
+        repoDir: options.repoDir,
+        call: cached,
+        branch: startBranch,
+        tip,
+        stopAt: onDefaultBranch,
+        connected: onDefault ? [onDefault] : [],
+      }));
+      break;
+    } catch (error) {
+      if (!(error instanceof TooFarError)) throw error;
+      if (listed.length < DEFAULT_MAX_COMMITS || page >= MAX_LISTING_PAGES) {
+        throw new TooFarError(
+          `the start branch ${startBranch} has more than ${DEFAULT_MAX_COMMITS} commits that ${defaultBranch} doesn't; a run fetches at most ${DEFAULT_MAX_COMMITS}`,
+        );
+      }
+    }
+  }
+  const touching = new Set(
+    [tip, ...[...walked.values()].flat()].filter((sha) =>
+      onDefaultBranch.includes(sha),
+    ),
+  );
+  const mergeBase =
+    onDefaultBranch.find((sha) => touching.has(sha)) ??
+    (onDefault ? await g(["merge-base", onDefault, tip]).catch(() => "") : "");
+  if (mergeBase) {
+    await g(["update-ref", `${FETCHED_BASES}${mergeBase}`, mergeBase]);
+  }
   return tip;
 }
 
