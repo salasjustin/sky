@@ -61,12 +61,12 @@ const help = (io: Io) => `Usage:
       an agent's next run once its last one has ended; @file reads the
       prompt from that file. Prints "<agentId> <runId>".
       --branch starts the agent on an existing GitHub branch, such as an
-      open pull request's, and its publish updates that branch and its PR;
-      only start takes it. Sandboxes have no git transport, so the agent
-      can't git fetch, pull or push: Sky fetches the branch through the
-      environment's GitHub connector (the GITHUB_CONNECTOR secret) when the
-      run starts, and the agent publishes through the runner's publish. The
-      agent runs nothing else of runner.mjs itself.
+      open pull request's; its publishes update that branch. Refused for
+      the repo's default branch and on an environment with no
+      GITHUB_CONNECTOR secret. Sandboxes have no git transport, so the
+      agent can't fetch or push itself: Sky fetches the branch through the
+      connector when each run starts, and the agent runs runner.mjs only
+      for publish.
   sky agent archive <agent> [options]
       Stop any active run and delete the agent's worktree; uncommitted work
       in it is lost.

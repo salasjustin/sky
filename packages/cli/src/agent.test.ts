@@ -111,6 +111,33 @@ test("start sends the branch when --branch is given", async () => {
   expect(r.stdout).toBe("agt_1 run_1\n");
 });
 
+test("start with no <env> shows its usage, --branch included", async () => {
+  const r = await runCli([
+    "agent",
+    "start",
+    "--branch=fix/login",
+    "--prompt=x",
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain(
+    "agent start takes <env> [--branch=<name>] --prompt=<text|@file>",
+  );
+  expect(writes).toEqual([]);
+});
+
+test("start sends --branch trimmed, the name it validated", async () => {
+  server.use(envList, post("/v1/agents", 202, { agent, run: run() }));
+  const r = await runCli([
+    "agent",
+    "start",
+    "env_1",
+    "--branch= fix/login ",
+    "--prompt=x",
+  ]);
+  expect(r.code).toBe(0);
+  expect(writes[0]?.body).toMatchObject({ branch: "fix/login" });
+});
+
 test("start omits branch when the flag is absent", async () => {
   server.use(envList, post("/v1/agents", 202, { agent, run: run() }));
   const r = await runCli(["agent", "start", "env_1", "--prompt=x"]);
@@ -129,6 +156,22 @@ test("start rejects an empty --branch", async () => {
   expect(r.code).toBe(2);
   expect(r.stdout).toBe("");
   expect(r.stderr).toContain("--branch is empty");
+  expect(writes).toEqual([]);
+});
+
+test("start rejects a --branch git wouldn't take as a branch name, before any request", async () => {
+  const r = await runCli([
+    "agent",
+    "start",
+    "env_1",
+    "--branch=refs/heads/fix-login",
+    "--prompt=x",
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toContain("--branch 'refs/heads/fix-login' is not a branch");
+  expect(r.stderr).toContain("not starting with '-', '/' or 'refs/'");
+  expect(r.stderr).toContain("Run 'sky --help' for usage.");
   expect(writes).toEqual([]);
 });
 
@@ -680,9 +723,12 @@ test("--help documents --branch on agent start and how the branch reaches the sa
   expect(text).toContain(
     "sky agent start <env> [--branch=<name>] --prompt=<text|@file>",
   );
-  expect(text).toContain("GITHUB_CONNECTOR");
-  expect(text).toMatch(/no git transport/);
-  expect(text).toMatch(/publish/);
+  expect(text).toContain("its publishes update that branch");
+  expect(text).toContain("Refused for the repo's default branch");
+  expect(text).toContain("no GITHUB_CONNECTOR secret");
+  expect(text).toContain("Sandboxes have no git transport");
+  expect(text).toContain("when each run starts");
+  expect(text).toContain("runs runner.mjs only for publish");
 });
 
 test("--help documents the run-state exit codes", async () => {
