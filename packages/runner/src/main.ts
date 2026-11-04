@@ -3,7 +3,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { writeClaudeCredentials } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
-import { holdSprite } from "./keepalive.js";
+import { holdSprite, spriteApiFrom } from "./keepalive.js";
 import { refreshPlugins } from "./plugins.js";
 import { publishMain } from "./publish.js";
 import { repoPullMain } from "./repo.js";
@@ -105,8 +105,7 @@ async function main(): Promise<void> {
     warn,
     // the local log is unreadable once the sprite sleeps, so a hold that fails also reaches the run's events
     report: warningReporter(post, config.runId),
-    // a sprite has its API at the default socket; tests and other hosts point this elsewhere
-    socketPath: process.env.SKY_SPRITE_API_SOCKET,
+    ...spriteApiFrom(process.env),
     signal: controller.signal,
   });
   await step("sprite hold", () => hold.ready);

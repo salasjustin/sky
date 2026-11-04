@@ -374,6 +374,9 @@ export function failLostRun(
 ): boolean {
   return db.transaction(
     (tx) => {
+      // in the where clause, not the select list: on a single-table select Drizzle drops the table
+      // name from a column in a selected expression, and `runs.id` inside would read `events.id`
+      // (`silentRuns` selects its subquery safely only because its joins keep the qualifier)
       const silent = tx
         .select({ id: runs.id })
         .from(runs)

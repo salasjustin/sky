@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { holdSprite } from "./keepalive.js";
+import { holdSprite, spriteApiFrom } from "./keepalive.js";
 
 let dir: string;
 let api: Server | undefined;
@@ -207,22 +207,89 @@ test("a refresh that fails after the hold landed is reported, once per streak of
   await hold.release();
 });
 
-test("a missing sprite socket means no sprite: logged once, never reported to the API", async () => {
+test("off a sprite, a missing socket means no sprite: logged once, never retried or reported to the API", async () => {
   const reports: string[] = [];
   const warnings: string[] = [];
   const hold = holdSprite({
     runId: "run_1",
     socketPath: join(dir, "absent.sock"),
+    onSprite: false,
     refreshMs: 10,
+    firstRetryMs: 5,
     warn: (m) => warnings.push(m),
     report: (m) => reports.push(m),
   });
   await expect(hold.ready).resolves.toBe(false);
   await sleep(50);
   await hold.release();
-  expect(warnings).toHaveLength(1);
-  expect(warnings[0]).toMatch(/absent\.sock/);
+  expect(warnings).toEqual([
+    `runner: no sprite API found at ${join(dir, "absent.sock")}; the run is not held`,
+  ]);
   expect(reports).toEqual([]);
+});
+
+test("on a sprite, a socket that never appears is retried, then only the give-up is reported", async () => {
+  const reports: string[] = [];
+  const warnings: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath: join(dir, "absent.sock"),
+    onSprite: true,
+    refreshMs: 60_000,
+    firstRetryMs: 5,
+    firstAttempts: 3,
+    warn: (m) => warnings.push(m),
+    report: (m) => reports.push(m),
+  });
+  await expect(hold.ready).resolves.toBe(false);
+  await hold.release();
+  expect(
+    warnings.filter((w) => /sprite task PUT failed: .*ENOENT/.test(w)),
+  ).toHaveLength(3);
+  expect(reports).toEqual([
+    "runner: sprite not held after the first retries; it may pause the run",
+  ]);
+});
+
+test("on a sprite, a socket that appears after the first attempt lands the hold and reports nothing", async () => {
+  const socketPath = join(dir, "api.sock");
+  const reports: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    onSprite: true,
+    refreshMs: 60_000,
+    firstRetryMs: 5,
+    firstAttempts: 200,
+    warn: () => {},
+    report: (m) => reports.push(m),
+  });
+  await sleep(30);
+  const { calls } = await spriteApi();
+  await expect(hold.ready).resolves.toBe(true);
+  await hold.release();
+  expect(calls.map((c) => c.method)).toEqual(["PUT", "DELETE"]);
+  expect(reports).toEqual([]);
+});
+
+test.each([
+  ["unset", {}],
+  ["empty", { SKY_SPRITE_API_SOCKET: "" }],
+])(
+  "SKY_SPRITE_API_SOCKET %s means the sprite's own socket, on a sprite",
+  (_, env) => {
+    expect(spriteApiFrom(env)).toEqual({
+      socketPath: undefined,
+      onSprite: true,
+    });
+  },
+);
+
+test("SKY_SPRITE_API_SOCKET set is a chosen socket, not assumed a sprite", () => {
+  expect(spriteApiFrom({ SKY_SPRITE_API_SOCKET: "/tmp/api.sock" })).toEqual({
+    socketPath: "/tmp/api.sock",
+    onSprite: false,
+  });
 });
 
 test("a report that throws never breaks the hold", async () => {

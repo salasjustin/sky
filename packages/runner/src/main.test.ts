@@ -260,6 +260,41 @@ test("a failed run posts run.failed to the API with the agent token, exits 1, an
   // resolves and the timeout fails the test, with no wall-clock threshold to tune
 }, 20_000);
 
+test("the runner holds the sprite through the Tasks API at SKY_SPRITE_API_SOCKET", async () => {
+  const sockets = mkdtempSync(join(tmpdir(), "runner-main-sprite-"));
+  const tasks: string[] = [];
+  const sprite = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      tasks.push(`${req.method} ${req.headers.host} ${req.url}`);
+      res.writeHead(200).end();
+    });
+  });
+  servers.push(sprite);
+  const socketPath = join(sockets, "api.sock");
+  sprite.listen(socketPath);
+  await once(sprite, "listening");
+  const api = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => res.writeHead(204).end());
+  });
+  servers.push(api);
+  api.listen(0, "127.0.0.1");
+  await once(api, "listening");
+  const { port } = api.address() as AddressInfo;
+  try {
+    const { code } = await runBundle({
+      ...runEnv(`http://127.0.0.1:${port}`, join(sockets, "run_1.prompt")),
+      SKY_SPRITE_API_SOCKET: socketPath,
+    });
+    expect(code).toBe(1);
+  } finally {
+    rmSync(sockets, { recursive: true, force: true });
+  }
+  const task = "/v1/tasks/sky-run-37ddff8ee13f1e57937fd048";
+  expect(tasks).toEqual([`PUT sprite ${task}`, `DELETE sprite ${task}`]);
+}, 20_000);
+
 test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies by the signal and frees its lock", async () => {
   const runs = mkdtempSync(join(tmpdir(), "runner-main-runs-"));
   const lock = join(runs, "run_1.lock");

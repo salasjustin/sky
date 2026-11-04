@@ -65,6 +65,7 @@ const RUNNER_ENV_NAMES: ReadonlySet<string> = new Set([
   "AUTO_APPROVE",
   "WAIT_TIMEOUT_MINUTES",
   "SESSION_ID",
+  "SKY_SPRITE_API_SOCKET",
   "PATH",
   "HOME",
   "NODE_OPTIONS",

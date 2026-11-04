@@ -1979,13 +1979,14 @@ test("a runner that spoke while the probe was running is not failed as lost", as
     type: "run.started",
     payload: { sessionId: "s" },
   });
-  // pgrep finds nothing, but the runner's event lands as it runs
+  // pgrep finds nothing, but the runner's event lands as it runs; its timestamp is an hour old, so
+  // only its id, higher than the run's latest when the probe began, says it came after
   pgrepAnswers(1, () => {
     db.$client
       .prepare(
         "insert into events (run_id, ts, type, payload) values (?, ?, 'claude.Message', '{\"text\":\"hi\"}')",
       )
-      .run(run.id, new Date(Date.now() + 1).toISOString());
+      .run(run.id, new Date(Date.now() - 3_600_000).toISOString());
   });
   const { prober } = proberOver();
   await prober.sweep(silentFor(config.runProbeMs + 1000));
