@@ -25,6 +25,7 @@ test("reads a run from env, defaulting the sprite paths", () => {
     sessionEnv: {},
     checks: [],
     waitTimeoutMs: 120 * 60_000,
+    startBranch: undefined,
   });
 });
 
@@ -44,6 +45,15 @@ test("reads the profile's session variables and checks, and refuses ones that ar
   );
   expect(() => loadConfig({ ...env, SKY_SESSION_ENV: '["A"]' })).toThrow(
     "SKY_SESSION_ENV",
+  );
+});
+
+test.each([
+  ["set", "feature/login", "feature/login"],
+  ["empty", "", undefined],
+])("reads the start branch when %s", (_, value, expected) => {
+  expect(loadConfig({ ...env, START_BRANCH: value }).startBranch).toBe(
+    expected,
   );
 });
 

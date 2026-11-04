@@ -1,6 +1,13 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   CONNECTOR_ENV,
@@ -183,6 +190,31 @@ export async function pullRepo(options: {
   return remote;
 }
 
+const INDEX_PREFIX = "sky-pull-index-";
+
+const isRunning = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: it exists, under another user
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+/** Temporary indexes a killed fetch left behind: each is named for its process, gone or not. */
+async function removeAbandonedIndexes(gitDir: string): Promise<void> {
+  const entries = await readdir(gitDir).catch(() => []);
+  await Promise.all(
+    entries
+      .filter((name) => {
+        const match = new RegExp(`^${INDEX_PREFIX}(\\d+)-`).exec(name);
+        return match && !isRunning(Number(match[1]));
+      })
+      .map((name) => rm(join(gitDir, name), { force: true })),
+  );
+}
+
 /**
  * Writes the commit, its tree and every blob into the repo `g` runs in as git objects, so
  * `remote.sha` resolves there; the checkout and refs are the caller's.
@@ -202,7 +234,9 @@ async function writeObjects(
   const entries = tree.filter(
     (item) => item.type === "blob" || item.type === "commit",
   );
-  const index = join(gitDir, "sky-pull-index");
+  await removeAbandonedIndexes(gitDir);
+  // one per call: every worktree shares the git dir, and another agent's fetch may be writing its own
+  const index = join(gitDir, `${INDEX_PREFIX}${process.pid}-${randomUUID()}`);
   const env = { GIT_INDEX_FILE: index };
   try {
     await g(["update-index", "-z", "--add", "--index-info"], {

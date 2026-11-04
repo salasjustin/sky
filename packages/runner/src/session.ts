@@ -28,7 +28,8 @@ import { type PostEvent, RunEndedError } from "./events.js";
 import { policyOutcome } from "./policy.js";
 import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
-import { commitAll, diffRollup, ensureWorktree, headSha } from "./worktree.js";
+import { prepareWorktree } from "./sync.js";
+import { commitAll, diffRollup, headSha } from "./worktree.js";
 
 /** The Agent SDK's `query`, narrowed to what the runner calls; tests feed it scripted streams. */
 export type QueryFn = (params: {
@@ -107,6 +108,8 @@ function sessionOptions(
   abortController: AbortController,
   hooks: Options["hooks"],
   canUseTool: CanUseTool,
+  /** What the worktree's refresh from GitHub did, for the agent; see `prepareWorktree`. */
+  notes: string[],
 ): Options {
   // `env` replaces the subprocess env rather than adding to it, so it carries the project's own
   // secrets (an ANTHROPIC_API_KEY among them) to the session's commands; the event token stays with
@@ -128,6 +131,9 @@ function sessionOptions(
       append: [
         ...(env[CONNECTOR_ENV] ? [publishInstructions()] : []),
         ...(config.checks.length > 0 ? [checkInstructions(config.checks)] : []),
+        ...(notes.length > 0
+          ? [[NOTES_HEADING, ...notes.map((note) => `- ${note}`)].join("\n")]
+          : []),
       ].join("\n\n"),
     },
     // the approval policy holds calls in the PreToolUse hook; everything else runs unasked
@@ -140,12 +146,15 @@ function sessionOptions(
 }
 
 /**
- * The sprite holds no GitHub credential, so `git push` and `gh` fail there; the runner's own
- * `publish` reaches GitHub through the Sprites connector instead.
+ * The sprite has no git transport and holds no GitHub credential, so `git fetch`/`pull`/`push` and
+ * `gh` fail there; the runner reaches GitHub through the Sprites connector instead, refreshing the
+ * repo before the session and publishing through its own `publish`.
  */
 const publishInstructions = () =>
   [
-    "This sandbox has no GitHub credential, so `git push` and `gh` fail here.",
+    "This sandbox has no git transport and no GitHub credential: `git fetch`, `git pull` and `git push` fail here, and so does `gh`.",
+    "The runner refreshed this repo from GitHub when this run started; what that changed, if anything, is in the notes at the end.",
+    `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` command: its other subcommands are the Sky API's, and run with none it starts a new run.`,
     "To publish your branch and open a pull request, commit your work, then run",
     `\`${process.execPath} ${process.argv[1]} ${PUBLISH_USAGE}\``,
     "instead of `git push` or `gh pr create`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and prints its URL. Run it again after more commits to update the same pull request.",
@@ -153,6 +162,9 @@ const publishInstructions = () =>
     "Once commits are published, add new commits rather than amending or rebasing them: a rewritten branch can't be published again.",
     "Pass a multi-line body from a quoted heredoc, `--body \"$(cat <<'EOF'` … `EOF` `)\"`, so the shell leaves its backticks and `$` alone. A large branch can take minutes to send, so give the Bash call a 10-minute timeout.",
   ].join("\n");
+
+const NOTES_HEADING =
+  "What the runner's refresh from GitHub at the start of this run did:";
 
 /**
  * The env's base profile lists what to run before finishing. A command that calls `claude` runs as
@@ -356,8 +368,12 @@ export async function runSession(
   };
 
   let cwd: string;
+  let notes: string[];
   try {
-    cwd = await ensureWorktree(config);
+    ({ cwd, notes } = await prepareWorktree(config, {
+      env: process.env,
+      warn,
+    }));
   } catch (error) {
     return fail(`worktree setup failed: ${messageOf(error)}`);
   }
@@ -554,7 +570,14 @@ export async function runSession(
   try {
     const stream = deps.query({
       prompt: config.prompt,
-      options: sessionOptions(config, cwd, abortController, hooks, canUseTool),
+      options: sessionOptions(
+        config,
+        cwd,
+        abortController,
+        hooks,
+        canUseTool,
+        notes,
+      ),
     });
     for await (const message of stream) {
       if (message.type === "system" && message.subtype === "init" && !started) {

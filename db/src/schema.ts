@@ -126,6 +126,9 @@ export const agents = sqliteTable(
     createdAt: createdAt(),
     // no CHECK: adding one makes drizzle-kit rebuild the table; the API writes toISOString() only
     archivedAt: text("archived_at"),
+    // the existing GitHub branch the agent started from and publishes to; null means it uses `branch`.
+    // no CHECK, for the same reason as archivedAt; the API validates the name
+    remoteBranch: text("remote_branch"),
   },
   (t) => [
     index("agents_env_id").on(t.envId),

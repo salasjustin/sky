@@ -1693,7 +1693,9 @@ test("a re-run finishes a run killed while building its index, and leaves no ind
   fakeGitHub();
   const dir = join(root, "repo");
   await pull(dir);
-  const stale = join(dir, ".git/sky-pull-index");
+  // named for the process that was killed, so no live fetch owns it
+  const { pid } = spawnSync("true");
+  const stale = join(dir, `.git/sky-pull-index-${pid}-killed`);
   execFileSync(
     "git",
     [

@@ -819,6 +819,59 @@ test("a ref GitHub refuses to fast-forward says the history was rewritten", asyn
   );
 });
 
+test("publishes to the start branch and skips the base rebase", async () => {
+  // someone's branch, with their commit, that this agent continues on claude/agt_1
+  git(work, "config", "branch.claude/agt_1.sky-remote-branch", "feature/x");
+  writeFileSync(join(work, "theirs.txt"), "theirs\n");
+  const theirs = commit("Their change");
+  writeFileSync(join(work, "mine.txt"), "mine\n");
+  commit("Agent change");
+  const gh = fakeGitHub({
+    pulls: [
+      {
+        number: 4,
+        html_url: "https://github.com/acme/widgets/pull/4",
+        head: "feature/x",
+        base: "main",
+      },
+    ],
+  });
+  let remoteRef = theirs;
+  const refWrites: unknown[] = [];
+  server.use(
+    // the base moved on GitHub; a rebase onto it would fetch the new head and fail on it here
+    http.get(`${REPO}/git/ref/heads/main`, () =>
+      HttpResponse.json({ object: { sha: "e".repeat(40) } }),
+    ),
+    http.get(`${REPO}/git/ref/heads/feature/x`, () =>
+      HttpResponse.json({ object: { sha: remoteRef } }),
+    ),
+    http.patch(`${REPO}/git/refs/heads/feature/x`, async ({ request }) => {
+      const body = (await request.json()) as { sha: string };
+      refWrites.push(body);
+      remoteRef = body.sha;
+      return HttpResponse.json({ object: { sha: body.sha } });
+    }),
+  );
+
+  const result = await run({ title: undefined });
+
+  expect(gh.commits.map((c) => [c.message, c.parents])).toEqual([
+    ["Agent change\n", [theirs]],
+  ]);
+  expect(refWrites).toEqual([{ sha: "commit1", force: false }]);
+  expect(gh.refWrites).toEqual([]);
+  expect(result).toEqual({
+    branch: "feature/x",
+    base: "main",
+    sha: "commit1",
+    created: false,
+    updated: false,
+    pullRequest: { number: 4, url: "https://github.com/acme/widgets/pull/4" },
+  });
+  expect(git(work, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+});
+
 test("with no open PR and no title, nothing is written", async () => {
   const gh = fakeGitHub();
   writeFileSync(join(work, "a.txt"), "first\n");

@@ -152,7 +152,11 @@ export function createApi(config: Config) {
   };
 
   return {
-    async createAgent(body: { envId: string; prompt: string }) {
+    async createAgent(body: {
+      envId: string;
+      prompt: string;
+      branch?: string;
+    }) {
       const { status, json } = await request("POST", "/v1/agents", body);
       return launched(status, json);
     },

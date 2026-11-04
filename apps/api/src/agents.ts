@@ -3,6 +3,7 @@ import { agents, type Db, environments, runs } from "@sky/db";
 import {
   AgentId,
   agentBranch,
+  BranchName,
   type Decision,
   EnvironmentId,
   RequestId,
@@ -12,6 +13,7 @@ import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
 import { mintAgentToken } from "./agent-token.js";
+import type { BranchCheck, BranchChecker } from "./branch-check.js";
 import { apiError } from "./errors.js";
 import { type AppEnv, factory } from "./factory.js";
 import { mintId } from "./ids.js";
@@ -54,6 +56,8 @@ const RunEnv = {
 const LaunchInput = z.strictObject({
   envId: EnvironmentId,
   prompt: Prompt,
+  /** An existing GitHub branch the agent starts from and publishes to. */
+  branch: BranchName.optional(),
   ...RunEnv,
 });
 const FollowUpInput = z.strictObject({ prompt: Prompt, ...RunEnv });
@@ -79,20 +83,27 @@ const ApprovalInput = z.discriminatedUnion("decision", [
 
 type AgentRow = typeof agents.$inferSelect;
 
+/** The branch the agent's publishes land on, path-escaped: a branch name may hold `#` or `%`. */
+const compareHead = (agent: Pick<AgentRow, "branch" | "remoteBranch">) =>
+  (agent.remoteBranch ?? agent.branch)
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+
 const presentRunDetail = (
   db: Db,
   run: typeof runs.$inferSelect,
-  branch: string,
+  agent: Pick<AgentRow, "branch" | "remoteBranch">,
   repo: string,
   diff: string | null,
 ) => ({
   ...presentRun(run, runError(db, run.id)),
-  branch,
+  branch: agent.branch,
   diff,
   pendingRequest: openRequestOf(db, run.id)?.request ?? null,
   rollup: run.rollup,
   compareUrl: run.rollup
-    ? `https://github.com/${repo}/compare/${run.rollup.base}...${branch}`
+    ? `https://github.com/${repo}/compare/${run.rollup.base}...${compareHead(agent)}`
     : null,
   // null until the launch records what it injected
   secretNames: run.secretNames,
@@ -103,6 +114,7 @@ const presentAgent = (row: AgentRow) => ({
   envId: row.envId,
   sessionId: row.sessionId,
   branch: row.branch,
+  remoteBranch: row.remoteBranch,
   status: row.status,
   createdAt: row.createdAt,
   archivedAt: row.archivedAt,
@@ -118,6 +130,66 @@ const activeRunsIn = (tx: Tx, envId: EnvironmentId) =>
       and(eq(agents.envId, envId), inArray(runs.status, activeRunStatuses)),
     )
     .get()?.n ?? 0;
+
+/** The env an agent can launch in, or why it can't. */
+function launchableEnv(db: Db | Tx, id: EnvironmentId) {
+  const env = db
+    .select()
+    .from(environments)
+    .where(eq(environments.id, id))
+    .get();
+  if (!env) return { kind: "not_found" } as const;
+  if (env.status !== "ready") return { kind: "not_ready" } as const;
+  return { kind: "ready", env } as const;
+}
+
+const refuseEnv = (c: Context, kind: "not_found" | "not_ready") =>
+  kind === "not_found"
+    ? apiError(c, 404, "not_found", "no such environment")
+    : apiError(
+        c,
+        409,
+        "env_not_ready",
+        "environment is not ready; wait for provisioning to succeed",
+      );
+
+function refuseBranch(
+  c: Context,
+  check: Exclude<BranchCheck, { kind: "exists" }>,
+  branch: BranchName,
+  env: { name: string; repo: string },
+) {
+  switch (check.kind) {
+    case "needs_connector":
+      return apiError(
+        c,
+        422,
+        "branch_needs_connector",
+        `starting on a branch needs a GitHub connector secret on the environment; set one with sky secret set ${env.name} GITHUB_CONNECTOR --connector=<id>`,
+      );
+    case "not_found":
+      return apiError(
+        c,
+        404,
+        "branch_not_found",
+        `branch ${branch} doesn't exist on GitHub (${env.repo}); check the name, or start without --branch`,
+      );
+    case "is_default":
+      return apiError(
+        c,
+        422,
+        "branch_is_default",
+        `${branch} is the default branch of ${env.repo}; agents publish to their own branch, so omit --branch`,
+      );
+    case "failed":
+      return apiError(
+        c,
+        502,
+        "branch_check_failed",
+        `could not check branch ${branch} in the environment's sprite; retry: ${check.detail}`,
+      );
+  }
+}
 
 const atCap = (c: Context, limit: number) =>
   c.json(
@@ -284,27 +356,39 @@ const lastEventId = zValidator(
 
 export function agentRoutes(
   launcher: Launcher,
+  checkBranch: BranchChecker,
   sprites: SpriteOps,
   log: (line: string) => void,
   heartbeatMs: number,
 ) {
   return factory
     .createApp()
-    .post("/", jsonBody, body(LaunchInput), (c) => {
-      const { envId, prompt, envVars, ttlSeconds } = c.req.valid("json");
+    .post("/", jsonBody, body(LaunchInput), async (c) => {
+      const { envId, prompt, envVars, ttlSeconds, branch } =
+        c.req.valid("json");
       const reserved = reservedIn(envVars);
       if (reserved) return reservedName(c, reserved);
+      // the check execs in the env's sprite, so it runs before the transaction, which re-checks the env
+      if (branch !== undefined) {
+        const gate = launchableEnv(c.var.db, envId);
+        if (gate.kind !== "ready") return refuseEnv(c, gate.kind);
+        const check = await checkBranch(gate.env, branch);
+        if (check.kind !== "exists") {
+          if (check.kind === "failed") {
+            log(
+              `branch check of ${branch} on ${envId} failed: ${check.detail}`,
+            );
+          }
+          return refuseBranch(c, check, branch, gate.env);
+        }
+      }
       const agentId = mintId("agt");
       const runId = mintId("run");
       const outcome = c.var.db.transaction(
         (tx) => {
-          const env = tx
-            .select()
-            .from(environments)
-            .where(eq(environments.id, envId))
-            .get();
-          if (!env) return { kind: "not_found" } as const;
-          if (env.status !== "ready") return { kind: "not_ready" } as const;
+          const gate = launchableEnv(tx, envId);
+          if (gate.kind !== "ready") return gate;
+          const { env } = gate;
           if (activeRunsIn(tx, envId) >= env.concurrency) {
             return { kind: "at_cap", limit: env.concurrency } as const;
           }
@@ -314,6 +398,7 @@ export function agentRoutes(
               id: agentId,
               envId,
               branch: agentBranch(agentId),
+              remoteBranch: branch ?? null,
               status: "running",
             })
             .returning()
@@ -336,14 +421,8 @@ export function agentRoutes(
       );
       switch (outcome.kind) {
         case "not_found":
-          return apiError(c, 404, "not_found", "no such environment");
         case "not_ready":
-          return apiError(
-            c,
-            409,
-            "env_not_ready",
-            "environment is not ready; wait for provisioning to succeed",
-          );
+          return refuseEnv(c, outcome.kind);
         case "at_cap":
           return atCap(c, outcome.limit);
       }
@@ -357,6 +436,7 @@ export function agentRoutes(
         sessionId: null,
         approvalPolicy: outcome.env.approvalPolicy,
         autoApprove: outcome.env.autoApprove,
+        remoteBranch: outcome.agent.remoteBranch,
       });
       c.header("Location", `/v1/agents/${agentId}/runs/${runId}`);
       return c.json(
@@ -452,12 +532,7 @@ export function agentRoutes(
             "the agent already has an active run; wait for it or stop it",
           );
         case "not_ready":
-          return apiError(
-            c,
-            409,
-            "env_not_ready",
-            "environment is not ready; wait for provisioning to succeed",
-          );
+          return refuseEnv(c, outcome.kind);
         case "at_cap":
           return atCap(c, outcome.limit);
       }
@@ -471,6 +546,7 @@ export function agentRoutes(
         sessionId: outcome.agent.sessionId,
         approvalPolicy: outcome.env.approvalPolicy,
         autoApprove: outcome.env.autoApprove,
+        remoteBranch: outcome.agent.remoteBranch,
       });
       c.header("Location", `/v1/agents/${id}/runs/${runId}`);
       return c.json(
@@ -577,7 +653,11 @@ export function agentRoutes(
       const { id } = c.req.valid("param");
       const db = c.var.db;
       const found = db
-        .select({ branch: agents.branch, repo: environments.repo })
+        .select({
+          branch: agents.branch,
+          remoteBranch: agents.remoteBranch,
+          repo: environments.repo,
+        })
         .from(agents)
         .innerJoin(environments, eq(agents.envId, environments.id))
         .where(eq(agents.id, id))
@@ -592,7 +672,7 @@ export function agentRoutes(
         .all();
       // reading a diff wakes the sprite, so only the single-run GET returns one
       const data = rows.map((run) =>
-        presentRunDetail(db, run, found.branch, found.repo, null),
+        presentRunDetail(db, run, found, found.repo, null),
       );
       return c.json({ data }, 200);
     })
@@ -616,11 +696,15 @@ export function agentRoutes(
       // the runner commits at run end, so an active run's branch doesn't hold its work yet
       let diff: string | null = null;
       if (!isActive(run.status)) {
+        // the runner keeps origin/<remoteBranch> at the start branch's tip, so the diff is the agent's own work
+        const base = agent.remoteBranch
+          ? `origin/${agent.remoteBranch}`
+          : "origin/HEAD";
         try {
           const out = await execInSprite(
             sprites,
             spriteName,
-            ["git", "diff", `origin/HEAD...${agent.branch}`],
+            ["git", "diff", `${base}...${agent.branch}`],
             { op: "diff", cwd: REPO_DIR },
           );
           // nonzero: the runner never created the branch (a launch that failed)
@@ -641,7 +725,7 @@ export function agentRoutes(
           );
         }
       }
-      return c.json(presentRunDetail(db, run, agent.branch, repo, diff), 200);
+      return c.json(presentRunDetail(db, run, agent, repo, diff), 200);
     })
     .get("/:id/runs/:runId/stream", runParam, afterQuery, lastEventId, (c) => {
       const { id, runId } = c.req.valid("param");

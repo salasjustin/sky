@@ -53,6 +53,8 @@ sky agent start web --prompt=@task.md
 agt_… run_…
 ```
 
+To pick up an existing branch, such as an open pull request's, add `--branch=<name>`: the agent starts from it and publishes back to it. Sandboxes have no git transport, so the agent can't fetch or push itself; Sky fetches through the environment's GitHub connector when each run starts. A branch that doesn't exist fails the start with `branch_not_found`.
+
 ## 2. Wait
 
 ```
@@ -127,7 +129,7 @@ compare: https://github.com/acme/web/compare/3f2a…...claude/agt_…
 sky agent follow-up agt_… --prompt="Also cover the logout path"
 ```
 
-Starts the agent's next run in the same session and branch, once its last run has ended. Then go back to step 2.
+Starts the agent's next run in the same session and branch, once its last run has ended. The run first fetches the agent's branch from GitHub, so commits someone pushed there in between reach a clean worktree; if the histories diverged, the agent is told and nothing is overwritten. Then go back to step 2.
 
 ## 7. Archive
 

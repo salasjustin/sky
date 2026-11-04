@@ -10,6 +10,7 @@ type Values = {
   timeout?: string;
   reason?: string;
   yes?: boolean;
+  branch?: string;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;
@@ -62,7 +63,7 @@ function readPrompt(prompt: string | undefined, command: string): string {
 }
 
 const agentSub: AgentCommand = {
-  options: { prompt: { type: "string" } },
+  options: { prompt: { type: "string" }, branch: { type: "string" } },
   prepare(positionals, values) {
     const [sub, ref, ...extra] = positionals;
     if (sub === "start" || sub === "follow-up") {
@@ -73,12 +74,26 @@ const agentSub: AgentCommand = {
           true,
         );
       }
+      const { branch } = values;
+      if (branch !== undefined && sub === "follow-up") {
+        throw new UsageError(
+          "agent follow-up takes no --branch: a branch can only be chosen when an agent starts",
+          true,
+        );
+      }
+      if (branch?.trim() === "") {
+        throw new UsageError("--branch is empty", true);
+      }
       const prompt = readPrompt(values.prompt, `agent ${sub}`);
       return sub === "start"
         ? async (api, _io, out) => {
             const envId = await resolveEnvId(api, ref, out);
             if (envId === undefined) return 1;
-            const r = await api.createAgent({ envId, prompt });
+            const r = await api.createAgent({
+              envId,
+              prompt,
+              ...(branch === undefined ? {} : { branch }),
+            });
             out.result(r.raw, `${r.agentId} ${r.runId}`);
             return 0;
           }

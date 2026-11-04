@@ -92,6 +92,80 @@ test("agent start launches on an env id and prints the agent and run ids", async
   noKeyLeak(r);
 });
 
+test("start sends the branch when --branch is given", async () => {
+  server.use(post("/v1/agents", 202, { agent, run: run() }));
+  const r = await runCli([
+    "agent",
+    "start",
+    "env_1",
+    "--branch=fix/login",
+    "--prompt=finish the PR",
+  ]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([
+    {
+      path: "/v1/agents",
+      body: { envId: "env_1", prompt: "finish the PR", branch: "fix/login" },
+    },
+  ]);
+  expect(r.stdout).toBe("agt_1 run_1\n");
+});
+
+test("start omits branch when the flag is absent", async () => {
+  server.use(post("/v1/agents", 202, { agent, run: run() }));
+  const r = await runCli(["agent", "start", "env_1", "--prompt=x"]);
+  expect(r.code).toBe(0);
+  expect(writes[0]?.body).not.toHaveProperty("branch");
+});
+
+test("start rejects an empty --branch", async () => {
+  const r = await runCli([
+    "agent",
+    "start",
+    "env_1",
+    "--branch=",
+    "--prompt=x",
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toContain("--branch is empty");
+  expect(writes).toEqual([]);
+});
+
+test("send rejects --branch: agent follow-up can't choose a branch", async () => {
+  const r = await runCli([
+    "agent",
+    "follow-up",
+    agentId,
+    "--branch=fix/login",
+    "--prompt=x",
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toContain(
+    "a branch can only be chosen when an agent starts",
+  );
+  expect(writes).toEqual([]);
+});
+
+test("start surfaces branch_not_found with its message and a nonzero exit", async () => {
+  const message = "branch fix/login does not exist in acme/web";
+  server.use(
+    post("/v1/agents", 404, { error: { code: "branch_not_found", message } }),
+  );
+  const argv = ["agent", "start", "env_1", "--branch=fix/login", "--prompt=x"];
+  const r = await runCli(argv);
+  expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toBe(`sky: ${message} (branch_not_found)\n`);
+  const j = await runCli([...argv, "--json"]);
+  expect(j.code).toBe(1);
+  expect(j.stdout).toBe("");
+  expect(JSON.parse(j.stderr)).toEqual({
+    error: { code: "branch_not_found", message },
+  });
+});
+
 test("agent start resolves an env name and reads an @file prompt", async () => {
   const dir = mkdtempSync(join(tmpdir(), "sky-agent-"));
   const file = join(dir, "prompt.md");
@@ -596,6 +670,18 @@ test("a dash-leading answer without -- points at the -- form", async () => {
 test("--help shows the -- form for answer", async () => {
   const r = await runCli(["answer", "--help"]);
   expect(r.stdout).toContain("sky answer <agent> <requestId> -- <text>");
+});
+
+test("--help documents --branch on agent start and how the branch reaches the sandbox", async () => {
+  const r = await runCli(["agent", "--help"]);
+  expect(r.code).toBe(0);
+  const text = r.stdout.replace(/\s+/g, " ");
+  expect(text).toContain(
+    "sky agent start <env> [--branch=<name>] --prompt=<text|@file>",
+  );
+  expect(text).toContain("GITHUB_CONNECTOR");
+  expect(text).toMatch(/no git transport/);
+  expect(text).toMatch(/publish/);
 });
 
 test("--help documents the run-state exit codes", async () => {

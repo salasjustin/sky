@@ -86,6 +86,53 @@ test("launch posts envId and prompt, returning the agent and its run", async () 
   ]);
 });
 
+test("launch on an existing branch posts it as branch", async () => {
+  const seen = route("post", "/v1/agents", 202, { agent: { id: "agt_1" } });
+  const client = await connect();
+
+  await client.callTool({
+    name: "launch",
+    arguments: {
+      envId: "env_1",
+      prompt: "address review",
+      branch: "fix/login",
+    },
+  });
+
+  expect(seen.map((s) => s.body)).toEqual([
+    { envId: "env_1", prompt: "address review", branch: "fix/login" },
+  ]);
+});
+
+test("launch rejects an invalid branch before any API call", async () => {
+  const seen = route("post", "/v1/agents", 202, {});
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "launch",
+    arguments: { envId: "env_1", prompt: "go", branch: "refs/heads/main" },
+  });
+
+  expect(result.isError).toBe(true);
+  expect(rawText(result)).toMatch(/branch/);
+  expect(seen).toEqual([]);
+});
+
+test("launch's branch says it starts from and publishes to that GitHub branch", async () => {
+  const client = await connect();
+  const { tools } = await client.listTools();
+  const launch = tools.find((t) => t.name === "launch");
+  const branch = (launch?.inputSchema.properties?.branch ?? {}) as {
+    description?: string;
+  };
+
+  expect(launch?.inputSchema.required).not.toContain("branch");
+  expect(branch.description).toMatch(/existing branch on GitHub/);
+  expect(branch.description).toMatch(/pull request/);
+  expect(branch.description).toMatch(/updates that same branch/);
+  expect(branch.description).toMatch(/branch_not_found/);
+});
+
 test("an API error comes back as a tool error carrying its code and message", async () => {
   route("post", "/v1/agents", 409, {
     error: {

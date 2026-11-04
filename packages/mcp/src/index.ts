@@ -3,6 +3,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   AgentId,
+  BranchName,
   Environment,
   EnvironmentId,
   EventCursor,
@@ -244,8 +245,14 @@ function buildServer(call: Call) {
     "launch",
     {
       description:
-        "Start a new agent, with its own session and branch, in a ready environment. To continue an existing agent, call followup.",
-      inputSchema: { envId: EnvironmentId, prompt: nonEmpty },
+        "Start a new agent, with its own session, in a ready environment. It works on its own claude/<agentId> branch unless you pass branch. To continue an existing agent, call followup.",
+      inputSchema: {
+        envId: EnvironmentId,
+        prompt: nonEmpty,
+        branch: BranchName.optional().describe(
+          "The agent starts from this existing branch on GitHub (for example an open pull request's branch), and publishing updates that same branch. The start fails with branch_not_found if it doesn't exist.",
+        ),
+      },
     },
     (input) => api("POST", "/v1/agents", input),
   );
