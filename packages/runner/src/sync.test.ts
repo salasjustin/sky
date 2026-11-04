@@ -19,6 +19,9 @@ import { pullRepo } from "./repo.js";
 import { type QueryFn, runSession } from "./session.js";
 import { branchCheckMain, fetchBranch, prepareWorktree } from "./sync.js";
 
+// these tests run real git against real repositories, which is slow when the whole suite shares a CI runner
+vi.setConfig({ testTimeout: 30_000 });
+
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
 const REPO = `${GATEWAY}/${CONNECTOR}/repos/acme/private`;
@@ -129,7 +132,10 @@ beforeEach(async () => {
   });
   requests = [];
 });
-afterEach(() => {
+afterEach(async () => {
+  // a test that timed out leaves its prepare running; let it finish before its repos are removed
+  // and before the next test starts
+  await Promise.allSettled(inFlight.splice(0));
   vi.unstubAllEnvs();
   rmSync(root, { recursive: true, force: true });
 });
@@ -269,8 +275,15 @@ const config = (extra: Extra = {}) => ({
   ...extra,
 });
 let warnings: string[] = [];
-const prepare = (extra: Extra = {}, env: NodeJS.ProcessEnv = ENV) =>
-  prepareWorktree(config(extra), { env, warn: (line) => warnings.push(line) });
+const inFlight: Promise<unknown>[] = [];
+const prepare = (extra: Extra = {}, env: NodeJS.ProcessEnv = ENV) => {
+  const run = prepareWorktree(config(extra), {
+    env,
+    warn: (line) => warnings.push(line),
+  });
+  inFlight.push(run.catch(() => {}));
+  return run;
+};
 
 test("fresh worktree starts from the refreshed default branch", async () => {
   const old = git(repoDir, "rev-parse", "origin/HEAD");
