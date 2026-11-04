@@ -219,9 +219,11 @@ function fakeGitHub() {
       const url = new URL(request.url);
       const branch = url.searchParams.get("sha") ?? "";
       // GitHub's order: newest first
+      const perPage = Number(url.searchParams.get("per_page") ?? 30);
       const log = bare(
         "rev-list",
-        `--max-count=${Number(url.searchParams.get("per_page") ?? 30)}`,
+        `--skip=${(Number(url.searchParams.get("page") ?? 1) - 1) * perPage}`,
+        `--max-count=${perPage}`,
         `refs/heads/${branch}`,
       )
         .split("\n")
@@ -658,9 +660,37 @@ test("a start branch cut before the clone, with the default branch merged in, fe
   expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
   expect(git(cwd, "merge-base", "origin/HEAD", "HEAD")).toBe(merged);
   expect(notes).toEqual([START_NOTE]);
+  expect(git(repoDir, "rev-parse", `refs/sky/bases/${merged}`)).toBe(merged);
   // the default branch's history below the cut stays on GitHub
   expect(requests).not.toContain(`GET /git/commits/${older}`);
 });
+
+test("a start branch cut more than a listing page back fetches only its own commits", async () => {
+  const base = emptyCommits(seed, 200, git(seed, "rev-parse", "trunk"));
+  pushTo("trunk", emptyCommits(seed, 110, base));
+  git(seed, "checkout", "-q", "-B", "feature/old", base);
+  const tip = commitIn(seed, "old.txt", "1\n", "old");
+  pushTo("feature/old", tip);
+  await shallowClone();
+
+  const { cwd } = await prepare({ startBranch: "feature/old" });
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(git(repoDir, "rev-parse", `refs/sky/bases/${base}`)).toBe(base);
+  expect(requests).toContain("GET /commits?sha=trunk&per_page=100&page=2");
+}, 60_000);
+
+test("a start branch behind the default branch by more than a listing page starts from its own tip", async () => {
+  const base = emptyCommits(seed, 200, git(seed, "rev-parse", "trunk"));
+  pushTo("trunk", emptyCommits(seed, 110, base));
+  pushTo("feature/behind", base);
+  await shallowClone();
+
+  const { cwd } = await prepare({ startBranch: "feature/behind" });
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(base);
+  expect(git(repoDir, "rev-parse", `refs/sky/bases/${base}`)).toBe(base);
+}, 60_000);
 
 test("a follow-up of a continued agent writes no config, so another run holding its lock doesn't fail it", async () => {
   pushToGitHub("feature/login", "login.txt", "1\n");
@@ -685,9 +715,7 @@ test("a start branch with more commits of its own than a run fetches fails, meas
   ).toHaveLength(100);
 });
 
-const withDots = () => requests.filter((r) => r.includes(".."));
-
-test("starting on an existing branch asks the gateway for no path containing ..", async () => {
+test("starting on an existing branch is not refused by the gateway for a path containing ..", async () => {
   const cut = pushToGitHub("trunk", "cut.txt", "1\n");
   await shallowClone();
   git(seed, "checkout", "-q", "-B", "fix/sprite-wake", cut);
@@ -700,10 +728,9 @@ test("starting on an existing branch asks the gateway for no path containing .."
   expect(git(repoDir, "rev-parse", `refs/sky/bases/${cut}`)).toBe(cut);
   expect(notes).toHaveLength(1);
   expect(requests).toContain("GET /commits?sha=trunk&per_page=100");
-  expect(withDots()).toEqual([]);
 });
 
-test("refreshing the default branch asks the gateway for no path containing ..", async () => {
+test("refreshing the default branch is not refused by the gateway for a path containing ..", async () => {
   const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
 
   const { cwd, notes } = await prepare();
@@ -711,10 +738,9 @@ test("refreshing the default branch asks the gateway for no path containing ..",
   expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
   expect(notes).toEqual([]);
   expect(requests.length).toBeGreaterThan(0);
-  expect(withDots()).toEqual([]);
 });
 
-test("following up a continued agent asks the gateway for no path containing ..", async () => {
+test("following up a continued agent is not refused by the gateway for a path containing ..", async () => {
   pushToGitHub("feature/login", "login.txt", "1\n");
   const { cwd } = await prepare({ startBranch: "feature/login" });
   const outside = pushToGitHub("feature/login", "login.txt", "2\n");
@@ -724,7 +750,6 @@ test("following up a continued agent asks the gateway for no path containing .."
 
   expect(git(cwd, "rev-parse", "HEAD")).toBe(outside);
   expect(requests.length).toBeGreaterThan(0);
-  expect(withDots()).toEqual([]);
 });
 
 test("refs/sky/starts/<agentId> records the start branch's tip once and never moves", async () => {

@@ -37,6 +37,8 @@ export class BranchNotFoundError extends Error {
 export class TooFarError extends Error {}
 
 const DEFAULT_MAX_COMMITS = 100;
+/** Pages of the default branch's listing `fetchStartBranch` reads before calling a branch too far. */
+const MAX_LISTING_PAGES = 10;
 
 const segments = (branch: string) =>
   branch.split("/").map(encodeURIComponent).join("/");
@@ -109,7 +111,7 @@ function cachingCommits(call: Call): Call {
  * (a base a publish fetched alone, say) counts as here only where it is an ancestor of a sha in
  * `connected`, the history the caller needs to stay joined to; elsewhere it is walked through, and
  * leaves `shallow` once its parents are written. A sha in `stopAt` is fetched but its parents are
- * not walked; `tipOnly` fetches the tip alone, shallow. More than `maxCommits` to fetch throws
+ * not walked; `tipOnly` fetches the tip alone, shallow. More than `maxCommits` to walk throws
  * `TooFarError` before anything is written. Every write converges, so another agent's run fetching
  * the same branch at once does no harm.
  */
@@ -127,7 +129,7 @@ export async function fetchBranch(options: {
   branch: string;
   sha: string;
   previous: string | null;
-  /** Each commit the walk met that wasn't here, with its parents. */
+  /** Each commit the walk met that wasn't here, with its parents; none for one in `stopAt`. */
   walked: Map<string, string[]>;
 }> {
   const { repoDir, branch } = options;
@@ -635,27 +637,37 @@ async function fetchStartBranch(options: {
     }
     throw error;
   });
-  // newest first
-  const onDefaultBranch = (
-    await call<{ sha: string }[]>(
-      "GET",
-      `/commits?sha=${encodeURIComponent(defaultBranch)}&per_page=${DEFAULT_MAX_COMMITS}`,
-    )
-  ).map(({ sha }) => sha);
   const onDefault = await resolved(g, `refs/remotes/origin/${defaultBranch}`);
-  const { walked } = await fetchBranch({
-    repoDir: options.repoDir,
-    call,
-    branch: startBranch,
-    tip,
-    stopAt: onDefaultBranch,
-    connected: onDefault ? [onDefault] : [],
-  }).catch((error: unknown) => {
-    if (!(error instanceof TooFarError)) throw error;
-    throw new TooFarError(
-      `the start branch ${startBranch} has more than ${DEFAULT_MAX_COMMITS} commits that ${defaultBranch} doesn't, more than the ${DEFAULT_MAX_COMMITS} a run fetches`,
+  const cached = cachingCommits(call);
+  // newest first; a branch cut further back than a page reaches walks the default branch's history
+  // as its own and hits the cap, and then the listing is read a page deeper before giving up
+  const onDefaultBranch: string[] = [];
+  let walked: Map<string, string[]>;
+  for (let page = 1; ; page++) {
+    const listed = await call<{ sha: string }[]>(
+      "GET",
+      `/commits?sha=${encodeURIComponent(defaultBranch)}&per_page=${DEFAULT_MAX_COMMITS}${page > 1 ? `&page=${page}` : ""}`,
     );
-  });
+    onDefaultBranch.push(...listed.map(({ sha }) => sha));
+    try {
+      ({ walked } = await fetchBranch({
+        repoDir: options.repoDir,
+        call: cached,
+        branch: startBranch,
+        tip,
+        stopAt: onDefaultBranch,
+        connected: onDefault ? [onDefault] : [],
+      }));
+      break;
+    } catch (error) {
+      if (!(error instanceof TooFarError)) throw error;
+      if (listed.length < DEFAULT_MAX_COMMITS || page >= MAX_LISTING_PAGES) {
+        throw new TooFarError(
+          `the start branch ${startBranch} has more than ${DEFAULT_MAX_COMMITS} commits that ${defaultBranch} doesn't, more than the ${DEFAULT_MAX_COMMITS} a run fetches`,
+        );
+      }
+    }
+  }
   const touching = new Set(
     [tip, ...[...walked.values()].flat()].filter((sha) =>
       onDefaultBranch.includes(sha),
