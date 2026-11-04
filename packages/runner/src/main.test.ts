@@ -32,6 +32,9 @@ beforeAll(() => {
 // the runner writes Claude Code's credential file; keep it out of the real home
 const CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), "runner-claude-"));
 afterAll(() => rmSync(CLAUDE_CONFIG_DIR, { recursive: true, force: true }));
+// no sprite API here, whatever host the tests run on: the runner would otherwise hold a real sprite
+// when run inside one, and report the missing socket when run outside
+const NO_SPRITE_SOCKET = join(CLAUDE_CONFIG_DIR, "absent.sock");
 
 const servers: Server[] = [];
 afterEach(() => {
@@ -47,7 +50,12 @@ async function runBundle(env: Record<string, string>, args?: string[]) {
     process.execPath,
     [bundle, ...(args ?? [env.RUN_ID ?? ""])],
     {
-      env: { PATH: process.env.PATH ?? "", CLAUDE_CONFIG_DIR, ...env },
+      env: {
+        PATH: process.env.PATH ?? "",
+        CLAUDE_CONFIG_DIR,
+        SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
+        ...env,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -275,6 +283,7 @@ test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies
     env: {
       PATH: process.env.PATH ?? "",
       CLAUDE_CONFIG_DIR,
+      SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
       AGENT_ID: "agt_1",
       RUN_ID: "run_1",
       PROMPT: "do it",

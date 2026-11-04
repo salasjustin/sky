@@ -303,30 +303,39 @@ export function failUnlaunchedRuns(
 
 /**
  * The `running` runs with no event of any kind (a `run.probed` included, so a probed run is next
- * due a window later) since `silentMs` ago, each with the sprite its runner is on.
+ * due a window later) since `silentMs` ago, each with the sprite its runner is on and the id of its
+ * latest event (0 when it has none), which `failLostRun` judges the run by.
  */
 export function silentRuns(
   db: Db,
   silentMs: number,
   now = Date.now(),
-): { runId: RunId; spriteName: string; silentMs: number }[] {
+): {
+  runId: RunId;
+  spriteName: string;
+  silentMs: number;
+  lastEventId: number;
+}[] {
   const cutoff = new Date(now - silentMs).toISOString();
   const last = lastEventAt();
+  const lastId = sql<number>`coalesce((select max(${events.id}) from ${events} where ${events.runId} = ${runs.id}), 0)`;
   return db
     .select({
       runId: runs.id,
       spriteName: environments.spriteName,
       lastAt: last,
+      lastEventId: lastId.mapWith(Number),
     })
     .from(runs)
     .innerJoin(agents, eq(runs.agentId, agents.id))
     .innerJoin(environments, eq(agents.envId, environments.id))
     .where(and(eq(runs.status, "running"), sql`${last} < ${cutoff}`))
     .all()
-    .map(({ runId, spriteName, lastAt }) => ({
+    .map(({ runId, spriteName, lastAt, lastEventId }) => ({
       runId,
       spriteName,
       silentMs: now - Date.parse(lastAt),
+      lastEventId,
     }));
 }
 
@@ -351,21 +360,20 @@ export function recordProbe(
 }
 
 /**
- * Fails, with `runner_lost` naming the sprite, a run that is still `running` and has had no event
- * since `probedAt`: the probe found its runner gone. An event after `probedAt` means the runner spoke
- * meanwhile, and the sweep's next window judges it. False when the run was left alone.
+ * Fails, with `runner_lost` naming the sprite, a run that is still `running` and has no event past
+ * `lastEventId`, the latest it had when the probe began: the probe found its runner gone. A later
+ * event means the runner spoke meanwhile, and the sweep's next window judges it. Event ids, not
+ * clock times: a fast host can stamp the last event and the probe's start in the same millisecond.
+ * False when the run was left alone.
  */
 export function failLostRun(
   db: Db,
   runId: RunId,
   spriteName: string,
-  probedAt: number,
+  lastEventId: number,
 ): boolean {
-  const since = new Date(probedAt).toISOString();
   return db.transaction(
     (tx) => {
-      // in the where clause, not the select list: on a single-table select Drizzle drops the table
-      // name from a column in a selected expression, and `runs.id` inside would read `events.id`
       const silent = tx
         .select({ id: runs.id })
         .from(runs)
@@ -373,7 +381,7 @@ export function failLostRun(
           and(
             eq(runs.id, runId),
             eq(runs.status, "running"),
-            sql`${lastEventAt()} < ${since}`,
+            sql`not exists (select 1 from ${events} where ${events.runId} = ${runs.id} and ${events.id} > ${lastEventId})`,
           ),
         )
         .get();

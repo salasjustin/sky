@@ -48,8 +48,8 @@ export function createRunProber({
     runId: RunId,
     spriteName: string,
     silentMs: number,
+    lastEventId: number,
   ): Promise<void> {
-    const started = Date.now();
     try {
       let alive: boolean;
       try {
@@ -67,7 +67,7 @@ export function createRunProber({
           );
           nudgeDeliveries();
         }
-      } else if (failLostRun(db, runId, spriteName, started)) {
+      } else if (failLostRun(db, runId, spriteName, lastEventId)) {
         log(`run ${runId} failed: runner_lost on sprite ${spriteName}`);
         nudgeDeliveries();
       }
@@ -95,11 +95,11 @@ export function createRunProber({
         return Promise.resolve();
       }
       const probes: Promise<void>[] = [];
-      for (const { runId, spriteName, silentMs } of silent) {
+      for (const { runId, spriteName, silentMs, lastEventId } of silent) {
         if (inFlight.has(runId) || attempts.has(runId)) continue;
         inFlight.add(runId);
         attempts.set(runId, now);
-        probes.push(probe(runId, spriteName, silentMs));
+        probes.push(probe(runId, spriteName, silentMs, lastEventId));
       }
       return Promise.all(probes).then(() => {});
     },

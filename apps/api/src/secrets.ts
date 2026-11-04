@@ -39,6 +39,7 @@ const reservedNames = new Set<string>([
   "WAIT_TIMEOUT_MINUTES",
   "SESSION_ID",
   "START_BRANCH",
+  "SKY_SPRITE_API_SOCKET",
   "PATH",
   "HOME",
   "NODE_OPTIONS",

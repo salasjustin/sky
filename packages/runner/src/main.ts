@@ -105,6 +105,8 @@ async function main(): Promise<void> {
     warn,
     // the local log is unreadable once the sprite sleeps, so a hold that fails also reaches the run's events
     report: warningReporter(post, config.runId),
+    // a sprite has its API at the default socket; tests and other hosts point this elsewhere
+    socketPath: process.env.SKY_SPRITE_API_SOCKET,
     signal: controller.signal,
   });
   await step("sprite hold", () => hold.ready);

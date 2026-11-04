@@ -32,9 +32,10 @@ const taskNameFor = (runId: string) =>
  * open connections even on a warm pause, so the runner holds a Tasks API task, refreshed on an
  * interval (a task lives an hour at most), and deletes it on `release`. Never throws: with no
  * socket (tests, local runs) it says so once on `warn`; a failed call is one line on `warn`.
- * `report` sends the API what the runner's local log can't show once the sprite is asleep: a missing
- * socket, the first hold giving up on its quick retries and, once a hold has landed, the first
- * failure of each streak of failed refreshes. It never throws.
+ * `report` sends the API what the runner's local log can't show once the sprite is asleep: the first
+ * hold giving up on its quick retries and, once a hold has landed, the first failure of each streak
+ * of failed refreshes. A missing socket is not reported: it means the runner is not on a sprite, so
+ * there is nothing to hold. It never throws.
  */
 export function holdSprite(options: {
   runId: string;
@@ -80,9 +81,9 @@ export function holdSprite(options: {
       const code = (error as NodeJS.ErrnoException).code;
       // only a missing socket means no sprite; a refused one may be an API not up yet, so keep trying
       if (socketFound === undefined && code === "ENOENT") {
-        const message = `runner: no sprite API at ${socketPath}; the sprite may pause while the run is idle`;
-        options.warn(message);
-        report(message);
+        options.warn(
+          `runner: no sprite API at ${socketPath}; the sprite may pause while the run is idle`,
+        );
         return false;
       }
       const message = `runner: sprite task ${method} failed: ${error instanceof Error ? error.message : String(error)}`;

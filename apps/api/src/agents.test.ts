@@ -3158,3 +3158,24 @@ test("heartbeats older than 7 days are pruned with their deliveries; newer ones 
       .all(),
   ).toEqual([{ event_id: young }]);
 });
+
+test("a lost runner is failed even when its last event and the probe share a millisecond", async () => {
+  const { agent, run, token } = await runningRun();
+  // a clock that does not move: on a fast host the last event and the probe really do share a tick
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    await postEvent(token, {
+      runId: run.id,
+      type: "run.started",
+      payload: { sessionId: "s" },
+    });
+    pgrepAnswers(1);
+    const { prober } = proberOver();
+    await prober.sweep(Date.now() + config.runProbeMs + 1000);
+  } finally {
+    vi.useRealTimers();
+  }
+  const failed = (await getRun(agent.id, run.id)).body;
+  expect(failed).toMatchObject({ status: "failed" });
+  expect(failed.error).toMatch(/^runner_lost: /);
+});

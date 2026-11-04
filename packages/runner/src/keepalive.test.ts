@@ -207,19 +207,22 @@ test("a refresh that fails after the hold landed is reported, once per streak of
   await hold.release();
 });
 
-test("a missing sprite socket is reported once", async () => {
+test("a missing sprite socket means no sprite: logged once, never reported to the API", async () => {
   const reports: string[] = [];
+  const warnings: string[] = [];
   const hold = holdSprite({
     runId: "run_1",
     socketPath: join(dir, "absent.sock"),
     refreshMs: 10,
-    warn: () => {},
+    warn: (m) => warnings.push(m),
     report: (m) => reports.push(m),
   });
+  await expect(hold.ready).resolves.toBe(false);
   await sleep(50);
   await hold.release();
-  expect(reports).toHaveLength(1);
-  expect(reports[0]).toMatch(/absent\.sock/);
+  expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toMatch(/absent\.sock/);
+  expect(reports).toEqual([]);
 });
 
 test("a report that throws never breaks the hold", async () => {
