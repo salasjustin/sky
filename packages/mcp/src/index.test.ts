@@ -131,6 +131,21 @@ test("launch's branch says it starts from and publishes to that GitHub branch", 
   expect(branch.description).toMatch(/pull request/);
   expect(branch.description).toMatch(/updates that same branch/);
   expect(branch.description).toMatch(/branch_not_found/);
+  expect(branch.description).toMatch(/not the repo's default branch/);
+  expect(branch.description).toMatch(/branch_is_default/);
+  expect(branch.description).toMatch(/GitHub connector/);
+  expect(branch.description).toMatch(/branch_needs_connector/);
+  expect(branch.description).toMatch(/not a full refs\/ ref/);
+});
+
+test("launch says the agent works on a local claude/<agentId> branch either way", async () => {
+  const client = await connect();
+  const { tools } = await client.listTools();
+  const description = tools.find((t) => t.name === "launch")?.description;
+
+  expect(description).toMatch(/local claude\/<agentId> branch/);
+  expect(description).toMatch(/starts from and publishes to/);
+  expect(description).not.toMatch(/unless you pass branch/);
 });
 
 test("an API error comes back as a tool error carrying its code and message", async () => {

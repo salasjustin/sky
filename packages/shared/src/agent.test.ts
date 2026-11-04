@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { expect, test } from "vitest";
 import { Agent, agentBranch, BranchName } from "./agent.js";
 
@@ -50,6 +52,12 @@ test("remoteBranch is null or an existing branch name, beside its own branch", (
   expect(Agent.safeParse(withoutField).success).toBe(false);
 });
 
+// git is the oracle: outside any repo, so `@{-1}`-style names can't expand to a real branch
+const gitAccepts = (name: string) =>
+  spawnSync("git", ["check-ref-format", "--branch", name], {
+    cwd: tmpdir(),
+  }).status === 0;
+
 test.each([
   "main",
   "feature/login",
@@ -57,38 +65,47 @@ test.each([
   "fix-123_v2.1",
   "user@host",
   "a.lockb",
+  "a.lock.b/c",
+  "feat/x.y",
   "x".repeat(255),
-])("BranchName accepts %j", (name) => {
-  expect(BranchName.parse(name)).toBe(name);
+  "",
+  "my branch",
+  "a\tb",
+  "a\u0001b",
+  "a\u007fb",
+  "a~1",
+  "a^2",
+  "a:b",
+  "a?",
+  "a*",
+  "a[b",
+  "a\\b",
+  "a..b",
+  "a@{1}",
+  "-main",
+  "/main",
+  "main/",
+  "main.",
+  "main.lock",
+  "a//b",
+  ".hidden",
+  "feat/.x",
+  "a.lock/b",
+  "feat/a.lock/b",
+  "HEAD",
+])("BranchName agrees with git check-ref-format --branch on %j", (name) => {
+  expect(BranchName.safeParse(name).success).toBe(gitAccepts(name));
 });
 
+// where git is laxer than a branch the API can start an agent on
 test.each([
-  ["empty", ""],
-  ["over 255 chars", "x".repeat(256)],
-  ["a space", "my branch"],
-  ["a tab", "a\tb"],
-  ["a control char", "a\u0001b"],
-  ["DEL", "a\u007fb"],
-  ["~", "a~1"],
-  ["^", "a^2"],
-  [":", "a:b"],
-  ["?", "a?"],
-  ["*", "a*"],
-  ["[", "a[b"],
-  ["backslash", "a\\b"],
-  ["..", "a..b"],
-  ["@{", "a@{1}"],
-  ["leading -", "-main"],
-  ["leading /", "/main"],
-  ["trailing /", "main/"],
-  ["trailing .", "main."],
-  ["trailing .lock", "main.lock"],
-  ["//", "a//b"],
-  ["exactly @", "@"],
-  ["refs/ prefix", "refs/heads/main"],
-])("BranchName rejects %s", (_, name) => {
-  const result = BranchName.safeParse(name);
-  expect(result.success).toBe(false);
+  ["a full ref, not a branch name", "refs/heads/main"],
+  ["over the 255-char cap", "x".repeat(256)],
+  ["Unicode whitespace", "feat x"],
+  ["exactly @, which git reads as HEAD inside a repo", "@"],
+])("BranchName rejects %s, which git accepts", (_, name) => {
+  expect(gitAccepts(name)).toBe(true);
+  expect(BranchName.safeParse(name).success).toBe(false);
 });
 
 test("BranchName names the rule it enforces", () => {

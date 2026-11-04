@@ -245,12 +245,12 @@ function buildServer(call: Call) {
     "launch",
     {
       description:
-        "Start a new agent, with its own session, in a ready environment. It works on its own claude/<agentId> branch unless you pass branch. To continue an existing agent, call followup.",
+        "Start a new agent, with its own session, in a ready environment. It works on a local claude/<agentId> branch; with branch it starts from and publishes to that GitHub branch, without it it publishes claude/<agentId>. To continue an existing agent, call followup.",
       inputSchema: {
         envId: EnvironmentId,
         prompt: nonEmpty,
         branch: BranchName.optional().describe(
-          "The agent starts from this existing branch on GitHub (for example an open pull request's branch), and publishing updates that same branch. The start fails with branch_not_found if it doesn't exist.",
+          "The agent starts from this existing branch on GitHub (for example an open pull request's branch), and publishing updates that same branch. A plain branch name like feature/login, not a full refs/ ref, and not the repo's default branch (the start fails with branch_is_default). The environment needs a GitHub connector (otherwise branch_needs_connector). The start fails with branch_not_found if it doesn't exist.",
         ),
       },
     },

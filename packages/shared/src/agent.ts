@@ -8,16 +8,19 @@ export const agentBranch = <Id extends AgentId>(agentId: Id) =>
   `claude/${agentId}` as const;
 
 const UNSAFE_IN_BRANCH =
-  /[\s\p{Cc}~^:?*[\\]|\.\.|@\{|\/\/|^[-/]|[/.]$|\.lock$|^@$|^refs\//u;
+  /[\s\p{Cc}~^:?*[\\]|\.\.|@\{|\/\/|^[-/]|[/.]$|(?:^|\/)\.|\.lock(?:\/|$)|^@$|^HEAD$|^refs\//u;
 
-/** A branch name git accepts and that names a branch, never a full ref. */
+/**
+ * A branch name `git check-ref-format --branch` accepts, narrowed to one the API can start an agent
+ * on: at most 255 characters, no Unicode whitespace, and never `@`, `HEAD` or a full `refs/` ref.
+ */
 export const BranchName = z
   .string()
   .min(1)
   .max(255)
   .refine((name) => !UNSAFE_IN_BRANCH.test(name), {
     message:
-      "expected a git branch name: no whitespace, control characters, ~ ^ : ? * [ \\, '..', '@{' or '//'; not starting with '-', '/' or 'refs/'; not ending with '/', '.' or '.lock'; not '@'",
+      "expected a git branch name: no whitespace, control characters, ~ ^ : ? * [ \\, '..', '@{' or '//'; not starting with '-', '/' or 'refs/'; not ending with '/' or '.'; no '/'-separated part starting with '.' or ending in '.lock'; not '@' or 'HEAD'",
   });
 export type BranchName = z.infer<typeof BranchName>;
 
