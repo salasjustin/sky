@@ -1,4 +1,4 @@
-import { RunnerEventPost } from "@sky/shared";
+import { type RunId, RunnerEventPost } from "@sky/shared";
 import { isTransient, RetryError, type RetryTiming, retry } from "./retry.js";
 
 const TIMEOUT_MS = 10_000;
@@ -100,6 +100,19 @@ export function createPoster(
     if (landed === "run_ended") throw new RunEndedError();
   };
 }
+
+/**
+ * A callback that posts its message as the run's `runner.warning` event, for problems the runner
+ * survives but the API should know of. Never throws or rejects; a post that doesn't land is already
+ * a line on the poster's `warn`.
+ */
+export const warningReporter =
+  (post: PostEvent, runId: RunId) =>
+  (message: string): void => {
+    post({ runId, type: "runner.warning", payload: { message } }).catch(
+      () => {},
+    );
+  };
 
 /** A `run.waiting` the API refused because it already stopped or failed the run, and recorded how. */
 export class RunEndedError extends Error {

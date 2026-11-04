@@ -39,19 +39,3 @@ server.events.on("response:bypass", ({ request }) => {
 server.events.on("unhandledException", ({ request, error }) => {
   leaks.push(`handler threw on ${request.method} ${request.url}: ${error}`);
 });
-
-/** Connections undici holds open, counted by the dispatcher `test/setup.ts` installs. */
-export const connections = { open: 0 };
-
-/**
- * Waits for every connection to close, and gives up after `timeoutMs` rather than hold a test on one
- * that is meant to stay open. An aborted request's mocked socket closes some ticks after the abort,
- * more of them under load, and a request the next test makes in that window can fail (a branch check
- * answered 502); undici's `disconnect` says the close has landed.
- */
-export async function connectionsClosed(timeoutMs = 2_000) {
-  const giveUp = Date.now() + timeoutMs;
-  while (connections.open > 0 && Date.now() < giveUp) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}

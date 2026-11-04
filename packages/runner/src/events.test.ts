@@ -1,7 +1,7 @@
 import { HttpResponse, http } from "msw";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import { createPoster, RunEndedError } from "./events.js";
+import { createPoster, RunEndedError, warningReporter } from "./events.js";
 
 const url = "https://api.test/internal/events";
 const options = {
@@ -427,3 +427,43 @@ function endingEvent(
       return { runId, type, payload: { error: "boom" } };
   }
 }
+
+test("warningReporter posts the message as the run's runner.warning, and swallows a post that fails", async () => {
+  const sent: unknown[] = [];
+  const report = warningReporter(async (event) => {
+    sent.push(event);
+  }, "run_1");
+  report("runner: sprite task PUT failed: HTTP 503");
+  expect(sent).toEqual([
+    {
+      runId: "run_1",
+      type: "runner.warning",
+      payload: { message: "runner: sprite task PUT failed: HTTP 503" },
+    },
+  ]);
+
+  const failing = warningReporter(async () => {
+    throw new Error("down");
+  }, "run_1");
+  expect(() => failing("again")).not.toThrow();
+  // the rejection was caught, not left unhandled
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+test("a runner.warning reaches the API as an ordinary event post", async () => {
+  const sent: unknown[] = [];
+  server.use(
+    http.post(url, async ({ request }) => {
+      sent.push(await request.json());
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const post = createPoster({ ...options, warn: () => {} });
+  warningReporter(post, "run_1")("runner: sprite not held");
+  await vi.waitFor(() => expect(sent).toHaveLength(1));
+  expect(sent[0]).toEqual({
+    runId: "run_1",
+    type: "runner.warning",
+    payload: { message: "runner: sprite not held" },
+  });
+});

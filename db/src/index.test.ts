@@ -156,6 +156,16 @@ test("events take claude.* hook types and run.resumed, and reject the retired ru
   );
 });
 
+test("events take run.probed and runner.warning, and still reject an unknown type", () => {
+  migrate(db);
+  seedRun();
+  expect(insertEvent("run.probed")).toBeGreaterThan(0);
+  expect(insertEvent("runner.warning")).toBeGreaterThan(0);
+  expect(() => insertEvent("runner.error")).toThrow(
+    /CHECK constraint failed: events_type/,
+  );
+});
+
 test("foreign keys are enforced after migrate", () => {
   migrate(db);
   expect(() =>
@@ -816,6 +826,51 @@ test("migrating a 0006 file drops run.progress events and their deliveries, keep
     db.$client.prepare("select event_id from webhook_deliveries").all(),
   ).toEqual([{ event_id: 1 }]);
   expect(insertEvent()).toBeGreaterThan(progress);
+});
+
+test("migrating a populated 0010 file keeps every event id, payload and delivery, and never reuses a deleted tail id", () => {
+  migrateThrough("0010_fixed_gladiator");
+  seedDelivery();
+  insertDelivery();
+  run(
+    "insert into events (run_id, ts, type, payload) values ('run_1', '2026-10-29T12:00:01.000Z', 'claude.Message', ?)",
+    JSON.stringify({ text: "hi", n: 2 }),
+  );
+  run(
+    "insert into webhook_deliveries (webhook_id, event_id, status, next_attempt_at, attempts, last_status) values ('wh_1', 2, 'delivered', '2026-10-29T12:00:00.000Z', 1, 200)",
+  );
+  const tail = insertEvent();
+  run("delete from events where id = ?", tail);
+  const eventsBefore = db.$client
+    .prepare("select * from events order by id")
+    .all();
+  const deliveriesBefore = db.$client
+    .prepare("select * from webhook_deliveries order by id")
+    .all();
+
+  migrate(db);
+
+  expect(db.$client.prepare("select * from events order by id").all()).toEqual(
+    eventsBefore,
+  );
+  expect(
+    db.$client.prepare("select * from webhook_deliveries order by id").all(),
+  ).toEqual(deliveriesBefore);
+  expect(insertEvent("run.probed")).toBe(tail + 1);
+  expect(
+    db.$client
+      .prepare(
+        "select name from sqlite_schema where type = 'index' and tbl_name in ('events', 'webhook_deliveries') and sql is not null order by name",
+      )
+      .pluck()
+      .all(),
+  ).toEqual([
+    "events_claude_ts",
+    "events_run_id_id",
+    "webhook_deliveries_event_id",
+    "webhook_deliveries_status_next_attempt_at",
+    "webhook_deliveries_webhook_id_event_id",
+  ]);
 });
 
 test("an agent round-trips with and without a remoteBranch", () => {

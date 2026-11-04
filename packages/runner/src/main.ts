@@ -2,7 +2,7 @@ import { appendFileSync } from "node:fs";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { writeClaudeCredentials } from "./credentials.js";
-import { createPoster } from "./events.js";
+import { createPoster, warningReporter } from "./events.js";
 import { holdSprite } from "./keepalive.js";
 import { refreshPlugins } from "./plugins.js";
 import { publishMain } from "./publish.js";
@@ -58,9 +58,12 @@ async function main(): Promise<void> {
   process.once("SIGHUP", onSignal);
   // first, so the sprite can't pause and freeze the run before it is held; held through waits for a
   // decision too: a paused sprite drops the long-poll and the event posts
+  const post = createPoster({ ...config, warn });
   const hold = holdSprite({
     runId: config.runId,
     warn,
+    // the local log is unreadable once the sprite sleeps, so a hold that fails also reaches the run's events
+    report: warningReporter(post, config.runId),
     signal: controller.signal,
   });
   await step("sprite hold", () => hold.ready);
@@ -70,7 +73,7 @@ async function main(): Promise<void> {
   try {
     process.exitCode = await runSession(config, {
       query,
-      post: createPoster({ ...config, warn }),
+      post,
       awaitDecision: createDecisionWaiter(config),
       signal: controller.signal,
       warn,

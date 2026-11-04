@@ -32,10 +32,14 @@ const taskNameFor = (runId: string) =>
  * open connections even on a warm pause, so the runner holds a Tasks API task, refreshed on an
  * interval (a task lives an hour at most), and deletes it on `release`. Never throws: with no
  * socket (tests, local runs) it says so once on `warn`; a failed call is one line on `warn`.
+ * `report` carries the failures that leave the sprite free to pause to the API, where the runner's
+ * local log can't be read once the sprite is asleep: the first failure of each streak of failed
+ * PUTs, and the first hold giving up. It never throws.
  */
 export function holdSprite(options: {
   runId: string;
   warn: (message: string) => void;
+  report?: (message: string) => void;
   socketPath?: string;
   refreshMs?: number;
   firstRetryMs?: number;
@@ -51,6 +55,13 @@ export function holdSprite(options: {
 
   let socketFound: boolean | undefined;
   let held = false;
+  // true while the last PUT failed, so a sprite API that stays down is reported once, not every minute
+  let failing = false;
+  const report = (message: string) => {
+    try {
+      options.report?.(message);
+    } catch {}
+  };
   const call = async (
     method: "PUT" | "DELETE",
     body?: string,
@@ -58,7 +69,10 @@ export function holdSprite(options: {
   ) => {
     try {
       await send(socketPath, method, path, body, abort);
-      if (method === "PUT") held = true;
+      if (method === "PUT") {
+        held = true;
+        failing = false;
+      }
       return true;
     } catch (error) {
       // a stop, said once by the first hold, not a failed call
@@ -66,14 +80,15 @@ export function holdSprite(options: {
       const code = (error as NodeJS.ErrnoException).code;
       // only a missing socket means no sprite; a refused one may be an API not up yet, so keep trying
       if (socketFound === undefined && code === "ENOENT") {
-        options.warn(
-          `runner: no sprite API at ${socketPath}; the sprite may pause while the run is idle`,
-        );
+        const message = `runner: no sprite API at ${socketPath}; the sprite may pause while the run is idle`;
+        options.warn(message);
+        report(message);
         return false;
       }
-      options.warn(
-        `runner: sprite task ${method} failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const message = `runner: sprite task ${method} failed: ${error instanceof Error ? error.message : String(error)}`;
+      options.warn(message);
+      if (method === "PUT" && !failing) report(message);
+      if (method === "PUT") failing = true;
       return true;
     }
   };
@@ -102,10 +117,12 @@ export function holdSprite(options: {
     }
     if (signal?.aborted && !held)
       options.warn("runner: sprite hold abandoned: the run is stopping");
-    else if (socketFound && !held)
-      options.warn(
-        "runner: sprite not held after the first retries; it may pause the run",
-      );
+    else if (socketFound && !held) {
+      const message =
+        "runner: sprite not held after the first retries; it may pause the run";
+      options.warn(message);
+      report(message);
+    }
     if (socketFound && !stopped)
       timer = setTimeout(() => {
         inFlight = refresh();

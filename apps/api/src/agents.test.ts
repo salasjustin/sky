@@ -20,8 +20,10 @@ import { createApp } from "./app.js";
 import { BASE_ENV_NAMES } from "./base-profile.js";
 import type { Config } from "./config.js";
 import { envSecretAad, seal } from "./crypto.js";
+import { createRunProber } from "./probe.js";
+import { KnownSecrets } from "./redact.js";
 import { failStaleRuns, failUnlaunchedRuns } from "./runs.js";
-import { spriteNameFor } from "./sprites.js";
+import { SPRITES_TIMEOUT_MS, spriteNameFor } from "./sprites.js";
 import {
   envFileOf,
   type SpritesWire,
@@ -927,6 +929,29 @@ test("events from the run's own token advance it: started stores the session, fi
   });
 });
 
+test("a runner.warning from the run's token is stored with its text redacted and trimmed, and leaves the run running", async () => {
+  const { agent, run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "runner.warning",
+    payload: {
+      message: `runner: sprite task PUT failed: ${config.spritesToken} ${"x".repeat(EVENT_TEXT_MAX)}`,
+    },
+  });
+  expect(res.status).toBe(201);
+  const [warning] = eventsOf(run.id).filter((e) => e.type === "runner.warning");
+  const { message } = JSON.parse(warning?.payload ?? "") as { message: string };
+  expect(message).not.toContain(config.spritesToken);
+  expect(message).toContain("sprite task PUT failed");
+  expect(message).toMatch(/…\[truncated \d+ chars\]$/);
+  expect((await getRun(agent.id, run.id)).body.status).toBe("running");
+});
+
 const tool = { toolName: "Bash", toolUseId: "tu_1", input: '{"command":"ls"}' };
 const task = { taskId: "t1", taskSubject: "write the test" };
 
@@ -1607,6 +1632,246 @@ test("the launch deadline leaves a run alone once its runner has reported in", a
   expect((await getRun(agent.id, run.id)).body).toMatchObject({
     status: "running",
   });
+});
+
+/** A prober over the stub sprites; `nudges` counts its dispatcher nudges. */
+function proberOver() {
+  const nudges = { count: 0 };
+  const prober = createRunProber({
+    db,
+    sprites: {
+      client: new SpritesClient(spritesToken),
+      log: () => {},
+      secrets: new KnownSecrets(),
+      timeoutMs: SPRITES_TIMEOUT_MS,
+      longTimeoutMs: config.spritesLongTimeoutMs,
+    },
+    probeMs: config.runProbeMs,
+    log: (line) => logs.push(line),
+    nudgeDeliveries: () => {
+      nudges.count++;
+    },
+  });
+  return { prober, nudges };
+}
+
+/** Makes `pgrep` on the stub sprite answer `exitCode` (0 found a runner, 1 none, 2 an error of its own). */
+const pgrepAnswers = (exitCode: number, during?: () => void) => {
+  const exec = wire.exec;
+  wire.exec = (argv) => {
+    if (argv[0] !== "pgrep") return exec(argv);
+    during?.();
+    return { exitCode, stderr: exitCode > 1 ? "pgrep: boom\n" : "" };
+  };
+};
+const pgreps = () => wire.calls.filter((c) => c.includes(" pgrep "));
+const eventsOf = (runId: string) =>
+  db.$client
+    .prepare("select type, payload from events where run_id = ? order by id")
+    .all(runId) as { type: string; payload: string }[];
+const silentFor = (ms: number) => Date.now() + ms;
+
+test("a run silent past the probe window whose runner is alive gets a run.probed and carries on", async () => {
+  const envId = readyEnv();
+  const { agent, run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(0);
+  const { prober, nudges } = proberOver();
+  const sprite = spriteNameFor(envId);
+  const silent = config.runProbeMs + 1000;
+  await prober.sweep(silentFor(silent));
+
+  expect(pgreps()).toEqual([
+    `exec ${sprite} - pgrep -f ${runnerPattern(run.id as RunId)}`,
+  ]);
+  const probed = eventsOf(run.id).filter((e) => e.type === "run.probed");
+  expect(probed).toHaveLength(1);
+  expect(JSON.parse(probed[0]?.payload ?? "")).toEqual({
+    spriteName: sprite,
+    silentMs: expect.any(Number),
+  });
+  expect(nudges.count).toBe(1);
+  expect((await getRun(agent.id, run.id)).body.status).toBe("running");
+  expect(failStaleRuns(db, config.runTimeoutMs, silentFor(silent))).toEqual([]);
+});
+
+test("a run.probed doesn't count as the runner's activity: a runner alive but wedged still times out", async () => {
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const probedAt = new Date(silentFor(20 * 60_000)).toISOString();
+  db.$client
+    .prepare(
+      `insert into events (run_id, ts, type, payload) values (?, ?, 'run.probed', '{"spriteName":"s","silentMs":1}')`,
+    )
+    .run(run.id, probedAt);
+  expect(
+    failStaleRuns(
+      db,
+      config.runTimeoutMs,
+      silentFor(config.runTimeoutMs + 1000),
+    ),
+  ).toEqual([run.id]);
+});
+
+test("a run silent past the probe window whose runner is gone fails at once with runner_lost naming the sprite, freeing the agent for a follow-up", async () => {
+  const envId = readyEnv({ concurrency: 1 });
+  const { agent, run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  const { prober, nudges } = proberOver();
+  const silent = config.runProbeMs + 1000;
+  // far inside the run timeout, which would only fail it as runner_timeout
+  expect(silent).toBeLessThan(config.runTimeoutMs);
+  await prober.sweep(silentFor(silent));
+
+  const failed = (await getRun(agent.id, run.id)).body;
+  expect(failed).toMatchObject({ status: "failed" });
+  expect(failed.error).toMatch(/^runner_lost: /);
+  expect(failed.error).toContain(spriteNameFor(envId));
+  expect(nudges.count).toBe(1);
+  expect(logs).toContain(
+    `run ${run.id} failed: runner_lost on sprite ${spriteNameFor(envId)}`,
+  );
+  const again = await followUp(agent.id, { prompt: "carry on" });
+  expect(again.status).toBe(202);
+  await sessionOpened(2);
+});
+
+test("a run silent for less than the probe window is not probed", async () => {
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs - 1000));
+  expect(pgreps()).toEqual([]);
+});
+
+test("only a running run is probed: a waiting or starting one is left to its own deadlines", async () => {
+  const { run, token } = await runningRun();
+  // still starting: no event yet
+  pgrepAnswers(1);
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+  expect(pgreps()).toEqual([]);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.waiting",
+    payload: {
+      request: {
+        kind: "question",
+        requestId: `req_${"a".repeat(22)}`,
+        prompt: "which?",
+      },
+    },
+  });
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+  expect(pgreps()).toEqual([]);
+});
+
+test("a run is probed at most once per window, however many sweeps, and again in the next", async () => {
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(0);
+  const { prober } = proberOver();
+  const window = config.runProbeMs;
+  const first = Date.now() + window + 1000;
+  await prober.sweep(first);
+  await prober.sweep(first + 60_000);
+  await prober.sweep(first + 120_000);
+  expect(pgreps()).toHaveLength(1);
+  expect(eventsOf(run.id).filter((e) => e.type === "run.probed")).toHaveLength(
+    1,
+  );
+  // the probe's event started a new window, measured from when it was recorded
+  await prober.sweep(Date.now() + 2 * window + 2000);
+  expect(pgreps()).toHaveLength(2);
+});
+
+test("a sprite that can't answer the probe is logged, not held against the run, and tried again a window later", async () => {
+  const { agent, run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(2);
+  const { prober, nudges } = proberOver();
+  const window = config.runProbeMs;
+  await prober.sweep(Date.now() + window + 1000);
+  await prober.sweep(Date.now() + window + 61_000);
+  expect(pgreps()).toHaveLength(1);
+  expect(logs.some((l) => l.includes(`probing the runner of ${run.id}`))).toBe(
+    true,
+  );
+  expect((await getRun(agent.id, run.id)).body.status).toBe("running");
+  expect(nudges.count).toBe(0);
+  await prober.sweep(Date.now() + 2 * window + 2000);
+  expect(pgreps()).toHaveLength(2);
+});
+
+test("a slow sprite is probed once while it wakes, and the sweep that started the probe doesn't wait on it", async () => {
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(0);
+  wire.hangs = (call) => call.includes(" pgrep ");
+  wire.hangMs = 300;
+  const { prober } = proberOver();
+  const now = Date.now() + config.runProbeMs + 1000;
+  const slow = prober.sweep(now);
+  await vi.waitFor(() => expect(pgreps()).toHaveLength(1));
+  // the next sweep finds the probe in flight and starts none
+  await prober.sweep(now + 60_000);
+  expect(pgreps()).toHaveLength(1);
+  await slow;
+});
+
+test("a runner that spoke while the probe was running is not failed as lost", async () => {
+  const { agent, run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  // pgrep finds nothing, but the runner's event lands as it runs
+  pgrepAnswers(1, () => {
+    db.$client
+      .prepare(
+        "insert into events (run_id, ts, type, payload) values (?, ?, 'claude.Message', '{\"text\":\"hi\"}')",
+      )
+      .run(run.id, new Date(Date.now() + 1).toISOString());
+  });
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+  expect((await getRun(agent.id, run.id)).body.status).toBe("running");
 });
 
 const followUp = (agentId: string, body: unknown) =>
@@ -2497,15 +2762,21 @@ test("preflight transport failure answers 502 branch_check_failed", async () => 
   });
   const envId = await connectedEnv();
   wire.hangs = (call) => call.includes(" branch-check ");
-  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
-  expect(res.status).toBe(502);
-  expect(await res.json()).toMatchObject({
-    error: {
-      code: "branch_check_failed",
-      message: expect.stringContaining("branch-check timed out after 200 ms"),
-    },
-  });
-  expect(agentCount()).toEqual({ n: 0 });
+  try {
+    const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({
+      error: {
+        code: "branch_check_failed",
+        message: expect.stringContaining("branch-check timed out after 200 ms"),
+      },
+    });
+    expect(agentCount()).toEqual({ n: 0 });
+  } finally {
+    // the timed-out exec's mocked socket closes a tick after the 502; left to the next test, undici's
+    // pool fails that test's first request on it with UND_ERR_SOCKET "closed"
+    await new Promise(setImmediate);
+  }
 });
 
 test("invalid branch name answers 400", async () => {

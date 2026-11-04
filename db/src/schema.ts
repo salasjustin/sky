@@ -201,6 +201,7 @@ export const events = sqliteTable(
     check(
       "events_type",
       sql`${c(t.type)} in ('run.started', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped', 'run.resumed',
+        'run.probed', 'runner.warning',
         'claude.PreToolUse', 'claude.PostToolUse', 'claude.PostToolUseFailure', 'claude.SubagentStart', 'claude.SubagentStop',
         'claude.TaskCreated', 'claude.TaskCompleted', 'claude.Notification', 'claude.PreCompact', 'claude.FileChanged', 'claude.Message')`,
     ),

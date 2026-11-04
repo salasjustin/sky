@@ -28,6 +28,7 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       runnerBundlePath: expect.stringMatching(/\/runner\.mjs$/),
       cliBundlePath: expect.stringMatching(/\/sky\.mjs$/),
       runTimeoutMs: 30 * 60_000,
+      runProbeMs: 5 * 60_000,
       launchDeadlineMs: 15 * 60_000,
       waitTimeoutMs: 120 * 60_000,
       baseProfiles: {},
@@ -58,6 +59,29 @@ test("RUNNER_BUNDLE_PATH, RUN_TIMEOUT_MINUTES, LAUNCH_DEADLINE_MINUTES, WAIT_TIM
     },
   });
 });
+
+test("RUN_PROBE_MINUTES overrides its default, and a short RUN_TIMEOUT_MINUTES shortens the default", () => {
+  expect(loadConfig({ ...required, RUN_PROBE_MINUTES: "2" })).toMatchObject({
+    ok: true,
+    config: { runProbeMs: 120_000 },
+  });
+  expect(loadConfig({ ...required, RUN_TIMEOUT_MINUTES: "4" })).toMatchObject({
+    ok: true,
+    config: { runTimeoutMs: 240_000, runProbeMs: 120_000 },
+  });
+});
+
+test.each(["30", "45"])(
+  "a RUN_PROBE_MINUTES of %s, not below the 30-minute run timeout, is rejected",
+  (minutes) => {
+    expect(loadConfig({ ...required, RUN_PROBE_MINUTES: minutes })).toEqual({
+      ok: false,
+      message: expect.stringContaining(
+        "RUN_PROBE_MINUTES is invalid: must be below RUN_TIMEOUT_MINUTES",
+      ),
+    });
+  },
+);
 
 test("a SPRITES_LONG_TIMEOUT_MINUTES that isn't a positive number is rejected", () => {
   const result = loadConfig({ ...required, SPRITES_LONG_TIMEOUT_MINUTES: "0" });

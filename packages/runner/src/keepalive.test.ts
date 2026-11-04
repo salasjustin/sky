@@ -24,8 +24,9 @@ afterEach(async () => {
 type Call = { method?: string; url?: string; host?: string; body: string };
 
 /** A stand-in for the sprite's management socket that records every Tasks API call. */
-async function spriteApi(status = 200) {
+async function spriteApi(initial = 200) {
   const calls: Call[] = [];
+  let status = initial;
   api = createServer((req, res) => {
     // a 400 for a task name outside lowercase letters, digits and hyphens, as the Sprites API does for a sprite name
     const named = /^\/v1\/tasks\/[a-z0-9-]+$/.test(req.url ?? "");
@@ -44,7 +45,14 @@ async function spriteApi(status = 200) {
   const socketPath = join(dir, "api.sock");
   api.listen(socketPath);
   await once(api, "listening");
-  return { calls, socketPath };
+  return {
+    calls,
+    socketPath,
+    /** The status the API answers from now on. */
+    answer: (next: number) => {
+      status = next;
+    },
+  };
 }
 
 test("holds a task named for the run, refreshes it, and deletes it on release", async () => {
@@ -79,6 +87,102 @@ test("holds a task named for the run, refreshes it, and deletes it on release", 
   expect(puts.length).toBeGreaterThanOrEqual(2);
   for (const call of puts) expect(call).toEqual(put);
   expect(warnings).toEqual([]);
+});
+
+test("a hold that lands and keeps refreshing reports nothing", async () => {
+  const { socketPath } = await spriteApi();
+  const reports: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 10,
+    warn: () => {},
+    report: (m) => reports.push(m),
+  });
+  await sleep(50);
+  await hold.release();
+  expect(reports).toEqual([]);
+});
+
+test("a first hold that fails reports the error once, and again when it gives up", async () => {
+  const { socketPath } = await spriteApi(500);
+  const reports: string[] = [];
+  const warnings: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 10,
+    firstRetryMs: 5,
+    firstAttempts: 3,
+    warn: (m) => warnings.push(m),
+    report: (m) => reports.push(m),
+  });
+  await expect(hold.ready).resolves.toBe(false);
+  // failing refreshes after the first retries ran out are the same streak
+  await sleep(50);
+  await hold.release();
+  expect(reports).toHaveLength(2);
+  expect(reports[0]).toMatch(/sprite task PUT failed: HTTP 500/);
+  expect(reports[1]).toMatch(/not held/);
+  // each report is also a line in the local log
+  for (const report of reports) expect(warnings).toContain(report);
+});
+
+test("a refresh that fails after the hold landed is reported, once per streak of failures", async () => {
+  const { socketPath, answer } = await spriteApi();
+  const reports: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 10,
+    warn: () => {},
+    report: (m) => reports.push(m),
+  });
+  await expect(hold.ready).resolves.toBe(true);
+  expect(reports).toEqual([]);
+  answer(503);
+  await vi.waitFor(() => expect(reports).toHaveLength(1));
+  await sleep(50);
+  expect(reports).toHaveLength(1);
+  expect(reports[0]).toMatch(/sprite task PUT failed: HTTP 503/);
+  // the hold recovers, then fails again: a new streak, reported again
+  answer(200);
+  await sleep(50);
+  answer(500);
+  await vi.waitFor(() => expect(reports).toHaveLength(2));
+  expect(reports[1]).toMatch(/HTTP 500/);
+  await hold.release();
+});
+
+test("a missing sprite socket is reported once", async () => {
+  const reports: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath: join(dir, "absent.sock"),
+    refreshMs: 10,
+    warn: () => {},
+    report: (m) => reports.push(m),
+  });
+  await sleep(50);
+  await hold.release();
+  expect(reports).toHaveLength(1);
+  expect(reports[0]).toMatch(/absent\.sock/);
+});
+
+test("a report that throws never breaks the hold", async () => {
+  const { socketPath } = await spriteApi(500);
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    firstRetryMs: 5,
+    firstAttempts: 2,
+    warn: () => {},
+    report: () => {
+      throw new Error("post failed");
+    },
+  });
+  await expect(hold.ready).resolves.toBe(false);
+  await hold.release();
 });
 
 test("two runs in one sprite hold tasks under distinct valid names", async () => {

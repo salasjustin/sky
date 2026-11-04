@@ -50,6 +50,8 @@ export const EventType = z.enum([
   "run.finished",
   "run.failed",
   "run.stopped",
+  "run.probed",
+  "runner.warning",
   "claude.PreToolUse",
   "claude.PostToolUse",
   "claude.PostToolUseFailure",
@@ -186,18 +188,35 @@ const resumedPayload = z.object({
   decision: z.enum(["answered", "approved", "denied"]),
 });
 
+/**
+ * Recorded by the API when its sweep woke a silent run's sprite and found the runner alive:
+ * the sprite probed and how long the run had been silent.
+ */
+const probedPayload = z.object({
+  spriteName: z.string().min(1),
+  silentMs: z.number().int().nonnegative(),
+});
+
+/** A problem the runner hit that doesn't end the run, e.g. a sprite hold that failed. */
+const runnerPayloads = (textMax: number) => ({
+  "runner.warning": z.object({ message: z.string().min(1).max(textMax) }),
+});
+
 const postPayloads = {
   ...runPayloads,
   "run.waiting": z.object({
     request: pendingRequest(z.string().min(1).max(RUNNER_TEXT_MAX)),
   }),
+  ...runnerPayloads(RUNNER_TEXT_MAX),
   ...claudePayloads(RUNNER_TEXT_MAX),
-} satisfies Record<Exclude<EventType, "run.resumed">, z.ZodType>;
+} satisfies Record<Exclude<EventType, "run.resumed" | "run.probed">, z.ZodType>;
 
 /** the extra 64 admits `truncationMarker` after a trimmed field */
 const storedPayloads = {
   ...runPayloads,
   "run.resumed": resumedPayload,
+  "run.probed": probedPayload,
+  ...runnerPayloads(EVENT_TEXT_MAX + 64),
   ...claudePayloads(EVENT_TEXT_MAX + 64),
 } satisfies Record<EventType, z.ZodType>;
 
@@ -215,6 +234,7 @@ export const RunnerEventPost = z.discriminatedUnion("type", [
   posted("run.finished"),
   posted("run.failed"),
   posted("run.stopped"),
+  posted("runner.warning"),
   posted("claude.PreToolUse"),
   posted("claude.PostToolUse"),
   posted("claude.PostToolUseFailure"),
@@ -246,6 +266,8 @@ export const Event = z.discriminatedUnion("type", [
   stored("run.finished"),
   stored("run.failed"),
   stored("run.stopped"),
+  stored("run.probed"),
+  stored("runner.warning"),
   stored("claude.PreToolUse"),
   stored("claude.PostToolUse"),
   stored("claude.PostToolUseFailure"),

@@ -161,12 +161,26 @@ export function stopActiveRun(tx: Tx, agentId: AgentId): RunRow | undefined {
 }
 
 /**
+ * When the run last had an event, else when it was created; events of the `excluding` types don't count.
+ */
+const lastEventAt = (excluding: EventType[] = []) =>
+  sql<string>`coalesce((select max(${events.ts}) from ${events} where ${events.runId} = ${runs.id}${
+    excluding.length > 0
+      ? sql` and ${events.type} not in (${sql.join(
+          excluding.map((t) => sql`${t}`),
+          sql`, `,
+        )})`
+      : sql``
+  }), ${runs.createdAt})`;
+
+/**
  * Fails every active run but a waiting one with no event (or, before its first, no launch) since
- * `timeoutMs` ago, so a runner that died can't hold a concurrency slot. Returns the ids it failed.
+ * `timeoutMs` ago, so a runner that died can't hold a concurrency slot. A `run.probed` doesn't count
+ * as an event: a runner that is alive but wedged still times out. Returns the ids it failed.
  */
 export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
   const cutoff = new Date(now - timeoutMs).toISOString();
-  const lastActivity = sql<string>`coalesce((select max(${events.ts}) from ${events} where ${events.runId} = ${runs.id}), ${runs.createdAt})`;
+  const lastActivity = lastEventAt(["run.probed"]);
   // one write transaction, so an event landing mid-sweep can't be overtaken by a stale read
   return db.transaction(
     (tx) => {
@@ -220,6 +234,94 @@ export function failUnlaunchedRuns(
         .all();
       for (const { runId } of late) failRun(tx, runId, "launch_timeout");
       return late;
+    },
+    { behavior: "immediate" },
+  );
+}
+
+/**
+ * The `running` runs with no event of any kind (a `run.probed` included, so a probed run is next
+ * due a window later) since `silentMs` ago, each with the sprite its runner is on.
+ */
+export function silentRuns(
+  db: Db,
+  silentMs: number,
+  now = Date.now(),
+): { runId: RunId; spriteName: string; silentMs: number }[] {
+  const cutoff = new Date(now - silentMs).toISOString();
+  const last = lastEventAt();
+  return db
+    .select({
+      runId: runs.id,
+      spriteName: environments.spriteName,
+      lastAt: last,
+    })
+    .from(runs)
+    .innerJoin(agents, eq(runs.agentId, agents.id))
+    .innerJoin(environments, eq(agents.envId, environments.id))
+    .where(and(eq(runs.status, "running"), sql`${last} < ${cutoff}`))
+    .all()
+    .map(({ runId, spriteName, lastAt }) => ({
+      runId,
+      spriteName,
+      silentMs: now - Date.parse(lastAt),
+    }));
+}
+
+/**
+ * Records a `run.probed` on a run that is still `running`; false when it ended meanwhile.
+ * The caller nudges the dispatcher when this returns true.
+ */
+export function recordProbe(
+  db: Db,
+  runId: RunId,
+  payload: { spriteName: string; silentMs: number },
+): boolean {
+  return db.transaction(
+    (tx) => {
+      const run = tx.select().from(runs).where(eq(runs.id, runId)).get();
+      if (run?.status !== "running") return false;
+      recordEvent(tx, runId, "run.probed", payload);
+      return true;
+    },
+    { behavior: "immediate" },
+  );
+}
+
+/**
+ * Fails, with `runner_lost` naming the sprite, a run that is still `running` and has had no event
+ * since `probedAt`: the probe found its runner gone. An event after `probedAt` means the runner spoke
+ * meanwhile, and the sweep's next window judges it. False when the run was left alone.
+ */
+export function failLostRun(
+  db: Db,
+  runId: RunId,
+  spriteName: string,
+  probedAt: number,
+): boolean {
+  const since = new Date(probedAt).toISOString();
+  return db.transaction(
+    (tx) => {
+      // in the where clause, not the select list: on a single-table select Drizzle drops the table
+      // name from a column in a selected expression, and `runs.id` inside would read `events.id`
+      const silent = tx
+        .select({ id: runs.id })
+        .from(runs)
+        .where(
+          and(
+            eq(runs.id, runId),
+            eq(runs.status, "running"),
+            sql`${lastEventAt()} < ${since}`,
+          ),
+        )
+        .get();
+      if (!silent) return false;
+      failRun(
+        tx,
+        runId,
+        `runner_lost: its runner is gone from sprite ${spriteName}`,
+      );
+      return true;
     },
     { behavior: "immediate" },
   );

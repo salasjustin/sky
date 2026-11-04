@@ -78,6 +78,13 @@
       "when": 1793792397941,
       "tag": "0010_fixed_gladiator",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1793810297635,
+      "tag": "0011_odd_spot",
+      "breakpoints": true
     }
   ]
 }

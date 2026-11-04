@@ -17,42 +17,56 @@ const json = z.string().transform((s, ctx) => {
   }
 });
 
-const configSchema = z.object({
-  /** Token68 only: bearerAuth rejects any token outside RFC 6750's token68 charset, so a key outside it could never match. */
-  SKY_API_KEY: z
-    .string()
-    .min(32)
-    .regex(/^[A-Za-z0-9._~+/-]+=*$/),
-  SPRITES_TOKEN: z.string().min(1),
-  DATA_DIR: z.string().min(1),
-  PORT: z.coerce.number().int().min(1).max(65535).default(8080),
-  CLAUDE_CODE_OAUTH_TOKEN: z.string().min(1),
-  /** How a sprite reaches this API; the runner posts its events here. */
-  PUBLIC_BASE_URL: z.url({ protocol: /^https?$/ }),
-  RUNNER_BUNDLE_PATH: z.string().min(1).default(bundledRunner),
-  CLI_BUNDLE_PATH: z.string().min(1).default(bundledCli),
-  /** A run with no event for this long is failed with `runner_timeout`. */
-  RUN_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
-  /**
-   * A run still starting with no event this long after it was created is failed with `launch_timeout`.
-   * Past the runner's longest startup: a store lock wait (10 minutes) and the plugin refresh.
-   */
-  LAUNCH_DEADLINE_MINUTES: z.coerce.number().positive().default(15),
-  /** How long a runner waits on a question or approval before giving up; the runner gets it at launch. */
-  WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
-  /** The bound on a sprite's clone, installs, setup script, store steps and checkpoint. */
-  SPRITES_LONG_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
-  /** Base profiles by name, as JSON; an environment's `base` names one. Holds no secret values. */
-  SKY_BASE_PROFILES: json.pipe(BaseProfiles).default({}),
-  /** HMAC key every outbound webhook delivery is signed with. */
-  WEBHOOK_SIGNING_KEY: z.string().min(32),
-  /** AES-256 key, base64, that env secrets and run envVars are encrypted under. */
-  SECRET_ENCRYPTION_KEY: z
-    .base64()
-    .refine((s) => Buffer.from(s, "base64").length === 32, {
-      error: "must decode to 32 bytes",
-    }),
-});
+const configSchema = z
+  .object({
+    /** Token68 only: bearerAuth rejects any token outside RFC 6750's token68 charset, so a key outside it could never match. */
+    SKY_API_KEY: z
+      .string()
+      .min(32)
+      .regex(/^[A-Za-z0-9._~+/-]+=*$/),
+    SPRITES_TOKEN: z.string().min(1),
+    DATA_DIR: z.string().min(1),
+    PORT: z.coerce.number().int().min(1).max(65535).default(8080),
+    CLAUDE_CODE_OAUTH_TOKEN: z.string().min(1),
+    /** How a sprite reaches this API; the runner posts its events here. */
+    PUBLIC_BASE_URL: z.url({ protocol: /^https?$/ }),
+    RUNNER_BUNDLE_PATH: z.string().min(1).default(bundledRunner),
+    CLI_BUNDLE_PATH: z.string().min(1).default(bundledCli),
+    /** A run with no event for this long is failed with `runner_timeout`. */
+    RUN_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
+    /**
+     * A `running` run with no event for this long has its runner checked on its sprite, and is failed
+     * with `runner_lost` if the runner is gone; the check repeats at most once per window. Must be
+     * below RUN_TIMEOUT_MINUTES, or the timeout would fail the run first. Defaults to 5, or half of a
+     * shorter timeout.
+     */
+    RUN_PROBE_MINUTES: z.coerce.number().positive().optional(),
+    /**
+     * A run still starting with no event this long after it was created is failed with `launch_timeout`.
+     * Past the runner's longest startup: a store lock wait (10 minutes) and the plugin refresh.
+     */
+    LAUNCH_DEADLINE_MINUTES: z.coerce.number().positive().default(15),
+    /** How long a runner waits on a question or approval before giving up; the runner gets it at launch. */
+    WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
+    /** The bound on a sprite's clone, installs, setup script, store steps and checkpoint. */
+    SPRITES_LONG_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
+    /** Base profiles by name, as JSON; an environment's `base` names one. Holds no secret values. */
+    SKY_BASE_PROFILES: json.pipe(BaseProfiles).default({}),
+    /** HMAC key every outbound webhook delivery is signed with. */
+    WEBHOOK_SIGNING_KEY: z.string().min(32),
+    /** AES-256 key, base64, that env secrets and run envVars are encrypted under. */
+    SECRET_ENCRYPTION_KEY: z
+      .base64()
+      .refine((s) => Buffer.from(s, "base64").length === 32, {
+        error: "must decode to 32 bytes",
+      }),
+  })
+  .refine(
+    (e) =>
+      e.RUN_PROBE_MINUTES === undefined ||
+      e.RUN_PROBE_MINUTES < e.RUN_TIMEOUT_MINUTES,
+    { path: ["RUN_PROBE_MINUTES"], error: "must be below RUN_TIMEOUT_MINUTES" },
+  );
 
 export type Config = {
   apiKey: string;
@@ -64,6 +78,7 @@ export type Config = {
   runnerBundlePath: string;
   cliBundlePath: string;
   runTimeoutMs: number;
+  runProbeMs: number;
   launchDeadlineMs: number;
   waitTimeoutMs: number;
   spritesLongTimeoutMs: number;
@@ -108,6 +123,9 @@ export function loadConfig(
         runnerBundlePath: e.RUNNER_BUNDLE_PATH,
         cliBundlePath: e.CLI_BUNDLE_PATH,
         runTimeoutMs: e.RUN_TIMEOUT_MINUTES * 60_000,
+        runProbeMs:
+          (e.RUN_PROBE_MINUTES ?? Math.min(5, e.RUN_TIMEOUT_MINUTES / 2)) *
+          60_000,
         launchDeadlineMs: e.LAUNCH_DEADLINE_MINUTES * 60_000,
         waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
         spritesLongTimeoutMs: e.SPRITES_LONG_TIMEOUT_MINUTES * 60_000,

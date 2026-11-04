@@ -73,6 +73,28 @@ export async function signalRunner(
   }
 }
 
+/**
+ * Whether the run's runner is alive on its sprite. The exec wakes a sleeping sprite, which is the
+ * point: a run silent for minutes may have been frozen by a pause. Throws when the sprite can't answer,
+ * which says nothing of the runner.
+ */
+export async function isRunnerAlive(
+  sprites: SpriteOps,
+  spriteName: string,
+  runId: RunId,
+): Promise<boolean> {
+  const out = await execInSprite(
+    sprites,
+    spriteName,
+    ["pgrep", "-f", runnerPattern(runId)],
+    { op: "pgrep" },
+  );
+  // pgrep exits 1 when nothing matched, 2 or more on its own errors
+  if (out.exitCode === 0) return true;
+  if (out.exitCode === 1) return false;
+  throw new Error(`pgrep exit ${out.exitCode}: ${out.stderr.trim()}`);
+}
+
 // exit 0 once nothing matches, 1 while a runner still does after 30 s; pgrep's own errors exit 2.
 // The wait stays well under `sprites.timeoutMs`, which bounds the exec
 const AWAIT_EXIT_OR_REPORT = `for _ in $(seq 30); do pgrep -f "$1" >/dev/null; case $? in 1) exit 0;; 0) sleep 1;; *) exit 2;; esac; done; exit 1`;

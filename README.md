@@ -246,6 +246,26 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 | `agents_exist`    | repo or setup can't change while unarchived agents exist                     |
 | `already_decided` | the request was already decided differently; that decision stands            |
 
+### Run errors
+
+A run the API fails ends with `run.failed`, and its `error` is one of:
+
+| error             | means                                                                                                                            |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `launch_failed`   | the runner couldn't be started on the sprite; the detail follows the colon                                                       |
+| `launch_timeout`  | the runner never reported in within `LAUNCH_DEADLINE_MINUTES` (default 15)                                                       |
+| `runner_lost`     | the run went quiet, the API woke its sprite, and the runner was no longer running there; the error names the sprite              |
+| `runner_timeout`  | no event for `RUN_TIMEOUT_MINUTES` (default 30), though the runner was still running (or its sprite couldn't be reached to tell) |
+| `waiting_timeout` | the run waited on an answer or approval past its limit and its runner is gone                                                    |
+
+**The probe.** A sprite can go to sleep under a run and lose its runner. Once a `running` run has had no event for `RUN_PROBE_MINUTES` (default 5, and always below `RUN_TIMEOUT_MINUTES`; when the timeout is under 10 minutes the default is half of it), the API wakes its sprite and looks for the run's runner:
+
+- **Runner alive:** the API records a `run.probed` event and the run carries on. A probe is not runner activity, so a runner that is alive but wedged still fails with `runner_timeout`.
+- **Runner gone:** the run fails at once with `runner_lost`, instead of waiting out `runner_timeout`. The agent is free for a follow-up, which resumes the session and worktree as any follow-up does.
+- **Sprite can't answer:** the API logs it and leaves the run alone; `runner_timeout` is the backstop.
+
+A run is probed at most once per window, and a slow sprite never holds up the API's sweep. Only `running` runs are probed; a run waiting on a request has its own deadline.
+
 ## MCP
 
 `POST /mcp` (streamable HTTP, same bearer key) exposes `create_env`, `launch`, `followup`, `status`, `answer`, `approve`, `stop`, `archive` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents.
@@ -261,6 +281,8 @@ What an agent does arrives as events, each with `agentId` and `runId`:
 | `run.started`, `run.finished`, `run.failed`, `run.stopped`             | the run's lifecycle                                                   |
 | `run.waiting`                                                          | the agent needs an `answer` or an approval                            |
 | `run.resumed`                                                          | a question was answered or a tool call approved or denied             |
+| `run.probed`                                                           | a silent run's runner was checked on its sprite and found alive       |
+| `runner.warning`                                                       | the runner hit a problem that didn't end the run, with its error      |
 | `claude.Message`                                                       | Claude, or a subagent (with `parentToolUseId`), wrote a message       |
 | `claude.PreToolUse`, `claude.PostToolUse`, `claude.PostToolUseFailure` | a tool call starts, finishes or fails, with its input and output      |
 | `claude.SubagentStart`, `claude.SubagentStop`                          | a subagent starts or finishes                                         |
