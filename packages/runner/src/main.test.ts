@@ -142,7 +142,7 @@ describe("a stray runner.mjs started in a run's shell, which inherits PROMPT_FIL
     expect({ code, stdout }).toEqual({ code: 2, stdout: "" });
     expect(stderr.trim().split("\n")).toHaveLength(1);
     expect(stderr).toMatch(/missing or invalid env: .*AGENT_TOKEN/);
-    expect(stderr).toMatch(/started by the Sky API/);
+    expect(stderr).toMatch(/only the Sky API starts a run/);
     untouched();
   });
 

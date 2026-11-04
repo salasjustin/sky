@@ -260,14 +260,14 @@ A run the API fails ends with `run.failed`, and its `error` is one of:
 
 **The probe.** A sprite can go to sleep under a run and lose its runner. Once a `running` run has had no event for `RUN_PROBE_MINUTES` (default 5, and always below `RUN_TIMEOUT_MINUTES`; when the timeout is under 10 minutes the default is half of it), the API wakes its sprite and looks for the run's runner:
 
-- **Heartbeats arriving:** while a tool call is running, the runner posts a `runner.heartbeat` about every 60 seconds, naming the tool and how long it has run. A run that is heartbeating is alive, so it is not probed, however long the call takes. A heartbeat is not progress, though: a tool call still running past `RUN_TIMEOUT_MINUTES` fails with `runner_timeout: <tool> was still running after <time> with no result, past the <limit> limit`. If the heartbeats themselves stopped, it reads `runner_timeout: the runner went quiet during <tool> after it had run <time>`. A `runner.warning` is not activity either.
+- **Heartbeats arriving:** while a tool call runs, the runner posts `runner.heartbeat` about every 60 seconds with the tool's name and how long it has run. A heartbeating run is alive, so it isn't probed, however long the call takes. A heartbeat isn't progress: a tool call still running past `RUN_TIMEOUT_MINUTES` fails with `runner_timeout: <tool> was still running after <time> with no result, past the <limit> limit`, or with `runner_timeout: the runner went quiet during <tool> after it had run <time>` when the heartbeats stopped. A `runner.warning` isn't progress either.
 - **Runner alive:** the API records a `run.probed` event and the run carries on. A probe is not runner activity, so a runner that is alive but wedged still fails with `runner_timeout`.
 - **Runner gone:** the run fails at once with `runner_lost`, instead of waiting out `runner_timeout`. The agent is free for a follow-up, which resumes the session and worktree as any follow-up does.
 - **Sprite can't answer:** the API logs it and leaves the run alone; `runner_timeout` is the backstop. If the sprite no longer exists, the run fails at once with `runner_lost`.
 
 A run is probed at most once per window, and a slow sprite never holds up the API's sweep. Only `running` runs are probed; a run waiting on a request has its own deadline.
 
-**The run log.** On the sprite, `/workspace/runs/<runId>.log` is written only by the run's own runner, which holds `<runId>.lock` while it runs. The runner starts only when launched by the API with the run's id as its argument; run any other way (by hand, or by an agent's shell, which inherits the log's location) it refuses with one line on stderr and never touches the log. An agent's own command is `node /opt/sky/runner.mjs publish`.
+**The run log.** On the sprite, `/workspace/runs/<runId>.log` is written only by the run's own runner, which holds `<runId>.lock` while it runs. The runner starts only when the API launches it with the run's id as its argument. Started any other way, by hand or from an agent's shell (which inherits the log's location), it refuses with one line on stderr and never touches the log. An agent's own command is `node /opt/sky/runner.mjs publish`.
 
 ## MCP
 

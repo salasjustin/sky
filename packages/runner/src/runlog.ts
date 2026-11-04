@@ -27,10 +27,10 @@ const codeOf = (error: unknown) => (error as NodeJS.ErrnoException).code;
 
 /**
  * Claims the run's log for this process: only the runner that holds the lock writes to it. A second
- * process for the same run, which the agent's own shell can start by running `runner.mjs` with the
- * run's environment about it, is refused and leaves the log alone. A lock that doesn't name a live
- * process (a runner killed outright, or a file that isn't a pid) is taken over. Returns the log's
- * path and a `release`, or the refusal.
+ * process for the same run (the agent's own shell can start one by running `runner.mjs` with the
+ * run's environment) is refused and leaves the log alone. A lock that doesn't name a live process
+ * (a runner killed outright, or a file that isn't a pid) is taken over. Returns the log's path and
+ * a `release`, or the refusal.
  */
 export function claimRunLog(
   promptFile: string,

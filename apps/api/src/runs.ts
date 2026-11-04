@@ -174,7 +174,7 @@ const lastEventAt = (excluding: EventType[] = []) =>
       : sql``
   }), ${runs.createdAt})`;
 
-// a heartbeat later than this ago says the runner stopped reporting too, not that the tool is running on
+// a heartbeat older than this says the runner stopped reporting, not that the tool is still running
 const HEARTBEAT_FRESH_MS = 3 * HEARTBEAT_INTERVAL_MS;
 
 type ToolInFlight = { toolName: string; ranMs: number; beatFresh: boolean };

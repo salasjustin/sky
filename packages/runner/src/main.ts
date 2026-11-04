@@ -34,7 +34,7 @@ function refuse(message: string): void {
 }
 
 const NOT_A_RUN =
-  "this is started by the Sky API for a run; an agent's own command is `runner.mjs publish`";
+  "only the Sky API starts a run (an agent's own command is `runner.mjs publish`)";
 
 async function step<T>(name: string, task: () => Promise<T>): Promise<T> {
   const started = Date.now();

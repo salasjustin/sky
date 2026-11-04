@@ -24,9 +24,10 @@ const SWEEP_EVERY_MS = 60_000;
  * Opens and migrates the one DB handle the app reuses for its lifetime, fails provisioning a previous
  * process left unfinished, and fails silent runs and abandoned waits now and every minute after. Runs
  * outlive a restart: their runners keep posting, so only silence fails one. A run failed for missing its
- * launch deadline has its runner signalled too, without waiting on the sprite. A `running` run silent past
- * the probe window has its runner looked for on its sprite, also unawaited (see `createRunProber`). The same sweep deletes
- * run envVars past their TTL and `claude.*` and `runner.heartbeat` events past 7 days. Webhook deliveries left pending resume at once.
+ * launch deadline has its runner signalled too, without waiting on the sprite. A `running` run silent
+ * past the probe window has its runner looked for on its sprite, also unawaited (see
+ * `createRunProber`). The same sweep deletes run envVars past their TTL and `claude.*` and
+ * `runner.heartbeat` events past 7 days. Webhook deliveries left pending resume at once.
  */
 export function boot(config: Config, log: (line: string) => void) {
   const db = openDb(join(config.dataDir, "sky.db"));
