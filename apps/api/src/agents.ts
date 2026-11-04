@@ -121,7 +121,7 @@ const presentAgent = (row: AgentRow) => ({
 });
 
 /** Runs still holding one of the env's concurrency slots. */
-const activeRunsIn = (tx: Tx, envId: EnvironmentId) =>
+const activeRunsIn = (tx: Db | Tx, envId: EnvironmentId) =>
   tx
     .select({ n: count() })
     .from(runs)
@@ -131,7 +131,7 @@ const activeRunsIn = (tx: Tx, envId: EnvironmentId) =>
     )
     .get()?.n ?? 0;
 
-/** The env an agent can launch in, or why it can't. */
+/** The env an agent can launch in with a free slot, or why it can't. */
 function launchableEnv(db: Db | Tx, id: EnvironmentId) {
   const env = db
     .select()
@@ -140,6 +140,9 @@ function launchableEnv(db: Db | Tx, id: EnvironmentId) {
     .get();
   if (!env) return { kind: "not_found" } as const;
   if (env.status !== "ready") return { kind: "not_ready" } as const;
+  if (activeRunsIn(db, id) >= env.concurrency) {
+    return { kind: "at_cap", limit: env.concurrency } as const;
+  }
   return { kind: "ready", env } as const;
 }
 
@@ -369,8 +372,10 @@ export function agentRoutes(
       const reserved = reservedIn(envVars);
       if (reserved) return reservedName(c, reserved);
       // the check execs in the env's sprite, so it runs before the transaction, which re-checks the env
+      // and its cap
       if (branch !== undefined) {
         const gate = launchableEnv(c.var.db, envId);
+        if (gate.kind === "at_cap") return atCap(c, gate.limit);
         if (gate.kind !== "ready") return refuseEnv(c, gate.kind);
         const check = await checkBranch(gate.env, branch);
         if (check.kind !== "exists") {
@@ -389,9 +394,6 @@ export function agentRoutes(
           const gate = launchableEnv(tx, envId);
           if (gate.kind !== "ready") return gate;
           const { env } = gate;
-          if (activeRunsIn(tx, envId) >= env.concurrency) {
-            return { kind: "at_cap", limit: env.concurrency } as const;
-          }
           const agent = tx
             .insert(agents)
             .values({
@@ -696,9 +698,10 @@ export function agentRoutes(
       // the runner commits at run end, so an active run's branch doesn't hold its work yet
       let diff: string | null = null;
       if (!isActive(run.status)) {
-        // the runner keeps origin/<remoteBranch> at the start branch's tip, so the diff is the agent's own work
+        // the runner pins refs/sky/starts/<agentId> where the worktree left the start branch and never
+        // moves it, unlike origin/<remoteBranch>, which an outside push advances past the agent's work
         const base = agent.remoteBranch
-          ? `origin/${agent.remoteBranch}`
+          ? `refs/sky/starts/${agent.id}`
           : "origin/HEAD";
         try {
           const out = await execInSprite(

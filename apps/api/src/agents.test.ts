@@ -2200,6 +2200,7 @@ test("an envVar a runner echoes is redacted from the stored event while it is he
 test.each([
   ["a reserved name", { envVars: { PATH: "/evil" } }, "reserved_name"],
   ["a sky name", { envVars: { AGENT_TOKEN: "x" } }, "reserved_name"],
+  ["the start branch", { envVars: { START_BRANCH: "main" } }, "reserved_name"],
   [
     "the env's auto-approve setting",
     { envVars: { AUTO_APPROVE: '{"defaults":true,"commands":["rm"]}' } },
@@ -2323,6 +2324,19 @@ test("follow-up runs pass START_BRANCH again", async () => {
   expect(wire.sessions[1]?.env.START_BRANCH).toBe("feature/login");
 });
 
+test("a follow-up can't redirect the start branch through envVars", async () => {
+  const { agent } = await finishedOnBranch("feature/login");
+  const res = await followUp(agent.id, {
+    prompt: "more",
+    envVars: { START_BRANCH: "main" },
+  });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toMatchObject({ error: { code: "reserved_name" } });
+  expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+    n: 1,
+  });
+});
+
 test("start without a branch is unchanged (remoteBranch null, no preflight exec)", async () => {
   const envId = await connectedEnv();
   const checks = branchCheckAnswers({ exitCode: 0 });
@@ -2363,26 +2377,37 @@ test("start with the default branch answers 422 branch_is_default", async () => 
   expect(agentCount()).toEqual({ n: 0 });
 });
 
-test.each([
-  ["no connector secret on the env", false],
-  ["the runner finding no connector", true],
-])(
-  "start with a branch and %s answers 422 branch_needs_connector",
-  async (_, connected) => {
-    const envId = connected ? await connectedEnv() : readyEnv();
-    const checks = branchCheckAnswers({ exitCode: 2 });
-    const res = await launch({ envId, prompt: "go", branch: "feature/login" });
-    expect(res.status).toBe(422);
-    expect(await res.json()).toEqual({
-      error: {
-        code: "branch_needs_connector",
-        message: `starting on a branch needs a GitHub connector secret on the environment; set one with sky secret set ${envId} GITHUB_CONNECTOR --connector=<id>`,
-      },
-    });
-    expect(checks).toHaveLength(connected ? 1 : 0);
-    expect(agentCount()).toEqual({ n: 0 });
-  },
-);
+test("start with a branch on an env with no connector secret answers 422 branch_needs_connector before any check", async () => {
+  const envId = readyEnv();
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(422);
+  expect(await res.json()).toEqual({
+    error: {
+      code: "branch_needs_connector",
+      message: `starting on a branch needs a GitHub connector secret on the environment; set one with sky secret set ${envId} GITHUB_CONNECTOR --connector=<id>`,
+    },
+  });
+  expect(checks).toEqual([]);
+  expect(agentCount()).toEqual({ n: 0 });
+});
+
+test("a check exiting 2 (a usage or shell error) answers 502 branch_check_failed with its stderr", async () => {
+  const envId = await connectedEnv();
+  branchCheckAnswers({
+    exitCode: 2,
+    stderr: "sh: 1: .: cannot open /tmp/x.env\n",
+  });
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: {
+      code: "branch_check_failed",
+      message: expect.stringContaining("cannot open /tmp/x.env"),
+    },
+  });
+  expect(agentCount()).toEqual({ n: 0 });
+});
 
 test("start with a branch on an unknown or unready env answers as without one, before any check", async () => {
   const checks = branchCheckAnswers({ exitCode: 0 });
@@ -2405,6 +2430,24 @@ test("start with a branch on an unknown or unready env answers as without one, b
   expect(checks).toEqual([]);
 });
 
+test("start with a branch on an env at its cap answers 409 concurrency_cap before any check", async () => {
+  const envId = await connectedEnv();
+  db.update(environments)
+    .set({ concurrency: 1 })
+    .where(eq(environments.id, envId))
+    .run();
+  await launched(envId);
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({
+    error: { code: "concurrency_cap", limit: 1 },
+  });
+  expect(checks).toEqual([]);
+  expect(agentCount()).toEqual({ n: 1 });
+  await sessionOpened();
+});
+
 test("a check exiting otherwise answers 502 branch_check_failed with its stderr tail redacted", async () => {
   const envId = await connectedEnv();
   const gateway = "https://gateway.example/secret-path-0042";
@@ -2423,6 +2466,26 @@ test("a check exiting otherwise answers 502 branch_check_failed with its stderr 
   expect(agentCount()).toEqual({ n: 0 });
 });
 
+test("a gateway secret that won't decrypt answers 502 branch_check_failed, not 500", async () => {
+  const envId = await connectedEnv();
+  seedLegacySecret(envId, "GITHUB_GATEWAY_URL", "https://gateway.example/x");
+  db.update(secrets)
+    .set({ keyVersion: 99 })
+    .where(eq(secrets.name, "GITHUB_GATEWAY_URL"))
+    .run();
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: {
+      code: "branch_check_failed",
+      message: expect.stringContaining("no key for version 99"),
+    },
+  });
+  expect(checks).toEqual([]);
+  expect(agentCount()).toEqual({ n: 0 });
+});
+
 test("preflight transport failure answers 502 branch_check_failed", async () => {
   app = createApp({
     db,
@@ -2434,18 +2497,21 @@ test("preflight transport failure answers 502 branch_check_failed", async () => 
   });
   const envId = await connectedEnv();
   wire.hangs = (call) => call.includes(" branch-check ");
-  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
-  expect(res.status).toBe(502);
-  expect(await res.json()).toMatchObject({
-    error: {
-      code: "branch_check_failed",
-      message: expect.stringContaining("branch-check timed out after 200 ms"),
-    },
-  });
-  expect(agentCount()).toEqual({ n: 0 });
-  // the timed-out exec's mocked socket closes a tick after the 502; left to the next test, undici's
-  // pool fails that test's first request on it with UND_ERR_SOCKET "closed"
-  await new Promise(setImmediate);
+  try {
+    const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({
+      error: {
+        code: "branch_check_failed",
+        message: expect.stringContaining("branch-check timed out after 200 ms"),
+      },
+    });
+    expect(agentCount()).toEqual({ n: 0 });
+  } finally {
+    // the timed-out exec's mocked socket closes a tick after the 502; left to the next test, undici's
+    // pool fails that test's first request on it with UND_ERR_SOCKET "closed"
+    await new Promise(setImmediate);
+  }
 });
 
 test("invalid branch name answers 400", async () => {
@@ -2499,7 +2565,19 @@ test("compareUrl uses the remote branch", async () => {
   ]);
 });
 
-test("an ended run's diff on a remote branch is against that branch's tip, so it shows only the agent's work", async () => {
+test("compareUrl escapes # and % within a branch segment, keeping its slashes", async () => {
+  const { agent } = await finishedOnBranch(
+    "fix/#12%done",
+    rollupWith("fix the flaky test"),
+  );
+  expect((await listRuns(agent.id)).body.data).toEqual([
+    expect.objectContaining({
+      compareUrl: `https://github.com/acme/kru/compare/${sha("b")}...fix/%2312%25done`,
+    }),
+  ]);
+});
+
+test("an ended run's diff on a remote branch is against the start point the runner pinned, so outside pushes never shrink it", async () => {
   const { agent, run, envId } = await finishedOnBranch("feature/login");
   wire.exec = (argv) =>
     argv[0] === "git" ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
@@ -2507,7 +2585,7 @@ test("an ended run's diff on a remote branch is against that branch's tip, so it
   expect(status).toBe(200);
   expect(body.diff).toBe(patch);
   expect(wire.calls.at(-1)).toBe(
-    `exec ${spriteNameFor(envId)} /workspace/repo git diff origin/feature/login...claude/${agent.id}`,
+    `exec ${spriteNameFor(envId)} /workspace/repo git diff refs/sky/starts/${agent.id}...claude/${agent.id}`,
   );
 });
 
