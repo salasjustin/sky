@@ -2766,21 +2766,15 @@ test("preflight transport failure answers 502 branch_check_failed", async () => 
   });
   const envId = await connectedEnv();
   wire.hangs = (call) => call.includes(" branch-check ");
-  try {
-    const res = await launch({ envId, prompt: "go", branch: "feature/login" });
-    expect(res.status).toBe(502);
-    expect(await res.json()).toMatchObject({
-      error: {
-        code: "branch_check_failed",
-        message: expect.stringContaining("branch-check timed out after 200 ms"),
-      },
-    });
-    expect(agentCount()).toEqual({ n: 0 });
-  } finally {
-    // the timed-out exec's mocked socket closes a tick after the 502; left to the next test, undici's
-    // pool fails that test's first request on it with UND_ERR_SOCKET "closed"
-    await new Promise(setImmediate);
-  }
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: {
+      code: "branch_check_failed",
+      message: expect.stringContaining("branch-check timed out after 200 ms"),
+    },
+  });
+  expect(agentCount()).toEqual({ n: 0 });
 });
 
 test("invalid branch name answers 400", async () => {
