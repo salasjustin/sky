@@ -8,13 +8,16 @@ import { refreshPlugins } from "./plugins.js";
 import { publishMain } from "./publish.js";
 import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
+import { claimRunLog } from "./runlog.js";
 import { runSession } from "./session.js";
 import { storeSyncMain, syncStoreQuietly } from "./store.js";
 import { branchCheckMain } from "./sync.js";
 
 // the runner's stderr is the exec session's terminal, gone once the API detaches, so every line also
-// lands in a log file beside the run's prompt: what a stuck launch was doing is readable on the sprite
-const logFile = process.env.PROMPT_FILE?.replace(/\.prompt$/, ".log");
+// lands in a log file beside the run's prompt: what a stuck launch was doing is readable on the sprite.
+// Set only once this process has been checked to be the run's runner and holds its lock (`claimRunLog`):
+// the agent's shell inherits PROMPT_FILE, so any `runner.mjs` it starts could otherwise write here
+let logFile: string | undefined;
 const warn = (message: string) => {
   const line = `${new Date().toISOString()} ${message}\n`;
   process.stderr.write(line);
@@ -23,6 +26,15 @@ const warn = (message: string) => {
       appendFileSync(logFile, line);
     } catch {}
 };
+
+/** Refuses to start as a run, saying why on stderr alone: the run's log is not this process's to write. */
+function refuse(message: string): void {
+  process.stderr.write(`${new Date().toISOString()} runner: ${message}\n`);
+  process.exitCode = 2;
+}
+
+const NOT_A_RUN =
+  "this is started by the Sky API for a run; an agent's own command is `runner.mjs publish`";
 
 async function step<T>(name: string, task: () => Promise<T>): Promise<T> {
   const started = Date.now();
@@ -40,9 +52,27 @@ async function main(): Promise<void> {
     config = loadConfig(process.env);
   } catch (error) {
     if (!(error instanceof ConfigError)) throw error;
-    warn(`runner: ${error.message}`);
-    process.exitCode = 2;
+    refuse(`${error.message}; ${NOT_A_RUN}`);
     return;
+  }
+  // the launcher passes the run's id as the argument; anything else is not the launcher
+  if (process.argv[2] !== config.runId) {
+    refuse(
+      `${process.argv[2] ? `unknown command ${JSON.stringify(process.argv[2])}` : "no command"}; ${NOT_A_RUN}`,
+    );
+    return;
+  }
+  const claim = process.env.PROMPT_FILE
+    ? claimRunLog(process.env.PROMPT_FILE)
+    : undefined;
+  if (claim && !claim.ok) {
+    refuse(`${claim.reason}; not starting a second runner for ${config.runId}`);
+    return;
+  }
+  if (claim) {
+    logFile = claim.logFile;
+    // however the runner ends, so a lock left behind is only ever from a process killed outright
+    process.on("exit", claim.release);
   }
 
   // the first SIGTERM/SIGINT/SIGHUP aborts the session and lets the run report and commit; a second one kills at once

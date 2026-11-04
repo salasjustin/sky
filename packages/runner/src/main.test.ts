@@ -1,11 +1,26 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, afterEach, beforeAll, expect, test } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from "vitest";
 
 const pkg = join(import.meta.dirname, "..");
 const bundle = join(pkg, "dist/bundle/runner.mjs");
@@ -26,11 +41,16 @@ afterEach(() => {
   }
 });
 
-async function runBundle(env: Record<string, string>) {
-  const child = spawn(process.execPath, [bundle], {
-    env: { PATH: process.env.PATH ?? "", CLAUDE_CONFIG_DIR, ...env },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+/** Runs the bundle as the launcher does: the run's id as its argument. `args` replaces that. */
+async function runBundle(env: Record<string, string>, args?: string[]) {
+  const child = spawn(
+    process.execPath,
+    [bundle, ...(args ?? [env.RUN_ID ?? ""])],
+    {
+      env: { PATH: process.env.PATH ?? "", CLAUDE_CONFIG_DIR, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
   let stdout = "";
   let stderr = "";
   child.stdout.on("data", (d) => (stdout += d));
@@ -84,6 +104,105 @@ test("missing env is a usage error: exit 2, one line on stderr, nothing on stdou
   expect(stderr.trim().split("\n")).toHaveLength(1);
   expect(stderr).toMatch(/AGENT_ID/);
   expect(stderr).not.toMatch(/secret/);
+});
+
+const runEnv = (api: string, promptFile: string) => ({
+  AGENT_ID: "agt_1",
+  RUN_ID: "run_1",
+  PROMPT: "do it",
+  PROMPT_FILE: promptFile,
+  API_BASE_URL: api,
+  AGENT_TOKEN: "agent-secret",
+  CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+  REPO_DIR: "/nonexistent/repo",
+  WORKTREES_DIR: "/nonexistent/worktrees",
+});
+
+describe("a stray runner.mjs started in a run's shell, which inherits PROMPT_FILE", () => {
+  let runs: string;
+  let promptFile: string;
+  let logFile: string;
+  beforeEach(() => {
+    runs = mkdtempSync(join(tmpdir(), "runner-main-runs-"));
+    promptFile = join(runs, "run_1.prompt");
+    logFile = join(runs, "run_1.log");
+    writeFileSync(logFile, "the live runner's line\n");
+  });
+  afterEach(() => rmSync(runs, { recursive: true, force: true }));
+  const untouched = () => {
+    expect(readFileSync(logFile, "utf8")).toBe("the live runner's line\n");
+    expect(readdirSync(runs).sort()).toEqual(["run_1.log"]);
+  };
+
+  test("without the run's env it refuses with a clear line on stderr, and leaves the run's log alone", async () => {
+    const { code, stdout, stderr } = await runBundle(
+      { PROMPT_FILE: promptFile },
+      [],
+    );
+    expect({ code, stdout }).toEqual({ code: 2, stdout: "" });
+    expect(stderr.trim().split("\n")).toHaveLength(1);
+    expect(stderr).toMatch(/missing or invalid env: .*AGENT_TOKEN/);
+    expect(stderr).toMatch(/started by the Sky API/);
+    untouched();
+  });
+
+  test.each([
+    ["no argument", [], /no command/],
+    ["an unknown command", ["publsh"], /unknown command "publsh"/],
+    ["another run's id", ["run_2"], /unknown command "run_2"/],
+  ])(
+    "with the run's env but %s it refuses, and leaves the run's log alone",
+    async (_, args, message) => {
+      const { code, stdout, stderr } = await runBundle(
+        runEnv("http://127.0.0.1:1", promptFile),
+        args,
+      );
+      expect({ code, stdout }).toEqual({ code: 2, stdout: "" });
+      expect(stderr).toMatch(message);
+      untouched();
+    },
+  );
+
+  test("with the run's env and its id, but a live runner already holding the run, it refuses and leaves the log alone", async () => {
+    writeFileSync(join(runs, "run_1.lock"), String(process.pid));
+    const { code, stderr } = await runBundle(
+      runEnv("http://127.0.0.1:1", promptFile),
+    );
+    expect(code).toBe(2);
+    expect(stderr).toMatch(
+      new RegExp(
+        `another runner \\(pid ${process.pid}\\) already runs this run`,
+      ),
+    );
+    expect(readFileSync(logFile, "utf8")).toBe("the live runner's line\n");
+    // the live runner's lock is still its own
+    expect(readFileSync(join(runs, "run_1.lock"), "utf8")).toBe(
+      String(process.pid),
+    );
+  });
+
+  test("the run's own runner appends to the log, holds the lock while it runs and frees it on exit", async () => {
+    const api = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => res.writeHead(204).end());
+    });
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    const { port } = api.address() as AddressInfo;
+    try {
+      const { code } = await runBundle(
+        runEnv(`http://127.0.0.1:${port}`, promptFile),
+      );
+      expect(code).toBe(1);
+    } finally {
+      api.closeAllConnections();
+      api.close();
+    }
+    const log = readFileSync(logFile, "utf8");
+    expect(log.startsWith("the live runner's line\n")).toBe(true);
+    expect(log).toMatch(/runner: sprite hold started/);
+    expect(existsSync(join(runs, "run_1.lock"))).toBe(false);
+  }, 20_000);
 });
 
 test("a failed run posts run.failed to the API with the agent token, exits 1, and leaves nothing running", async () => {
@@ -150,7 +269,7 @@ test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies
   if (!api) throw new Error("no server");
   await once(api, "listening");
   const { port } = api.address() as AddressInfo;
-  const child = spawn(process.execPath, [bundle], {
+  const child = spawn(process.execPath, [bundle, "run_1"], {
     env: {
       PATH: process.env.PATH ?? "",
       CLAUDE_CONFIG_DIR,

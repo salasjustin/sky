@@ -52,6 +52,7 @@ export const EventType = z.enum([
   "run.stopped",
   "run.probed",
   "runner.warning",
+  "runner.heartbeat",
   "claude.PreToolUse",
   "claude.PostToolUse",
   "claude.PostToolUseFailure",
@@ -197,9 +198,18 @@ const probedPayload = z.object({
   silentMs: z.number().int().nonnegative(),
 });
 
-/** A problem the runner hit that doesn't end the run, e.g. a sprite hold that failed. */
+/** How often the runner posts a `runner.heartbeat` while a tool call is in flight. */
+export const HEARTBEAT_INTERVAL_MS = 60_000;
+
 const runnerPayloads = (textMax: number) => ({
+  /** A problem the runner hit that doesn't end the run, e.g. a sprite hold that failed. */
   "runner.warning": z.object({ message: z.string().min(1).max(textMax) }),
+  /** A tool call still running: the longest-running one in flight, and how long it has run. */
+  "runner.heartbeat": z.object({
+    toolName: z.string().min(1),
+    toolUseId: z.string().min(1),
+    elapsedMs: z.number().int().nonnegative(),
+  }),
 });
 
 const postPayloads = {
@@ -235,6 +245,7 @@ export const RunnerEventPost = z.discriminatedUnion("type", [
   posted("run.failed"),
   posted("run.stopped"),
   posted("runner.warning"),
+  posted("runner.heartbeat"),
   posted("claude.PreToolUse"),
   posted("claude.PostToolUse"),
   posted("claude.PostToolUseFailure"),
@@ -268,6 +279,7 @@ export const Event = z.discriminatedUnion("type", [
   stored("run.stopped"),
   stored("run.probed"),
   stored("runner.warning"),
+  stored("runner.heartbeat"),
   stored("claude.PreToolUse"),
   stored("claude.PostToolUse"),
   stored("claude.PostToolUseFailure"),

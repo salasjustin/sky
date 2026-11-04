@@ -38,6 +38,7 @@ const statusAfter: Record<EventType, RunStatus | null> = {
   "run.stopped": "stopped",
   "run.probed": null,
   "runner.warning": null,
+  "runner.heartbeat": null,
   "claude.PreToolUse": null,
   "claude.PostToolUse": null,
   "claude.PostToolUseFailure": null,

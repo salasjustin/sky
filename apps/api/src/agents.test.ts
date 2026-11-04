@@ -22,7 +22,11 @@ import type { Config } from "./config.js";
 import { envSecretAad, seal } from "./crypto.js";
 import { createRunProber } from "./probe.js";
 import { KnownSecrets } from "./redact.js";
-import { failStaleRuns, failUnlaunchedRuns } from "./runs.js";
+import {
+  failStaleRuns,
+  failUnlaunchedRuns,
+  pruneClaudeEvents,
+} from "./runs.js";
 import { SPRITES_TIMEOUT_MS, spriteNameFor } from "./sprites.js";
 import {
   envFileOf,
@@ -2858,4 +2862,109 @@ test("a secret named START_BRANCH is refused, so it can't redirect the runner", 
   const res = await putSecret(readyEnv(), "START_BRANCH", { value: "main" });
   expect(res.status).toBe(400);
   expect(await res.json()).toMatchObject({ error: { code: "reserved_name" } });
+});
+
+const insertEvent = (
+  runId: string,
+  type: string,
+  ts: number,
+  payload: object,
+) =>
+  db.$client
+    .prepare(
+      "insert into events (run_id, ts, type, payload) values (?, ?, ?, ?)",
+    )
+    .run(runId, new Date(ts).toISOString(), type, JSON.stringify(payload));
+const beat = (toolName: string, elapsedMs: number) => ({
+  toolName,
+  toolUseId: "t1",
+  elapsedMs,
+});
+test("a runner.heartbeat from the run's token is stored and leaves the run running", async () => {
+  const { agent, run, token } = await startedRun();
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "runner.heartbeat",
+    payload: beat("Bash", 61_000),
+  });
+  expect(res.status).toBe(201);
+  const stored = eventsOf(run.id).filter((e) => e.type === "runner.heartbeat");
+  expect(stored.map((e) => JSON.parse(e.payload))).toEqual([
+    beat("Bash", 61_000),
+  ]);
+  expect((await getRun(agent.id, run.id)).body.status).toBe("running");
+});
+
+test("a run whose heartbeats are arriving is alive: it is not probed, however long its tool call has been quiet", async () => {
+  const { run } = await startedRun();
+  pgrepAnswers(1);
+  const { prober } = proberOver();
+  const now = Date.now() + 20 * 60_000;
+  // the call began 20 minutes ago, and its last heartbeat was 30 s ago
+  insertEvent(run.id, "claude.PreToolUse", Date.now() + 1, {
+    toolName: "Bash",
+    toolUseId: "t1",
+    input: "{}",
+  });
+  insertEvent(
+    run.id,
+    "runner.heartbeat",
+    now - 30_000,
+    beat("Bash", 1_170_000),
+  );
+  await prober.sweep(now);
+  expect(pgreps()).toEqual([]);
+});
+
+test("a tool call that outlives the run timeout fails the run as runner_timeout naming the tool and how long it ran, though heartbeats kept arriving", async () => {
+  const { agent, run } = await startedRun();
+  const limit = config.runTimeoutMs;
+  const now = Date.now() + limit + 60_000;
+  insertEvent(run.id, "claude.PreToolUse", Date.now() + 1, {
+    toolName: "Bash",
+    toolUseId: "t1",
+    input: "{}",
+  });
+  // a beat 30 s before the sweep, from a call 30 minutes in
+  insertEvent(run.id, "runner.heartbeat", now - 30_000, beat("Bash", limit));
+  expect(failStaleRuns(db, limit, now)).toEqual([run.id]);
+  const { error } = (await getRun(agent.id, run.id)).body;
+  expect(error).toBe(
+    "runner_timeout: Bash was still running after 31m with no result, past the 30m limit",
+  );
+});
+
+test("a run quiet past the timeout with no tool call in flight is a bare runner_timeout, even after earlier heartbeats", async () => {
+  const { agent, run, token } = await startedRun();
+  insertEvent(run.id, "runner.heartbeat", Date.now() + 1, beat("Bash", 60_000));
+  await postEvent(token, {
+    runId: run.id,
+    type: "claude.PostToolUse",
+    payload: { toolName: "Bash", toolUseId: "t1", input: "{}", output: "ok" },
+  });
+  expect(
+    failStaleRuns(
+      db,
+      config.runTimeoutMs,
+      silentFor(config.runTimeoutMs + 1000),
+    ),
+  ).toEqual([run.id]);
+  expect((await getRun(agent.id, run.id)).body.error).toBe("runner_timeout");
+});
+
+test("heartbeats older than 7 days are pruned with their deliveries; newer ones and run events stay", async () => {
+  const { run } = await startedRun();
+  const day = 86_400_000;
+  insertEvent(
+    run.id,
+    "runner.heartbeat",
+    Date.now() - 8 * day,
+    beat("Bash", 1),
+  );
+  insertEvent(run.id, "runner.heartbeat", Date.now() - day, beat("Bash", 2));
+  expect(pruneClaudeEvents(db)).toBe(1);
+  expect(eventsOf(run.id).map((e) => e.type)).toEqual([
+    "run.started",
+    "runner.heartbeat",
+  ]);
 });

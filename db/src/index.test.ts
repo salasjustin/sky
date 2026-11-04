@@ -156,11 +156,12 @@ test("events take claude.* hook types and run.resumed, and reject the retired ru
   );
 });
 
-test("events take run.probed and runner.warning, and still reject an unknown type", () => {
+test("events take run.probed, runner.warning and runner.heartbeat, and still reject an unknown type", () => {
   migrate(db);
   seedRun();
   expect(insertEvent("run.probed")).toBeGreaterThan(0);
   expect(insertEvent("runner.warning")).toBeGreaterThan(0);
+  expect(insertEvent("runner.heartbeat")).toBeGreaterThan(0);
   expect(() => insertEvent("runner.error")).toThrow(
     /CHECK constraint failed: events_type/,
   );
@@ -781,6 +782,16 @@ test("the claude.* prune finds old rows through the partial ts index", () => {
   ).toMatch(/USING (COVERING )?INDEX events_claude_ts \(ts<\?\)/);
 });
 
+test("the heartbeat prune finds old rows through the partial ts index", () => {
+  migrate(db);
+  expect(
+    planOf(
+      "select id from events where type = 'runner.heartbeat' and ts < ?",
+      PRUNE_CUTOFF,
+    ),
+  ).toMatch(/USING (COVERING )?INDEX events_heartbeat_ts \(ts<\?\)/);
+});
+
 test("deleting deliveries by event finds them through the event_id index", () => {
   migrate(db);
   expect(
@@ -866,6 +877,7 @@ test("migrating a populated 0010 file keeps every event id, payload and delivery
       .all(),
   ).toEqual([
     "events_claude_ts",
+    "events_heartbeat_ts",
     "events_run_id_id",
     "webhook_deliveries_event_id",
     "webhook_deliveries_status_next_attempt_at",

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "d79dde7d-5da5-49ab-8a60-0741ce3a32df",
+  "id": "7309ed32-2a16-4d26-98e7-dba2bcb10c48",
   "prevId": "b870d3a7-2454-4548-ad71-ffbbb4c99496",
   "tables": {
     "agents": {
@@ -297,6 +297,12 @@
           "columns": ["ts"],
           "isUnique": false,
           "where": "\"type\" glob 'claude.*'"
+        },
+        "events_heartbeat_ts": {
+          "name": "events_heartbeat_ts",
+          "columns": ["ts"],
+          "isUnique": false,
+          "where": "\"type\" = 'runner.heartbeat'"
         }
       },
       "foreignKeys": {
@@ -315,7 +321,7 @@
       "checkConstraints": {
         "events_type": {
           "name": "events_type",
-          "value": "\"type\" in ('run.started', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped', 'run.resumed',\n        'run.probed', 'runner.warning',\n        'claude.PreToolUse', 'claude.PostToolUse', 'claude.PostToolUseFailure', 'claude.SubagentStart', 'claude.SubagentStop',\n        'claude.TaskCreated', 'claude.TaskCompleted', 'claude.Notification', 'claude.PreCompact', 'claude.FileChanged', 'claude.Message')"
+          "value": "\"type\" in ('run.started', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped', 'run.resumed',\n        'run.probed', 'runner.warning', 'runner.heartbeat',\n        'claude.PreToolUse', 'claude.PostToolUse', 'claude.PostToolUseFailure', 'claude.SubagentStart', 'claude.SubagentStop',\n        'claude.TaskCreated', 'claude.TaskCompleted', 'claude.Notification', 'claude.PreCompact', 'claude.FileChanged', 'claude.Message')"
         },
         "events_ts": {
           "name": "events_ts",

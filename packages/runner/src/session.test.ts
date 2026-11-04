@@ -2278,3 +2278,111 @@ test("a rollup that can't be computed is left off with one warning; the run stil
     expect.stringMatching(/^runner: rollup skipped: /),
   ]);
 });
+
+const pause =
+  (ms: number): Step =>
+  () =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+const bash = (id: string) => ({
+  tool_name: "Bash",
+  tool_input: { command: "pnpm build" },
+  tool_use_id: id,
+});
+
+test("a tool call in flight is reported as runner.heartbeat with its name and how long it has run, and stops when it returns", async () => {
+  const { posted, post } = recorder();
+  const query = scripted([
+    init,
+    hook("PreToolUse", bash("t1")),
+    pause(110),
+    hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
+    pause(80),
+    success,
+  ]);
+  const code = await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    heartbeatMs: 25,
+  });
+  expect(code).toBe(0);
+  const beats = posted.filter((e) => e.type === "runner.heartbeat");
+  expect(beats.length).toBeGreaterThanOrEqual(2);
+  for (const beat of beats) {
+    expect(beat).toEqual({
+      runId: "run_1",
+      type: "runner.heartbeat",
+      payload: {
+        toolName: "Bash",
+        toolUseId: "t1",
+        elapsedMs: expect.any(Number),
+      },
+    });
+  }
+  const elapsed = beats.map((b) =>
+    b.type === "runner.heartbeat" ? b.payload.elapsedMs : -1,
+  );
+  expect(elapsed).toEqual([...elapsed].sort((a, b) => a - b));
+  // none after the call returned: its PostToolUse is the last thing before the quiet pause
+  const types = posted.map((e) => e.type);
+  const returned = types.indexOf("claude.PostToolUse");
+  expect(types.slice(returned)).not.toContain("runner.heartbeat");
+});
+
+test("with several tool calls in flight the heartbeat names the longest-running; with none, it is silent", async () => {
+  const { posted, post } = recorder();
+  const query = scripted([
+    init,
+    pause(60),
+    hook("PreToolUse", bash("t1")),
+    pause(20),
+    hook("PreToolUse", bash("t2")),
+    pause(70),
+    hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
+    hook("PostToolUseFailure", { ...bash("t2"), error: "x" }),
+    pause(80),
+    success,
+  ]);
+  await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    heartbeatMs: 25,
+  });
+  const beats = posted.flatMap((e) =>
+    e.type === "runner.heartbeat" ? [e.payload.toolUseId] : [],
+  );
+  expect(beats.length).toBeGreaterThanOrEqual(2);
+  expect(new Set(beats)).toEqual(new Set(["t1"]));
+  const types = posted.map((e) => e.type);
+  expect(types.slice(types.indexOf("claude.PostToolUseFailure"))).not.toContain(
+    "runner.heartbeat",
+  );
+});
+
+test("a call held for approval, or denied, is not beaten for: only one that runs is", async () => {
+  const { posted, post } = recorder();
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      // a denying gate: the policy holds Bash and the person denies
+      await fire(options, "PreToolUse", bash("t1"));
+      await pause(100)(options);
+    },
+    success,
+  ]);
+  const denying = { ...config, approvalPolicy: ["Bash"] };
+  await runSession(denying, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: async () => ({
+      kind: "decided",
+      decision: { requestId: "req_x", decision: "deny" },
+    }),
+    heartbeatMs: 20,
+  });
+  expect(posted.map((e) => e.type)).not.toContain("runner.heartbeat");
+});

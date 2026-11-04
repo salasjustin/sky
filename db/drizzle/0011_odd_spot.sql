@@ -7,7 +7,7 @@ CREATE TABLE `__new_events` (
 	`payload` text NOT NULL,
 	FOREIGN KEY (`run_id`) REFERENCES `runs`(`id`) ON UPDATE no action ON DELETE no action,
 	CONSTRAINT "events_type" CHECK("type" in ('run.started', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped', 'run.resumed',
-        'run.probed', 'runner.warning',
+        'run.probed', 'runner.warning', 'runner.heartbeat',
         'claude.PreToolUse', 'claude.PostToolUse', 'claude.PostToolUseFailure', 'claude.SubagentStart', 'claude.SubagentStop',
         'claude.TaskCreated', 'claude.TaskCompleted', 'claude.Notification', 'claude.PreCompact', 'claude.FileChanged', 'claude.Message')),
 	CONSTRAINT "events_ts" CHECK("ts" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'),
@@ -22,4 +22,5 @@ DROP TABLE `events`;--> statement-breakpoint
 ALTER TABLE `__new_events` RENAME TO `events`;--> statement-breakpoint
 PRAGMA foreign_keys=ON;--> statement-breakpoint
 CREATE INDEX `events_run_id_id` ON `events` (`run_id`,`id`);--> statement-breakpoint
-CREATE INDEX `events_claude_ts` ON `events` (`ts`) WHERE "type" glob 'claude.*';
+CREATE INDEX `events_claude_ts` ON `events` (`ts`) WHERE "type" glob 'claude.*';--> statement-breakpoint
+CREATE INDEX `events_heartbeat_ts` ON `events` (`ts`) WHERE "type" = 'runner.heartbeat';

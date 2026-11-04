@@ -11,12 +11,13 @@ import {
   type AgentId,
   type AgentStatus,
   type EventType,
+  HEARTBEAT_INTERVAL_MS,
   type RunId,
   RunStatus,
   runTransitions,
   type Usage,
 } from "@sky/shared";
-import { and, count, eq, inArray, isNull, lt, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, lt, sql } from "drizzle-orm";
 import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { enqueueDeliveries } from "./deliveries.js";
 import { runEvents } from "./run-events.js";
@@ -173,14 +174,63 @@ const lastEventAt = (excluding: EventType[] = []) =>
       : sql``
   }), ${runs.createdAt})`;
 
+// a heartbeat later than this ago says the runner stopped reporting too, not that the tool is running on
+const HEARTBEAT_FRESH_MS = 3 * HEARTBEAT_INTERVAL_MS;
+
+/**
+ * The tool call the run's latest `runner.heartbeat` reports, when that heartbeat came after every
+ * other event (so no result has been seen since), and how long it has run.
+ */
+function toolInFlight(
+  tx: Tx,
+  runId: RunId,
+  now: number,
+): { toolName: string; ranMs: number } | undefined {
+  const beat = tx
+    .select({ ts: events.ts, payload: events.payload })
+    .from(events)
+    .where(
+      and(
+        eq(events.runId, runId),
+        eq(events.type, "runner.heartbeat"),
+        sql`${events.id} > coalesce((select max(e.id) from ${events} e where e.run_id = ${runId} and e.type not in ('runner.heartbeat', 'run.probed')), 0)`,
+      ),
+    )
+    .orderBy(desc(events.id))
+    .get();
+  if (!beat) return undefined;
+  const { toolName, elapsedMs } = beat.payload as {
+    toolName: string;
+    elapsedMs: number;
+  };
+  const sinceBeat = now - Date.parse(beat.ts);
+  return {
+    toolName,
+    ranMs: elapsedMs + (sinceBeat <= HEARTBEAT_FRESH_MS ? sinceBeat : 0),
+  };
+}
+
+const duration = (ms: number) =>
+  ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)}m`;
+
+const timeoutError = (
+  tool: { toolName: string; ranMs: number } | undefined,
+  timeoutMs: number,
+) =>
+  tool
+    ? `runner_timeout: ${tool.toolName} was still running after ${duration(tool.ranMs)} with no result, past the ${duration(timeoutMs)} limit`
+    : "runner_timeout";
+
 /**
  * Fails every active run but a waiting one with no event (or, before its first, no launch) since
- * `timeoutMs` ago, so a runner that died can't hold a concurrency slot. A `run.probed` doesn't count
- * as an event: a runner that is alive but wedged still times out. Returns the ids it failed.
+ * `timeoutMs` ago, so a runner that died can't hold a concurrency slot. A `run.probed` or a
+ * `runner.heartbeat` doesn't count as an event: a runner that is alive but wedged, or a tool call
+ * that never returns, still times out. A run that went quiet with a tool call in flight is failed
+ * naming it and how long it ran. Returns the ids it failed.
  */
 export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
   const cutoff = new Date(now - timeoutMs).toISOString();
-  const lastActivity = lastEventAt(["run.probed"]);
+  const lastActivity = lastEventAt(["run.probed", "runner.heartbeat"]);
   // one write transaction, so an event landing mid-sweep can't be overtaken by a stale read
   return db.transaction(
     (tx) => {
@@ -198,7 +248,9 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
         )
         .all()
         .map((r) => r.id);
-      for (const id of stale) failRun(tx, id, "runner_timeout");
+      for (const id of stale) {
+        failRun(tx, id, timeoutError(toolInFlight(tx, id, now), timeoutMs));
+      }
       return stale;
     },
     { behavior: "immediate" },
@@ -365,27 +417,33 @@ export function failAbandonedWaits(
 const CLAUDE_EVENT_TTL_MS = 7 * 86_400_000;
 
 /**
- * Deletes `claude.*` events older than 7 days and their webhook deliveries; `run.*` events are kept.
+ * Deletes `claude.*` and `runner.heartbeat` events older than 7 days and their webhook deliveries;
+ * `run.*` events are kept.
  * Returns how many events it deleted.
  */
 export function pruneClaudeEvents(db: Db, now = Date.now()) {
   const cutoff = new Date(now - CLAUDE_EVENT_TTL_MS).toISOString();
-  // the literal pattern, not LIKE or a bound parameter: only then does the planner use events_claude_ts
-  const expired = and(
-    sql`${events.type} glob 'claude.*'`,
-    lt(events.ts, cutoff),
-  );
+  // the literal patterns, not LIKE or a bound parameter: only then does the planner use the partial
+  // indexes events_claude_ts and events_heartbeat_ts
+  const expired = [
+    and(sql`${events.type} glob 'claude.*'`, lt(events.ts, cutoff)),
+    and(sql`${events.type} = 'runner.heartbeat'`, lt(events.ts, cutoff)),
+  ];
   return db.transaction(
     (tx) => {
-      tx.delete(webhookDeliveries)
-        .where(
-          inArray(
-            webhookDeliveries.eventId,
-            tx.select({ id: events.id }).from(events).where(expired),
-          ),
-        )
-        .run();
-      return tx.delete(events).where(expired).run().changes;
+      let pruned = 0;
+      for (const where of expired) {
+        tx.delete(webhookDeliveries)
+          .where(
+            inArray(
+              webhookDeliveries.eventId,
+              tx.select({ id: events.id }).from(events).where(where),
+            ),
+          )
+          .run();
+        pruned += tx.delete(events).where(where).run().changes;
+      }
+      return pruned;
     },
     { behavior: "immediate" },
   );

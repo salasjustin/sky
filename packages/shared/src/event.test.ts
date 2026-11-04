@@ -5,6 +5,7 @@ import {
   Event,
   EventCursor,
   EventType,
+  HEARTBEAT_INTERVAL_MS,
   PendingRequest,
   Rollup,
   RUNNER_TEXT_MAX,
@@ -198,6 +199,28 @@ test("runner.warning is posted by the runner with a message; run.probed is the A
   expect(Event.parse({ ...meta, ...warning, runId: "run_1" })).toMatchObject({
     type: "runner.warning",
   });
+});
+
+test("runner.heartbeat names the tool call in flight and how long it has run", () => {
+  const heartbeat = {
+    runId: "run_1",
+    type: "runner.heartbeat",
+    payload: { toolName: "Bash", toolUseId: "toolu_1", elapsedMs: 61_000 },
+  };
+  expect(RunnerEventPost.parse(heartbeat)).toEqual(heartbeat);
+  expect(Event.parse({ ...meta, ...heartbeat })).toMatchObject({
+    type: "runner.heartbeat",
+  });
+  for (const payload of [
+    { toolName: "Bash", toolUseId: "toolu_1" },
+    { toolName: "", toolUseId: "toolu_1", elapsedMs: 1 },
+    { toolName: "Bash", toolUseId: "toolu_1", elapsedMs: -1 },
+  ]) {
+    expect(RunnerEventPost.safeParse({ ...heartbeat, payload }).success).toBe(
+      false,
+    );
+  }
+  expect(HEARTBEAT_INTERVAL_MS).toBe(60_000);
 });
 
 const sha = (c: string) => c.repeat(40);
