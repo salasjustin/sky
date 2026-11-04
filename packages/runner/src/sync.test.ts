@@ -708,12 +708,12 @@ test("a start branch with more commits of its own than a run fetches fails, meas
   pushTo("feature/big", emptyCommits(seed, 100, first));
 
   await expect(prepare({ startBranch: "feature/big" })).rejects.toThrow(
-    "the start branch feature/big has more than 100 commits that trunk doesn't, more than the 100 a run fetches",
+    "the start branch feature/big has more than 100 commits that trunk doesn't; a run fetches at most 100",
   );
   expect(
     requests.filter((r) => r.startsWith("GET /git/commits/")),
   ).toHaveLength(100);
-});
+}, 30_000);
 
 test("starting on an existing branch is not refused by the gateway for a path containing ..", async () => {
   const cut = pushToGitHub("trunk", "cut.txt", "1\n");

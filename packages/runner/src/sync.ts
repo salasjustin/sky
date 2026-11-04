@@ -615,9 +615,9 @@ export async function syncAgentBranch(options: {
 /**
  * Fetches GitHub's `startBranch`: the commits it has that the default branch doesn't, each parent
  * on the default branch fetched alone, so a branch that merged the default branch in never walks
- * down the default branch's history. The default branch's newest `DEFAULT_MAX_COMMITS` commits come
- * from the commits listing, not a compare: the gateway refuses `..` in a path. Records the newest
- * default-branch commit the branch was cut from or merged, its merge base, under `FETCHED_BASES` so
+ * down the default branch's history. Which commits are the default branch's comes from its commit
+ * listing, a page at a time, not from a compare: the gateway refuses `..` in a path. Records the
+ * newest of them the branch was cut from or merged, its merge base, under `FETCHED_BASES` so
  * publish finds the base it was cut from. Returns the branch's tip.
  */
 async function fetchStartBranch(options: {
@@ -639,8 +639,8 @@ async function fetchStartBranch(options: {
   });
   const onDefault = await resolved(g, `refs/remotes/origin/${defaultBranch}`);
   const cached = cachingCommits(call);
-  // newest first; a branch cut further back than a page reaches walks the default branch's history
-  // as its own and hits the cap, and then the listing is read a page deeper before giving up
+  // newest first. A branch cut further back than the pages read so far walks the default branch's
+  // history as its own until it hits the cap; the listing is then read a page deeper and the walk redone
   const onDefaultBranch: string[] = [];
   let walked: Map<string, string[]>;
   for (let page = 1; ; page++) {
@@ -663,7 +663,7 @@ async function fetchStartBranch(options: {
       if (!(error instanceof TooFarError)) throw error;
       if (listed.length < DEFAULT_MAX_COMMITS || page >= MAX_LISTING_PAGES) {
         throw new TooFarError(
-          `the start branch ${startBranch} has more than ${DEFAULT_MAX_COMMITS} commits that ${defaultBranch} doesn't, more than the ${DEFAULT_MAX_COMMITS} a run fetches`,
+          `the start branch ${startBranch} has more than ${DEFAULT_MAX_COMMITS} commits that ${defaultBranch} doesn't; a run fetches at most ${DEFAULT_MAX_COMMITS}`,
         );
       }
     }

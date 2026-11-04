@@ -4,11 +4,11 @@ import { setupServer } from "msw/node";
 // request no handler answered; the setup file fails the test on any entry
 export const leaks: string[] = [];
 
-// the live Sprites GitHub gateway refuses any path containing `..` (a compare URL, `main...branch`)
-// with a 400, so the fake does too and records the request as a leak, which fails the test even when
-// the code under test swallows the 400. Only `..` inside a path segment reaches it: URL parsing
-// collapses a whole `..` segment first. It is an initial handler, which `server.use` always leaves
-// behind the handlers a test adds, so `use` is wrapped to put it ahead of them again.
+// the live Sprites GitHub gateway answers 400 to any path containing `..` (a compare URL,
+// `main...branch`), so the fake does too, and records the request as a leak so the test fails even
+// when the code under test swallows the 400. Only `..` inside a segment gets here: URL parsing
+// collapses a whole `..` segment first. The guard is an initial handler, which `resetHandlers()`
+// keeps, and `server.use` is wrapped to keep it ahead of the handlers a test adds.
 const refuseTraversal = http.all(/\/gateway\/github\//, ({ request }) => {
   const { pathname } = new URL(request.url);
   const decoded = (() => {
