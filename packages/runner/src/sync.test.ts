@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -13,10 +14,10 @@ import type { RunnerEventPost } from "@sky/shared";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import { publish } from "./publish.js";
+import { gateway, publish } from "./publish.js";
 import { pullRepo } from "./repo.js";
 import { type QueryFn, runSession } from "./session.js";
-import { branchCheckMain, prepareWorktree } from "./sync.js";
+import { branchCheckMain, fetchBranch, prepareWorktree } from "./sync.js";
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
@@ -78,6 +79,34 @@ const pushToGitHub = (branch: string, file: string, content: string) => {
   git(seed, "push", "-q", remote, `${branch}:refs/heads/${branch}`);
   return sha;
 };
+
+let chains = 0;
+/**
+ * `n` empty commits on top of `from` (a root when omitted), written by one `git fast-import` so a
+ * long history costs one process, not `n`. Returns the tip; no branch points at it yet.
+ */
+const emptyCommits = (repo: string, n: number, from?: string) => {
+  const ref = `refs/tmp/chain-${chains++}`;
+  const stream = Array.from({ length: n }, (_, i) => {
+    const message = `c${i + 1}`;
+    const parent = i === 0 ? from : `:${i}`;
+    return [
+      `commit ${ref}`,
+      `mark :${i + 1}`,
+      `committer Ada L <ada@example.com> ${1_700_000_000 + i} +0000`,
+      `data ${message.length}`,
+      message,
+      ...(parent ? [`from ${parent}`] : []),
+      "",
+    ].join("\n");
+  }).join("\n");
+  execFileSync("git", ["fast-import", "--quiet"], { cwd: repo, input: stream });
+  return git(repo, "rev-parse", ref);
+};
+
+/** Points GitHub's `branch` at `sha`, a commit already in `seed`. */
+const pushTo = (branch: string, sha: string) =>
+  git(seed, "push", "-q", remote, `${sha}:refs/heads/${branch}`);
 
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), "runner-sync-"));
@@ -654,10 +683,8 @@ test("a follow-up of a continued agent writes no config, so another run holding 
 });
 
 test("a start branch with more commits of its own than a run fetches fails, measured by compare", async () => {
-  pushToGitHub("feature/big", "big.txt", "0\n");
-  for (let i = 1; i <= 100; i++)
-    git(seed, "commit", "-q", "--allow-empty", "-m", `c${i}`);
-  git(seed, "push", "-q", remote, "feature/big:refs/heads/feature/big");
+  const first = pushToGitHub("feature/big", "big.txt", "0\n");
+  pushTo("feature/big", emptyCommits(seed, 100, first));
 
   await expect(prepare({ startBranch: "feature/big" })).rejects.toThrow(
     "the start branch feature/big has 101 commits that trunk doesn't, more than the 100 a run fetches",
@@ -942,11 +969,9 @@ test("branch-check when GitHub fails otherwise exits 1, saying why", async () =>
 
 test("branch too far behind to connect leaves origin default where it was", async () => {
   const old = git(repoDir, "rev-parse", "origin/HEAD");
-  pushToGitHub("trunk", "new.txt", "0\n");
-  for (let i = 1; i <= 100; i++)
-    git(seed, "commit", "-q", "--allow-empty", "-m", `c${i}`);
-  git(seed, "push", "-q", remote, "trunk:refs/heads/trunk");
-  const tip = bare("rev-parse", "trunk");
+  const first = pushToGitHub("trunk", "new.txt", "0\n");
+  const tip = emptyCommits(seed, 100, first);
+  pushTo("trunk", tip);
 
   const { cwd, notes } = await prepare();
 
@@ -1023,4 +1048,385 @@ test("a head publish fetched shallow doesn't become an island under origin defau
   ]);
   expect(shallowFile()).toContain(cloned);
   expect(shallowFile()).not.toContain(head);
+});
+
+/** A `git` ahead of the real one on PATH that runs the shell `before` first; `$REAL` is the real git. */
+let shims = 0;
+const gitShim = (before: string) => {
+  const bin = join(root, `bin-${shims++}`);
+  mkdirSync(bin);
+  const real = execFileSync("sh", ["-c", "command -v git"], {
+    encoding: "utf8",
+  }).trim();
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh\nREAL=${real}\n${before}\nexec "$REAL" "$@"\n`,
+    { mode: 0o755 },
+  );
+  vi.stubEnv("PATH", `${bin}:${process.env.PATH}`);
+};
+
+const refuseAbort = `for a in "$@"; do [ "$a" = --abort ] && { echo "fatal: simulated abort failure" >&2; exit 128; }; done`;
+
+const note = (branch: string, tip: string, detail: string, head: string) =>
+  `\`${branch}\` on GitHub is at ${tip.slice(0, 7)}, ${detail}; your worktree (at ${head.slice(0, 7)}) was not touched. \`publish\` will refuse to overwrite commits the branch never had.`;
+
+test.each([
+  ["same shas", false],
+  ["recreated shas", true],
+])(
+  "follow-up on a worktree with uncommitted changes brings nothing in (%s)",
+  async (_, recreated) => {
+    const { cwd, sha } = await earlierRun();
+    if (recreated) publishRecreated();
+    else publishAsIs(cwd);
+    const outside = pushToGitHub("claude/agt_1", "review.txt", "fix\n");
+    writeFileSync(join(cwd, "agent.txt"), "half-done edit\n");
+
+    const { notes } = await prepare();
+
+    expect(git(cwd, "rev-parse", "HEAD")).toBe(sha);
+    expect(git(cwd, "status", "--porcelain")).toBe("M agent.txt");
+    expect(notes).toEqual([
+      note(
+        "claude/agt_1",
+        outside,
+        "with 1 commit pushed from outside this sandbox, but your worktree has uncommitted changes",
+        sha,
+      ),
+    ]);
+  },
+);
+
+test("follow-up whose GitHub branch shares no history with the worktree says none of what it walked matches", async () => {
+  const { cwd, sha } = await earlierRun();
+  const root1 = emptyCommits(seed, 1);
+  pushTo("claude/agt_1", root1);
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(sha);
+  expect(notes).toEqual([
+    note(
+      "claude/agt_1",
+      root1,
+      "and none of the 1 commit seen walking back from it matches this worktree",
+      sha,
+    ),
+  ]);
+});
+
+test("the walk back through GitHub's history stops at 101 commits", async () => {
+  const { cwd, sha } = await earlierRun();
+  const tip = emptyCommits(seed, 150);
+  pushTo("claude/agt_1", tip);
+  requests = [];
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(sha);
+  expect(notes).toEqual([
+    note(
+      "claude/agt_1",
+      tip,
+      "and none of the 101 commits seen walking back from it matches this worktree",
+      sha,
+    ),
+  ]);
+  expect(
+    requests.filter((r) => r.startsWith("GET /git/commits/")),
+  ).toHaveLength(101);
+});
+
+test("a fast-forward git refuses leaves the worktree as it was, with the reason", async () => {
+  const { cwd, sha } = await earlierRun();
+  publishAsIs(cwd);
+  const outside = pushToGitHub("claude/agt_1", "review.txt", "fix\n");
+  // untracked files don't make a worktree dirty, but the merge would overwrite this one
+  writeFileSync(join(cwd, "review.txt"), "mine\n");
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(sha);
+  expect(readFileSync(join(cwd, "review.txt"), "utf8")).toBe("mine\n");
+  expect(notes).toHaveLength(1);
+  expect(notes[0]).toMatch(
+    new RegExp(
+      `^\`claude/agt_1\` on GitHub is at ${outside.slice(0, 7)}, with 1 commit pushed from outside this sandbox, but bringing them in failed \\(".*review\\.txt.*"\\); your worktree \\(at ${sha.slice(0, 7)}\\) was not touched\\.`,
+    ),
+  );
+});
+
+/** Two outside commits on a recreated branch; the second adds `b.txt`, which the worktree holds untracked. */
+const cherryPickStopsOnSecond = async () => {
+  const { cwd, sha } = await earlierRun();
+  publishRecreated();
+  pushToGitHub("claude/agt_1", "a.txt", "a\n");
+  pushToGitHub("claude/agt_1", "b.txt", "b\n");
+  writeFileSync(join(cwd, "b.txt"), "mine\n");
+  return { cwd, sha };
+};
+
+test("a cherry-pick that stops part-way is aborted, so none of the outside commits are half applied", async () => {
+  const { cwd, sha } = await cherryPickStopsOnSecond();
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(sha);
+  expect(existsSync(join(cwd, "a.txt"))).toBe(false);
+  expect(readFileSync(join(cwd, "b.txt"), "utf8")).toBe("mine\n");
+  expect(
+    spawnSync("git", ["rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"], {
+      cwd,
+    }).status,
+  ).not.toBe(0);
+  expect(notes).toHaveLength(1);
+  expect(notes[0]).toContain("but bringing them in failed (");
+  expect(notes[0]).not.toContain("--abort");
+});
+
+test("a cherry-pick whose abort fails too says the worktree is left mid-cherry-pick", async () => {
+  const { cwd } = await cherryPickStopsOnSecond();
+  gitShim(refuseAbort);
+
+  const { notes } = await prepare();
+
+  expect(notes).toHaveLength(1);
+  expect(notes[0]).toContain(
+    '`git cherry-pick --abort` failed too ("fatal: simulated abort failure"), so the worktree is left mid-cherry-pick, with some of them applied; run `git cherry-pick --abort` before anything else.',
+  );
+  expect(existsSync(join(cwd, "a.txt"))).toBe(true);
+});
+
+test("a default branch exactly 100 commits ahead is fetched whole", {
+  timeout: 120_000,
+}, async () => {
+  const tip = emptyCommits(seed, 100, bare("rev-parse", "trunk"));
+  pushTo("trunk", tip);
+
+  const { cwd, notes } = await prepare();
+
+  expect(git(repoDir, "rev-parse", "refs/remotes/origin/trunk")).toBe(tip);
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(notes).toEqual([]);
+});
+
+test("outside commits whose merged-in history is more than a run fetches are reported, not half taken", {
+  timeout: 120_000,
+}, async () => {
+  const { cwd, sha } = await earlierRun();
+  publishAsIs(cwd);
+  git(seed, "fetch", "-q", remote, "+refs/heads/*:refs/remotes/gh/*");
+  git(seed, "checkout", "-q", "-B", "side", sha);
+  const side = commitIn(seed, "side.txt", "s\n", "side");
+  const sideTip = emptyCommits(seed, 99, side);
+  git(seed, "checkout", "-q", "-B", "claude/agt_1", sha);
+  git(seed, "merge", "-q", "--no-ff", "-m", "merge side", sideTip);
+  git(seed, "push", "-q", remote, "claude/agt_1:refs/heads/claude/agt_1");
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(sha);
+  expect(notes).toEqual([
+    "The runner couldn't refresh from GitHub: claude/agt_1 on GitHub is more than 100 commits past anything this clone has; working from the commit the sandbox last had.",
+  ]);
+  expect(warnings).toEqual([
+    "runner: refresh from GitHub failed: claude/agt_1 on GitHub is more than 100 commits past anything this clone has",
+  ]);
+});
+
+const gh = () =>
+  gateway({
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    owner: "acme",
+    repo: "private",
+  });
+const originRef = (branch: string) =>
+  git(repoDir, "rev-parse", `refs/remotes/origin/${branch}`);
+
+/** `feature/race` fetched at its first commit, then two more on GitHub and the first of them fetched. */
+const raceSetup = async () => {
+  const first = pushToGitHub("feature/race", "a.txt", "1\n");
+  const created = await fetchBranch({
+    repoDir,
+    call: gh(),
+    branch: "feature/race",
+    tip: first,
+  });
+  expect(created).toEqual({
+    branch: "feature/race",
+    sha: first,
+    previous: null,
+  });
+  const next = pushToGitHub("feature/race", "a.txt", "2\n");
+  const newer = pushToGitHub("feature/race", "a.txt", "3\n");
+  // `newer` and `next` arrive under another name; origin/feature/race stays at `first`
+  await fetchBranch({
+    repoDir,
+    call: gh(),
+    branch: "feature/seen",
+    tip: newer,
+  });
+  return { first, next, newer };
+};
+
+/** A competing run that moves origin/feature/race to `to` just before this run's own update. */
+const rivalMoves = (to: string) =>
+  gitShim(
+    `case " $* " in *" update-ref refs/remotes/origin/feature/race "*) [ -e "${root}/rival" ] || { : > "${root}/rival"; "$REAL" update-ref refs/remotes/origin/feature/race ${to}; };; esac`,
+  );
+
+test("a ref another run moved past this tip meanwhile is left at the newer tip", async () => {
+  const { first, next, newer } = await raceSetup();
+  rivalMoves(newer);
+
+  const result = await fetchBranch({
+    repoDir,
+    call: gh(),
+    branch: "feature/race",
+    tip: next,
+  });
+
+  expect(existsSync(join(root, "rival"))).toBe(true);
+  expect(result).toEqual({
+    branch: "feature/race",
+    sha: next,
+    previous: first,
+  });
+  expect(originRef("feature/race")).toBe(newer);
+});
+
+test("a ref another run moved somewhere unrelated meanwhile is moved on to this tip", async () => {
+  const { next } = await raceSetup();
+  const other = pushToGitHub("feature/other", "o.txt", "o\n");
+  await fetchBranch({
+    repoDir,
+    call: gh(),
+    branch: "feature/other",
+    tip: other,
+  });
+  rivalMoves(other);
+
+  await fetchBranch({ repoDir, call: gh(), branch: "feature/race", tip: next });
+
+  expect(existsSync(join(root, "rival"))).toBe(true);
+  expect(originRef("feature/race")).toBe(next);
+});
+
+test("two fetches into one repo at once each build their tree in an index of their own", async () => {
+  const one = pushToGitHub("feature/one", "one.txt", "1\n");
+  const two = pushToGitHub("feature/two", "two.txt", "2\n");
+  const log = join(root, "indexes.log");
+  // held open so both are mid-update when the other starts
+  gitShim(
+    `case " $* " in *" update-index "*) echo "$GIT_INDEX_FILE" >> "${log}"; sleep 0.5;; esac`,
+  );
+
+  await Promise.all([
+    fetchBranch({ repoDir, call: gh(), branch: "feature/one", tip: one }),
+    fetchBranch({ repoDir, call: gh(), branch: "feature/two", tip: two }),
+  ]);
+
+  const used = readFileSync(log, "utf8").split("\n").filter(Boolean);
+  expect(used).toHaveLength(2);
+  expect(new Set(used).size).toBe(2);
+  for (const path of used) {
+    expect(path).toMatch(/\.git\/sky-pull-index-\d+-[0-9a-f-]{36}$/);
+    expect(existsSync(path)).toBe(false);
+  }
+});
+
+test("START_BRANCH with no connector can't be fetched, so no worktree is made", async () => {
+  await expect(prepare({ startBranch: "feature/login" }, {})).rejects.toThrow(
+    "START_BRANCH is feature/login, but GITHUB_CONNECTOR is not set, so there is no way to fetch it from GitHub",
+  );
+  expect(existsSync(join(worktreesDir, "agt_1"))).toBe(false);
+});
+
+test("an existing worktree is recorded as continuing START_BRANCH even with no connector", async () => {
+  const { cwd } = await prepare();
+
+  const { notes } = await prepare({ startBranch: "feature/login" }, {});
+
+  expect(notes).toEqual([START_NOTE]);
+  expect(
+    git(repoDir, "config", "--get", "branch.claude/agt_1.sky-remote-branch"),
+  ).toBe("feature/login");
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+});
+
+test("a failed refresh of the default branch doesn't stop a start branch being fetched", async () => {
+  const tip = pushToGitHub("feature/login", "login.txt", "1\n");
+  server.use(
+    http.get(`${REPO}/git/ref/heads/trunk`, () =>
+      HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
+    ),
+  );
+
+  const { cwd, notes } = await prepare({ startBranch: "feature/login" });
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(notes).toEqual([
+    "The runner couldn't refresh from GitHub: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 502: Bad Gateway; working from the commit the sandbox last had.",
+    START_NOTE,
+  ]);
+});
+
+test("a start branch can't be fetched when the runner can't tell where GitHub is, and says why", async () => {
+  pushToGitHub("feature/login", "login.txt", "1\n");
+  git(repoDir, "remote", "set-url", "origin", "/srv/not-github.git");
+
+  await expect(prepare({ startBranch: "feature/login" })).rejects.toThrow(
+    "can't fetch START_BRANCH feature/login from GitHub: origin is not a GitHub repo: /srv/not-github.git",
+  );
+  expect(existsSync(join(worktreesDir, "agt_1"))).toBe(false);
+});
+
+test("a continued worktree takes commits pushed to its start branch, and isn't rebased onto the default branch", async () => {
+  const start = pushToGitHub("feature/login", "login.txt", "1\n");
+  const { cwd } = await prepare({ startBranch: "feature/login" });
+  const outside = pushToGitHub("feature/login", "login.txt", "2\n");
+  pushToGitHub("trunk", "new.txt", "trunk moved on\n");
+
+  const { notes } = await prepare({ startBranch: "feature/login" });
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(outside);
+  expect(git(cwd, "rev-parse", "HEAD^")).toBe(start);
+  expect(notes).toEqual([
+    `1 commit pushed to \`feature/login\` from outside this sandbox was brought into your worktree: ${outside.slice(0, 7)} "edit login.txt on feature/login".`,
+    START_NOTE,
+  ]);
+});
+
+test("an untracked file blocking the rebase fails it without a conflict, and the note says what git said", async () => {
+  const { cwd, sha } = await earlierRun();
+  pushToGitHub("trunk", "new.txt", "from outside\n");
+  writeFileSync(join(cwd, "new.txt"), "mine\n");
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(sha);
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+  expect(readFileSync(join(cwd, "new.txt"), "utf8")).toBe("mine\n");
+  expect(notes).toHaveLength(1);
+  expect(notes[0]).toMatch(
+    /^Your worktree is 1 commit behind `origin\/trunk`; rebasing onto it failed \(".*new\.txt.*"\), so the worktree was left as it was\.$/,
+  );
+});
+
+test("an untracked file that blocks nothing doesn't keep the worktree from being rebased", async () => {
+  const { cwd } = await earlierRun();
+  const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
+  writeFileSync(join(cwd, "scratch.txt"), "notes to self\n");
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "HEAD^")).toBe(tip);
+  expect(readFileSync(join(cwd, "scratch.txt"), "utf8")).toBe(
+    "notes to self\n",
+  );
+  expect(notes).toEqual([
+    `Your worktree was rebased onto \`origin/trunk\`, which GitHub had moved 1 commit ahead to ${tip.slice(0, 7)}; your commits now have new shas.`,
+  ]);
 });

@@ -1128,6 +1128,36 @@ test.each([
   expect(gh.pullCreates).toMatchObject([{ head: expected }]);
 });
 
+test("--branch over a continued branch sends every commit onto the base as a new branch, with no base rebase", async () => {
+  git(work, "config", "branch.claude/agt_1.sky-remote-branch", "feature/x");
+  writeFileSync(join(work, "theirs.txt"), "theirs\n");
+  commit("Their change");
+  writeFileSync(join(work, "mine.txt"), "mine\n");
+  commit("Agent change");
+  const gh = fakeGitHub({ branch: "cli/branch" });
+  // the base moved on GitHub; a rebase onto it would fetch this head, which the fake doesn't hold
+  server.use(
+    http.get(`${REPO}/git/ref/heads/main`, () =>
+      HttpResponse.json({ object: { sha: "e".repeat(40) } }),
+    ),
+  );
+
+  const { status } = await publishMainWith(
+    ["--title", "T", "--branch", "cli/branch"],
+    {},
+  );
+
+  expect(status).toBe(0);
+  expect(gh.commits.map((c) => [c.message, c.parents])).toEqual([
+    ["Their change\n", [baseSha]],
+    ["Agent change\n", ["commit1"]],
+  ]);
+  expect(gh.refWrites).toMatchObject([
+    { method: "POST", body: { ref: "refs/heads/cli/branch", sha: "commit2" } },
+  ]);
+  expect(gh.pullCreates).toMatchObject([{ head: "cli/branch", base: "main" }]);
+});
+
 test("an empty SKY_PUBLISH_BRANCH falls back to the worktree's branch", async () => {
   const gh = fakeGitHub();
   writeFileSync(join(work, "a.txt"), "first\n");

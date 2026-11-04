@@ -56,6 +56,24 @@ test("branch-check is its own command, not a run: with no branch it exits 2 with
   });
 });
 
+test.each(["constructor", "toString", "__proto__"])(
+  "%s is not a command: the runner starts a run, which wants its env",
+  async (name) => {
+    const child = spawn(process.execPath, [bundle, name], {
+      env: { PATH: process.env.PATH ?? "", CLAUDE_CONFIG_DIR },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    const [code] = await once(child, "exit");
+    expect(code).toBe(2);
+    expect(stdout).toBe("");
+    expect(stderr).toMatch(/AGENT_ID/);
+  },
+);
+
 test("missing env is a usage error: exit 2, one line on stderr, nothing on stdout", async () => {
   const { code, stdout, stderr } = await runBundle({
     AGENT_TOKEN: "agent-secret",
