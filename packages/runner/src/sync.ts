@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { type AgentId, agentBranch } from "@sky/shared";
 import {
+  BRANCH_ENV,
   CONNECTOR_ENV,
   DEFAULT_GATEWAY_URL,
   FETCHED_BASES,
@@ -13,8 +14,9 @@ import {
   movingCommitsConfig,
   parseOrigin,
   REMOTE_BRANCH_KEY,
+  rebaseInProgress,
 } from "./publish.js";
-import { fetchCommit } from "./repo.js";
+import { editShallow, fetchCommit, shallowCommits } from "./repo.js";
 import { git, messageOf } from "./store.js";
 import { ensureWorktree } from "./worktree.js";
 
@@ -39,25 +41,42 @@ const DEFAULT_MAX_COMMITS = 100;
 const segments = (branch: string) =>
   branch.split("/").map(encodeURIComponent).join("/");
 
-/** GitHub's tip of `branch`; a branch GitHub doesn't have throws `BranchNotFoundError`. */
+const isNotFound = (error: unknown) =>
+  error instanceof GatewayError && error.status === 404;
+
+/**
+ * GitHub's tip of `branch`; a branch GitHub doesn't have throws `BranchNotFoundError`. GitHub
+ * answers 404 for a repo the connector can't see too, so a 404 counts as a missing branch only once
+ * the repo itself answers.
+ */
 export async function remoteTip(call: Call, branch: string): Promise<string> {
   const ref = await call<{ object: { sha: string } }>(
     "GET",
     `/git/ref/heads/${segments(branch)}`,
-  ).catch((error: unknown) => {
-    if (error instanceof GatewayError && error.status === 404) {
-      throw new BranchNotFoundError(
-        branch,
-        `${branch} doesn't exist on GitHub (${error.message})`,
+  ).catch(async (error: unknown) => {
+    if (!isNotFound(error)) throw error;
+    await call("GET", "").catch((probe: unknown) => {
+      if (!isNotFound(probe)) throw probe;
+      throw new Error(
+        `the connector in ${CONNECTOR_ENV} can't see the repo; check its connection id and the repos it grants (${messageOf(probe)})`,
       );
-    }
-    throw error;
+    });
+    throw new BranchNotFoundError(
+      branch,
+      `${branch} doesn't exist on GitHub (${messageOf(error)})`,
+    );
   });
   return ref.object.sha;
 }
 
 const present = (g: Git, sha: string) =>
   g(["cat-file", "-e", `${sha}^{commit}`]).then(
+    () => true,
+    () => false,
+  );
+
+const isAncestorIn = (g: Git, sha: string, of: string) =>
+  g(["merge-base", "--is-ancestor", sha, of]).then(
     () => true,
     () => false,
   );
@@ -86,10 +105,13 @@ function cachingCommits(call: Call): Call {
  * Brings GitHub's `branch` into `repoDir` through the gateway and points
  * `refs/remotes/origin/<branch>` at it. Walks from the tip over every parent until it reaches
  * commits already here, and fetches what it walked oldest-first, so each commit's parents exist
- * when it is written and the history stays connected rather than shallow. A sha in `stopAt` is
- * fetched but its parents are not walked; `tipOnly` fetches the tip alone, shallow. More than
- * `maxCommits` to fetch throws `TooFarError` before anything is written. Every write converges, so
- * another agent's run fetching the same branch at once does no harm.
+ * when it is written and the history stays connected rather than shallow. A commit `shallow` lists
+ * (a base a publish fetched alone, say) counts as here only where it is an ancestor of a sha in
+ * `connected`, the history the caller needs to stay joined to; elsewhere it is walked through, and
+ * leaves `shallow` once its parents are written. A sha in `stopAt` is fetched but its parents are
+ * not walked; `tipOnly` fetches the tip alone, shallow. More than `maxCommits` to fetch throws
+ * `TooFarError` before anything is written. Every write converges, so another agent's run fetching
+ * the same branch at once does no harm.
  */
 export async function fetchBranch(options: {
   repoDir: string;
@@ -98,6 +120,9 @@ export async function fetchBranch(options: {
   /** GitHub's tip, when the caller has already looked it up. */
   tip?: string;
   stopAt?: string[];
+  connected?: string[];
+  /** The only commits whose parents are walked, a set the caller has measured, so `maxCommits` doesn't apply; the rest are fetched shallow. */
+  within?: Set<string>;
   maxCommits?: number;
   tipOnly?: boolean;
 }): Promise<{ branch: string; sha: string; previous: string | null }> {
@@ -107,19 +132,34 @@ export async function fetchBranch(options: {
   const sha = options.tip ?? (await remoteTip(call, branch));
   const maxCommits = options.maxCommits ?? DEFAULT_MAX_COMMITS;
   const stopAt = new Set(options.stopAt ?? []);
+  const { within } = options;
+  const shallow = await shallowCommits(g);
+  const connected = options.connected ?? [];
+  const here = async (commit: string) => {
+    if (!(await present(g, commit))) return false;
+    if (!shallow.has(commit)) return true;
+    for (const joined of connected) {
+      if (await isAncestorIn(g, commit, joined)) return true;
+    }
+    return false;
+  };
 
   const parentsOf = new Map<string, string[]>();
-  if (!(await present(g, sha))) {
+  if (!(await here(sha))) {
     const queue = [sha];
     while (queue.length > 0) {
       const next = queue.shift() as string;
-      if (parentsOf.has(next) || (await present(g, next))) continue;
-      if (parentsOf.size >= maxCommits) {
+      if (parentsOf.has(next) || (await here(next))) continue;
+      if (!within && parentsOf.size >= maxCommits) {
         throw new TooFarError(
           `${branch} on GitHub is more than ${maxCommits} commits past anything this clone has`,
         );
       }
-      if (options.tipOnly || stopAt.has(next)) {
+      if (
+        options.tipOnly ||
+        stopAt.has(next) ||
+        (within && !within.has(next))
+      ) {
         parentsOf.set(next, []);
         continue;
       }
@@ -135,7 +175,17 @@ export async function fetchBranch(options: {
     }
   }
   for (const commit of oldestFirst(sha, parentsOf)) {
-    await fetchCommit(g, call, commit);
+    // a shallow commit walked through is already written; only its parents were missing
+    if (!(await present(g, commit))) await fetchCommit(g, call, commit);
+  }
+  const joined = [...parentsOf]
+    .filter(([commit, parents]) => parents.length > 0 && shallow.has(commit))
+    .map(([commit]) => commit);
+  if (joined.length > 0) {
+    await editShallow(g, (held) => {
+      for (const commit of joined) held.delete(commit);
+      return held;
+    });
   }
 
   const ref = `refs/remotes/origin/${branch}`;
@@ -227,7 +277,12 @@ export async function syncDefaultBranch(options: {
   const result = { default: name, previous, sha, moved: false, tooFar: false };
   if (sha === previous) return result;
   try {
-    await fetchBranch({ ...options, branch: name, tip: sha });
+    await fetchBranch({
+      ...options,
+      branch: name,
+      tip: sha,
+      connected: previous ? [previous] : [],
+    });
   } catch (error) {
     if (error instanceof TooFarError) return { ...result, tooFar: true };
     throw error;
@@ -250,9 +305,24 @@ async function inTree(cwd: string, ...args: string[]): Promise<string> {
   return stdout.trim();
 }
 
-/** A failed git command's own words, not execFile's "Command failed: …" wrapper. */
+/**
+ * Text from the repository or git for a note: whoever can push to the branch writes it, and notes
+ * reach the system prompt, so it goes in as one quoted, capped line, which the notes' heading marks
+ * as data.
+ */
+const quoted = (text: string, max = 120) => {
+  const line = text.replace(/\s+/g, " ").trim();
+  return JSON.stringify(
+    line.length > max ? `${line.slice(0, max - 1)}…` : line,
+  );
+};
+
+/** A failed git command's own words, not execFile's "Command failed: …" wrapper, quoted. */
 const gitSaid = (error: unknown) =>
-  (error as { stderr?: string }).stderr?.trim() || messageOf(error);
+  quoted(
+    (error as { stderr?: string }).stderr?.trim() || messageOf(error),
+    300,
+  );
 
 const short = (sha: string | null) => (sha ?? "").slice(0, 7);
 const commits = (n: number) => `${n} commit${n === 1 ? "" : "s"}`;
@@ -271,19 +341,66 @@ async function unmerged(cwd: string): Promise<string[]> {
   ];
 }
 
+/** Whether a stopped `op` is in progress in `cwd`, so there is something to abort. */
+async function stopped(cwd: string, op: "rebase" | "cherry-pick") {
+  if (op === "rebase") return (await rebaseInProgress(cwd)) !== undefined;
+  // CHERRY_PICK_HEAD marks the commit it stopped on; `sequencer` the rest of a series
+  const sequencer = await inTree(
+    cwd,
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-path",
+    "sequencer",
+  );
+  return (
+    existsSync(sequencer) ||
+    (await inTree(
+      cwd,
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      "CHERRY_PICK_HEAD",
+    ).then(
+      () => true,
+      () => false,
+    ))
+  );
+}
+
+/**
+ * Aborts the rebase or cherry-pick a failed command left stopped in `cwd`. "" when nothing was
+ * left or the abort worked, else the end of a note saying the worktree is left mid-way.
+ */
+async function abortStopped(
+  cwd: string,
+  op: "rebase" | "cherry-pick",
+): Promise<string> {
+  if (!(await stopped(cwd, op))) return "";
+  const state =
+    op === "rebase"
+      ? "mid-rebase with HEAD detached, and commits made now land on no branch"
+      : "mid-cherry-pick, with some of them applied";
+  return inTree(cwd, op, "--abort").then(
+    () => "",
+    (abort: unknown) =>
+      `, and \`git ${op} --abort\` failed too (${gitSaid(abort)}), so the worktree is left ${state}; run \`git ${op} --abort\` before anything else.`,
+  );
+}
+
 /** Whether the worktree has changes to tracked files; untracked files block nothing by themselves. */
 const isDirty = async (cwd: string) =>
   (await inTree(cwd, "status", "--porcelain", "--untracked-files=no")) !== "";
 
 /**
  * Rebases an existing worktree's branch onto `origin/<name>` when it is behind, unless the branch
- * is published (rewriting it would break the pull request built from it) or has uncommitted
- * changes; a rebase that fails is aborted and the worktree left as it was. Says what it did.
+ * is published (rewriting it would break the pull request built from it), may be (`published`
+ * undefined: GitHub couldn't be asked), or has uncommitted changes; a rebase that fails is aborted
+ * and the worktree left as it was, or, when the abort fails too, left mid-rebase. Says what it did.
  */
 async function rebaseOntoDefault(
   cwd: string,
   name: string,
-  published: boolean,
+  published: boolean | undefined,
 ): Promise<string[]> {
   const target = `refs/remotes/origin/${name}`;
   const behind = Number(
@@ -291,9 +408,12 @@ async function rebaseOntoDefault(
   );
   if (behind === 0) return [];
   const behindBy = `Your worktree is ${commits(behind)} behind \`origin/${name}\``;
-  if (published) {
+  if (published !== false) {
+    const why = published
+      ? "its branch is already published to GitHub"
+      : "the runner couldn't tell whether its branch is published to GitHub";
     return [
-      `${behindBy}; it wasn't rebased because its branch is already published to GitHub, and rewriting published commits would rewrite its pull request.`,
+      `${behindBy}; it wasn't rebased because ${why}, and rewriting published commits would rewrite its pull request.`,
     ];
   }
   if (await isDirty(cwd)) {
@@ -311,11 +431,11 @@ async function rebaseOntoDefault(
     );
   } catch (error) {
     const conflicted = await unmerged(cwd);
-    await inTree(cwd, "rebase", "--abort").catch(() => {});
+    const stuck = await abortStopped(cwd, "rebase");
     return [
       conflicted.length > 0
-        ? `${behindBy}; rebasing onto it conflicted (in ${conflicted.join(", ")}), so the rebase was aborted and the worktree left as it was.`
-        : `${behindBy}; rebasing onto it failed (${gitSaid(error)}), so the worktree was left as it was.`,
+        ? `${behindBy}; rebasing onto it conflicted (in ${conflicted.join(", ")})${stuck || ", so the rebase was aborted and the worktree left as it was."}`
+        : `${behindBy}; rebasing onto it failed (${gitSaid(error)})${stuck || ", so the worktree was left as it was."}`,
     ];
   }
   const tip = await inTree(cwd, "rev-parse", target);
@@ -339,8 +459,8 @@ const isAncestor = (cwd: string, sha: string, of: string) =>
 /**
  * Brings commits pushed to the agent's GitHub `branch` from outside the sandbox into its existing
  * worktree, when that can't lose anything: the worktree is clean, everything in it is published,
- * and the outside commits are a plain line on top. GitHub's history is classified before any body
- * is fetched: walking the tip's first parents to the first commit that matches the worktree, by sha
+ * and the outside commits sit on top, merges among them only where they fast-forward. GitHub's
+ * history is classified before any body is fetched: walking the tip's first parents to the first commit that matches the worktree, by sha
  * (HEAD, or an ancestor of it) or by tree (HEAD's, or one on its first-parent line since the
  * default branch), since `publish` recreates commits on GitHub under new shas. Anything else is
  * left as it is, with a note. `published` is whether GitHub has the branch at all.
@@ -428,8 +548,14 @@ export async function syncAgentBranch(options: {
       `with ${pushed}, but your worktree has uncommitted changes`,
     );
   }
-  if (outside.some(({ commit }) => commit.parents.length > 1)) {
-    return untouched(`with ${pushed}, including a merge`);
+  // on HEAD's own sha they fast-forward, merges and all
+  if (
+    match.sha !== head &&
+    outside.some(({ commit }) => commit.parents.length > 1)
+  ) {
+    return untouched(
+      `with ${pushed}, including a merge: GitHub's copies of your commits have other shas than yours, so they can only be brought in by cherry-pick, which can't replay a merge`,
+    );
   }
 
   await fetchBranch({
@@ -438,6 +564,7 @@ export async function syncAgentBranch(options: {
     branch,
     tip,
     stopAt: [match.sha],
+    connected: [head],
   });
   const oldest = outside.map(({ sha }) => sha).reverse();
   try {
@@ -454,15 +581,24 @@ export async function syncAgentBranch(options: {
       );
     }
   } catch (error) {
-    if (match.sha !== head) {
-      await inTree(cwd, "cherry-pick", "--abort").catch(() => {});
+    const failed = `with ${pushed}, but bringing them in failed (${gitSaid(error)})`;
+    const stuck =
+      match.sha === head ? "" : await abortStopped(cwd, "cherry-pick");
+    if (stuck) {
+      return {
+        published: true,
+        notes: [
+          `\`${branch}\` on GitHub is at ${short(tip)}, ${failed}${stuck}`,
+        ],
+      };
     }
-    return untouched(
-      `with ${pushed}, but bringing them in failed (${gitSaid(error)})`,
-    );
+    return untouched(failed);
   }
   const list = outside
-    .map(({ sha, commit }) => `${short(sha)} ${commit.message.split("\n")[0]}`)
+    .map(
+      ({ sha, commit }) =>
+        `${short(sha)} ${quoted(commit.message.split("\n")[0] ?? "")}`,
+    )
     .reverse()
     .join("; ");
   return {
@@ -474,16 +610,19 @@ export async function syncAgentBranch(options: {
 }
 
 /**
- * Fetches GitHub's `startBranch` back to where it left the default branch, and records that merge
- * base under `FETCHED_BASES` so publish finds the base it was cut from.
+ * Fetches GitHub's `startBranch`: the commits it has that the default branch doesn't, as GitHub's
+ * compare lists them, each parent outside that list fetched shallow, so a branch that merged the
+ * default branch in never walks down the default branch's history. Records the merge base under
+ * `FETCHED_BASES` so publish finds the base it was cut from. Returns the branch's tip.
  */
 async function fetchStartBranch(options: {
   repoDir: string;
   call: Call;
   startBranch: string;
   defaultBranch: string;
-}): Promise<void> {
-  const { call, startBranch } = options;
+}): Promise<string> {
+  const { call, startBranch, defaultBranch } = options;
+  const g = git(options.repoDir);
   const tip = await remoteTip(call, startBranch).catch((error: unknown) => {
     if (error instanceof BranchNotFoundError) {
       throw new BranchNotFoundError(
@@ -493,25 +632,35 @@ async function fetchStartBranch(options: {
     }
     throw error;
   });
-  const { merge_base_commit: mergeBase } = await call<{
+  const compare = await call<{
     merge_base_commit: { sha: string };
+    total_commits: number;
+    commits: { sha: string }[];
   }>(
     "GET",
-    `/compare/${segments(options.defaultBranch)}...${segments(startBranch)}?per_page=1`,
+    `/compare/${segments(defaultBranch)}...${segments(startBranch)}?per_page=${DEFAULT_MAX_COMMITS}`,
   );
+  if (compare.total_commits > compare.commits.length) {
+    throw new TooFarError(
+      `the start branch ${startBranch} has ${commits(compare.total_commits)} that ${defaultBranch} doesn't, more than the ${DEFAULT_MAX_COMMITS} a run fetches`,
+    );
+  }
+  const onDefault = await resolved(g, `refs/remotes/origin/${defaultBranch}`);
   await fetchBranch({
     repoDir: options.repoDir,
     call,
     branch: startBranch,
     tip,
-    stopAt: [mergeBase.sha],
+    within: new Set(compare.commits.map(({ sha }) => sha)),
+    connected: onDefault ? [onDefault] : [],
   });
-  await git(options.repoDir)([
-    "update-ref",
-    `${FETCHED_BASES}${mergeBase.sha}`,
-    mergeBase.sha,
-  ]);
+  const mergeBase = compare.merge_base_commit.sha;
+  await g(["update-ref", `${FETCHED_BASES}${mergeBase}`, mergeBase]);
+  return tip;
 }
+
+/** `refs/sky/starts/<agentId>`: the start branch's tip when the agent's worktree was first made from it; never moved. */
+export const STARTS = "refs/sky/starts/";
 
 export const BRANCH_CHECK_USAGE = "branch-check <branch>";
 
@@ -569,6 +718,21 @@ export async function branchCheckMain(
   }
 }
 
+/**
+ * The GitHub branch `publish` sends `branch` to when no `--branch` is given: the branch a continued
+ * agent was started on, then the environment's `SKY_PUBLISH_BRANCH`, then its own name.
+ */
+const publishedBranch = async (
+  g: Git,
+  branch: string,
+  env: NodeJS.ProcessEnv,
+): Promise<string> =>
+  (await g(["config", "--get", `branch.${branch}.${REMOTE_BRANCH_KEY}`]).catch(
+    () => "",
+  )) ||
+  env[BRANCH_ENV] ||
+  branch;
+
 const tooFarNote = (s: DefaultSync) =>
   `GitHub's ${s.default} is more than ${DEFAULT_MAX_COMMITS} commits ahead of what this sandbox has, too far to fetch, so \`origin/${s.default}\` was left at ${short(s.previous)}; you are working from that commit, not GitHub's ${short(s.sha)}.`;
 
@@ -593,8 +757,11 @@ export async function prepareWorktree(
   const isNew = !existsSync(join(config.worktreesDir, config.agentId));
   const continueStartBranch = async (cwd: string) => {
     if (!startBranch) return { cwd, notes };
-    // the repo's config, shared by every worktree; the key is per branch
-    await g(["config", `branch.${branch}.${REMOTE_BRANCH_KEY}`, startBranch]);
+    // the repo's config, shared by every worktree, and `git config` fails outright while another
+    // run holds its lock, so it is written only when it changes; the key is per branch
+    const key = `branch.${branch}.${REMOTE_BRANCH_KEY}`;
+    const held = await g(["config", "--get", key]).catch(() => "");
+    if (held !== startBranch) await g(["config", key, startBranch]);
     notes.push(
       `This worktree continues the existing GitHub branch \`${startBranch}\`; \`publish\` updates that branch (and its open pull request), not \`${branch}\`.`,
     );
@@ -647,27 +814,33 @@ export async function prepareWorktree(
         `can't fetch START_BRANCH ${startBranch} from GitHub: ${messageOf(lastFailure)}`,
       );
     }
-    await fetchStartBranch({
+    const tip = await fetchStartBranch({
       repoDir: config.repoDir,
       call,
       startBranch,
       defaultBranch: defaultName,
     });
+    // the API's: what the agent's own work is diffed from, however `origin/<start>` moves after
+    const startRef = `${STARTS}${config.agentId}`;
+    if (!(await resolved(g, startRef))) {
+      await g(["update-ref", startRef, tip, ""]);
+    }
   }
   const cwd = await ensureWorktree({
     ...config,
     ...(isNew && startBranch && { from: `refs/remotes/origin/${startBranch}` }),
   });
   if (!isNew && defaultName) {
-    // unknown is taken as published: a rebase can't be taken back once the branch turns out to be
-    let published = true;
+    // unknown blocks the rebase as published does: a rebase can't be taken back once the branch
+    // turns out to be
+    let published: boolean | undefined;
     if (call) {
       try {
         const synced = await syncAgentBranch({
           repoDir: config.repoDir,
           cwd,
           call,
-          branch: startBranch ?? branch,
+          branch: startBranch ?? (await publishedBranch(g, branch, deps.env)),
           defaultBranch: defaultName,
         });
         published = synced.published;

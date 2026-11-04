@@ -1,14 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
-  appendFile,
+  type FileHandle,
   mkdir,
+  open,
   readdir,
   readFile,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import {
   CONNECTOR_ENV,
   DEFAULT_GATEWAY_URL,
@@ -288,17 +291,73 @@ export async function fetchCommit(
       () => false,
     );
   const parents = await Promise.all(commit.parents.map((p) => here(p.sha)));
-  if (parents.includes(false)) {
-    const shallow = await g([
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-path",
-      "shallow",
-    ]);
-    const held = existsSync(shallow) ? await readFile(shallow, "utf8") : "";
-    // appended, not rewritten: the file is shared by every worktree, and another agent's fetch may
-    // add its own line between the read and the write; git takes a line twice as once
-    if (!held.split("\n").includes(sha)) await appendFile(shallow, `${sha}\n`);
+  if (parents.includes(false)) await editShallow(g, (held) => held.add(sha));
+}
+
+const shallowPath = (g: ReturnType<typeof git>) =>
+  g(["rev-parse", "--path-format=absolute", "--git-path", "shallow"]);
+
+const linesOf = (text: string) => new Set(text.split("\n").filter(Boolean));
+
+/** The commits `shallow` lists: here, with their parents left on GitHub. */
+export async function shallowCommits(
+  g: ReturnType<typeof git>,
+): Promise<Set<string>> {
+  return linesOf(await readFile(await shallowPath(g), "utf8").catch(() => ""));
+}
+
+const SHALLOW_LOCK_WAIT_MS = 10_000;
+
+/** Creates `lock` exclusively, waiting a while for another holder to let it go. */
+async function takeLock(lock: string): Promise<FileHandle> {
+  const deadline = Date.now() + SHALLOW_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      return await open(lock, "wx");
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code !== "EEXIST" ||
+        Date.now() > deadline
+      ) {
+        throw new Error(
+          `can't take ${lock} (${messageOf(error)}); if no git command or run is using the repo, remove it`,
+        );
+      }
+      await sleep(50);
+    }
+  }
+}
+
+/**
+ * Rewrites `shallow` under `shallow.lock`, git's own lock for it: every worktree shares the file,
+ * and another agent's fetch may be changing it at once. The new list is written to the lock and
+ * renamed into place, so a reader never sees half of it.
+ */
+export async function editShallow(
+  g: ReturnType<typeof git>,
+  edit: (held: Set<string>) => Set<string>,
+): Promise<void> {
+  const path = await shallowPath(g);
+  const lock = `${path}.lock`;
+  const handle = await takeLock(lock);
+  let placed = false;
+  try {
+    const held = linesOf(await readFile(path, "utf8").catch(() => ""));
+    const next = edit(new Set(held));
+    if (next.size === held.size && [...next].every((sha) => held.has(sha))) {
+      return;
+    }
+    if (next.size === 0) {
+      await rm(path, { force: true });
+      return;
+    }
+    await handle.writeFile([...next].map((sha) => `${sha}\n`).join(""));
+    await handle.close();
+    await rename(lock, path);
+    placed = true;
+  } finally {
+    await handle.close().catch(() => {});
+    if (!placed) await rm(lock, { force: true });
   }
 }
 

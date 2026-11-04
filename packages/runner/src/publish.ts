@@ -270,7 +270,9 @@ const resolves = (cwd: string, ref: string) =>
  * undefined when no rebase is in progress. `rebase-merge` is the merge backend's state directory,
  * `rebase-apply` the apply backend's, and `git am`'s too, marked by an `applying` file.
  */
-async function rebaseInProgress(cwd: string): Promise<string | undefined> {
+export async function rebaseInProgress(
+  cwd: string,
+): Promise<string | undefined> {
   for (const dir of ["rebase-merge", "rebase-apply"]) {
     const path = (
       await git(cwd, "rev-parse", "--path-format=absolute", "--git-path", dir)
@@ -402,8 +404,8 @@ async function sitsOn(
  * first-parent history is replayed, so a merge commit arrives as a plain commit with the same
  * content, and a merge from the base shows the base's changes in the pull request's diff as the
  * branch's own. A branch on GitHub whose head this branch held before a rebase or amend here is
- * force-updated to the rewritten history; one holding a commit this branch never had is only ever
- * fast-forwarded.
+ * force-updated to the rewritten history; one holding a commit this branch never had, or the GitHub
+ * branch a continued agent works on, is only ever fast-forwarded.
  */
 export async function publish(options: {
   cwd: string;
@@ -621,6 +623,13 @@ export async function publish(options: {
           return sha === remote || heldTree === tree.sha;
         });
       }
+    }
+    // a continued branch is someone's pull request: its head is theirs even when it sits in this
+    // branch's reflog, as the head the worktree was made from always does
+    if (at === -1 && continued && remoteBranch === continued) {
+      throw new PublishError(
+        `${remoteBranch} on GitHub is at ${remote}, which this branch doesn't build on (as after an amend or rebase here, or a push there); a branch this agent continues is only ever fast-forwarded, so nothing was sent. Put your work back on top of it: \`git reset --soft ${remote}\` and \`git commit\` keep your files as they are in a new commit on it (when git doesn't know ${remote}, it was pushed during this run, and the next run brings it in), then publish again`,
+      );
     }
     if (at !== -1) {
       start = at;
