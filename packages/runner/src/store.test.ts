@@ -12,13 +12,10 @@ import { dirname, join } from "node:path";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import {
-  pullStore,
-  pushStore,
-  storeSyncMain,
-  syncStoreQuietly,
-  underLock,
-} from "./store.js";
+import * as store from "./store.js";
+
+// these tests run real git against real repositories, which is slow when the whole suite shares a CI runner
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
@@ -37,6 +34,20 @@ let root: string;
 let remote: string;
 let home: string;
 let hub: ReturnType<typeof fakeGitHub>;
+/** Every run of the code under test, so `afterEach` can wait out any run a timed-out test left going. */
+const pending: Promise<unknown>[] = [];
+const track =
+  <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
+  (...args: A) => {
+    const run = fn(...args);
+    pending.push(run.catch(() => {}));
+    return run;
+  };
+const pullStore = track(store.pullStore);
+const pushStore = track(store.pushStore);
+const storeSyncMain = track(store.storeSyncMain);
+const syncStoreQuietly = track(store.syncStoreQuietly);
+const underLock = track(store.underLock);
 
 /** Adds a commit on the fake GitHub's main, as another machine pushing would; `null` deletes. */
 function pushElsewhere(
@@ -256,9 +267,15 @@ beforeEach(() => {
   git(seed, "push", "-q", remote, "HEAD:main");
   hub = fakeGitHub();
 });
-afterEach(() => {
-  vi.unstubAllEnvs();
-  rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  // a test that timed out leaves its runs going; let them finish so their requests are not counted
+  // against the next test and their repos are not removed under them
+  try {
+    await Promise.allSettled(pending.splice(0));
+  } finally {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a pull checks the store out into a directory that does not exist yet", async () => {
@@ -582,7 +599,11 @@ test("a sync that waits out the lock says so, and exits 1", async () => {
   writeFileSync(script, `touch ${held}; sleep 2\n`);
   const quiet = { stdout: () => {}, stderr: () => {} };
   const holder = underLock(home, "push", quiet, ["bash", script]);
-  while (!existsSync(held)) await new Promise((r) => setTimeout(r, 20));
+  const giveUp = Date.now() + 5_000;
+  while (!existsSync(held)) {
+    if (Date.now() > giveUp) throw new Error("the lock holder never started");
+    await new Promise((r) => setTimeout(r, 20));
+  }
   let stderr = "";
   const waiter = { stdout: () => {}, stderr: (s: string) => (stderr += s) };
 

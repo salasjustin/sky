@@ -14,10 +14,28 @@ import type { RunnerEventPost } from "@sky/shared";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import { gateway, publish } from "./publish.js";
+import { gateway, publish as publishRun } from "./publish.js";
 import { pullRepo } from "./repo.js";
-import { type QueryFn, runSession } from "./session.js";
-import { branchCheckMain, fetchBranch, prepareWorktree } from "./sync.js";
+import { type QueryFn, runSession as runSessionRaw } from "./session.js";
+import * as sync from "./sync.js";
+
+// these tests run real git against real repositories, which is slow when the whole suite shares a CI runner
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
+
+/** Every run of the code under test, so `afterEach` can wait out any run a timed-out test left going. */
+const pending: Promise<unknown>[] = [];
+const track =
+  <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
+  (...args: A) => {
+    const run = fn(...args);
+    pending.push(run.catch(() => {}));
+    return run;
+  };
+const publish = track(publishRun);
+const runSession = track(runSessionRaw);
+const branchCheckMain = track(sync.branchCheckMain);
+const fetchBranch = track(sync.fetchBranch);
+const prepareWorktree = track(sync.prepareWorktree);
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
@@ -129,9 +147,15 @@ beforeEach(async () => {
   });
   requests = [];
 });
-afterEach(() => {
-  vi.unstubAllEnvs();
-  rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  // a test that timed out leaves its runs going; let them finish so their requests are not counted
+  // against the next test and their repos are not removed under them
+  try {
+    await Promise.allSettled(pending.splice(0));
+  } finally {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 const NOTES_HEADING =
