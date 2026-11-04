@@ -58,12 +58,7 @@ beforeEach(() => {
     launchWatchMs: 50,
   });
 });
-afterEach(async () => {
-  // an aborted hung call's mocked socket closes only after the call answers, and when depends on
-  // load; left to the next test, undici's pool fails that test's first request on it with
-  // UND_ERR_SOCKET "closed". A tick after the answer lets the close land.
-  await wire.hangsSettled();
-  await new Promise(setImmediate);
+afterEach(() => {
   if (db.$client.open) db.$client.close();
   rmSync(dir, { recursive: true, force: true });
 });
