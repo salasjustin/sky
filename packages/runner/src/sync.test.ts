@@ -14,13 +14,28 @@ import type { RunnerEventPost } from "@sky/shared";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import { gateway, publish } from "./publish.js";
+import { gateway, publish as publishRun } from "./publish.js";
 import { pullRepo } from "./repo.js";
-import { type QueryFn, runSession } from "./session.js";
-import { branchCheckMain, fetchBranch, prepareWorktree } from "./sync.js";
+import { type QueryFn, runSession as runSessionRaw } from "./session.js";
+import * as sync from "./sync.js";
 
 // these tests run real git against real repositories, which is slow when the whole suite shares a CI runner
-vi.setConfig({ testTimeout: 30_000 });
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
+
+/** Runs of the code under test still going when a test ends (it timed out); `afterEach` waits them out. */
+const pending: Promise<unknown>[] = [];
+const track =
+  <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
+  (...args: A) => {
+    const run = fn(...args);
+    pending.push(run.catch(() => {}));
+    return run;
+  };
+const publish = track(publishRun);
+const runSession = track(runSessionRaw);
+const branchCheckMain = track(sync.branchCheckMain);
+const fetchBranch = track(sync.fetchBranch);
+const prepareWorktree = track(sync.prepareWorktree);
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
@@ -133,11 +148,14 @@ beforeEach(async () => {
   requests = [];
 });
 afterEach(async () => {
-  // a test that timed out leaves its prepare running; let it finish before its repos are removed
-  // and before the next test starts
-  await Promise.allSettled(inFlight.splice(0));
-  vi.unstubAllEnvs();
-  rmSync(root, { recursive: true, force: true });
+  // a test that timed out leaves its runs going; let them finish so their requests are not counted
+  // against the next test and their repos are not removed under them
+  try {
+    await Promise.allSettled(pending.splice(0));
+  } finally {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 const NOTES_HEADING =
@@ -275,15 +293,8 @@ const config = (extra: Extra = {}) => ({
   ...extra,
 });
 let warnings: string[] = [];
-const inFlight: Promise<unknown>[] = [];
-const prepare = (extra: Extra = {}, env: NodeJS.ProcessEnv = ENV) => {
-  const run = prepareWorktree(config(extra), {
-    env,
-    warn: (line) => warnings.push(line),
-  });
-  inFlight.push(run.catch(() => {}));
-  return run;
-};
+const prepare = (extra: Extra = {}, env: NodeJS.ProcessEnv = ENV) =>
+  prepareWorktree(config(extra), { env, warn: (line) => warnings.push(line) });
 
 test("fresh worktree starts from the refreshed default branch", async () => {
   const old = git(repoDir, "rev-parse", "origin/HEAD");

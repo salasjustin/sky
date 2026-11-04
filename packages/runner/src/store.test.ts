@@ -12,16 +12,10 @@ import { dirname, join } from "node:path";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import {
-  pullStore,
-  pushStore,
-  storeSyncMain,
-  syncStoreQuietly,
-  underLock,
-} from "./store.js";
+import * as store from "./store.js";
 
 // these tests run real git against real repositories, which is slow when the whole suite shares a CI runner
-vi.setConfig({ testTimeout: 30_000 });
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
@@ -40,11 +34,20 @@ let root: string;
 let remote: string;
 let home: string;
 let hub: ReturnType<typeof fakeGitHub>;
-const inFlight: Promise<unknown>[] = [];
-const tracked = <T>(run: Promise<T>) => {
-  inFlight.push(run.catch(() => {}));
-  return run;
-};
+/** Runs of the code under test still going when a test ends (it timed out); `afterEach` waits them out. */
+const pending: Promise<unknown>[] = [];
+const track =
+  <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
+  (...args: A) => {
+    const run = fn(...args);
+    pending.push(run.catch(() => {}));
+    return run;
+  };
+const pullStore = track(store.pullStore);
+const pushStore = track(store.pushStore);
+const storeSyncMain = track(store.storeSyncMain);
+const syncStoreQuietly = track(store.syncStoreQuietly);
+const underLock = track(store.underLock);
 
 /** Adds a commit on the fake GitHub's main, as another machine pushing would; `null` deletes. */
 function pushElsewhere(
@@ -265,11 +268,14 @@ beforeEach(() => {
   hub = fakeGitHub();
 });
 afterEach(async () => {
-  // a test that timed out leaves its syncs running; let them finish so their requests are not
-  // counted against the next test
-  await Promise.allSettled(inFlight.splice(0));
-  vi.unstubAllEnvs();
-  rmSync(root, { recursive: true, force: true });
+  // a test that timed out leaves its runs going; let them finish so their requests are not counted
+  // against the next test and their repos are not removed under them
+  try {
+    await Promise.allSettled(pending.splice(0));
+  } finally {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a pull checks the store out into a directory that does not exist yet", async () => {
@@ -593,7 +599,11 @@ test("a sync that waits out the lock says so, and exits 1", async () => {
   writeFileSync(script, `touch ${held}; sleep 2\n`);
   const quiet = { stdout: () => {}, stderr: () => {} };
   const holder = underLock(home, "push", quiet, ["bash", script]);
-  while (!existsSync(held)) await new Promise((r) => setTimeout(r, 20));
+  const giveUp = Date.now() + 5_000;
+  while (!existsSync(held)) {
+    if (Date.now() > giveUp) throw new Error("the lock holder never started");
+    await new Promise((r) => setTimeout(r, 20));
+  }
   let stderr = "";
   const waiter = { stdout: () => {}, stderr: (s: string) => (stderr += s) };
 
@@ -658,9 +668,7 @@ test("a pull that downloads blobs reports its progress on stderr, and one with n
   };
   const first = io();
 
-  expect(
-    await tracked(storeSyncMain(["pull", "--locked"], env, first.io)),
-  ).toBe(0);
+  expect(await storeSyncMain(["pull", "--locked"], env, first.io)).toBe(0);
 
   expect(first.out.stderr).toBe(
     [
@@ -674,18 +682,14 @@ test("a pull that downloads blobs reports its progress on stderr, and one with n
 
   pushElsewhere({ "new.md": "new\n" });
   const second = io();
-  expect(
-    await tracked(storeSyncMain(["pull", "--locked"], env, second.io)),
-  ).toBe(0);
+  expect(await storeSyncMain(["pull", "--locked"], env, second.io)).toBe(0);
   expect(second.out.stderr).toBe(
     "store sync: fetching 1 of 254 blobs\nstore sync: fetched 1/1 blobs\n",
   );
 
   pushElsewhere({ "new.md": null });
   const third = io();
-  expect(
-    await tracked(storeSyncMain(["pull", "--locked"], env, third.io)),
-  ).toBe(0);
+  expect(await storeSyncMain(["pull", "--locked"], env, third.io)).toBe(0);
   expect(third.out.stderr).toBe("");
 });
 
@@ -699,9 +703,7 @@ test("a sync that fails is logged and never thrown", async () => {
     GITHUB_GATEWAY_URL: GATEWAY,
   };
   const failed = io();
-  expect(
-    await tracked(storeSyncMain(["pull", "--locked"], env, failed.io)),
-  ).toBe(1);
+  expect(await storeSyncMain(["pull", "--locked"], env, failed.io)).toBe(1);
   expect(failed.out.stderr).toContain("pull failed");
 
   const warnings: string[] = [];
