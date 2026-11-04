@@ -33,7 +33,7 @@ beforeAll(() => {
 const CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), "runner-claude-"));
 afterAll(() => rmSync(CLAUDE_CONFIG_DIR, { recursive: true, force: true }));
 // no sprite API here, whatever host the tests run on: the runner would otherwise hold a real sprite
-// when run inside one, and report the missing socket when run outside
+// when run inside one, and retry a missing socket for 30 seconds when run outside
 const NO_SPRITE_SOCKET = join(CLAUDE_CONFIG_DIR, "absent.sock");
 
 const servers: Server[] = [];

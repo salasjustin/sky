@@ -9,8 +9,8 @@ const EXPIRE = "5m";
 const REFRESH_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 
-// on a sprite, a socket that is missing or refuses may be an API not up yet, as on a sprite woken
-// cold; until the first hold lands the sprite may pause and freeze the run, so the first PUT retries quickly
+// a sprite woken cold may not have its API up yet (the socket missing or refusing); until the first
+// hold lands the sprite may pause and freeze the run, so the first PUT retries quickly
 const FIRST_HOLD_RETRY_MS = 1_000;
 const FIRST_HOLD_ATTEMPTS = 30;
 
@@ -22,7 +22,7 @@ export type SpriteHold = {
 
 /**
  * Where the runner finds the sprite API: `SKY_SPRITE_API_SOCKET` when set and not empty (tests,
- * other hosts), else the sprite's own socket, taken to be on a sprite.
+ * other hosts), else the sprite's own socket, where the runner is taken to be on a sprite.
  */
 export const spriteApiFrom = (env: NodeJS.ProcessEnv) => {
   const socketPath = env.SKY_SPRITE_API_SOCKET || undefined;
@@ -40,9 +40,9 @@ const taskNameFor = (runId: string) =>
  * Keeps the sprite from pausing while the runner lives: a sprite pauses once idle and drops
  * open connections even on a warm pause, so the runner holds a Tasks API task, refreshed on an
  * interval (a task lives an hour at most), and deletes it on `release`. Never throws: a failed
- * call is one line on `warn`. `report` sends the API what the runner's local log can't show once
- * the sprite is asleep: the first hold giving up on its quick retries and, once a hold has landed,
- * the first failure of each streak of failed refreshes. It never throws.
+ * call is one line on `warn`. `report`, which also never throws, sends the API what the runner's
+ * local log can't show once the sprite is asleep: the first hold giving up on its quick retries
+ * and, once a hold has landed, the first failure of each streak of failed refreshes.
  */
 export function holdSprite(options: {
   runId: string;
