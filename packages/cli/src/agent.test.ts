@@ -93,7 +93,7 @@ test("agent start launches on an env id and prints the agent and run ids", async
 });
 
 test("start sends the branch when --branch is given", async () => {
-  server.use(post("/v1/agents", 202, { agent, run: run() }));
+  server.use(envList, post("/v1/agents", 202, { agent, run: run() }));
   const r = await runCli([
     "agent",
     "start",
@@ -112,7 +112,7 @@ test("start sends the branch when --branch is given", async () => {
 });
 
 test("start omits branch when the flag is absent", async () => {
-  server.use(post("/v1/agents", 202, { agent, run: run() }));
+  server.use(envList, post("/v1/agents", 202, { agent, run: run() }));
   const r = await runCli(["agent", "start", "env_1", "--prompt=x"]);
   expect(r.code).toBe(0);
   expect(writes[0]?.body).not.toHaveProperty("branch");
@@ -151,6 +151,7 @@ test("send rejects --branch: agent follow-up can't choose a branch", async () =>
 test("start surfaces branch_not_found with its message and a nonzero exit", async () => {
   const message = "branch fix/login does not exist in acme/web";
   server.use(
+    envList,
     post("/v1/agents", 404, { error: { code: "branch_not_found", message } }),
   );
   const argv = ["agent", "start", "env_1", "--branch=fix/login", "--prompt=x"];

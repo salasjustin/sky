@@ -538,6 +538,8 @@ async function runOnce(extra: { startBranch?: string } = {}) {
       agentToken: "agent-secret",
       approvalPolicy: [],
       autoApprove: { defaults: true, commands: [] },
+      sessionEnv: {},
+      checks: [],
       waitTimeoutMs: 60_000,
       startBranch: extra.startBranch,
     },

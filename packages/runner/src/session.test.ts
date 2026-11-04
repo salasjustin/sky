@@ -888,7 +888,13 @@ test("with a connector and checks, the publish instructions come first, then the
   vi.stubEnv("GITHUB_CONNECTOR", "conn_123");
   try {
     const append = await appendOf(["update the changelog"]);
-    const paragraphs = append.split("\n\n");
+    // the connector makes the run try to refresh from GitHub, which this test's origin fails, and
+    // that failure is a note of its own
+    const paragraphs = append
+      .split("\n\n")
+      .filter(
+        (paragraph) => !paragraph.startsWith("What the runner's refresh"),
+      );
     expect(paragraphs).toHaveLength(2);
     expect(paragraphs[0]).toContain(" publish --title <title>");
     expect(paragraphs[0]).not.toContain("Before you finish");

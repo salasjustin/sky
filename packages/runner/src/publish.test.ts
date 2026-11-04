@@ -1107,6 +1107,27 @@ test("--branch outranks SKY_PUBLISH_BRANCH", async () => {
   expect(gh.pullCreates).toMatchObject([{ head: "cli/branch" }]);
 });
 
+test.each([
+  ["the started-on branch outranks SKY_PUBLISH_BRANCH", [], "cfg/branch"],
+  [
+    "--branch outranks the started-on branch",
+    ["--branch", "cli/branch"],
+    "cli/branch",
+  ],
+])("%s", async (_, flags, expected) => {
+  const gh = fakeGitHub({ branch: expected });
+  git(work, "config", "branch.claude/agt_1.sky-remote-branch", "cfg/branch");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const { status } = await publishMainWith(["--title", "T", ...flags], {
+    SKY_PUBLISH_BRANCH: "from/env",
+  });
+
+  expect(status).toBe(0);
+  expect(gh.pullCreates).toMatchObject([{ head: expected }]);
+});
+
 test("an empty SKY_PUBLISH_BRANCH falls back to the worktree's branch", async () => {
   const gh = fakeGitHub();
   writeFileSync(join(work, "a.txt"), "first\n");
