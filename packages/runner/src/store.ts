@@ -58,7 +58,12 @@ const GIT_CONFIG = [
   "commit.gpgsign=false",
 ];
 
-type GitOptions = { input?: string | Buffer; env?: NodeJS.ProcessEnv };
+type GitOptions = {
+  input?: string | Buffer;
+  env?: NodeJS.ProcessEnv;
+  /** Kills git and rejects when it runs longer. */
+  timeoutMs?: number;
+};
 
 /** Runs git in `home`; resolves with stdout bytes, rejects with git's stderr. */
 const gitBytes =
@@ -73,8 +78,19 @@ const gitBytes =
       const err: Buffer[] = [];
       child.stdout.on("data", (d: Buffer) => out.push(d));
       child.stderr.on("data", (d: Buffer) => err.push(d));
+      const timer =
+        options.timeoutMs &&
+        setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(
+            new Error(
+              `git ${args[0]} timed out after ${Math.round((options.timeoutMs ?? 0) / 1000)}s`,
+            ),
+          );
+        }, options.timeoutMs);
       child.on("error", reject);
       child.on("close", (code) => {
+        if (timer) clearTimeout(timer);
         if (code === 0) return resolve(Buffer.concat(out));
         const stderr = Buffer.concat(err).toString().trim();
         reject(new Error(`git ${args[0]} failed: ${stderr || `exit ${code}`}`));

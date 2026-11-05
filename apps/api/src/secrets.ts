@@ -123,20 +123,6 @@ export function hasConnectorSecret(
   return row?.kind === "connector";
 }
 
-/** Whether the env stores `name` as a value secret. */
-export function hasValueSecret(
-  db: Db,
-  envId: EnvironmentId,
-  name: string,
-): boolean {
-  const row = db
-    .select({ kind: secrets.kind })
-    .from(secrets)
-    .where(and(eq(secrets.envId, envId), eq(secrets.name, name)))
-    .get();
-  return row?.kind === "value";
-}
-
 /** A run's envVars, decrypted; one purged after its TTL is gone. */
 export function openRunEnvVars(
   db: Db,

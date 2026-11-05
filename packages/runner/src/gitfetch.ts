@@ -2,82 +2,76 @@ import { mkdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { git, messageOf, type Progress } from "./store.js";
 
-/**
- * The env var holding a read-only GitHub token (a fine-grained token with Contents: read on the
- * one repo). When it is set the runner pulls the repo over git, which costs no REST calls.
- */
-export const READ_TOKEN_ENV = "GITHUB_READ_TOKEN";
+/** Set to `0` to skip the anonymous git attempt and pull through the connector, as for a private repo. */
+export const ANON_GIT_ENV = "SKY_ANON_GIT";
 
-export const readToken = (env: NodeJS.ProcessEnv): string | undefined =>
-  env[READ_TOKEN_ENV]?.trim() || undefined;
+export const anonGitEnabled = (env: NodeJS.ProcessEnv): boolean =>
+  env[ANON_GIT_ENV] !== "0";
+
+// a public repo answers at once; a stalled network falls back to the connector rather than holding the run
+const LS_REMOTE_TIMEOUT_MS = 30_000;
+const FETCH_TIMEOUT_MS = 300_000;
 
 const originUrl = (repo: string) => `https://github.com/${repo}.git`;
 
-const basic = (token: string) =>
-  Buffer.from(`x-access-token:${token}`).toString("base64");
-
-/** Text with the token, and the header form git would echo it in, taken out. */
-export const scrub = (text: string, token: string): string =>
-  text.split(token).join("***").split(basic(token)).join("***");
-
-/** Why a git step failed, on one line and without the token. */
-export const whyFailed = (error: unknown, token: string): string =>
-  scrub(messageOf(error), token).replace(/\s+/g, " ").trim();
+/** Why an anonymous git step failed, on one line. */
+export const whyFailed = (error: unknown): string =>
+  messageOf(error).replace(/\s+/g, " ").trim();
 
 /**
- * git in `dir` with the token as an `http.extraHeader` for github.com alone, set through git's
- * environment config: the token reaches neither argv (`ps`), `.git/config`, nor a remote URL. A
- * failure's message is scrubbed of it.
+ * git in `dir` with no way to ask for a credential: no terminal prompt, no askpass program, and an
+ * empty credential helper that clears the machine's own list. A repo that needs a login fails
+ * at once instead of waiting for one.
  */
-export function gitWithToken(dir: string, token: string) {
+function anonymousGit(dir: string) {
   const base = git(dir);
-  // after any config the caller's env already carries, which GIT_CONFIG_COUNT would otherwise replace
   const held = Number(process.env.GIT_CONFIG_COUNT) || 0;
   const env = {
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_ASKPASS: "true",
+    SSH_ASKPASS: "true",
+    GCM_INTERACTIVE: "never",
     GIT_CONFIG_COUNT: String(held + 1),
-    [`GIT_CONFIG_KEY_${held}`]: "http.https://github.com/.extraheader",
-    [`GIT_CONFIG_VALUE_${held}`]: `Authorization: Basic ${basic(token)}`,
+    [`GIT_CONFIG_KEY_${held}`]: "credential.helper",
+    [`GIT_CONFIG_VALUE_${held}`]: "",
   };
-  return async (args: string[]): Promise<string> => {
-    try {
-      return await base(args, { env });
-    } catch (error) {
-      throw new Error(scrub(messageOf(error), token));
-    }
-  };
+  return (args: string[], timeoutMs: number): Promise<string> =>
+    base(args, { env, timeoutMs });
 }
 
 /** Fetches `branch` into `refs/remotes/origin/<branch>` of the clone in `repoDir`, history included. */
 export async function fetchOverGit(options: {
   repoDir: string;
-  token: string;
   branch: string;
 }): Promise<string> {
-  const g = gitWithToken(options.repoDir, options.token);
+  const g = anonymousGit(options.repoDir);
   const ref = `refs/remotes/origin/${options.branch}`;
-  await g([
-    "fetch",
-    "--quiet",
-    "--no-tags",
-    "origin",
-    `+refs/heads/${options.branch}:${ref}`,
-  ]);
-  return g(["rev-parse", "--verify", `${ref}^{commit}`]);
+  await g(
+    [
+      "fetch",
+      "--quiet",
+      "--no-tags",
+      "origin",
+      `+refs/heads/${options.branch}:${ref}`,
+    ],
+    FETCH_TIMEOUT_MS,
+  );
+  return g(["rev-parse", "--verify", `${ref}^{commit}`], FETCH_TIMEOUT_MS);
 }
 
 /**
- * Clones `repo` into `dir` over git: its default branch with full history, checked out, with
- * `origin/HEAD` naming it. The remote URL is the plain one; a failure removes what this run created.
+ * Clones `repo` into `dir` over git without a credential: its default branch with full history,
+ * checked out, with `origin/HEAD` naming it. Only a public repo succeeds. A failure removes what
+ * this run created.
  */
 export async function cloneOverGit(options: {
   repo: string;
   dir: string;
-  token: string;
   progress?: Progress;
 }): Promise<{ branch: string; sha: string }> {
   const dir = resolve(options.dir);
   const created = await mkdir(dir, { recursive: true });
-  const g = gitWithToken(dir, options.token);
+  const g = anonymousGit(dir);
   const plain = git(dir);
   try {
     await plain(["init", "-q"]);
@@ -88,7 +82,10 @@ export async function cloneOverGit(options: {
       "remote.origin.fetch",
       "+refs/heads/*:refs/remotes/origin/*",
     ]);
-    const head = await g(["ls-remote", "--symref", "origin", "HEAD"]);
+    const head = await g(
+      ["ls-remote", "--symref", "origin", "HEAD"],
+      LS_REMOTE_TIMEOUT_MS,
+    );
     const branch = /^ref: refs\/heads\/(\S+)\s+HEAD$/m.exec(head)?.[1];
     if (!branch) {
       throw new Error(
@@ -96,13 +93,12 @@ export async function cloneOverGit(options: {
       );
     }
     options.progress?.(`repo pull: fetching ${options.repo} over git`);
-    const sha = await fetchOverGit({
-      repoDir: dir,
-      token: options.token,
-      branch,
-    });
-    const remoteRef = `refs/remotes/origin/${branch}`;
-    await plain(["symbolic-ref", "refs/remotes/origin/HEAD", remoteRef]);
+    const sha = await fetchOverGit({ repoDir: dir, branch });
+    await plain([
+      "symbolic-ref",
+      "refs/remotes/origin/HEAD",
+      `refs/remotes/origin/${branch}`,
+    ]);
     await plain(["symbolic-ref", "HEAD", `refs/heads/${branch}`]);
     await plain(["update-ref", `refs/heads/${branch}`, sha]);
     await plain(["config", `branch.${branch}.remote`, "origin"]);

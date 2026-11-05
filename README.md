@@ -195,20 +195,11 @@ An agent's sandbox holds no GitHub token, so `git push` and `gh` don't work ther
 
 Agents in that environment then get `GITHUB_CONNECTOR` and are told to publish with Sky's own command, which sends the branch's commits to GitHub and opens a pull request into the default branch, or updates the one already open. The connector must belong to the same Sprites org as `SPRITES_TOKEN`; another org's connector doesn't recognize Sky's sandboxes.
 
-### Cloning over git with a read-only token
+### How the sandbox pulls the repo
 
-Without more, Sky pulls the repo through the connector one file per REST call, and a fresh sandbox of a few thousand files spends most of the connector's hourly GitHub quota, which every environment on it shares. Give the environment a read-only token and Sky fetches over git instead, at no REST cost:
+A **public** repo is pulled over git with no credential: provisioning clones it with its full history, and each run's refresh of the default branch (and of a `--branch` start) is a `git fetch`. That costs no GitHub REST calls. A **private** repo goes through the connector, one REST call per file, which spends the connector's shared hourly quota; Sky never calls the API to ask which kind a repo is, it tries git first. When the anonymous fetch fails (a private repo, no network) Sky logs one line saying why and uses the connector. The attempt has a time limit and can't prompt for a login or use a stored credential. Set the environment secret `SKY_ANON_GIT` to `0` (`sky secret set <env> SKY_ANON_GIT`) to skip it for a repo known to be private. When the connector's quota runs out, a call waits for GitHub's reset if it is within five minutes and otherwise fails naming the reset time. The store repo (`storeRepo`) always syncs through the connector.
 
-1. In GitHub, create a **fine-grained personal access token** for the one repo (Repository access: only that repo) with **Contents: Read-only** and nothing else.
-2. Store it as a secret of the environment:
-
-   ```
-   sky secret set web GITHUB_READ_TOKEN
-   ```
-
-With it set, provisioning clones the repo's default branch over git with full history, and each run's refresh of the default branch (and of a `--branch` start) is a git fetch. Publishing still goes through the connector; the token can't write. Without the token, or when a git fetch fails (a bad or expired token, no network), Sky logs one line saying why and falls back to the connector. The token is passed to git per command, so it is in no remote URL and not in `.git/config`.
-
-Like every secret of the environment, `GITHUB_READ_TOKEN` is in the agents' environment, so **agents in the sandbox can read it** and use it to read that repo; keep it to the one repo and Contents read-only. The store repo (`storeRepo`) still syncs through the connector.
+Follow-up, not built: a GitHub App that mints a short-lived read token per clone would let private repos use git too.
 
 Some repos reject commits by unverified authors, or commits with a `Co-authored-by` trailer. For those:
 

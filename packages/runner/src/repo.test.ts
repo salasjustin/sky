@@ -12,14 +12,15 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import { gitWithToken, scrub } from "./gitfetch.js";
 import { DEFAULT_GATEWAY_URL, PublishError, publish } from "./publish.js";
 import { pullRepo, rebuildCommit, repoPullMain } from "./repo.js";
+import { git as runnerGit } from "./store.js";
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
@@ -1570,7 +1571,13 @@ const sinks = () => {
     },
   };
 };
-const mainEnv = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
+// the anonymous git attempt is off, so these reach the connector and never the real github.com
+const mainEnv = {
+  GITHUB_CONNECTOR: CONNECTOR,
+  GITHUB_GATEWAY_URL: GATEWAY,
+  SKY_ANON_GIT: "0",
+};
+const anonEnv = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
 
 test.each([
   ["no dir", ["acme/private"]],
@@ -1934,8 +1941,7 @@ test("a default branch with a slash is checked out under that name, with origin/
   );
 });
 
-// GITHUB_READ_TOKEN: the pull goes over git, with the token kept out of everything written or said
-const TOKEN = "github_pat_11READONLYSECRET";
+// anonymous git: a public repo is pulled over git with no credential; anything else uses the connector
 const gatewayCalls = () => {
   const urls: string[] = [];
   const onStart = ({ request }: { request: Request }) => {
@@ -1948,24 +1954,23 @@ const gatewayCalls = () => {
   };
 };
 
-/** Makes `https://github.com/acme/private.git` reach `to` (the bare remote by default), as GitHub would. */
-const githubIs = (to = remote) => {
+/** Makes `https://github.com/acme/private.git` reach `to`, with `extra` git config lines, as GitHub would. */
+const githubIs = (to = remote, extra = "") => {
   const file = join(root, "gitconfig");
   writeFileSync(
     file,
-    `[url "${to}"]\n\tinsteadOf = https://github.com/acme/private.git\n`,
+    `[url "${to}"]\n\tinsteadOf = https://github.com/acme/private.git\n${extra}`,
   );
   vi.stubEnv("GIT_CONFIG_GLOBAL", file);
 };
 
-test("with GITHUB_READ_TOKEN the repo is cloned over git: no connector calls, full history, and the token is in no config, URL or output", async () => {
+test("a public repo is cloned over git with no connector calls, full history, and the plain remote URL", async () => {
   githubIs();
   const calls = gatewayCalls();
   const { io, sink } = sinks();
   const dir = join(root, "x");
-  const env = { ...mainEnv, GITHUB_READ_TOKEN: TOKEN };
 
-  expect(await repoPullMain(["acme/private", dir], env, sink)).toBe(0);
+  expect(await repoPullMain(["acme/private", dir], anonEnv, sink)).toBe(0);
   calls.stop();
 
   expect(calls.urls).toEqual([]);
@@ -1978,118 +1983,96 @@ test("with GITHUB_READ_TOKEN the repo is cloned over git: no connector calls, fu
   // the history publish builds on is all here, not a shallow tip
   expect(git(dir, "rev-list", "--count", "HEAD")).toBe("2");
   expect(existsSync(join(dir, ".git", "shallow"))).toBe(false);
-  expect(git(dir, "remote", "get-url", "origin")).toBe(
-    "https://github.com/acme/private.git",
-  );
   expect(git(dir, "config", "--get", "branch.trunk.merge")).toBe(
     "refs/heads/trunk",
   );
-  expect(readFileSync(join(dir, ".git", "config"), "utf8")).not.toContain(
-    TOKEN,
-  );
-  expect(io.out + io.err).not.toContain(TOKEN);
   expect(readFileSync(join(dir, "README.md"), "utf8")).toBe("private\n");
 });
 
-test("the token reaches git as an extraheader for github.com in git's environment, never in argv or .git/config", async () => {
-  const dir = join(root, "y");
-  mkdirSync(dir);
-  git(dir, "init", "-q");
-  const g = gitWithToken(dir, TOKEN);
-  const header = await g([
-    "config",
-    "--get",
-    "http.https://github.com/.extraheader",
-  ]);
-  expect(header).toBe(
-    `Authorization: Basic ${Buffer.from(`x-access-token:${TOKEN}`).toString("base64")}`,
-  );
-  expect(readFileSync(join(dir, ".git", "config"), "utf8")).not.toContain(
-    TOKEN,
-  );
-});
-
-test("a git failure's message is scrubbed of the token and its header form", async () => {
-  const dir = join(root, "z");
-  mkdirSync(dir);
-  git(dir, "init", "-q");
-  const g = gitWithToken(dir, TOKEN);
-  const error = await g(["fetch", `remote-${TOKEN}`]).catch((e: Error) => e);
-  expect(error).toBeInstanceOf(Error);
-  expect((error as Error).message).toContain("remote-***");
-  expect((error as Error).message).not.toContain(TOKEN);
-  const header = Buffer.from(`x-access-token:${TOKEN}`).toString("base64");
-  expect(scrub(`sent ${header} and ${TOKEN}`, TOKEN)).toBe("sent *** and ***");
-});
-
-test("without GITHUB_READ_TOKEN the pull goes through the connector and says why on one line", async () => {
-  fakeGitHub();
-  const { io, sink } = sinks();
-  const dir = join(root, "x");
-
-  expect(await repoPullMain(["acme/private", dir], mainEnv, sink)).toBe(0);
-
-  expect(
-    io.err.split("\n").filter((l) => l.includes("GITHUB_READ_TOKEN")),
-  ).toEqual([
-    "repo pull: GITHUB_READ_TOKEN is not set; pulling through the connector",
-  ]);
-  expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
-});
-
-test("a git fetch that fails (bad token, no network) falls back to the connector with one line that names the cause but not the token", async () => {
+test("an anonymous fetch that fails (private repo, no network) falls back to the connector with one line saying why", async () => {
   githubIs(join(root, "gone.git"));
   fakeGitHub();
   const { io, sink } = sinks();
   const dir = join(root, "x");
-  const env = { ...mainEnv, GITHUB_READ_TOKEN: TOKEN };
 
-  expect(await repoPullMain(["acme/private", dir], env, sink)).toBe(0);
+  expect(await repoPullMain(["acme/private", dir], anonEnv, sink)).toBe(0);
 
-  const lines = io.err
-    .split("\n")
-    .filter((l) => l.includes("GITHUB_READ_TOKEN"));
+  const lines = io.err.split("\n").filter((l) => l.includes("anonymous git"));
   expect(lines).toHaveLength(1);
   expect(lines[0]).toMatch(
-    /^repo pull: git fetch with GITHUB_READ_TOKEN failed \(.+\); falling back to the connector$/,
+    /^repo pull: anonymous git fetch failed \(.+\); pulling through the connector$/,
   );
-  expect(io.err).not.toContain(TOKEN);
   expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
   // the connector's checkout, whole: nothing of the failed clone is left in the way
   expect(existsSync(join(dir, ".git", "shallow"))).toBe(true);
 });
 
-test("a git fetch that fails with no connector is a failed pull, exit 1, and leaves no directory", async () => {
-  githubIs(join(root, "gone.git"));
+/** A stand-in for GitHub that wants a login: answers 401 and keeps every Authorization header it sees. */
+const loginRequired = async () => {
+  const seen: (string | undefined)[] = [];
+  const web = createServer((request, response) => {
+    seen.push(request.headers.authorization);
+    response.writeHead(401, { "www-authenticate": 'Basic realm="GitHub"' });
+    response.end();
+  });
+  await new Promise<void>((done) => web.listen(0, "127.0.0.1", done));
+  const { port } = web.address() as { port: number };
+  return {
+    url: `http://127.0.0.1:${port}/acme/private.git`,
+    seen,
+    close: () => web.close(),
+  };
+};
+
+test("a repo that asks for a login fails at once with no prompt and no stored credential offered, then uses the connector", async () => {
+  const gh = await loginRequired();
+  // the machine's own helper would answer a login request; the anonymous fetch must not consult it
+  githubIs(
+    gh.url,
+    '[credential]\n\thelper = "!f() { echo username=u; echo password=p; }; f"\n',
+  );
+  fakeGitHub();
   const { io, sink } = sinks();
   const dir = join(root, "x");
+  const started = Date.now();
+  try {
+    expect(await repoPullMain(["acme/private", dir], anonEnv, sink)).toBe(0);
+  } finally {
+    gh.close();
+  }
 
-  expect(
-    await repoPullMain(
-      ["acme/private", dir],
-      { GITHUB_READ_TOKEN: TOKEN },
-      sink,
-    ),
-  ).toBe(1);
-
-  expect(io.err).toMatch(
-    /^repo pull: failed: git fetch with GITHUB_READ_TOKEN: /,
-  );
-  expect(io.err).not.toContain(TOKEN);
-  expect(existsSync(dir)).toBe(false);
+  expect(Date.now() - started).toBeLessThan(15_000);
+  expect(gh.seen.length).toBeGreaterThan(0);
+  expect(gh.seen.every((header) => header === undefined)).toBe(true);
+  expect(io.err).toContain("anonymous git fetch failed");
+  expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
 });
 
-test("a repo with no commits over git says it is empty", async () => {
+test("a git command given a time limit is killed and fails when it overruns", async () => {
+  const web = createServer(() => {});
+  await new Promise<void>((done) => web.listen(0, "127.0.0.1", done));
+  const { port } = web.address() as { port: number };
+  const dir = join(root, "slow");
+  mkdirSync(dir);
+  git(dir, "init", "-q");
+  try {
+    await expect(
+      runnerGit(dir)(["ls-remote", `http://127.0.0.1:${port}/a/b.git`], {
+        timeoutMs: 300,
+      }),
+    ).rejects.toThrow("git ls-remote timed out after 0s");
+  } finally {
+    web.closeAllConnections();
+    web.close();
+  }
+});
+
+test("a repo with no commits over git says it is empty, then the connector is tried", async () => {
   const empty = join(root, "empty.git");
   execFileSync("git", ["init", "-q", "--bare", "-b", "trunk", empty]);
   githubIs(empty);
+  fakeGitHub();
   const { io, sink } = sinks();
-  expect(
-    await repoPullMain(
-      ["acme/private", join(root, "x")],
-      { GITHUB_READ_TOKEN: TOKEN },
-      sink,
-    ),
-  ).toBe(1);
+  await repoPullMain(["acme/private", join(root, "x")], anonEnv, sink);
   expect(io.err).toContain("acme/private is empty");
 });

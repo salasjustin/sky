@@ -41,7 +41,13 @@ const prepareWorktree = track(sync.prepareWorktree);
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
 const REPO = `${GATEWAY}/${CONNECTOR}/repos/acme/private`;
-const ENV = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
+// the anonymous git attempt is off, so these reach the connector and never the real github.com
+const ENV = {
+  GITHUB_CONNECTOR: CONNECTOR,
+  GITHUB_GATEWAY_URL: GATEWAY,
+  SKY_ANON_GIT: "0",
+};
+const ANON_ENV = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
 
 // the fixtures commit, rebase and cherry-pick; a CI runner has no identity and may sign by default
 const IDENTITY = {
@@ -294,9 +300,6 @@ const config = (extra: Extra = {}) => ({
   ...extra,
 });
 let warnings: string[] = [];
-/** Warnings less the line every connector-only run logs about the missing read token. */
-const withoutNotSet = (lines: string[]) =>
-  lines.filter((line) => !line.includes("GITHUB_READ_TOKEN is not set"));
 const prepare = (extra: Extra = {}, env: NodeJS.ProcessEnv = ENV) =>
   prepareWorktree(config(extra), { env, warn: (line) => warnings.push(line) });
 
@@ -817,6 +820,7 @@ async function runOnce(
   sessionEnv: Record<string, string> = {},
 ) {
   vi.stubEnv("GITHUB_CONNECTOR", CONNECTOR);
+  vi.stubEnv("SKY_ANON_GIT", "0");
   vi.stubEnv("GITHUB_GATEWAY_URL", GATEWAY);
   const posted: RunnerEventPost[] = [];
   let options: Options | undefined;
@@ -904,7 +908,7 @@ test("sync failure is a note, not a failed run", async () => {
   const note =
     "The runner couldn't refresh from GitHub: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 502: Bad Gateway; working from the commit the sandbox last had.";
   expect(append).toContain(`\n- ${note}`);
-  expect(withoutNotSet(warnings)).toEqual([
+  expect(warnings).toEqual([
     "runner: refresh from GitHub failed: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 502: Bad Gateway",
   ]);
 });
@@ -1318,7 +1322,7 @@ test("outside commits whose merged-in history is more than a run fetches are rep
   expect(notes).toEqual([
     "The runner couldn't refresh from GitHub: claude/agt_1 on GitHub is more than 100 commits past anything this clone has; working from the commit the sandbox last had.",
   ]);
-  expect(withoutNotSet(warnings)).toEqual([
+  expect(warnings).toEqual([
     "runner: refresh from GitHub failed: claude/agt_1 on GitHub is more than 100 commits past anything this clone has",
   ]);
 });
@@ -1693,9 +1697,7 @@ test("when GitHub can't say whether the old branch was published, the agent is t
     expect.stringContaining("moved `claude/agt_1`"),
     "The runner couldn't tell whether `small-fixes-1` was published to GitHub. If it was, publish with `--branch small-fixes-1` to update its pull request rather than open a new one.",
   ]);
-  expect(withoutNotSet(warnings)).toEqual([
-    expect.stringContaining("small-fixes-1"),
-  ]);
+  expect(warnings).toEqual([expect.stringContaining("small-fixes-1")]);
 });
 
 test("with no connector the worktree is still moved, and the agent is told to pass --branch", async () => {
@@ -1724,10 +1726,7 @@ test("an agent started on a GitHub branch that is left on another branch is not 
   expect(notes).toEqual([expect.stringContaining("the runner left it there")]);
 });
 
-// GITHUB_READ_TOKEN: the refresh goes over git and costs no REST calls
-const TOKEN = "github_pat_11READONLYSECRET";
-const TOKEN_ENV = { ...ENV, GITHUB_READ_TOKEN: TOKEN };
-
+// anonymous git: a public repo's refresh costs no REST calls
 /**
  * Makes `https://github.com/acme/private.git` reach `to` (GitHub's bare repo by default). The
  * stand-in's path still reads as a GitHub URL, since `git remote get-url` shows the rewritten one.
@@ -1744,12 +1743,12 @@ const githubIs = (to = remote) => {
   vi.stubEnv("GIT_CONFIG_GLOBAL", file);
 };
 
-test("with the read token a fresh worktree starts from GitHub's new tip fetched over git, with no REST calls", async () => {
+test("a public repo's fresh worktree starts from GitHub's new tip fetched over git, with no REST calls", async () => {
   githubIs();
   const old = git(repoDir, "rev-parse", "origin/HEAD");
   const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
 
-  const { cwd, notes } = await prepare({}, TOKEN_ENV);
+  const { cwd, notes } = await prepare({}, ANON_ENV);
 
   expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
   expect(git(repoDir, "rev-parse", "refs/remotes/origin/trunk")).toBe(tip);
@@ -1758,17 +1757,14 @@ test("with the read token a fresh worktree starts from GitHub's new tip fetched 
   expect(notes).toEqual([]);
   expect(requests).toEqual([]);
   expect(warnings).toEqual([]);
-  expect(readFileSync(join(repoDir, ".git", "config"), "utf8")).not.toContain(
-    TOKEN,
-  );
 });
 
-test("with the read token a start branch is fetched over git, its merge base recorded, with no REST calls", async () => {
+test("a public repo's start branch is fetched over git, its merge base recorded, with no REST calls", async () => {
   githubIs();
   const base = git(repoDir, "rev-parse", "origin/HEAD");
   const tip = pushToGitHub("feature/x", "x.txt", "x\n");
 
-  const { cwd, notes } = await prepare({ startBranch: "feature/x" }, TOKEN_ENV);
+  const { cwd, notes } = await prepare({ startBranch: "feature/x" }, ANON_ENV);
 
   expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
   expect(git(repoDir, "rev-parse", `refs/sky/bases/${base}`)).toBe(base);
@@ -1780,68 +1776,33 @@ test("with the read token a start branch is fetched over git, its merge base rec
 test("a start branch GitHub lacks fails as a missing branch, over git too", async () => {
   githubIs();
   await expect(
-    prepare({ startBranch: "nope" }, TOKEN_ENV),
+    prepare({ startBranch: "nope" }, ANON_ENV),
   ).rejects.toBeInstanceOf(sync.BranchNotFoundError);
   expect(requests).toEqual([]);
 });
 
-test("a read token and no connector refreshes over git alone", async () => {
-  githubIs();
-  const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
-
-  const { cwd } = await prepare({}, { GITHUB_READ_TOKEN: TOKEN });
-
-  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
-  expect(requests).toEqual([]);
-  expect(warnings).toEqual([]);
-});
-
-test("without the read token the refresh uses the connector and logs one line saying why", async () => {
-  const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
-
-  const { cwd } = await prepare({}, ENV);
-
-  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
-  expect(requests.length).toBeGreaterThan(0);
-  expect(warnings).toEqual([
-    "runner: GITHUB_READ_TOKEN is not set; refreshing through the connector",
-  ]);
-});
-
-test("a git fetch that fails falls back to the connector, with one warning that never carries the token", async () => {
+test("an anonymous fetch that fails falls back to the connector with one warning saying why", async () => {
   githubIs(join(root, "gone.git"));
   const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
 
-  const { cwd, notes } = await prepare({}, TOKEN_ENV);
+  const { cwd } = await prepare({}, ANON_ENV);
 
   expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
   expect(requests.length).toBeGreaterThan(0);
   expect(warnings).toHaveLength(1);
   expect(warnings[0]).toMatch(
-    /^runner: git fetch with GITHUB_READ_TOKEN failed \(.+\); falling back to the connector$/,
+    /^runner: anonymous git fetch failed \(.+\); falling back to the connector$/,
   );
   expect(warnings[0]).not.toContain("\n");
-  expect(warnings.join() + notes.join()).not.toContain(TOKEN);
 });
 
-test("a start branch whose git fetch fails is fetched through the connector", async () => {
+test("a start branch is fetched through the connector once the anonymous fetch has failed, which is not tried twice", async () => {
   githubIs(join(root, "gone.git"));
   const tip = pushToGitHub("feature/x", "x.txt", "x\n");
 
-  const { cwd } = await prepare({ startBranch: "feature/x" }, TOKEN_ENV);
+  const { cwd } = await prepare({ startBranch: "feature/x" }, ANON_ENV);
 
   expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
   expect(requests.length).toBeGreaterThan(0);
-  expect(warnings.filter((w) => w.includes("falling back"))).toHaveLength(1);
-});
-
-test("a git failure with no connector is a refresh failure noted for the agent, without the token", async () => {
-  githubIs(join(root, "gone.git"));
-  const old = git(repoDir, "rev-parse", "origin/HEAD");
-
-  const { cwd, notes } = await prepare({}, { GITHUB_READ_TOKEN: TOKEN });
-
-  expect(git(cwd, "rev-parse", "HEAD")).toBe(old);
-  expect(notes.join("\n")).toContain("couldn't refresh from GitHub");
-  expect(notes.join() + warnings.join()).not.toContain(TOKEN);
+  expect(warnings.filter((w) => w.includes("anonymous git"))).toHaveLength(1);
 });
