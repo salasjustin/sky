@@ -12,6 +12,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HttpResponse, http } from "msw";
@@ -19,6 +20,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { DEFAULT_GATEWAY_URL, PublishError, publish } from "./publish.js";
 import { pullRepo, rebuildCommit, repoPullMain } from "./repo.js";
+import { git as runnerGit } from "./store.js";
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
@@ -93,7 +95,11 @@ beforeEach(() => {
   );
   execFileSync("git", ["clone", "-q", "--bare", seed, remote]);
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => {
+  // githubIs() stubs GIT_CONFIG_GLOBAL with a file under `root`, which is removed here
+  vi.unstubAllEnvs();
+  rmSync(root, { recursive: true, force: true });
+});
 
 const bare = (...args: string[]) => git(remote, ...args);
 
@@ -1569,7 +1575,13 @@ const sinks = () => {
     },
   };
 };
-const mainEnv = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
+// the anonymous git attempt is off, so these reach the connector and never the real github.com
+const mainEnv = {
+  GITHUB_CONNECTOR: CONNECTOR,
+  GITHUB_GATEWAY_URL: GATEWAY,
+  SKY_ANON_GIT: "0",
+};
+const anonEnv = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
 
 test.each([
   ["no dir", ["acme/private"]],
@@ -1931,4 +1943,207 @@ test("a default branch with a slash is checked out under that name, with origin/
   expect(git(dir, "config", "branch.release/1.0.merge")).toBe(
     "refs/heads/release/1.0",
   );
+});
+
+// anonymous git: a public repo is pulled over git with no credential; anything else uses the connector
+const gatewayCalls = () => {
+  const urls: string[] = [];
+  const onStart = ({ request }: { request: Request }) => {
+    if (request.url.startsWith(GATEWAY)) urls.push(request.url);
+  };
+  server.events.on("request:start", onStart);
+  return {
+    urls,
+    stop: () => server.events.removeListener("request:start", onStart),
+  };
+};
+
+/** Makes `https://github.com/acme/private.git` reach `to`, with `extra` git config lines, as GitHub would. */
+const githubIs = (to = remote, extra = "") => {
+  const file = join(root, "gitconfig");
+  writeFileSync(
+    file,
+    `[url "${to}"]\n\tinsteadOf = https://github.com/acme/private.git\n${extra}`,
+  );
+  vi.stubEnv("GIT_CONFIG_GLOBAL", file);
+};
+
+test("a public repo is cloned over git with no connector calls, full history, and the plain remote URL", async () => {
+  githubIs();
+  const calls = gatewayCalls();
+  const { io, sink } = sinks();
+  const dir = join(root, "x");
+
+  expect(await repoPullMain(["acme/private", dir], anonEnv, sink)).toBe(0);
+  calls.stop();
+
+  expect(calls.urls).toEqual([]);
+  expect(io.out).toBe(
+    `repo pull: acme/private trunk at ${headSha} (over git)\n`,
+  );
+  expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
+  expect(git(dir, "rev-parse", "origin/HEAD")).toBe(headSha);
+  expect(git(dir, "rev-parse", "--abbrev-ref", "HEAD")).toBe("trunk");
+  // the history publish builds on is all here, not a shallow tip
+  expect(git(dir, "rev-list", "--count", "HEAD")).toBe("2");
+  expect(existsSync(join(dir, ".git", "shallow"))).toBe(false);
+  expect(git(dir, "config", "--get", "branch.trunk.merge")).toBe(
+    "refs/heads/trunk",
+  );
+  expect(readFileSync(join(dir, "README.md"), "utf8")).toBe("private\n");
+});
+
+test("SKY_ANON_GIT=0 pulls through the connector even when git could reach a public remote", async () => {
+  githubIs();
+  fakeGitHub();
+  const calls = gatewayCalls();
+  const { io, sink } = sinks();
+  const dir = join(root, "x");
+
+  expect(await repoPullMain(["acme/private", dir], mainEnv, sink)).toBe(0);
+  calls.stop();
+
+  expect(calls.urls.length).toBeGreaterThan(0);
+  expect(io.out).toBe(`repo pull: acme/private trunk at ${headSha}\n`);
+  expect(io.err).not.toContain("anonymous git");
+  // the connector's checkout is a shallow tip; git's would be whole history
+  expect(existsSync(join(dir, ".git", "shallow"))).toBe(true);
+});
+
+test("an anonymous fetch that fails (private repo, no network) falls back to the connector with one line saying why", async () => {
+  githubIs(join(root, "gone.git"));
+  fakeGitHub();
+  const { io, sink } = sinks();
+  const dir = join(root, "x");
+
+  expect(await repoPullMain(["acme/private", dir], anonEnv, sink)).toBe(0);
+
+  const lines = io.err.split("\n").filter((l) => l.includes("anonymous git"));
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toMatch(
+    /^repo pull: anonymous git fetch failed \(.+\); pulling through the connector$/,
+  );
+  expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
+  // the connector's checkout, whole: nothing of the failed clone is left in the way
+  expect(existsSync(join(dir, ".git", "shallow"))).toBe(true);
+});
+
+/** A stand-in for GitHub that wants a login: answers 401 and keeps every Authorization header it sees. */
+const loginRequired = async () => {
+  const seen: (string | undefined)[] = [];
+  const web = createServer((request, response) => {
+    seen.push(request.headers.authorization);
+    response.writeHead(401, { "www-authenticate": 'Basic realm="GitHub"' });
+    response.end();
+  });
+  await new Promise<void>((done) => web.listen(0, "127.0.0.1", done));
+  const { port } = web.address() as { port: number };
+  return {
+    url: `http://127.0.0.1:${port}/acme/private.git`,
+    seen,
+    close: () => web.close(),
+  };
+};
+
+test("a repo that asks for a login fails at once with no prompt and no stored credential offered, then uses the connector", async () => {
+  const gh = await loginRequired();
+  // the machine's own helper would answer a login request; the anonymous fetch must not consult it
+  githubIs(
+    gh.url,
+    '[credential]\n\thelper = "!f() { echo username=u; echo password=p; }; f"\n',
+  );
+  fakeGitHub();
+  const { io, sink } = sinks();
+  const dir = join(root, "x");
+  const started = Date.now();
+  try {
+    expect(await repoPullMain(["acme/private", dir], anonEnv, sink)).toBe(0);
+  } finally {
+    gh.close();
+  }
+
+  expect(Date.now() - started).toBeLessThan(15_000);
+  expect(gh.seen.length).toBeGreaterThan(0);
+  expect(gh.seen.every((header) => header === undefined)).toBe(true);
+  expect(io.err).toContain("anonymous git fetch failed");
+  expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
+});
+
+/** A remote that accepts every connection and never answers, as a stalled network looks to git. */
+const silentRemote = async () => {
+  const web = createServer(() => {});
+  let connected!: () => void;
+  const reached = new Promise<void>((done) => {
+    connected = done;
+  });
+  web.on("connection", () => connected());
+  await new Promise<void>((done) => web.listen(0, "127.0.0.1", done));
+  const { port } = web.address() as { port: number };
+  const url = `http://127.0.0.1:${port}/acme/private.git`;
+  return {
+    url,
+    reached,
+    /** Processes still running whose command line names this remote: git's transport helpers. */
+    survivors: () =>
+      execFileSync("ps", ["-eo", "args"], { encoding: "utf8" })
+        .split("\n")
+        .filter((line) => line.includes(`127.0.0.1:${port}`)),
+    close: () => {
+      web.closeAllConnections();
+      web.close();
+    },
+  };
+};
+
+test("a git command given a time limit is killed with its transport helpers and fails promptly when it overruns", async () => {
+  const remote = await silentRemote();
+  const dir = join(root, "slow");
+  mkdirSync(dir);
+  git(dir, "init", "-q");
+  const started = Date.now();
+  try {
+    await expect(
+      runnerGit(dir)(["ls-remote", remote.url], { timeoutMs: 300 }),
+    ).rejects.toThrow("git ls-remote timed out after 0s");
+    expect(Date.now() - started).toBeLessThan(1_300);
+    expect(remote.survivors()).toEqual([]);
+  } finally {
+    remote.close();
+  }
+});
+
+test("a remote that never answers times out the anonymous clone, leaves no git running, and the connector pulls instead", async () => {
+  const remote = await silentRemote();
+  githubIs(remote.url);
+  fakeGitHub();
+  const { io, sink } = sinks();
+  const dir = join(root, "x");
+  // only git's own time limit is faked; the processes and the connector's requests stay real
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const pulled = repoPullMain(["acme/private", dir], anonEnv, sink);
+    await remote.reached;
+    vi.advanceTimersByTime(30_000);
+    vi.useRealTimers();
+
+    expect(await pulled).toBe(0);
+    expect(io.err).toContain(
+      "anonymous git fetch failed (git ls-remote timed out after 30s); pulling through the connector",
+    );
+    expect(remote.survivors()).toEqual([]);
+    expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
+  } finally {
+    vi.useRealTimers();
+    remote.close();
+  }
+});
+
+test("a repo with no commits over git says it is empty, then the connector is tried", async () => {
+  const empty = join(root, "empty.git");
+  execFileSync("git", ["init", "-q", "--bare", "-b", "trunk", empty]);
+  githubIs(empty);
+  fakeGitHub();
+  const { io, sink } = sinks();
+  await repoPullMain(["acme/private", join(root, "x")], anonEnv, sink);
+  expect(io.err).toContain("acme/private is empty");
 });

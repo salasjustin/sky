@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { type AgentId, agentBranch } from "@sky/shared";
+import { anonGitEnabled, fetchOverGit, whyFailed } from "./gitfetch.js";
 import {
   BRANCH_ENV,
   CONNECTOR_ENV,
@@ -292,6 +293,59 @@ export async function syncDefaultBranch(options: {
   }
   await g(["update-ref", `${FETCHED_BASES}${sha}`, sha]);
   return { ...result, moved: true };
+}
+
+/**
+ * `syncDefaultBranch` over git without a credential: no REST calls, and `origin/<default>`
+ * moves to GitHub's tip with the history between.
+ */
+export async function syncDefaultOverGit(options: {
+  repoDir: string;
+}): Promise<DefaultSync> {
+  const g = git(options.repoDir);
+  const name = await defaultBranchOf(g);
+  const previous = (await resolved(g, `refs/remotes/origin/${name}`)) || null;
+  const sha = await fetchOverGit({ repoDir: options.repoDir, branch: name });
+  const result = { default: name, previous, sha, moved: false, tooFar: false };
+  if (sha === previous) return result;
+  await g(["update-ref", `${FETCHED_BASES}${sha}`, sha]);
+  return { ...result, moved: true };
+}
+
+/** GitHub's answer to a fetch of a branch it doesn't have. */
+const NO_REMOTE_REF = /couldn't find remote ref/;
+
+/**
+ * `fetchStartBranch` over git without a credential: fetches the branch with its history and
+ * records its merge base with the default branch under `FETCHED_BASES`. Returns the branch's tip.
+ */
+async function fetchStartBranchOverGit(options: {
+  repoDir: string;
+  startBranch: string;
+  defaultBranch: string;
+}): Promise<string> {
+  const { startBranch, defaultBranch } = options;
+  const g = git(options.repoDir);
+  const tip = await fetchOverGit({
+    repoDir: options.repoDir,
+    branch: startBranch,
+  }).catch((error: unknown) => {
+    if (NO_REMOTE_REF.test(messageOf(error))) {
+      throw new BranchNotFoundError(
+        startBranch,
+        `the start branch ${startBranch} doesn't exist on GitHub (${messageOf(error)})`,
+      );
+    }
+    throw error;
+  });
+  const onDefault = await resolved(g, `refs/remotes/origin/${defaultBranch}`);
+  const mergeBase = onDefault
+    ? await g(["merge-base", onDefault, tip]).catch(() => "")
+    : "";
+  if (mergeBase) {
+    await g(["update-ref", `${FETCHED_BASES}${mergeBase}`, mergeBase]);
+  }
+  return tip;
 }
 
 const run = promisify(execFile);
@@ -760,9 +814,10 @@ const tooFarNote = (s: DefaultSync) =>
   `GitHub's ${s.default} is more than ${DEFAULT_MAX_COMMITS} commits ahead of what this sandbox has, too far to fetch, so \`origin/${s.default}\` was left at ${short(s.previous)}; you are working from that commit, not GitHub's ${short(s.sha)}.`;
 
 /**
- * The agent's worktree for this run, brought up to date with GitHub through the connector, with
- * notes for the agent on what that did or couldn't do. Without a connector there is no way to
- * reach GitHub, and the worktree is made or reused as it stands.
+ * The agent's worktree for this run, brought up to date with GitHub, with notes for the agent on
+ * what that did or couldn't do. A public repo's default branch and a start branch come
+ * over git, at no REST cost; a private one, or a failed fetch, goes through the connector. Without
+ * a connector there is no way to reach GitHub, and the worktree is made or reused as it stands.
  */
 export async function prepareWorktree(
   config: {
@@ -877,6 +932,14 @@ export async function prepareWorktree(
     );
   };
   let call: Call | undefined;
+  // cleared by the first anonymous fetch that fails (a private repo), which is not tried again this run
+  let overGit = anonGitEnabled(deps.env);
+  const gitFailed = (error: unknown) => {
+    overGit = false;
+    deps.warn(
+      `runner: anonymous git fetch failed (${whyFailed(error)}); falling back to the connector`,
+    );
+  };
   try {
     if (!defaultName) throw new Error("origin/HEAD names no branch");
     const { owner, repo } = parseOrigin(
@@ -888,7 +951,16 @@ export async function prepareWorktree(
       owner,
       repo,
     });
-    const synced = await syncDefaultBranch({ repoDir: config.repoDir, call });
+    let synced: DefaultSync | undefined;
+    if (overGit) {
+      synced = await syncDefaultOverGit({ repoDir: config.repoDir }).catch(
+        (error: unknown) => {
+          gitFailed(error);
+          return undefined;
+        },
+      );
+    }
+    synced ??= await syncDefaultBranch({ repoDir: config.repoDir, call });
     if (synced.tooFar) notes.push(tooFarNote(synced));
   } catch (error) {
     syncFailed(error);
@@ -900,7 +972,20 @@ export async function prepareWorktree(
         `can't fetch branch ${startBranch} from GitHub: ${messageOf(lastFailure)}`,
       );
     }
-    const tip = await fetchStartBranch({
+    let tip: string | undefined;
+    if (overGit) {
+      try {
+        tip = await fetchStartBranchOverGit({
+          repoDir: config.repoDir,
+          startBranch,
+          defaultBranch: defaultName,
+        });
+      } catch (error) {
+        if (error instanceof BranchNotFoundError) throw error;
+        gitFailed(error);
+      }
+    }
+    tip ??= await fetchStartBranch({
       repoDir: config.repoDir,
       call,
       startBranch,

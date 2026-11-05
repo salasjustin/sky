@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -40,7 +41,13 @@ const prepareWorktree = track(sync.prepareWorktree);
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
 const REPO = `${GATEWAY}/${CONNECTOR}/repos/acme/private`;
-const ENV = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
+// the anonymous git attempt is off, so these reach the connector and never the real github.com
+const ENV = {
+  GITHUB_CONNECTOR: CONNECTOR,
+  GITHUB_GATEWAY_URL: GATEWAY,
+  SKY_ANON_GIT: "0",
+};
+const ANON_ENV = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
 
 // the fixtures commit, rebase and cherry-pick; a CI runner has no identity and may sign by default
 const IDENTITY = {
@@ -813,6 +820,7 @@ async function runOnce(
   sessionEnv: Record<string, string> = {},
 ) {
   vi.stubEnv("GITHUB_CONNECTOR", CONNECTOR);
+  vi.stubEnv("SKY_ANON_GIT", "0");
   vi.stubEnv("GITHUB_GATEWAY_URL", GATEWAY);
   const posted: RunnerEventPost[] = [];
   let options: Options | undefined;
@@ -1716,4 +1724,99 @@ test("an agent started on a GitHub branch that is left on another branch is not 
 
   expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("elsewhere");
   expect(notes).toEqual([expect.stringContaining("the runner left it there")]);
+});
+
+// anonymous git: a public repo's refresh costs no REST calls
+/**
+ * Makes `https://github.com/acme/private.git` reach `to` (GitHub's bare repo by default). The
+ * stand-in's path still reads as a GitHub URL, since `git remote get-url` shows the rewritten one.
+ */
+const githubIs = (to = remote) => {
+  const stand = join(root, "mirror", "github.com", "acme");
+  mkdirSync(stand, { recursive: true });
+  symlinkSync(to, join(stand, "private.git"));
+  const file = join(root, "gitconfig");
+  writeFileSync(
+    file,
+    `[url "${join(stand, "private.git")}"]\n\tinsteadOf = https://github.com/acme/private.git\n`,
+  );
+  vi.stubEnv("GIT_CONFIG_GLOBAL", file);
+};
+
+test("a public repo's fresh worktree starts from GitHub's new tip fetched over git, with no REST calls", async () => {
+  githubIs();
+  const old = git(repoDir, "rev-parse", "origin/HEAD");
+  const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
+
+  const { cwd, notes } = await prepare({}, ANON_ENV);
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(git(repoDir, "rev-parse", "refs/remotes/origin/trunk")).toBe(tip);
+  expect(git(repoDir, "rev-parse", `${tip}^`)).toBe(old);
+  expect(git(repoDir, "rev-parse", `refs/sky/bases/${tip}`)).toBe(tip);
+  expect(notes).toEqual([]);
+  expect(requests).toEqual([]);
+  expect(warnings).toEqual([]);
+});
+
+test("a public repo's start branch is fetched over git, its merge base recorded, with no REST calls", async () => {
+  githubIs();
+  const base = git(repoDir, "rev-parse", "origin/HEAD");
+  const tip = pushToGitHub("feature/x", "x.txt", "x\n");
+
+  const { cwd, notes } = await prepare({ startBranch: "feature/x" }, ANON_ENV);
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(git(repoDir, "rev-parse", `refs/sky/bases/${base}`)).toBe(base);
+  expect(git(repoDir, "rev-parse", "refs/sky/starts/agt_1")).toBe(tip);
+  expect(notes.join("\n")).toContain("feature/x");
+  expect(requests).toEqual([]);
+});
+
+test("SKY_ANON_GIT=0 refreshes and fetches the start branch through the connector even when git could reach a public remote", async () => {
+  githubIs();
+  const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
+  const featureTip = pushToGitHub("feature/x", "x.txt", "x\n");
+
+  const { cwd } = await prepare({ startBranch: "feature/x" }, ENV);
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(featureTip);
+  expect(git(repoDir, "rev-parse", "refs/remotes/origin/trunk")).toBe(tip);
+  expect(requests).toContain("GET /git/ref/heads/trunk");
+  expect(requests).toContain("GET /git/ref/heads/feature/x");
+  expect(warnings).toEqual([]);
+});
+
+test("a start branch GitHub lacks fails as a missing branch, over git too", async () => {
+  githubIs();
+  await expect(
+    prepare({ startBranch: "nope" }, ANON_ENV),
+  ).rejects.toBeInstanceOf(sync.BranchNotFoundError);
+  expect(requests).toEqual([]);
+});
+
+test("an anonymous fetch that fails falls back to the connector with one warning saying why", async () => {
+  githubIs(join(root, "gone.git"));
+  const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
+
+  const { cwd } = await prepare({}, ANON_ENV);
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(requests.length).toBeGreaterThan(0);
+  expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toMatch(
+    /^runner: anonymous git fetch failed \(.+\); falling back to the connector$/,
+  );
+  expect(warnings[0]).not.toContain("\n");
+});
+
+test("a start branch is fetched through the connector once the anonymous fetch has failed, which is not tried twice", async () => {
+  githubIs(join(root, "gone.git"));
+  const tip = pushToGitHub("feature/x", "x.txt", "x\n");
+
+  const { cwd } = await prepare({ startBranch: "feature/x" }, ANON_ENV);
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(requests.length).toBeGreaterThan(0);
+  expect(warnings.filter((w) => w.includes("anonymous git"))).toHaveLength(1);
 });

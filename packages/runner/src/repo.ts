@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { anonGitEnabled, cloneOverGit, whyFailed } from "./gitfetch.js";
 import {
   CONNECTOR_ENV,
   DEFAULT_GATEWAY_URL,
@@ -411,7 +412,8 @@ async function writeCheckout(
 
 /**
  * `runner.mjs repo-pull <owner/repo> <dir>`: the API's, at provisioning, for a repo a plain clone
- * can't reach. Returns the exit status: 2 for a usage or config error, 1 for a failed pull.
+ * can't reach. It tries an anonymous git clone first (a public repo costs no REST calls), and
+ * pulls through the connector when that fails, saying why on stderr. Returns the exit status: 2 for a usage or config error, 1 for a failed pull.
  */
 export async function repoPullMain(
   argv: string[],
@@ -427,6 +429,21 @@ export async function repoPullMain(
   if (!connectorId) {
     io.stderr(`repo pull: ${CONNECTOR_ENV} is not set\n`);
     return 2;
+  }
+  if (anonGitEnabled(env)) {
+    try {
+      const { branch, sha } = await cloneOverGit({
+        repo,
+        dir,
+        progress: (line) => io.stderr(`${line}\n`),
+      });
+      io.stdout(`repo pull: ${repo} ${branch} at ${sha} (over git)\n`);
+      return 0;
+    } catch (error) {
+      io.stderr(
+        `repo pull: anonymous git fetch failed (${whyFailed(error)}); pulling through the connector\n`,
+      );
+    }
   }
   try {
     const { branch, sha } = await pullRepo({

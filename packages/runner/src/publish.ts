@@ -177,6 +177,8 @@ async function changes(cwd: string, from: string, to: string) {
 // GitHub's secondary rate limit answers 403 or 429 with a `retry-after`; a pause this long is waited out
 const MAX_RETRY_AFTER_S = 60;
 const RETRIES = 3;
+// the primary rate limit resets on the hour at the latest; a reset this near is waited out, a farther one fails naming its time
+const MAX_RESET_WAIT_S = 300;
 // a stalled gateway call fails rather than holding the caller
 const REQUEST_TIMEOUT_MS = 120_000;
 
@@ -216,6 +218,25 @@ export function gateway(options: {
         );
       }
       const retryAfter = Number(response.headers.get("retry-after") ?? NaN);
+      // the primary limit: the quota is spent until `x-ratelimit-reset`, epoch seconds
+      const resetAt = Number(response.headers.get("x-ratelimit-reset") ?? NaN);
+      if (
+        (response.status === 403 || response.status === 429) &&
+        response.headers.get("x-ratelimit-remaining") === "0" &&
+        Number.isFinite(resetAt)
+      ) {
+        const waitS = Math.max(0, resetAt - Date.now() / 1000);
+        if (waitS > MAX_RESET_WAIT_S || attempt >= RETRIES) {
+          await response.body?.cancel();
+          throw new GatewayError(
+            `GitHub gateway: ${where} hit GitHub's rate limit, which resets at ${new Date(resetAt * 1000).toISOString()} (in ${Math.ceil(waitS / 60)} min); try again then`,
+            response.status,
+          );
+        }
+        await response.body?.cancel();
+        await new Promise((resolve) => setTimeout(resolve, waitS * 1000 + 250));
+        continue;
+      }
       if (
         (response.status === 403 || response.status === 429) &&
         retryAfter >= 0 &&

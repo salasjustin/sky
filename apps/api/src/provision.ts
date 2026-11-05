@@ -253,7 +253,7 @@ export const envFile = (vars: Iterable<readonly [string, string]>) =>
 // the store steps' env, as a run's, rides in a file: an exec's argv and env reach the sprite as URL
 // query params
 const STORE_ENV_FILE = "/tmp/sky-store.env";
-// the repo pull's env, the connector and gateway only, rides in a file for the same reason
+// the repo pull's env, only the env secrets `cloneRepo` reads, rides in a file for the same reason
 const REPO_ENV_FILE = "/tmp/sky-repo.env";
 const PULL_REPO = `. "$1" && exec node ${RUNNER} repo-pull "$2" "$3"`;
 const PULL_STORE = `. "$1" && exec node ${RUNNER} store-sync pull`;
@@ -274,6 +274,10 @@ export const WITH_PACKAGE_MANAGERS = `export PATH="${PACKAGE_MANAGERS_DIR}:$PATH
  * Then enables the shims and execs its argv (the setup); enabling again on a rerun is harmless.
  */
 const PREPARE_SETUP = `for c in ${RUNNER_DIR}/node_modules/@anthropic-ai/claude-agent-sdk-*/claude; do "$c" --version >/dev/null 2>&1 && export SKY_CLAUDE="$c" && break; done; mkdir -p "${PACKAGE_MANAGERS_DIR}" && corepack enable --install-directory "${PACKAGE_MANAGERS_DIR}" && ${WITH_PACKAGE_MANAGERS} && exec "$@"`;
+// env values the runner reads as switches, not secrets: redacting a "0" or "1" shreds every digit
+const SWITCHES = new Set(["SKY_ANON_GIT"]);
+const secretValues = (vars: ReadonlyMap<string, string>) =>
+  [...vars].filter(([name]) => !SWITCHES.has(name)).map(([, value]) => value);
 // ≤ the length CHECK on environments.failure_stderr in db/src/schema.ts
 const TAIL_CHARS = 4000;
 
@@ -383,7 +387,7 @@ export function createProvisioner({
         ) {
           return;
         }
-        const known = [...stored.values()];
+        const known = secretValues(stored);
         await ensureBundle(sprite, `provision-${envId}`);
         await writeSpriteFile(
           sprites,
@@ -415,7 +419,7 @@ export function createProvisioner({
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         log(
-          `checking out the store in ${sprite} failed: ${redact(detail, [...secrets.values(), ...stored.values()])}`,
+          `checking out the store in ${sprite} failed: ${redact(detail, [...secrets.values(), ...secretValues(stored)])}`,
         );
       }
     };
@@ -434,12 +438,13 @@ export function createProvisioner({
         );
         return;
       }
-      // only these two are read, so an unrelated secret that won't decrypt can't fail the clone
+      // only these are read, so an unrelated secret that won't decrypt can't fail the clone
       const pulled = openEnvSecrets(db, secretEncryptionKey, env.id, [
         "GITHUB_CONNECTOR",
         "GITHUB_GATEWAY_URL",
+        "SKY_ANON_GIT",
       ]);
-      const known = [...pulled.values()];
+      const known = secretValues(pulled);
       stepSecrets.push(...known);
       const removeEnvFile = () =>
         removeEnvFiles([REPO_ENV_FILE], "rm-repo-env");

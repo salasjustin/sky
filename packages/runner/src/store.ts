@@ -58,7 +58,12 @@ const GIT_CONFIG = [
   "commit.gpgsign=false",
 ];
 
-type GitOptions = { input?: string | Buffer; env?: NodeJS.ProcessEnv };
+type GitOptions = {
+  input?: string | Buffer;
+  env?: NodeJS.ProcessEnv;
+  /** Kills git and every process it started, and rejects once git is gone, when it runs longer. */
+  timeoutMs?: number;
+};
 
 /** Runs git in `home`; resolves with stdout bytes, rejects with git's stderr. */
 const gitBytes =
@@ -68,13 +73,36 @@ const gitBytes =
       const child = spawn("git", [...GIT_CONFIG, ...args], {
         cwd: home,
         env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...options.env },
+        // its own process group, so a timeout reaches the transport helpers (`git-remote-https`,
+        // `index-pack`) too: killed alone, git leaves them holding our pipes and writing the repo
+        detached: Boolean(options.timeoutMs),
       });
       const out: Buffer[] = [];
       const err: Buffer[] = [];
       child.stdout.on("data", (d: Buffer) => out.push(d));
       child.stderr.on("data", (d: Buffer) => err.push(d));
+      const timer =
+        options.timeoutMs &&
+        setTimeout(() => {
+          try {
+            if (child.pid) process.kill(-child.pid, "SIGKILL");
+          } catch {
+            // ESRCH: the group is already gone
+          }
+          // a helper that escaped the group still can't hold the promise or the event loop open
+          child.stdin.destroy();
+          child.stdout.destroy();
+          child.stderr.destroy();
+          const timedOut = new Error(
+            `git ${args[0]} timed out after ${Math.round((options.timeoutMs ?? 0) / 1000)}s`,
+          );
+          if (child.exitCode !== null || child.signalCode !== null)
+            reject(timedOut);
+          else child.once("exit", () => reject(timedOut));
+        }, options.timeoutMs);
       child.on("error", reject);
       child.on("close", (code) => {
+        if (timer) clearTimeout(timer);
         if (code === 0) return resolve(Buffer.concat(out));
         const stderr = Buffer.concat(err).toString().trim();
         reject(new Error(`git ${args[0]} failed: ${stderr || `exit ${code}`}`));
