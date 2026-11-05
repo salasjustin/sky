@@ -805,7 +805,7 @@ export async function prepareWorktree(
     }
     // publishing there would write to the default branch directly
     if (old === lookup?.defaultName) return;
-    // undefined: couldn't tell
+    // undefined when GitHub couldn't say
     let published: boolean | undefined;
     if (lookup) {
       published = await remoteTip(lookup.call, old).then(
