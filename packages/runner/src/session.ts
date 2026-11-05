@@ -11,6 +11,7 @@ import type {
   PreToolUseHookInput,
   SDKMessage,
   SDKResultMessage,
+  SDKUserMessage,
   SyncHookJSONOutput,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AskUserQuestionInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools";
@@ -34,9 +35,39 @@ import { commitAll, diffRollup, headSha } from "./worktree.js";
 
 /** The Agent SDK's `query`, narrowed to what the runner calls; tests feed it scripted streams. */
 export type QueryFn = (params: {
-  prompt: string;
+  prompt: AsyncIterable<SDKUserMessage>;
   options: Options;
 }) => AsyncIterable<SDKMessage>;
+
+/**
+ * The run's prompt as streaming input, held open until `close`. A string prompt makes the SDK close
+ * the Claude process's stdin at the first `result`, and a turn that wakes after that (a background
+ * task finishing, as a nested `claude -p` does) has its first tool call cancelled with "The user
+ * doesn't want to take this action right now" and the session stops.
+ */
+function promptInput(text: string) {
+  let close = () => {};
+  const closed = new Promise<void>((resolve) => {
+    close = resolve;
+  });
+  const messages = (async function* (): AsyncGenerator<SDKUserMessage> {
+    yield {
+      type: "user",
+      message: { role: "user", content: text },
+      parent_tool_use_id: null,
+    };
+    await closed;
+  })();
+  return { messages, close };
+}
+
+/**
+ * How long a `result` with a background task still running holds the prompt open for the turn its
+ * notification wakes. Kept under the API's `RUN_TIMEOUT_MINUTES` (30 by default), which fails a
+ * quiet run, because the worktree is committed only when the stream ends: a task that never
+ * finishes, such as a dev server left running, ends the run with the result it has.
+ */
+export const BACKGROUND_HOLD_MS = 28 * 60_000;
 
 /**
  * Seconds before the SDK cancels a PreToolUse hook, and with it the approval gate (its default is
@@ -358,6 +389,8 @@ export async function runSession(
     warn?: (line: string) => void;
     /** How often a tool call in flight is reported; `HEARTBEAT_INTERVAL_MS` when absent. */
     heartbeatMs?: number;
+    /** `BACKGROUND_HOLD_MS` when absent. */
+    backgroundHoldMs?: number;
   },
 ): Promise<0 | 1> {
   const { runId } = config;
@@ -600,9 +633,15 @@ export async function runSession(
     toolStarted: heartbeat.started,
     toolEnded: heartbeat.ended,
   });
+  const input = promptInput(config.prompt);
+  // background tasks still running, such as a nested `claude -p`: a `result` that arrives while any
+  // are leaves the input open for the turn their notification wakes, for at most the hold
+  let liveTasks = 0;
+  let holdTimer: NodeJS.Timeout | undefined;
+  const endHold = () => clearTimeout(holdTimer);
   try {
     const stream = deps.query({
-      prompt: config.prompt,
+      prompt: input.messages,
       options: sessionOptions(
         config,
         cwd,
@@ -630,8 +669,29 @@ export async function runSession(
             },
             progress,
           ).catch(() => {});
+      } else if (
+        message.type === "system" &&
+        message.subtype === "background_tasks_changed"
+      ) {
+        liveTasks = message.tasks.filter((task) => !task.ambient).length;
+      } else if (
+        message.type === "system" &&
+        message.subtype === "task_notification"
+      ) {
+        // a task ended, so a woken turn is on its way
+        endHold();
       } else if (message.type === "result") {
         result = message;
+        endHold();
+        if (liveTasks === 0) input.close();
+        else {
+          holdTimer = setTimeout(() => {
+            warn(
+              `runner: ${liveTasks} background task(s) still running ${Math.round((deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS) / 60_000)} minutes after the last result; ending the run with that result`,
+            );
+            input.close();
+          }, deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS);
+        }
       }
     }
   } catch (error) {
@@ -640,6 +700,8 @@ export async function runSession(
       : messageOf(error);
   } finally {
     deps.signal.removeEventListener("abort", forward);
+    endHold();
+    input.close();
     heartbeat.stop();
   }
 

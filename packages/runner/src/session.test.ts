@@ -153,6 +153,58 @@ function scripted(
   return Object.assign(fn, { calls });
 }
 
+/** Reads a run's streaming prompt to its end, as the Claude process does; the texts of its messages. */
+async function textOf(prompt: Parameters<QueryFn>[0]["prompt"] | undefined) {
+  const texts: string[] = [];
+  for await (const message of prompt ?? [])
+    texts.push(String(message.message.content));
+  return texts;
+}
+
+/**
+ * A stand-in for the SDK and its Claude process: it reads the prompt as it streams. Each function
+ * in `turns` is a point where `atPoint` learns whether the prompt had ended by then, and the end
+ * of the script is one more.
+ */
+function claudeProcess(
+  turns: unknown[],
+  atPoint: (inputEnded: boolean) => void,
+): QueryFn {
+  return ({ prompt }) =>
+    (async function* () {
+      let inputEnded = false;
+      const reading = (async () => {
+        for await (const _ of prompt);
+        inputEnded = true;
+      })();
+      for (const m of turns) {
+        if (typeof m === "function") {
+          // a beat for a closing input to be seen
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          atPoint(inputEnded);
+        } else yield m as SDKMessage;
+      }
+      // a process whose stdin never closes does not exit
+      await Promise.race([
+        reading,
+        new Promise((resolve) => setTimeout(resolve, 1000)),
+      ]);
+      atPoint(inputEnded);
+    })();
+}
+
+const backgroundTasks = (count: number, ambient = false) => ({
+  type: "system",
+  subtype: "background_tasks_changed",
+  tasks: Array.from({ length: count }, (_, i) => ({
+    task_id: `t${i}`,
+    task_type: "local_bash",
+    description: "claude -p /kru:reflect",
+    ...(ambient && { ambient }),
+  })),
+  session_id: "sess-new",
+});
+
 /** For runs that hold nothing: any wait fails the test. */
 const noDecision = async (): Promise<never> => {
   throw new Error("no request should wait");
@@ -608,7 +660,7 @@ test("runs the session in the agent worktree, resuming the stored session, witho
       },
     );
     const [call] = query.calls;
-    expect(call?.prompt).toBe("add a file");
+    expect(await textOf(call?.prompt)).toEqual(["add a file"]);
     expect(call?.options.cwd).toBe(join(root, "worktrees", "agt_1"));
     expect(call?.options.resume).toBe("sess-old");
     expect(call?.options.env).not.toHaveProperty("AGENT_TOKEN");
@@ -917,6 +969,81 @@ test("a check written as plain `claude -p` is still run with the API key unset",
   } finally {
     vi.unstubAllEnvs();
   }
+});
+
+test("a result with a background task still running leaves the prompt open for the turn its notification wakes (JUS-96)", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  const outcome = await runSession(config, {
+    query: claudeProcess(
+      [
+        init,
+        backgroundTasks(1),
+        success,
+        // the turn ended and the nested `claude -p` is still running: stdin must still be open
+        () => {},
+        backgroundTasks(0),
+        success,
+      ],
+      (inputEnded) => seen.push(inputEnded),
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  // open at the idle turn end; closed once the last result came with nothing running
+  expect(seen).toEqual([false, true]);
+  expect(outcome).toBe(0);
+});
+
+test("a background task that never finishes holds the prompt open only for the hold, then the run ends with its result", async () => {
+  const seen: boolean[] = [];
+  const warnings: string[] = [];
+  const { post } = recorder();
+  const outcome = await runSession(config, {
+    query: claudeProcess(
+      [init, backgroundTasks(1), success, () => {}],
+      (ended) => seen.push(ended),
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 5,
+  });
+  expect(seen).toEqual([true, true]);
+  expect(
+    warnings.some((w) => w.includes("1 background task(s) still running")),
+  ).toBe(true);
+  expect(outcome).toBe(0);
+});
+
+test("a result with no background task running closes the prompt, so the process can exit", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: claudeProcess([init, backgroundTasks(0), success], (ended) =>
+      seen.push(ended),
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([true]);
+});
+
+test("an ambient background task (a watcher) does not hold the prompt open", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: claudeProcess([init, backgroundTasks(1, true), success], (ended) =>
+      seen.push(ended),
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([true]);
 });
 
 test("without checks, the session is told nothing about them", async () => {
