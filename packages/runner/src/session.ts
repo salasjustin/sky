@@ -190,7 +190,7 @@ const publishInstructions = () =>
     "To publish your branch and open a pull request, commit your work, then run",
     `\`${process.execPath} ${process.argv[1]} ${PUBLISH_USAGE}\``,
     "instead of `git push` or `gh pr create`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and prints its URL. Run it again after more commits to update the same pull request.",
-    "`--branch <name>` publishes to a GitHub branch of that name instead of your worktree's branch, and the pull request's head is that branch; pass the same name each time. Commits go out under the git author configured for this environment, with every `Co-authored-by` trailer removed.",
+    "`--branch <name>` publishes to a GitHub branch of that name instead of your worktree's branch, and the pull request's head is that branch; pass the same name each time. Stay on your worktree's branch: don't switch to another local branch, and use `--branch <name>` to choose the GitHub branch. Commits go out under the git author configured for this environment, with every `Co-authored-by` trailer removed.",
     "Once commits are published, add new commits rather than amending or rebasing them: a rewritten branch can't be published again.",
     "Pass a multi-line body from a quoted heredoc, `--body \"$(cat <<'EOF'` … `EOF` `)\"`, so the shell leaves its backticks and `$` alone. A large branch can take minutes to send, so give the Bash call a 10-minute timeout.",
   ].join("\n");

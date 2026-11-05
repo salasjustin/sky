@@ -28,13 +28,8 @@ export async function ensureWorktree(options: {
 }): Promise<string> {
   const branch = agentBranch(options.agentId);
   const path = join(options.worktreesDir, options.agentId);
-  if (existsSync(path)) {
-    const head = await git(path, "rev-parse", "--abbrev-ref", "HEAD");
-    if (head !== branch) {
-      throw new Error(`worktree ${path} is on ${head}, expected ${branch}`);
-    }
-    return path;
-  }
+  // an existing worktree is used as it stands; `adoptAgentBranch` deals with one on another branch
+  if (existsSync(path)) return path;
   // forget a worktree whose directory was deleted, so its branch can be checked out again
   await git(options.repoDir, "worktree", "prune");
   const branchExists = await git(options.repoDir, "branch", "--list", branch);
@@ -52,6 +47,71 @@ export async function ensureWorktree(options: {
     );
   }
   return path;
+}
+
+export type BranchAdoption = {
+  /** Whether the worktree is on the agent's branch afterwards. */
+  onBranch: boolean;
+  /** The branch the worktree was on, when the agent's branch was moved to it. */
+  from?: string;
+  /** For the agent's prompt; absent when the worktree was already on its branch. */
+  note?: string;
+};
+
+/**
+ * The agent may have switched its worktree to another local branch. When `branch` is an ancestor
+ * of that branch's commit and the tree is clean, `branch` is moved forward to that commit and
+ * checked out, so nothing is lost; otherwise the worktree is left as it is and the note says why.
+ * Nothing is reset, forced or discarded.
+ */
+export async function adoptAgentBranch(
+  cwd: string,
+  branch: string,
+): Promise<BranchAdoption> {
+  const current = await git(cwd, "rev-parse", "--abbrev-ref", "HEAD");
+  if (current === branch) return { onBranch: true };
+  const where = current === "HEAD" ? "a detached HEAD" : `\`${current}\``;
+  const stays = (reason: string): BranchAdoption => ({
+    onBranch: false,
+    note: `This worktree is on ${where}, not \`${branch}\`, and the runner left it there: ${reason}. Nothing was changed.`,
+  });
+  const tip = await git(cwd, "rev-parse", "--verify", "--quiet", branch).catch(
+    () => "",
+  );
+  if (!tip) return stays(`\`${branch}\` doesn't exist`);
+  for (const marker of ["rebase-merge", "rebase-apply", "MERGE_HEAD"]) {
+    const file = await git(cwd, "rev-parse", "--git-path", marker);
+    if (existsSync(join(cwd, file))) {
+      return stays("a rebase or merge is in progress");
+    }
+  }
+  const head = await git(cwd, "rev-parse", "HEAD");
+  const ancestor = await git(
+    cwd,
+    "merge-base",
+    "--is-ancestor",
+    tip,
+    head,
+  ).then(
+    () => true,
+    () => false,
+  );
+  if (!ancestor) {
+    return stays(
+      `\`${branch}\` is not an ancestor of it (the two have diverged), so moving \`${branch}\` there would lose commits`,
+    );
+  }
+  if (await git(cwd, "status", "--porcelain")) {
+    return stays("it has uncommitted changes");
+  }
+  // compare-and-swap on the old tip: a fast-forward, never a reset
+  await git(cwd, "update-ref", `refs/heads/${branch}`, head, tip);
+  await git(cwd, "switch", "--quiet", branch);
+  return {
+    onBranch: true,
+    ...(current !== "HEAD" && { from: current }),
+    note: `The runner found this worktree on ${where} instead of \`${branch}\`, moved \`${branch}\` forward to its commit ${head.slice(0, 7)} and checked it out; nothing was lost. Stay on \`${branch}\` from here.`,
+  };
 }
 
 /** Commits everything in the worktree; false when there was nothing to commit. Never pushes. */

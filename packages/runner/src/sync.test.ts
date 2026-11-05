@@ -1516,3 +1516,118 @@ test("an untracked file that blocks nothing doesn't keep the worktree from being
     `Your worktree was rebased onto \`origin/trunk\`, which GitHub had moved 1 commit ahead to ${tip.slice(0, 7)}; your commits now have new shas.`,
   ]);
 });
+
+/** The agent's worktree after it ran `git switch -c small-fixes-1` and committed there. */
+const switchedBranch = async () => {
+  const { cwd, sha } = await earlierRun();
+  git(cwd, "switch", "-qc", "small-fixes-1");
+  const head = commitIn(cwd, "fix.txt", "fix\n", "small fix");
+  requests = [];
+  return { cwd, sha, head };
+};
+
+test("a worktree on a descendant local branch, clean: claude/<agent> is moved to it and the agent is told", async () => {
+  const { cwd, head } = await switchedBranch();
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+  expect(git(cwd, "rev-parse", "claude/agt_1")).toBe(head);
+  // the other branch is untouched
+  expect(git(cwd, "rev-parse", "small-fixes-1")).toBe(head);
+  expect(notes).toEqual([
+    `The runner found this worktree on \`small-fixes-1\` instead of \`claude/agt_1\`, moved \`claude/agt_1\` forward to its commit ${head.slice(0, 7)} and checked it out; nothing was lost. Stay on \`claude/agt_1\` from here.`,
+  ]);
+  // never published under that name, so publish keeps its own branch name
+  expect(
+    spawnSync(
+      "git",
+      ["config", "--get", "branch.claude/agt_1.sky-remote-branch"],
+      {
+        cwd: repoDir,
+      },
+    ).status,
+  ).not.toBe(0);
+});
+
+test("a worktree on a local branch claude/<agent> has diverged from is left alone, and the note says why", async () => {
+  const { cwd } = await earlierRun();
+  git(cwd, "switch", "-qc", "elsewhere", "origin/HEAD");
+  const head = commitIn(cwd, "else.txt", "else\n", "elsewhere");
+  const agentTip = git(cwd, "rev-parse", "claude/agt_1");
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("elsewhere");
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(head);
+  expect(git(cwd, "rev-parse", "claude/agt_1")).toBe(agentTip);
+  expect(notes).toEqual([
+    "This worktree is on `elsewhere`, not `claude/agt_1`, and the runner left it there: `claude/agt_1` is not an ancestor of it (the two have diverged), so moving `claude/agt_1` there would lose commits. Nothing was changed.",
+  ]);
+});
+
+test("a dirty worktree on another local branch is left alone, and the note says why", async () => {
+  const { cwd, sha, head } = await switchedBranch();
+  writeFileSync(join(cwd, "fix.txt"), "half-done edit\n");
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("small-fixes-1");
+  expect(git(cwd, "rev-parse", "claude/agt_1")).toBe(sha);
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(head);
+  expect(git(cwd, "status", "--porcelain")).toBe("M fix.txt");
+  expect(notes).toEqual([
+    "This worktree is on `small-fixes-1`, not `claude/agt_1`, and the runner left it there: it has uncommitted changes. Nothing was changed.",
+  ]);
+});
+
+test("a follow-up after a publish from the switched branch updates that GitHub branch and its pull request, not a new one", async () => {
+  const { cwd, head } = await switchedBranch();
+  // the earlier run's `publish` named the GitHub branch after the local one
+  git(cwd, "push", "-q", remote, "HEAD:refs/heads/small-fixes-1");
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+  expect(
+    git(repoDir, "config", "--get", "branch.claude/agt_1.sky-remote-branch"),
+  ).toBe("small-fixes-1");
+  expect(notes).toEqual([
+    expect.stringContaining("moved `claude/agt_1` forward"),
+    "`small-fixes-1` is already on GitHub, so `publish` updates it (and its open pull request) rather than opening `claude/agt_1`.",
+  ]);
+
+  commitIn(cwd, "more.txt", "more\n", "more fixes");
+  const sent = githubWrites();
+  server.use(
+    http.get(`${REPO}/pulls`, ({ request }) => {
+      sent.pulls.push(
+        `GET head=${new URL(request.url).searchParams.get("head")}`,
+      );
+      return HttpResponse.json([
+        {
+          number: 7,
+          html_url: "https://github.com/acme/private/pull/7",
+          title: "Small fixes",
+          body: null,
+        },
+      ]);
+    }),
+  );
+  const result = await publish({
+    cwd,
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+  });
+
+  expect(result).toMatchObject({
+    branch: "small-fixes-1",
+    created: false,
+    pullRequest: { number: 7 },
+  });
+  expect(sent.commits.map((c) => c.parents)).toEqual([[head]]);
+  expect(sent.refs).toEqual([
+    `PATCH heads/small-fixes-1 {"sha":"${"d".repeat(40)}","force":false}`,
+  ]);
+  expect(sent.pulls).toEqual(["GET head=acme:small-fixes-1"]);
+});

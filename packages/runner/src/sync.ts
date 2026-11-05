@@ -18,7 +18,7 @@ import {
 } from "./publish.js";
 import { editShallow, fetchCommit, shallowCommits } from "./repo.js";
 import { git, messageOf } from "./store.js";
-import { ensureWorktree } from "./worktree.js";
+import { adoptAgentBranch, ensureWorktree } from "./worktree.js";
 
 type Call = ReturnType<typeof gateway>;
 type Git = ReturnType<typeof git>;
@@ -797,7 +797,12 @@ export async function prepareWorktree(
         `this agent was started on branch ${startBranch}, but ${CONNECTOR_ENV} is not set, so there is no way to fetch it from GitHub`,
       );
     }
-    return continueStartBranch(await ensureWorktree(config));
+    const cwd = await ensureWorktree(config);
+    if (!isNew) {
+      const adopted = await adoptAgentBranch(cwd, branch);
+      if (adopted.note) notes.push(adopted.note);
+    }
+    return continueStartBranch(cwd);
   }
   const defaultName = await defaultBranchOf(g).catch(() => undefined);
   if (startBranch && startBranch === defaultName) {
@@ -853,7 +858,46 @@ export async function prepareWorktree(
     ...config,
     ...(isNew && startBranch && { from: `refs/remotes/origin/${startBranch}` }),
   });
-  if (!isNew && defaultName) {
+  let onBranch = true;
+  if (!isNew) {
+    const adopted = await adoptAgentBranch(cwd, branch);
+    onBranch = adopted.onBranch;
+    if (adopted.note) notes.push(adopted.note);
+    // `publish` names the GitHub branch after the local one, so a branch already sent under the
+    // old name keeps its pull request only when the agent's branch is pointed at it
+    if (adopted.from && adopted.from !== defaultName && call) {
+      const held = await g([
+        "config",
+        "--get",
+        `branch.${branch}.${REMOTE_BRANCH_KEY}`,
+      ]).catch(() => "");
+      if (!held && !startBranch) {
+        const onGitHub = await remoteTip(call, adopted.from).then(
+          () => true,
+          (error: unknown) => {
+            if (!(error instanceof BranchNotFoundError)) {
+              deps.warn(
+                `runner: looking for ${adopted.from} on GitHub failed: ${messageOf(error)}`,
+              );
+            }
+            return false;
+          },
+        );
+        if (onGitHub) {
+          await g([
+            "config",
+            `branch.${branch}.${REMOTE_BRANCH_KEY}`,
+            adopted.from,
+          ]);
+          notes.push(
+            `\`${adopted.from}\` is already on GitHub, so \`publish\` updates it (and its open pull request) rather than opening \`${branch}\`.`,
+          );
+        }
+      }
+    }
+  }
+  // the sync and rebase below assume the agent's own branch is checked out
+  if (!isNew && onBranch && defaultName) {
     // unknown blocks the rebase as published does: a rebase can't be taken back once the branch
     // turns out to be
     let published: boolean | undefined;
