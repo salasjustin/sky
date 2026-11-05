@@ -996,6 +996,28 @@ test("a result with a background task still running leaves the prompt open for t
   expect(outcome).toBe(0);
 });
 
+test("a background task that never finishes holds the prompt open only for the hold, then the run ends with its result", async () => {
+  const seen: boolean[] = [];
+  const warnings: string[] = [];
+  const { post } = recorder();
+  const outcome = await runSession(config, {
+    query: claudeProcess(
+      [init, backgroundTasks(1), success, () => {}],
+      (ended) => seen.push(ended),
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 5,
+  });
+  expect(seen).toEqual([true, true]);
+  expect(
+    warnings.some((w) => w.includes("1 background task(s) still running")),
+  ).toBe(true);
+  expect(outcome).toBe(0);
+});
+
 test("a result with no background task running closes the prompt, so the process can exit", async () => {
   const seen: boolean[] = [];
   const { post } = recorder();

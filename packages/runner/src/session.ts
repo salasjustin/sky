@@ -62,6 +62,14 @@ function promptInput(text: string) {
 }
 
 /**
+ * How long a `result` with a background task still running holds the prompt open for the turn its
+ * notification wakes. The API fails a run that is quiet for `RUN_TIMEOUT_MINUTES` (30 by default),
+ * and the worktree is committed only when the stream ends, so a task that never finishes (a dev
+ * server left running) must not be waited on past that: the run ends with the result it has.
+ */
+export const BACKGROUND_HOLD_MS = 28 * 60_000;
+
+/**
  * Seconds before the SDK cancels a PreToolUse hook, and with it the approval gate (its default is
  * 600). `waitTimeoutMs` bounds each wait, but this clock also runs while a call queues behind
  * other waits, so it covers ten waits, and a day at least; kept far below a Node timer's
@@ -381,6 +389,8 @@ export async function runSession(
     warn?: (line: string) => void;
     /** How often a tool call in flight is reported; `HEARTBEAT_INTERVAL_MS` when absent. */
     heartbeatMs?: number;
+    /** `BACKGROUND_HOLD_MS` when absent. */
+    backgroundHoldMs?: number;
   },
 ): Promise<0 | 1> {
   const { runId } = config;
@@ -624,8 +634,11 @@ export async function runSession(
     toolEnded: heartbeat.ended,
   });
   const input = promptInput(config.prompt);
-  // background tasks (a nested `claude -p`) still running; a `result` while any is leaves the input open for the turn their notification wakes
+  // background tasks (a nested `claude -p`) still running; a `result` while any is leaves the input
+  // open for the turn their notification wakes, for at most the hold
   let liveTasks = 0;
+  let holdTimer: NodeJS.Timeout | undefined;
+  const endHold = () => clearTimeout(holdTimer);
   try {
     const stream = deps.query({
       prompt: input.messages,
@@ -661,9 +674,24 @@ export async function runSession(
         message.subtype === "background_tasks_changed"
       ) {
         liveTasks = message.tasks.filter((task) => !task.ambient).length;
+      } else if (
+        message.type === "system" &&
+        message.subtype === "task_notification"
+      ) {
+        // a task ended, so a woken turn is on its way
+        endHold();
       } else if (message.type === "result") {
         result = message;
+        endHold();
         if (liveTasks === 0) input.close();
+        else {
+          holdTimer = setTimeout(() => {
+            warn(
+              `runner: ${liveTasks} background task(s) still running ${Math.round((deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS) / 60_000)} minutes after the session's last result; ending the run with it`,
+            );
+            input.close();
+          }, deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS);
+        }
       }
     }
   } catch (error) {
@@ -672,6 +700,7 @@ export async function runSession(
       : messageOf(error);
   } finally {
     deps.signal.removeEventListener("abort", forward);
+    endHold();
     input.close();
     heartbeat.stop();
   }
