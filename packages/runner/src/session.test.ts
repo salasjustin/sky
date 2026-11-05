@@ -162,9 +162,9 @@ async function textOf(prompt: Parameters<QueryFn>[0]["prompt"] | undefined) {
 }
 
 /**
- * The SDK with a Claude process behind it: the prompt is read as it is streamed, and the process
- * can only do what the run still has open, so `inputEnded` says whether stdin had closed by the
- * time of each point the script marks with a function.
+ * A stand-in for the SDK and its Claude process: it reads the prompt as it streams. Each function
+ * in `turns` is a point where `atPoint` learns whether the prompt had ended by then, and the end
+ * of the script is one more.
  */
 function claudeProcess(
   turns: unknown[],

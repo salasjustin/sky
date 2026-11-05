@@ -63,9 +63,9 @@ function promptInput(text: string) {
 
 /**
  * How long a `result` with a background task still running holds the prompt open for the turn its
- * notification wakes. The API fails a run that is quiet for `RUN_TIMEOUT_MINUTES` (30 by default),
- * and the worktree is committed only when the stream ends, so a task that never finishes (a dev
- * server left running) must not be waited on past that: the run ends with the result it has.
+ * notification wakes. Kept under the API's `RUN_TIMEOUT_MINUTES` (30 by default), which fails a
+ * quiet run, because the worktree is committed only when the stream ends: a task that never
+ * finishes, such as a dev server left running, ends the run with the result it has.
  */
 export const BACKGROUND_HOLD_MS = 28 * 60_000;
 
@@ -634,8 +634,8 @@ export async function runSession(
     toolEnded: heartbeat.ended,
   });
   const input = promptInput(config.prompt);
-  // background tasks (a nested `claude -p`) still running; a `result` while any is leaves the input
-  // open for the turn their notification wakes, for at most the hold
+  // background tasks still running, such as a nested `claude -p`: a `result` that arrives while any
+  // are leaves the input open for the turn their notification wakes, for at most the hold
   let liveTasks = 0;
   let holdTimer: NodeJS.Timeout | undefined;
   const endHold = () => clearTimeout(holdTimer);
@@ -687,7 +687,7 @@ export async function runSession(
         else {
           holdTimer = setTimeout(() => {
             warn(
-              `runner: ${liveTasks} background task(s) still running ${Math.round((deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS) / 60_000)} minutes after the session's last result; ending the run with it`,
+              `runner: ${liveTasks} background task(s) still running ${Math.round((deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS) / 60_000)} minutes after the last result; ending the run with that result`,
             );
             input.close();
           }, deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS);
