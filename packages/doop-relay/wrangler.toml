@@ -1,0 +1,9 @@
+name = "doop-relay"
+main = "src/worker.ts"
+compatibility_date = "2026-10-01"
+
+# No account_id here: wrangler takes it from the logged-in account or CLOUDFLARE_ACCOUNT_ID.
+# Secrets (DOOP_WEBHOOK_SECRET, OPENBOT_WEBHOOK_SECRET) are set with `wrangler secret put`, never here.
+
+[vars]
+OPENBOT_WEBHOOK_URL = "" # set to OpenBot's webhook listener URL

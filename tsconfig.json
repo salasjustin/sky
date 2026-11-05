@@ -5,6 +5,7 @@
     { "path": "packages/runner" },
     { "path": "packages/mcp" },
     { "path": "packages/cli" },
+    { "path": "packages/doop-relay" },
     { "path": "packages/shared" },
     { "path": "db" },
     { "path": "test" }
