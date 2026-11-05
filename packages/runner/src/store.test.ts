@@ -693,6 +693,36 @@ test("a pull that downloads blobs reports its progress on stderr, and one with n
   expect(third.out.stderr).toBe("");
 });
 
+test("the store is pulled through the connector with SKY_ANON_GIT unset, even when git could reach it", async () => {
+  const config = join(root, "gitconfig");
+  writeFileSync(
+    config,
+    `[url "${remote}"]\n\tinsteadOf = https://github.com/acme/store.git\n`,
+  );
+  vi.stubEnv("GIT_CONFIG_GLOBAL", config);
+  const urls: string[] = [];
+  const onStart = ({ request }: { request: Request }) => {
+    if (request.url.startsWith(GATEWAY)) urls.push(request.url);
+  };
+  server.events.on("request:start", onStart);
+  const env = {
+    SKY_STORE_HOME: ".store",
+    SKY_STORE_LAYOUT: JSON.stringify(layout),
+    SKY_STORE_REPO: "acme/store",
+    GITHUB_CONNECTOR: CONNECTOR,
+    GITHUB_GATEWAY_URL: GATEWAY,
+  };
+
+  try {
+    expect(await storeSyncMain(["pull", "--locked"], env, io().io)).toBe(0);
+  } finally {
+    server.events.removeListener("request:start", onStart);
+  }
+
+  expect(local("inbox.md")).toBe("one\ntwo\n");
+  expect(urls.length).toBeGreaterThan(0);
+});
+
 test("a sync that fails is logged and never thrown", async () => {
   server.use(http.get(REPO, () => new HttpResponse("down", { status: 500 })));
   const env = {

@@ -95,7 +95,11 @@ beforeEach(() => {
   );
   execFileSync("git", ["clone", "-q", "--bare", seed, remote]);
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => {
+  // githubIs() stubs GIT_CONFIG_GLOBAL with a file under `root`, which is removed here
+  vi.unstubAllEnvs();
+  rmSync(root, { recursive: true, force: true });
+});
 
 const bare = (...args: string[]) => git(remote, ...args);
 
@@ -1989,6 +1993,23 @@ test("a public repo is cloned over git with no connector calls, full history, an
   expect(readFileSync(join(dir, "README.md"), "utf8")).toBe("private\n");
 });
 
+test("SKY_ANON_GIT=0 pulls through the connector even when git could reach a public remote", async () => {
+  githubIs();
+  fakeGitHub();
+  const calls = gatewayCalls();
+  const { io, sink } = sinks();
+  const dir = join(root, "x");
+
+  expect(await repoPullMain(["acme/private", dir], mainEnv, sink)).toBe(0);
+  calls.stop();
+
+  expect(calls.urls.length).toBeGreaterThan(0);
+  expect(io.out).toBe(`repo pull: acme/private trunk at ${headSha}\n`);
+  expect(io.err).not.toContain("anonymous git");
+  // the connector's checkout is a shallow tip; git's would be whole history
+  expect(existsSync(join(dir, ".git", "shallow"))).toBe(true);
+});
+
 test("an anonymous fetch that fails (private repo, no network) falls back to the connector with one line saying why", async () => {
   githubIs(join(root, "gone.git"));
   fakeGitHub();
@@ -2048,22 +2069,72 @@ test("a repo that asks for a login fails at once with no prompt and no stored cr
   expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
 });
 
-test("a git command given a time limit is killed and fails when it overruns", async () => {
+/** A remote that accepts every connection and never answers, as a stalled network looks to git. */
+const silentRemote = async () => {
   const web = createServer(() => {});
+  let connected!: () => void;
+  const reached = new Promise<void>((done) => {
+    connected = done;
+  });
+  web.on("connection", () => connected());
   await new Promise<void>((done) => web.listen(0, "127.0.0.1", done));
   const { port } = web.address() as { port: number };
+  const url = `http://127.0.0.1:${port}/acme/private.git`;
+  return {
+    url,
+    reached,
+    /** Processes still running whose command line names this remote: git's transport helpers. */
+    survivors: () =>
+      execFileSync("ps", ["-eo", "args"], { encoding: "utf8" })
+        .split("\n")
+        .filter((line) => line.includes(`127.0.0.1:${port}`)),
+    close: () => {
+      web.closeAllConnections();
+      web.close();
+    },
+  };
+};
+
+test("a git command given a time limit is killed with its transport helpers and fails promptly when it overruns", async () => {
+  const remote = await silentRemote();
   const dir = join(root, "slow");
   mkdirSync(dir);
   git(dir, "init", "-q");
+  const started = Date.now();
   try {
     await expect(
-      runnerGit(dir)(["ls-remote", `http://127.0.0.1:${port}/a/b.git`], {
-        timeoutMs: 300,
-      }),
+      runnerGit(dir)(["ls-remote", remote.url], { timeoutMs: 300 }),
     ).rejects.toThrow("git ls-remote timed out after 0s");
+    expect(Date.now() - started).toBeLessThan(1_300);
+    expect(remote.survivors()).toEqual([]);
   } finally {
-    web.closeAllConnections();
-    web.close();
+    remote.close();
+  }
+});
+
+test("a remote that never answers times out the anonymous clone, leaves no git running, and the connector pulls instead", async () => {
+  const remote = await silentRemote();
+  githubIs(remote.url);
+  fakeGitHub();
+  const { io, sink } = sinks();
+  const dir = join(root, "x");
+  // only git's own time limit is faked; the processes and the connector's requests stay real
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const pulled = repoPullMain(["acme/private", dir], anonEnv, sink);
+    await remote.reached;
+    vi.advanceTimersByTime(30_000);
+    vi.useRealTimers();
+
+    expect(await pulled).toBe(0);
+    expect(io.err).toContain(
+      "anonymous git fetch failed (git ls-remote timed out after 30s); pulling through the connector",
+    );
+    expect(remote.survivors()).toEqual([]);
+    expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
+  } finally {
+    vi.useRealTimers();
+    remote.close();
   }
 });
 

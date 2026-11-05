@@ -1218,6 +1218,70 @@ test("a failed repo pull ends failed at the clone step with the runner's output,
   );
 });
 
+test.each([
+  {
+    step: "clone",
+    flag: "0",
+    exec: (argv: string[]) =>
+      argv.join(" ").includes("repo-pull")
+        ? {
+            exitCode: 1,
+            stderr: "repo pull: failed: HTTP 404 Not Found via VPpb7x\n",
+          }
+        : { exitCode: 0 },
+    // the connector id, as short as the flag, is still scrubbed
+    stderr: "repo pull: failed: HTTP 404 Not Found via [redacted]\n",
+  },
+  {
+    step: "setup",
+    flag: "1",
+    exec: (argv: string[]) =>
+      isSetup(argv) ? { exitCode: 1 } : { exitCode: 0 },
+    stderr: "exited with code 1",
+  },
+])(
+  "with SKY_ANON_GIT=$flag, a failed $step step's stored output keeps its digits",
+  async ({ flag, exec, step, stderr }) => {
+    const { env } = await reprovisionWith(
+      { ...githubConnector, SKY_ANON_GIT: { value: flag } },
+      "// runner",
+      () => {
+        wire.exec = exec;
+      },
+    );
+    expect(env).toMatchObject({ status: "failed", failure: { step, stderr } });
+  },
+);
+
+test("with SKY_ANON_GIT=0, a failed store checkout's log keeps its digits and still scrubs the connector id", async () => {
+  const { id, logged } = await reprovisionWith(
+    { ...githubConnector, SKY_ANON_GIT: { value: "0" } },
+    "// runner",
+    () => {
+      wire.exec = (argv) =>
+        argv.some((arg) => arg.includes("store-sync pull"))
+          ? { exitCode: 1, stderr: "store sync: pull failed: 502 VPpb7x" }
+          : { exitCode: 0 };
+    },
+  );
+  const log = logged.join("\n");
+  expect(log).toContain("store sync: pull failed: 502 [redacted]");
+  // a sprite name holds hex digits, so a scrubbed "0" would break it in every Sprites-call line
+  expect(log).toContain(`sprite ${spriteNameFor(id)} store-pull: exited 1`);
+});
+
+test("SKY_ANON_GIT reaches the repo pull's env file", async () => {
+  const { env } = await reprovisionWith({
+    ...githubConnector,
+    SKY_ANON_GIT: { value: "0" },
+  });
+  expect(env).toMatchObject({ status: "ready", failure: null });
+  expect(envFileOf(wire, { env: { ENV_FILE: REPO_ENV_FILE } })).toEqual({
+    GITHUB_CONNECTOR: "VPpb7x",
+    SKY_ANON_GIT: "0",
+  });
+});
+
 test("a repo env file write that fails ends failed at the clone step, runs no pull, and still removes the file", async () => {
   const { id, env } = await reprovisionWith(
     githubConnector,

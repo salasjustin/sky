@@ -1773,6 +1773,20 @@ test("a public repo's start branch is fetched over git, its merge base recorded,
   expect(requests).toEqual([]);
 });
 
+test("SKY_ANON_GIT=0 refreshes and fetches the start branch through the connector even when git could reach a public remote", async () => {
+  githubIs();
+  const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
+  const featureTip = pushToGitHub("feature/x", "x.txt", "x\n");
+
+  const { cwd } = await prepare({ startBranch: "feature/x" }, ENV);
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(featureTip);
+  expect(git(repoDir, "rev-parse", "refs/remotes/origin/trunk")).toBe(tip);
+  expect(requests).toContain("GET /git/ref/heads/trunk");
+  expect(requests).toContain("GET /git/ref/heads/feature/x");
+  expect(warnings).toEqual([]);
+});
+
 test("a start branch GitHub lacks fails as a missing branch, over git too", async () => {
   githubIs();
   await expect(

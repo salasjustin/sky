@@ -61,7 +61,7 @@ const GIT_CONFIG = [
 type GitOptions = {
   input?: string | Buffer;
   env?: NodeJS.ProcessEnv;
-  /** Kills git and rejects when it runs longer. */
+  /** Kills git and every process it started, and rejects once git is gone, when it runs longer. */
   timeoutMs?: number;
 };
 
@@ -73,6 +73,9 @@ const gitBytes =
       const child = spawn("git", [...GIT_CONFIG, ...args], {
         cwd: home,
         env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...options.env },
+        // its own process group, so a timeout reaches the transport helpers (`git-remote-https`,
+        // `index-pack`) too: killed alone, git leaves them holding our pipes and writing the repo
+        detached: Boolean(options.timeoutMs),
       });
       const out: Buffer[] = [];
       const err: Buffer[] = [];
@@ -81,12 +84,21 @@ const gitBytes =
       const timer =
         options.timeoutMs &&
         setTimeout(() => {
-          child.kill("SIGKILL");
-          reject(
-            new Error(
-              `git ${args[0]} timed out after ${Math.round((options.timeoutMs ?? 0) / 1000)}s`,
-            ),
+          try {
+            if (child.pid) process.kill(-child.pid, "SIGKILL");
+          } catch {
+            // ESRCH: the group is already gone
+          }
+          // a helper that escaped the group still can't hold the promise or the event loop open
+          child.stdin.destroy();
+          child.stdout.destroy();
+          child.stderr.destroy();
+          const timedOut = new Error(
+            `git ${args[0]} timed out after ${Math.round((options.timeoutMs ?? 0) / 1000)}s`,
           );
+          if (child.exitCode !== null || child.signalCode !== null)
+            reject(timedOut);
+          else child.once("exit", () => reject(timedOut));
         }, options.timeoutMs);
       child.on("error", reject);
       child.on("close", (code) => {
