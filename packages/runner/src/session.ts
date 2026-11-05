@@ -178,7 +178,7 @@ const checkInstructions = (checks: string[]) =>
     "Before you finish, run these checks on your change, in order, from the repo root. Plugin skills can't be invoked through the Skill tool, so run any `claude -p` command through Bash:",
     ...checks.map((check) => `- ${check}`),
     "Run each command that calls `claude` with ANTHROPIC_API_KEY unset, as `env -u ANTHROPIC_API_KEY claude -p …`, even where the check leaves that prefix out.",
-    "A nested `claude` session is already logged in with the sandbox's subscription. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.",
+    "A nested `claude` session is already logged in with the sandbox's subscription. Never set or use an API key for it, and never print or read credential files or tokens. Run each one in the foreground, one at a time, as a Bash call with `timeout: 600000` (the 10-minute maximum): never with `run_in_background`, a trailing `&` or `nohup`, and never two at once. A nested `claude` that finished in the background has been seen to cancel the starting session's next tool call and stop it. Fix what the checks find, and report the checks' output if one can't run.",
   ].join("\n");
 
 /**

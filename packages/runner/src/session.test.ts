@@ -919,6 +919,19 @@ test("a check written as plain `claude -p` is still run with the API key unset",
   }
 });
 
+test("a nested `claude -p` check is run in the foreground, never in the background (JUS-96)", async () => {
+  vi.stubEnv("GITHUB_CONNECTOR", undefined);
+  try {
+    const append = await appendOf(['claude -p "/acme:review"']);
+    expect(append).toContain("in the foreground, one at a time");
+    expect(append).toContain("`timeout: 600000`");
+    expect(append).toContain("never with `run_in_background`");
+    expect(append).not.toContain("Give each call a 10-minute timeout");
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
 test("without checks, the session is told nothing about them", async () => {
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
   try {
