@@ -1324,6 +1324,38 @@ test("a failed repo pull whose output carries the gateway URL and connector id s
   expect(logs).not.toContain("VPpb7x");
 });
 
+test("a GITHUB_READ_TOKEN secret alone sends the clone through the runner's repo-pull with the token in the env file, and a failed pull's output stores no token", async () => {
+  const token = "github_pat_READONLY123";
+  let pullEnv = "";
+  const { env, logged } = await reprovisionWith(
+    { GITHUB_READ_TOKEN: { value: token } },
+    "// runner",
+    () => {
+      wire.exec = (argv) => {
+        if (!argv.join(" ").includes("repo-pull")) return { exitCode: 0 };
+        pullEnv = Buffer.from(wire.files.get(REPO_ENV_FILE) ?? []).toString();
+        return {
+          exitCode: 1,
+          stderr: `repo pull: failed: git fetch with GITHUB_READ_TOKEN: bad credentials for ${token}`,
+        };
+      };
+    },
+    null,
+  );
+  expect(pullEnv).toContain("GITHUB_READ_TOKEN");
+  expect(pullEnv).toContain(token);
+  expect(wire.calls.some((c) => c.includes("git clone"))).toBe(false);
+  expect(env).toMatchObject({
+    status: "failed",
+    failure: {
+      step: "clone",
+      stderr: expect.stringContaining("bad credentials"),
+    },
+  });
+  expect(JSON.stringify(env)).not.toContain(token);
+  expect(logged.join("\n")).not.toContain(token);
+});
+
 test("provisioning's store steps see the env's own gateway and the profile's store home, as a run does", async () => {
   const local = mkdtempSync(join(tmpdir(), "sky-store-"));
   const storeHome = join(local, ".store");

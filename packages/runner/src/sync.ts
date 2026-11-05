@@ -4,6 +4,12 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { type AgentId, agentBranch } from "@sky/shared";
 import {
+  fetchOverGit,
+  READ_TOKEN_ENV,
+  readToken,
+  whyFailed,
+} from "./gitfetch.js";
+import {
   BRANCH_ENV,
   CONNECTOR_ENV,
   DEFAULT_GATEWAY_URL,
@@ -292,6 +298,62 @@ export async function syncDefaultBranch(options: {
   }
   await g(["update-ref", `${FETCHED_BASES}${sha}`, sha]);
   return { ...result, moved: true };
+}
+
+/**
+ * `syncDefaultBranch` over git with the read-only token: no REST calls, and `origin/<default>`
+ * moves to GitHub's tip with the history between.
+ */
+export async function syncDefaultOverGit(options: {
+  repoDir: string;
+  token: string;
+}): Promise<DefaultSync> {
+  const g = git(options.repoDir);
+  const name = await defaultBranchOf(g);
+  const previous = (await resolved(g, `refs/remotes/origin/${name}`)) || null;
+  const sha = await fetchOverGit({ ...options, branch: name });
+  const result = { default: name, previous, sha, moved: false, tooFar: false };
+  if (sha === previous) return result;
+  await g(["update-ref", `${FETCHED_BASES}${sha}`, sha]);
+  return { ...result, moved: true };
+}
+
+/** GitHub's answer to a fetch of a branch it doesn't have. */
+const NO_REMOTE_REF = /couldn't find remote ref/;
+
+/**
+ * `fetchStartBranch` over git with the read-only token: fetches the branch with its history and
+ * records its merge base with the default branch under `FETCHED_BASES`. Returns the branch's tip.
+ */
+async function fetchStartBranchOverGit(options: {
+  repoDir: string;
+  token: string;
+  startBranch: string;
+  defaultBranch: string;
+}): Promise<string> {
+  const { startBranch, defaultBranch } = options;
+  const g = git(options.repoDir);
+  const tip = await fetchOverGit({
+    repoDir: options.repoDir,
+    token: options.token,
+    branch: startBranch,
+  }).catch((error: unknown) => {
+    if (NO_REMOTE_REF.test(messageOf(error))) {
+      throw new BranchNotFoundError(
+        startBranch,
+        `the start branch ${startBranch} doesn't exist on GitHub (${messageOf(error)})`,
+      );
+    }
+    throw error;
+  });
+  const onDefault = await resolved(g, `refs/remotes/origin/${defaultBranch}`);
+  const mergeBase = onDefault
+    ? await g(["merge-base", onDefault, tip]).catch(() => "")
+    : "";
+  if (mergeBase) {
+    await g(["update-ref", `${FETCHED_BASES}${mergeBase}`, mergeBase]);
+  }
+  return tip;
 }
 
 const run = promisify(execFile);
@@ -760,9 +822,10 @@ const tooFarNote = (s: DefaultSync) =>
   `GitHub's ${s.default} is more than ${DEFAULT_MAX_COMMITS} commits ahead of what this sandbox has, too far to fetch, so \`origin/${s.default}\` was left at ${short(s.previous)}; you are working from that commit, not GitHub's ${short(s.sha)}.`;
 
 /**
- * The agent's worktree for this run, brought up to date with GitHub through the connector, with
- * notes for the agent on what that did or couldn't do. Without a connector there is no way to
- * reach GitHub, and the worktree is made or reused as it stands.
+ * The agent's worktree for this run, brought up to date with GitHub, with notes for the agent on
+ * what that did or couldn't do. With `GITHUB_READ_TOKEN` the default branch and a start branch come
+ * over git, at no REST cost; without it, or when that fails, through the connector. With neither
+ * there is no way to reach GitHub, and the worktree is made or reused as it stands.
  */
 export async function prepareWorktree(
   config: {
@@ -852,7 +915,8 @@ export async function prepareWorktree(
     return { cwd, notes };
   };
   const connectorId = deps.env[CONNECTOR_ENV];
-  if (!connectorId) {
+  const token = readToken(deps.env);
+  if (!connectorId && !token) {
     if (startBranch && isNew) {
       throw new Error(
         `this agent was started on branch ${startBranch}, but ${CONNECTOR_ENV} is not set, so there is no way to fetch it from GitHub`,
@@ -877,32 +941,75 @@ export async function prepareWorktree(
     );
   };
   let call: Call | undefined;
+  // set once a fetch with the read-only token has worked; a failed one is not tried again this run
+  let overGit = Boolean(token);
+  // one line, and the connector takes over; with no connector the failure is the caller's
+  const gitFailed = (error: unknown) => {
+    overGit = false;
+    if (!call) return;
+    deps.warn(
+      `runner: git fetch with ${READ_TOKEN_ENV} failed (${whyFailed(error, token ?? "")}); falling back to the connector`,
+    );
+  };
+  if (!token) {
+    deps.warn(
+      `runner: ${READ_TOKEN_ENV} is not set; refreshing through the connector`,
+    );
+  }
   try {
     if (!defaultName) throw new Error("origin/HEAD names no branch");
-    const { owner, repo } = parseOrigin(
-      await g(["remote", "get-url", "origin"]),
-    );
-    call = gateway({
-      gatewayUrl: deps.env[GATEWAY_URL_ENV] || DEFAULT_GATEWAY_URL,
-      connectorId,
-      owner,
-      repo,
-    });
-    const synced = await syncDefaultBranch({ repoDir: config.repoDir, call });
-    if (synced.tooFar) notes.push(tooFarNote(synced));
+    if (connectorId) {
+      const { owner, repo } = parseOrigin(
+        await g(["remote", "get-url", "origin"]),
+      );
+      call = gateway({
+        gatewayUrl: deps.env[GATEWAY_URL_ENV] || DEFAULT_GATEWAY_URL,
+        connectorId,
+        owner,
+        repo,
+      });
+    }
+    let synced: DefaultSync | undefined;
+    if (token) {
+      try {
+        synced = await syncDefaultOverGit({ repoDir: config.repoDir, token });
+      } catch (error) {
+        gitFailed(error);
+        if (!call) throw error;
+      }
+    }
+    if (!synced && call) {
+      synced = await syncDefaultBranch({ repoDir: config.repoDir, call });
+    }
+    if (synced?.tooFar) notes.push(tooFarNote(synced));
   } catch (error) {
     syncFailed(error);
   }
   if (isNew && startBranch) {
     // unlike the refresh, the run can't go on without it: there is nothing else to start from
-    if (!call || !defaultName) {
+    if ((!call && !overGit) || !defaultName) {
       throw new Error(
         `can't fetch branch ${startBranch} from GitHub: ${messageOf(lastFailure)}`,
       );
     }
-    const tip = await fetchStartBranch({
+    let tip: string | undefined;
+    if (overGit && token) {
+      try {
+        tip = await fetchStartBranchOverGit({
+          repoDir: config.repoDir,
+          token,
+          startBranch,
+          defaultBranch: defaultName,
+        });
+      } catch (error) {
+        if (error instanceof BranchNotFoundError) throw error;
+        gitFailed(error);
+        if (!call) throw error;
+      }
+    }
+    tip ??= await fetchStartBranch({
       repoDir: config.repoDir,
-      call,
+      call: call as Call,
       startBranch,
       defaultBranch: defaultName,
     });

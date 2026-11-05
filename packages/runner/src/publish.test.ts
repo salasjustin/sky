@@ -940,6 +940,69 @@ test("a rate-limit pause GitHub asks for is waited out, then the call goes on", 
   expect(gh.blobs).toEqual([{ content: b64("first\n"), encoding: "base64" }]);
 });
 
+test("a spent rate limit that resets within the wait is waited out until x-ratelimit-reset, then the call goes on", async () => {
+  const gh = fakeGitHub();
+  let refused = 0;
+  const reset = Math.floor(Date.now() / 1000) + 1;
+  server.use(
+    http.post(
+      `${REPO}/git/blobs`,
+      () => {
+        refused++;
+        return HttpResponse.json(
+          { message: "API rate limit exceeded" },
+          {
+            status: 403,
+            headers: {
+              "x-ratelimit-remaining": "0",
+              "x-ratelimit-reset": String(reset),
+            },
+          },
+        );
+      },
+      { once: true },
+    ),
+  );
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const before = Date.now();
+  await run();
+
+  expect(refused).toBe(1);
+  expect(Date.now()).toBeGreaterThanOrEqual(reset * 1000);
+  expect(Date.now() - before).toBeLessThan(10_000);
+  expect(gh.blobs).toEqual([{ content: b64("first\n"), encoding: "base64" }]);
+});
+
+test("a spent rate limit that resets later than the wait allows fails naming the reset time, with no raw 403", async () => {
+  fakeGitHub();
+  const reset = Math.floor(Date.now() / 1000) + 3000;
+  server.use(
+    http.post(`${REPO}/git/blobs`, () =>
+      HttpResponse.json(
+        { message: "API rate limit exceeded" },
+        {
+          status: 403,
+          headers: {
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(reset),
+          },
+        },
+      ),
+    ),
+  );
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const error = await run().catch((e: Error) => e);
+
+  expect((error as Error).message).toContain(
+    `rate limit, which resets at ${new Date(reset * 1000).toISOString()}`,
+  );
+  expect((error as Error).message).not.toContain("API rate limit exceeded");
+});
+
 test("--branch sends the commits to the named GitHub branch and opens the PR from it, while the worktree keeps its own branch", async () => {
   const gh = fakeGitHub({ branch: "feature/widgets" });
   writeFileSync(join(work, "a.txt"), "first\n");

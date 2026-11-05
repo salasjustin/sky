@@ -5,7 +5,11 @@ import { storeEnv } from "./base-profile.js";
 import { type KnownSecrets, redact } from "./redact.js";
 import { cloneUrl } from "./remote.js";
 import type { BundleInstaller } from "./runner-bundle.js";
-import { hasConnectorSecret, openEnvSecrets } from "./secrets.js";
+import {
+  hasConnectorSecret,
+  hasValueSecret,
+  openEnvSecrets,
+} from "./secrets.js";
 import {
   baseSpriteLabels,
   checkpointSprite,
@@ -253,7 +257,7 @@ export const envFile = (vars: Iterable<readonly [string, string]>) =>
 // the store steps' env, as a run's, rides in a file: an exec's argv and env reach the sprite as URL
 // query params
 const STORE_ENV_FILE = "/tmp/sky-store.env";
-// the repo pull's env, the connector and gateway only, rides in a file for the same reason
+// the repo pull's env, the connector, gateway and read token only, rides in a file for the same reason
 const REPO_ENV_FILE = "/tmp/sky-repo.env";
 const PULL_REPO = `. "$1" && exec node ${RUNNER} repo-pull "$2" "$3"`;
 const PULL_STORE = `. "$1" && exec node ${RUNNER} store-sync pull`;
@@ -420,13 +424,16 @@ export function createProvisioner({
       }
     };
     /**
-     * Puts the env's repo at `REPO_DIR`. With a connector secret the runner's `repo-pull` fetches it
-     * through the gateway, so a private repo works; the checkout holds GitHub's own commit, which
+     * Puts the env's repo at `REPO_DIR`. With a `GITHUB_READ_TOKEN` or a connector secret the
+     * runner's `repo-pull` fetches it, over git with the token (no REST calls) or else through the
+     * gateway, so a private repo works; the checkout holds GitHub's own commit, which
      * the agents' worktrees branch from and their publishes build on. Without one, a plain clone
      * of a public repo.
      */
     const cloneRepo = async (): Promise<void> => {
-      if (!hasConnectorSecret(db, env.id, "GITHUB_CONNECTOR")) {
+      const viaConnector = hasConnectorSecret(db, env.id, "GITHUB_CONNECTOR");
+      const viaToken = hasValueSecret(db, env.id, "GITHUB_READ_TOKEN");
+      if (!viaConnector && !viaToken) {
         await execNoisy(
           ["git", "clone", cloneUrl(env.repo), REPO_DIR],
           "clone",
@@ -438,6 +445,7 @@ export function createProvisioner({
       const pulled = openEnvSecrets(db, secretEncryptionKey, env.id, [
         "GITHUB_CONNECTOR",
         "GITHUB_GATEWAY_URL",
+        "GITHUB_READ_TOKEN",
       ]);
       const known = [...pulled.values()];
       stepSecrets.push(...known);

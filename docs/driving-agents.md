@@ -41,6 +41,15 @@ A bot must pass `--yes` to `env delete`: without a terminal to ask on, with `CI`
 
 `<env>` is a name or an id everywhere, and a name that looks like an id (`env_prod`) still works. `sky secret list` never prints a value, in either mode: `--json` gives `{"data": [{"name": …, "kind": …}]}`. The deletes answer `deleted <id or NAME>`, or `{"id"|"name": …, "deleted": true}` under `--json`. An unknown environment or secret exits 1 with `not_found`; `env delete` while a run is active or the env is provisioning, and `env retry` on an env that hasn't failed, exit 1 too, with the API's reason.
 
+### Reading the repo over git: `GITHUB_READ_TOKEN`
+
+By default Sky pulls the repo through the GitHub connector, one REST call per file, which drains the connector's shared hourly quota on a large repo. Set a read-only token and the clone, and each run's refresh of the default branch and of a `--branch` start, go over git instead, at no REST cost:
+
+1. Create a **fine-grained personal access token** on GitHub for the one repo, with **Contents: Read-only** and no other permission.
+2. `sky secret set <env> GITHUB_READ_TOKEN`, then `sky env retry <env>` (or re-apply) so provisioning clones with it.
+
+Without the token, or if a git fetch fails (bad or expired token, no network), Sky logs one line saying why and uses the connector. Publishing always goes through the connector; the token can't write. **Agents in the sandbox can read the token** (it is an ordinary secret of the environment), so scope it to that repo, read-only.
+
 ## 1. Start
 
 ```
@@ -53,7 +62,7 @@ sky agent start web --prompt=@task.md
 agt_… run_…
 ```
 
-To pick up an existing branch, such as an open pull request's, add `--branch=<name>`: the agent starts from it and publishes back to it. Sandboxes have no git transport, so the agent can't fetch or push itself; Sky fetches through the environment's GitHub connector when each run starts. A branch that doesn't exist fails the start with `branch_not_found`. Two agents may target the same branch, and `publish` refuses to overwrite commits the branch never had.
+To pick up an existing branch, such as an open pull request's, add `--branch=<name>`: the agent starts from it and publishes back to it. Sandboxes have no git transport, so the agent can't fetch or push itself; Sky fetches the branch when each run starts: over git when the environment has a `GITHUB_READ_TOKEN` secret, otherwise through its GitHub connector. A branch that doesn't exist fails the start with `branch_not_found`. Two agents may target the same branch, and `publish` refuses to overwrite commits the branch never had.
 
 ## 2. Wait
 
