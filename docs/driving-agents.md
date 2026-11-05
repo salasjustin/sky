@@ -46,7 +46,7 @@ A bot must pass `--yes` to `env delete`: without a terminal to ask on, with `CI`
 By default Sky pulls the repo through the GitHub connector, one REST call per file, which drains the connector's shared hourly quota on a large repo. Set a read-only token and the clone, and each run's refresh of the default branch and of a `--branch` start, go over git instead, at no REST cost:
 
 1. Create a **fine-grained personal access token** on GitHub for the one repo, with **Contents: Read-only** and no other permission.
-2. `sky secret set <env> GITHUB_READ_TOKEN`, then `sky env retry <env>` (or re-apply) so provisioning clones with it.
+2. `sky secret set <env> GITHUB_READ_TOKEN`. Runs use it at once; the clone uses it the next time the environment is provisioned.
 
 Without the token, or if a git fetch fails (bad or expired token, no network), Sky logs one line saying why and uses the connector. Publishing always goes through the connector; the token can't write. **Agents in the sandbox can read the token** (it is an ordinary secret of the environment), so scope it to that repo, read-only.
 
