@@ -778,6 +778,65 @@ export async function prepareWorktree(
   const branch = agentBranch(config.agentId);
   const g = git(config.repoDir);
   const isNew = !existsSync(join(config.worktreesDir, config.agentId));
+  // false when the agent switched to another branch and the runner left it there
+  let onBranch = true;
+  /**
+   * The agent may have switched its worktree to another local branch (see `adoptAgentBranch`).
+   * `publish` names the GitHub branch after the checked-out one, so a branch already sent under
+   * the old name keeps its pull request only when the agent's branch is pointed at it. That is
+   * decided now or never: the next run is already on the agent's branch.
+   */
+  const adopt = async (
+    cwd: string,
+    lookup?: { call: Call; defaultName: string | undefined },
+  ) => {
+    if (isNew) return;
+    const adopted = await adoptAgentBranch(cwd, branch);
+    onBranch = adopted.onBranch;
+    if (adopted.note) notes.push(adopted.note);
+    const old = adopted.from;
+    const key = `branch.${branch}.${REMOTE_BRANCH_KEY}`;
+    if (
+      !old ||
+      startBranch ||
+      (await g(["config", "--get", key]).catch(() => ""))
+    ) {
+      return;
+    }
+    // publishing there would write to the default branch directly
+    if (old === lookup?.defaultName) return;
+    // undefined: couldn't tell
+    let published: boolean | undefined;
+    if (lookup) {
+      published = await remoteTip(lookup.call, old).then(
+        () => true,
+        (error: unknown) => {
+          if (error instanceof BranchNotFoundError) return false;
+          deps.warn(
+            `runner: looking for ${old} on GitHub failed: ${messageOf(error)}`,
+          );
+          return undefined;
+        },
+      );
+    }
+    if (published) {
+      try {
+        await g(["config", key, old]);
+        notes.push(
+          `\`${old}\` is already on GitHub, so \`publish\` updates it (and its open pull request) rather than opening \`${branch}\`.`,
+        );
+        return;
+      } catch (error) {
+        deps.warn(`runner: recording ${old} failed: ${messageOf(error)}`);
+        published = undefined;
+      }
+    }
+    if (published === undefined) {
+      notes.push(
+        `The runner couldn't tell whether \`${old}\` was published to GitHub. If it was, publish with \`--branch ${old}\` to update its pull request rather than open a new one.`,
+      );
+    }
+  };
   const continueStartBranch = async (cwd: string) => {
     if (!startBranch) return { cwd, notes };
     // the repo's config, shared by every worktree, and `git config` fails outright while another
@@ -785,6 +844,8 @@ export async function prepareWorktree(
     const key = `branch.${branch}.${REMOTE_BRANCH_KEY}`;
     const held = await g(["config", "--get", key]).catch(() => "");
     if (held !== startBranch) await g(["config", key, startBranch]);
+    // `publish` reads the checked-out branch's key, which is not this one
+    if (!onBranch) return { cwd, notes };
     notes.push(
       `This worktree continues the existing GitHub branch \`${startBranch}\`; \`publish\` updates that branch (and its open pull request), not \`${branch}\`.`,
     );
@@ -798,10 +859,7 @@ export async function prepareWorktree(
       );
     }
     const cwd = await ensureWorktree(config);
-    if (!isNew) {
-      const adopted = await adoptAgentBranch(cwd, branch);
-      if (adopted.note) notes.push(adopted.note);
-    }
+    await adopt(cwd);
     return continueStartBranch(cwd);
   }
   const defaultName = await defaultBranchOf(g).catch(() => undefined);
@@ -858,44 +916,7 @@ export async function prepareWorktree(
     ...config,
     ...(isNew && startBranch && { from: `refs/remotes/origin/${startBranch}` }),
   });
-  let onBranch = true;
-  if (!isNew) {
-    const adopted = await adoptAgentBranch(cwd, branch);
-    onBranch = adopted.onBranch;
-    if (adopted.note) notes.push(adopted.note);
-    // `publish` names the GitHub branch after the local one, so a branch already sent under the
-    // old name keeps its pull request only when the agent's branch is pointed at it
-    if (adopted.from && adopted.from !== defaultName && call) {
-      const held = await g([
-        "config",
-        "--get",
-        `branch.${branch}.${REMOTE_BRANCH_KEY}`,
-      ]).catch(() => "");
-      if (!held && !startBranch) {
-        const onGitHub = await remoteTip(call, adopted.from).then(
-          () => true,
-          (error: unknown) => {
-            if (!(error instanceof BranchNotFoundError)) {
-              deps.warn(
-                `runner: looking for ${adopted.from} on GitHub failed: ${messageOf(error)}`,
-              );
-            }
-            return false;
-          },
-        );
-        if (onGitHub) {
-          await g([
-            "config",
-            `branch.${branch}.${REMOTE_BRANCH_KEY}`,
-            adopted.from,
-          ]);
-          notes.push(
-            `\`${adopted.from}\` is already on GitHub, so \`publish\` updates it (and its open pull request) rather than opening \`${branch}\`.`,
-          );
-        }
-      }
-    }
-  }
+  await adopt(cwd, call && { call, defaultName });
   // the sync and rebase below assume the agent's own branch is checked out
   if (!isNew && onBranch && defaultName) {
     // unknown blocks the rebase as published does: a rebase can't be taken back once the branch

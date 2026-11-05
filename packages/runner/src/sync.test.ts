@@ -1539,15 +1539,7 @@ test("a worktree on a descendant local branch, clean: claude/<agent> is moved to
     `The runner found this worktree on \`small-fixes-1\` instead of \`claude/agt_1\`, moved \`claude/agt_1\` forward to its commit ${head.slice(0, 7)} and checked it out; nothing was lost. Stay on \`claude/agt_1\` from here.`,
   ]);
   // never published under that name, so publish keeps its own branch name
-  expect(
-    spawnSync(
-      "git",
-      ["config", "--get", "branch.claude/agt_1.sky-remote-branch"],
-      {
-        cwd: repoDir,
-      },
-    ).status,
-  ).not.toBe(0);
+  expect(git(repoDir, "config", "--list")).not.toContain("sky-remote-branch");
 });
 
 test("a worktree on a local branch claude/<agent> has diverged from is left alone, and the note says why", async () => {
@@ -1630,4 +1622,98 @@ test("a follow-up after a publish from the switched branch updates that GitHub b
     `PATCH heads/small-fixes-1 {"sha":"${"d".repeat(40)}","force":false}`,
   ]);
   expect(sent.pulls).toEqual(["GET head=acme:small-fixes-1"]);
+});
+
+test("a rebase stopped in the worktree leaves it alone instead of failing the follow-up", async () => {
+  const { cwd } = await switchedBranch();
+  execFileSync("git", ["rebase", "-i", "HEAD~1"], {
+    cwd,
+    env: {
+      ...process.env,
+      ...IDENTITY,
+      GIT_SEQUENCE_EDITOR: "sed -i '1i break'",
+    },
+  });
+  expect(git(cwd, "status", "--porcelain")).toBe("");
+
+  const { notes } = await prepare();
+
+  expect(
+    existsSync(`${git(cwd, "rev-parse", "--absolute-git-dir")}/rebase-merge`),
+  ).toBe(true);
+  expect(notes).toEqual([
+    "This worktree is on a detached HEAD, not `claude/agt_1`, and the runner left it there: a rebase, merge, cherry-pick or revert is in progress. Nothing was changed.",
+  ]);
+});
+
+test("a worktree checked out behind claude/<agent> goes back to it, losing nothing", async () => {
+  const { cwd, sha } = await earlierRun();
+  const tip = commitIn(cwd, "two.txt", "2\n", "second");
+  git(cwd, "checkout", "-q", "--detach", sha);
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(notes).toEqual([
+    "The runner found this worktree on a detached HEAD, behind `claude/agt_1`, and checked `claude/agt_1` out; nothing was lost. Stay on `claude/agt_1` from here.",
+  ]);
+});
+
+test("switching to a local copy of the default branch never records it as the branch to publish to", async () => {
+  const { cwd } = await earlierRun();
+  // the clone's own checkout of its default branch, freed so the agent can switch to it
+  git(repoDir, "checkout", "-q", "--detach");
+  git(cwd, "switch", "-q", "trunk");
+  git(cwd, "merge", "-q", "--ff-only", "claude/agt_1");
+  const head = commitIn(cwd, "t.txt", "t\n", "on trunk");
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "claude/agt_1")).toBe(head);
+  expect(notes).toEqual([expect.stringContaining("moved `claude/agt_1`")]);
+  expect(git(repoDir, "config", "--list")).not.toContain("sky-remote-branch");
+});
+
+test("when GitHub can't say whether the old branch was published, the agent is told to pass --branch", async () => {
+  await switchedBranch();
+  server.use(
+    http.get(`${REPO}/git/ref/heads/small-fixes-1`, () =>
+      HttpResponse.json({ message: "Forbidden" }, { status: 403 }),
+    ),
+  );
+
+  const { notes } = await prepare();
+
+  expect(notes).toEqual([
+    expect.stringContaining("moved `claude/agt_1`"),
+    "The runner couldn't tell whether `small-fixes-1` was published to GitHub. If it was, publish with `--branch small-fixes-1` to update its pull request rather than open a new one.",
+  ]);
+  expect(warnings).toEqual([expect.stringContaining("small-fixes-1")]);
+});
+
+test("with no connector the worktree is still moved, and the agent is told to pass --branch", async () => {
+  const { cwd, head } = await switchedBranch();
+
+  const { notes } = await prepare({}, {});
+
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(head);
+  expect(notes).toEqual([
+    expect.stringContaining("moved `claude/agt_1`"),
+    expect.stringContaining("`--branch small-fixes-1`"),
+  ]);
+  expect(requests).toEqual([]);
+});
+
+test("an agent started on a GitHub branch that is left on another branch is not told publish continues it", async () => {
+  pushToGitHub("feature/login", "login.txt", "1\n");
+  const { cwd } = await prepare({ startBranch: "feature/login" });
+  git(cwd, "switch", "-qc", "elsewhere", "origin/HEAD");
+  commitIn(cwd, "else.txt", "else\n", "elsewhere");
+
+  const { notes } = await prepare({ startBranch: "feature/login" });
+
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("elsewhere");
+  expect(notes).toEqual([expect.stringContaining("the runner left it there")]);
 });

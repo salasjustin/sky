@@ -19,7 +19,7 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return stdout.trim();
 }
 
-/** The agent's worktree on `claude/<agentId>`, created from `from` (the clone's `origin/HEAD` by default) on first use. */
+/** The agent's worktree on `claude/<agentId>`, created from `from` (the clone's `origin/HEAD` by default) on first use; an existing one is returned as it stands, `adoptAgentBranch` dealing with one on another branch. */
 export async function ensureWorktree(options: {
   repoDir: string;
   worktreesDir: string;
@@ -28,7 +28,6 @@ export async function ensureWorktree(options: {
 }): Promise<string> {
   const branch = agentBranch(options.agentId);
   const path = join(options.worktreesDir, options.agentId);
-  // an existing worktree is used as it stands; `adoptAgentBranch` deals with one on another branch
   if (existsSync(path)) return path;
   // forget a worktree whose directory was deleted, so its branch can be checked out again
   await git(options.repoDir, "worktree", "prune");
@@ -79,24 +78,35 @@ export async function adoptAgentBranch(
     () => "",
   );
   if (!tip) return stays(`\`${branch}\` doesn't exist`);
-  for (const marker of ["rebase-merge", "rebase-apply", "MERGE_HEAD"]) {
-    const file = await git(cwd, "rev-parse", "--git-path", marker);
-    if (existsSync(join(cwd, file))) {
-      return stays("a rebase or merge is in progress");
+  for (const marker of [
+    "rebase-merge",
+    "rebase-apply",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+  ]) {
+    // a linked worktree keeps these outside its own directory
+    const file = await git(
+      cwd,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      marker,
+    );
+    if (existsSync(file)) {
+      return stays("a rebase, merge, cherry-pick or revert is in progress");
     }
   }
   const head = await git(cwd, "rev-parse", "HEAD");
-  const ancestor = await git(
-    cwd,
-    "merge-base",
-    "--is-ancestor",
-    tip,
-    head,
-  ).then(
-    () => true,
-    () => false,
-  );
-  if (!ancestor) {
+  const isAncestor = (a: string, b: string) =>
+    git(cwd, "merge-base", "--is-ancestor", a, b).then(
+      () => true,
+      () => false,
+    );
+  const forward = await isAncestor(tip, head);
+  // HEAD at or behind the agent's branch (a commit checked out to look at): switching loses nothing
+  const behind = !forward && (await isAncestor(head, tip));
+  if (!forward && !behind) {
     return stays(
       `\`${branch}\` is not an ancestor of it (the two have diverged), so moving \`${branch}\` there would lose commits`,
     );
@@ -104,9 +114,29 @@ export async function adoptAgentBranch(
   if (await git(cwd, "status", "--porcelain")) {
     return stays("it has uncommitted changes");
   }
+  const elsewhere = (await git(cwd, "worktree", "list", "--porcelain"))
+    .split("\n")
+    .includes(`branch refs/heads/${branch}`);
+  if (elsewhere)
+    return stays(`\`${branch}\` is checked out in another worktree`);
   // compare-and-swap on the old tip: a fast-forward, never a reset
-  await git(cwd, "update-ref", `refs/heads/${branch}`, head, tip);
-  await git(cwd, "switch", "--quiet", branch);
+  if (forward) await git(cwd, "update-ref", `refs/heads/${branch}`, head, tip);
+  try {
+    await git(cwd, "switch", "--quiet", branch);
+  } catch (error) {
+    // put the branch back where it was
+    if (forward)
+      await git(cwd, "update-ref", `refs/heads/${branch}`, tip, head);
+    return stays(
+      `git would not switch (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+  if (behind) {
+    return {
+      onBranch: true,
+      note: `The runner found this worktree on ${where}, behind \`${branch}\`, and checked \`${branch}\` out; nothing was lost. Stay on \`${branch}\` from here.`,
+    };
+  }
   return {
     onBranch: true,
     ...(current !== "HEAD" && { from: current }),
