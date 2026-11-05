@@ -11,6 +11,7 @@ import type {
   PreToolUseHookInput,
   SDKMessage,
   SDKResultMessage,
+  SDKUserMessage,
   SyncHookJSONOutput,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AskUserQuestionInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools";
@@ -34,9 +35,31 @@ import { commitAll, diffRollup, headSha } from "./worktree.js";
 
 /** The Agent SDK's `query`, narrowed to what the runner calls; tests feed it scripted streams. */
 export type QueryFn = (params: {
-  prompt: string;
+  prompt: AsyncIterable<SDKUserMessage>;
   options: Options;
 }) => AsyncIterable<SDKMessage>;
+
+/**
+ * The run's prompt as streaming input, held open until `close`. A string prompt makes the SDK close
+ * the Claude process's stdin at the first `result`, and a turn that wakes after that (a background
+ * task finishing, as a nested `claude -p` does) has its first tool call cancelled with "The user
+ * doesn't want to take this action right now" and the session stops.
+ */
+function promptInput(text: string) {
+  let close = () => {};
+  const closed = new Promise<void>((resolve) => {
+    close = resolve;
+  });
+  const messages = (async function* (): AsyncGenerator<SDKUserMessage> {
+    yield {
+      type: "user",
+      message: { role: "user", content: text },
+      parent_tool_use_id: null,
+    };
+    await closed;
+  })();
+  return { messages, close };
+}
 
 /**
  * Seconds before the SDK cancels a PreToolUse hook, and with it the approval gate (its default is
@@ -178,7 +201,7 @@ const checkInstructions = (checks: string[]) =>
     "Before you finish, run these checks on your change, in order, from the repo root. Plugin skills can't be invoked through the Skill tool, so run any `claude -p` command through Bash:",
     ...checks.map((check) => `- ${check}`),
     "Run each command that calls `claude` with ANTHROPIC_API_KEY unset, as `env -u ANTHROPIC_API_KEY claude -p …`, even where the check leaves that prefix out.",
-    "A nested `claude` session is already logged in with the sandbox's subscription. Never set or use an API key for it, and never print or read credential files or tokens. Run each one in the foreground, one at a time, as a Bash call with `timeout: 600000` (the 10-minute maximum): never with `run_in_background`, a trailing `&` or `nohup`, and never two at once. A nested `claude` that finished in the background has been seen to cancel the starting session's next tool call and stop it. Fix what the checks find, and report the checks' output if one can't run.",
+    "A nested `claude` session is already logged in with the sandbox's subscription. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.",
   ].join("\n");
 
 /**
@@ -600,9 +623,12 @@ export async function runSession(
     toolStarted: heartbeat.started,
     toolEnded: heartbeat.ended,
   });
+  const input = promptInput(config.prompt);
+  // background tasks (a nested `claude -p`) still running; a `result` while any is leaves the input open for the turn their notification wakes
+  let liveTasks = 0;
   try {
     const stream = deps.query({
-      prompt: config.prompt,
+      prompt: input.messages,
       options: sessionOptions(
         config,
         cwd,
@@ -630,8 +656,14 @@ export async function runSession(
             },
             progress,
           ).catch(() => {});
+      } else if (
+        message.type === "system" &&
+        message.subtype === "background_tasks_changed"
+      ) {
+        liveTasks = message.tasks.filter((task) => !task.ambient).length;
       } else if (message.type === "result") {
         result = message;
+        if (liveTasks === 0) input.close();
       }
     }
   } catch (error) {
@@ -640,6 +672,7 @@ export async function runSession(
       : messageOf(error);
   } finally {
     deps.signal.removeEventListener("abort", forward);
+    input.close();
     heartbeat.stop();
   }
 
