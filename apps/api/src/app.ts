@@ -37,6 +37,8 @@ export type AppDeps = {
   launchWatchMs?: number;
   /** The bound on a Sprites call that should answer promptly; 60 s unless a test shortens it. */
   spritesTimeoutMs?: number;
+  /** Called with a sprite's name when an exec on it exits 137; `boot` probes that sprite's running runs. */
+  onExecKilled?: (spriteName: string) => void;
   /** The redaction registry, shared with whatever else purges from it; one from `config` by default. */
   secrets?: KnownSecrets;
   /** Aborted at shutdown: event streams send a final `server.shutdown` frame and end, parked event polls answer. */
@@ -53,6 +55,7 @@ export function createApp({
   longPollMs = 25_000,
   launchWatchMs = 3_000,
   spritesTimeoutMs = SPRITES_TIMEOUT_MS,
+  onExecKilled,
   secrets = KnownSecrets.fromConfig(config),
   closing = new AbortController().signal,
 }: AppDeps) {
@@ -67,6 +70,7 @@ export function createApp({
     secrets,
     timeoutMs: spritesTimeoutMs,
     longTimeoutMs: config.spritesLongTimeoutMs,
+    onExecKilled,
   };
   const ensureBundle = createBundleInstaller(
     spriteOps,

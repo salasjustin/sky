@@ -18,6 +18,11 @@ export type SpriteOps = {
   timeoutMs: number;
   /** The bound on clone, installs, the setup script, the store steps and checkpoint. */
   longTimeoutMs: number;
+  /**
+   * Called with the sprite's name when an exec on it exits 137 (SIGKILL): something on the sprite is
+   * being killed, most often for memory. Not awaited, and its failure never reaches the exec's caller.
+   */
+  onExecKilled?: (spriteName: string) => void;
 };
 
 export const SPRITES_TIMEOUT_MS = 60_000;
@@ -173,8 +178,20 @@ export function execInSprite(
       }
     },
     (out) => (out.exitCode === 0 ? "ok" : `exited ${out.exitCode}`),
-  );
+  ).then((out) => {
+    if (out.exitCode === SIGKILLED) {
+      try {
+        ops.onExecKilled?.(name);
+      } catch (err) {
+        ops.log(`sprite ${name} ${options.op}: onExecKilled failed: ${err}`);
+      }
+    }
+    return out;
+  });
 }
+
+// 128 + SIGKILL: what the kernel's OOM killer, or the sprite's own, leaves as an exit status
+const SIGKILLED = 137;
 
 const toOutcome = (r: ExecError["result"]): ExecOutcome => ({
   exitCode: r.exitCode,

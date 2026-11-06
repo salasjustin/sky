@@ -6,6 +6,7 @@ import { createPoster, warningReporter } from "./events.js";
 import { holdSprite, spriteApiFrom } from "./keepalive.js";
 import { refreshPlugins } from "./plugins.js";
 import { publishMain } from "./publish.js";
+import { endSessionProcesses } from "./reap.js";
 import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
 import { claimRunLog } from "./runlog.js";
@@ -121,6 +122,8 @@ async function main(): Promise<void> {
       warn,
     });
   } finally {
+    // the run is over, whatever way: nothing it started may keep its memory on a sprite other runs share
+    await endSessionProcesses({ runId: config.runId, warn });
     await syncStoreQuietly("push", process.env, warn);
     await hold.release();
   }

@@ -27,7 +27,12 @@ import {
   failUnlaunchedRuns,
   pruneClaudeEvents,
 } from "./runs.js";
-import { SPRITES_TIMEOUT_MS, spriteNameFor } from "./sprites.js";
+import {
+  execInSprite,
+  SPRITES_TIMEOUT_MS,
+  type SpriteOps,
+  spriteNameFor,
+} from "./sprites.js";
 import {
   envFileOf,
   type SpritesWire,
@@ -154,6 +159,8 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   await sessionOpened();
   const sprite = spriteNameFor(envId);
   expect(wire.calls).toEqual([
+    // the sprite's free memory is checked before anything is written to it
+    `exec ${sprite} - free -m`,
     `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
     // written beside it, then renamed over it: a node starting on the bundle never reads it half-written
     `write ${sprite} /opt/sky/runner.mjs.${run.id}`,
@@ -1662,25 +1669,31 @@ test("a runner.warning or runner.heartbeat before run.started doesn't prove the 
   });
 });
 
-/** A prober over the stub sprites; `nudges` counts its dispatcher nudges. */
-function proberOver() {
+/**
+ * A prober over the stub sprites; `nudges` counts its dispatcher nudges. `sprites` is the ops it
+ * probes through, wired as `boot` wires them: an exec on it that exits 137 probes the sprite's runs.
+ */
+function proberOver(secrets = new KnownSecrets()) {
   const nudges = { count: 0 };
+  const sprites: SpriteOps = {
+    client: new SpritesClient(spritesToken),
+    log: () => {},
+    secrets,
+    timeoutMs: SPRITES_TIMEOUT_MS,
+    longTimeoutMs: config.spritesLongTimeoutMs,
+    onExecKilled: (name) => void prober.probeSprite(name),
+  };
   const prober = createRunProber({
     db,
-    sprites: {
-      client: new SpritesClient(spritesToken),
-      log: () => {},
-      secrets: new KnownSecrets(),
-      timeoutMs: SPRITES_TIMEOUT_MS,
-      longTimeoutMs: config.spritesLongTimeoutMs,
-    },
+    sprites,
     probeMs: config.runProbeMs,
+    lowMemoryMb: config.spriteMinFreeMb,
     log: (line) => logs.push(line),
     nudgeDeliveries: () => {
       nudges.count++;
     },
   });
-  return { prober, nudges };
+  return { prober, nudges, sprites };
 }
 
 /** Makes `pgrep` on the stub sprite answer `exitCode` (0 found a runner, 1 none, 2 an error of its own). */
@@ -1943,6 +1956,354 @@ test("a probe on a sprite that no longer exists fails the run at once with runne
   expect(nudges.count).toBe(1);
   expect(logs).toContain(
     `run ${run.id} failed: runner_lost on sprite ${sprite}`,
+  );
+});
+
+const freeOutput = (availableMb: number, totalMb = 16_000) =>
+  `               total        used        free      shared  buff/cache   available
+Mem:           ${totalMb}        9019        1500         100        5000        ${availableMb}
+Swap:              0           0           0
+`;
+
+/** What the sprite's diagnostics script writes for a sprite with `availableMb` free. */
+const diagnosticsReport = ({
+  availableMb,
+  ps = "4242 1 3100000 12:03 node server.js",
+  kernel = [],
+}: {
+  availableMb: number;
+  ps?: string;
+  kernel?: string[];
+}) =>
+  `== free -m
+${freeOutput(availableMb)}== uptime
+ 17:03:01 up 2 min,  0 users,  load average: 9.10, 4.20, 1.70
+== top processes by RSS (pid ppid rss_kb elapsed command)
+${ps}
+== kernel kills (dmesg)
+${kernel.join("\n")}
+`;
+
+/** The stub sprite's answer to the diagnostics script: `report` in the file the script is told to write. */
+const diagnosticsAnswer = (report: string) => {
+  const exec = wire.exec;
+  wire.exec = (argv) => {
+    if (argv[0] !== "bash" || !argv[2]?.includes("== free -m"))
+      return exec(argv);
+    wire.files.set(argv[4] ?? "", new TextEncoder().encode(report));
+    return { exitCode: 0 };
+  };
+};
+
+/** Makes `free -m` on the stub sprite report `availableMb` available. */
+const freeAnswers = (availableMb: number) => {
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "free"
+      ? { exitCode: 0, stdout: freeOutput(availableMb) }
+      : exec(argv);
+};
+
+const warningsOf = (runId: string) =>
+  eventsOf(runId)
+    .filter((e) => e.type === "runner.warning")
+    .map((e) => (JSON.parse(e.payload) as { message: string }).message);
+
+test("a runner found gone has its sprite's diagnostics collected, redacted, logged and stored on the run before it fails", async () => {
+  const envId = readyEnv();
+  const { run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  diagnosticsAnswer(
+    diagnosticsReport({
+      availableMb: 5_000,
+      ps: "4242 1 3100000 12:03 node server.js --token hunter2-hunter2",
+    }),
+  );
+  const secrets = new KnownSecrets();
+  secrets.add("PROJECT_TOKEN", "hunter2-hunter2");
+  const { prober } = proberOver(secrets);
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  const sprite = spriteNameFor(envId);
+  const [message] = warningsOf(run.id);
+  expect(message).toContain(`diagnostics of sprite ${sprite}`);
+  for (const part of [
+    "== free -m",
+    "Mem:",
+    "== uptime",
+    "load average",
+    "== top processes by RSS",
+    "node server.js",
+    "== kernel kills",
+  ]) {
+    expect(message).toContain(part);
+  }
+  expect(message).not.toContain("hunter2");
+  expect(logs).toContain(`run ${run.id}: ${message}`);
+  // plenty of memory and no kill line: lost, not killed
+  expect(runFailure(run.id)).toBe(
+    `runner_lost: its runner is gone from sprite ${sprite}`,
+  );
+  // the diagnostics land before the failure, which ends the run
+  expect(
+    eventsOf(run.id)
+      .map((e) => e.type)
+      .slice(-2),
+  ).toEqual(["runner.warning", "run.failed"]);
+});
+
+test("the diagnostics stored on a run are bounded below what an event holds", async () => {
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  diagnosticsAnswer(
+    diagnosticsReport({ availableMb: 5_000, ps: "x".repeat(20_000) }),
+  );
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  const [message] = warningsOf(run.id);
+  expect(message?.length).toBeLessThan(EVENT_TEXT_MAX);
+  expect(message).toMatch(/\d+ characters omitted/);
+  expect(runStatus(run.id)).toEqual({ status: "failed" });
+});
+
+test("a sprite that can't give its diagnostics still fails the run, saying so in the stored report", async () => {
+  const envId = readyEnv();
+  const { run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "bash" && argv[2]?.includes("== free -m")
+      ? { exitCode: 3, stderr: "bash: boom\n" }
+      : exec(argv);
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  expect(warningsOf(run.id)[0]).toContain("diagnostics unavailable: exit 3");
+  expect(runFailure(run.id)).toBe(
+    `runner_lost: its runner is gone from sprite ${spriteNameFor(envId)}`,
+  );
+});
+
+test("a runner gone after the kernel logged a kill fails as runner_killed, naming the sprite and the memory it had", async () => {
+  const envId = readyEnv();
+  const { run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  diagnosticsAnswer(
+    diagnosticsReport({
+      availableMb: 5_000,
+      kernel: ["Out of memory: Killed process 3912 (node) total-vm:9012344kB"],
+    }),
+  );
+  const { prober, nudges } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  const sprite = spriteNameFor(envId);
+  const error = runFailure(run.id);
+  expect(error).toMatch(
+    /^runner_killed: the sprite killed the runner, likely out of memory/,
+  );
+  expect(error).toContain(sprite);
+  expect(error).toContain("5000 MB of 16000 MB available");
+  expect(logs).toContain(
+    `run ${run.id} failed: runner_killed on sprite ${sprite}`,
+  );
+  expect(nudges.count).toBe(1);
+});
+
+test("a runner gone from a sprite with less memory available than the floor is runner_killed though dmesg can't be read", async () => {
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  diagnosticsAnswer(
+    diagnosticsReport({
+      availableMb: config.spriteMinFreeMb - 1,
+      kernel: ["dmesg not readable"],
+    }),
+  );
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  expect(runFailure(run.id)).toContain(
+    `runner_killed: the sprite killed the runner, likely out of memory`,
+  );
+  expect(runFailure(run.id)).toContain(`${config.spriteMinFreeMb - 1} MB of`);
+});
+
+test("an exec on a sprite exiting 137 probes its running runs at once: a run whose runner is gone fails as runner_killed without waiting out the window", async () => {
+  const envId = readyEnv({ concurrency: 2 });
+  const first = await runningRun(envId);
+  const second = await runningRun(envId);
+  const elsewhere = await runningRun();
+  for (const { run, token } of [first, second, elsewhere]) {
+    await postEvent(token, {
+      runId: run.id,
+      type: "run.started",
+      payload: { sessionId: "s" },
+    });
+  }
+  pgrepAnswers(1);
+  diagnosticsAnswer(
+    diagnosticsReport({
+      availableMb: 200,
+      kernel: ["Out of memory: Killed process 77 (node)"],
+    }),
+  );
+  const exec = wire.exec;
+  // the wake exec of the incident, as the kernel's kill leaves it
+  wire.exec = (argv) => (argv[0] === "true" ? { exitCode: 137 } : exec(argv));
+  const { prober, sprites } = proberOver();
+  // nothing has been silent for a window yet, so a sweep probes nothing
+  await prober.sweep();
+  expect(pgreps()).toEqual([]);
+
+  const woken = await execInSprite(sprites, spriteNameFor(envId), ["true"], {
+    op: "wake",
+  });
+  expect(woken.exitCode).toBe(137);
+
+  await vi.waitFor(() => {
+    expect(runStatus(first.run.id)).toEqual({ status: "failed" });
+    expect(runStatus(second.run.id)).toEqual({ status: "failed" });
+  });
+  expect(runFailure(first.run.id)).toMatch(/^runner_killed: /);
+  expect(runFailure(second.run.id)).toContain(spriteNameFor(envId));
+  // the run on another sprite was not probed
+  expect(runStatus(elsewhere.run.id)).toEqual({ status: "running" });
+  expect(pgreps()).toHaveLength(2);
+  expect(
+    logs.some((l) =>
+      l.includes(`an exec on ${spriteNameFor(envId)} was killed`),
+    ),
+  ).toBe(true);
+});
+
+test("an exec exiting 137 that finds the runner alive leaves the run alone and records nothing", async () => {
+  const envId = readyEnv();
+  const { agent, run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(0);
+  const exec = wire.exec;
+  wire.exec = (argv) => (argv[0] === "true" ? { exitCode: 137 } : exec(argv));
+  const { sprites, nudges } = proberOver();
+  const before = eventsOf(run.id).length;
+  await execInSprite(sprites, spriteNameFor(envId), ["true"], { op: "wake" });
+  await vi.waitFor(() => expect(pgreps()).toHaveLength(1));
+
+  expect((await getRun(agent.id, run.id)).body.status).toBe("running");
+  expect(eventsOf(run.id)).toHaveLength(before);
+  expect(nudges.count).toBe(0);
+});
+
+test("an exec exiting 137 probes only running runs: a starting run is left to its launch deadline", async () => {
+  const envId = readyEnv();
+  const { agent } = await launched(envId);
+  await sessionOpened();
+  pgrepAnswers(1);
+  const exec = wire.exec;
+  wire.exec = (argv) => (argv[0] === "true" ? { exitCode: 137 } : exec(argv));
+  const { prober } = proberOver();
+  await prober.probeSprite(spriteNameFor(envId));
+  expect(pgreps()).toEqual([]);
+  expect(
+    db.$client.prepare("select status from agents where id = ?").get(agent.id),
+  ).toEqual({ status: "running" });
+});
+
+test("a launch on a sprite with less memory available than the floor is refused with sprite_low_memory saying how much is free, and starts nothing", async () => {
+  const envId = readyEnv();
+  freeAnswers(500);
+  const { agent, run } = await launched(envId);
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
+  );
+
+  const sprite = spriteNameFor(envId);
+  const error = runFailure(run.id);
+  expect(error).toMatch(/^sprite_low_memory: /);
+  expect(error).toContain(sprite);
+  expect(error).toContain("500 MB of memory available (of 16000 MB)");
+  expect(error).toContain("1024 MB floor");
+  expect(wire.sessions).toHaveLength(0);
+  expect(wire.calls.some((c) => c.startsWith("write "))).toBe(false);
+  expect(
+    db.$client.prepare("select status from agents where id = ?").get(agent.id),
+  ).toEqual({ status: "idle" });
+  // the refused agent is free for a follow-up once memory is back
+  freeAnswers(4_000);
+  const again = await followUp(agent.id, { prompt: "try again" });
+  expect(again.status).toBe(202);
+  await sessionOpened();
+});
+
+test("a launch on a sprite with memory at or above the floor goes ahead", async () => {
+  const envId = readyEnv();
+  freeAnswers(config.spriteMinFreeMb);
+  const { run } = await launched(envId);
+  await sessionOpened();
+  expect(wire.calls[0]).toBe(`exec ${spriteNameFor(envId)} - free -m`);
+  expect(runStatus(run.id)).toEqual({ status: "starting" });
+});
+
+test("a floor of 0 turns the launch memory check off", async () => {
+  config = testConfig({
+    runnerBundlePath: join(dir, "runner.mjs"),
+    spriteMinFreeMb: 0,
+  });
+  app = createApp({
+    db,
+    config,
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logs.push(line),
+    nudgeDeliveries: () => {},
+    launchWatchMs: 50,
+  });
+  const envId = readyEnv();
+  freeAnswers(10);
+  await launched(envId);
+  await sessionOpened();
+  expect(wire.calls.some((c) => c.includes(" free "))).toBe(false);
+});
+
+test("a launch on a sprite whose memory can't be read goes ahead and logs it", async () => {
+  const envId = readyEnv();
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "free"
+      ? { exitCode: 127, stderr: "free: not found\n" }
+      : exec(argv);
+  const { run } = await launched(envId);
+  await sessionOpened();
+  expect(logs).toContain(
+    `launching ${run.id}: the memory of ${spriteNameFor(envId)} could not be read; launching anyway`,
   );
 });
 

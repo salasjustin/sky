@@ -19,6 +19,7 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   runTimeoutMs: 30 * 60_000,
   runProbeMs: 5 * 60_000,
   launchDeadlineMs: 15 * 60_000,
+  spriteMinFreeMb: 1024,
   spritesLongTimeoutMs: 30 * 60_000,
   waitTimeoutMs: 120 * 60_000,
   baseProfiles: {},

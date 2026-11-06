@@ -46,6 +46,11 @@ const configSchema = z
      * Past the runner's longest startup: a store lock wait (10 minutes) and the plugin refresh.
      */
     LAUNCH_DEADLINE_MINUTES: z.coerce.number().positive().default(15),
+    /**
+     * A launch is refused with `sprite_low_memory` when its sprite has less memory available (MB, as
+     * `free -m` reports it) than this; 0 turns the check off.
+     */
+    SPRITE_MIN_FREE_MB: z.coerce.number().int().min(0).default(1024),
     /** How long a runner waits on a question or approval before giving up; the runner gets it at launch. */
     WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
     /** The bound on a sprite's clone, installs, setup script, store steps and checkpoint. */
@@ -80,6 +85,7 @@ export type Config = {
   runTimeoutMs: number;
   runProbeMs: number;
   launchDeadlineMs: number;
+  spriteMinFreeMb: number;
   waitTimeoutMs: number;
   spritesLongTimeoutMs: number;
   baseProfiles: BaseProfiles;
@@ -127,6 +133,7 @@ export function loadConfig(
           (e.RUN_PROBE_MINUTES ?? Math.min(5, e.RUN_TIMEOUT_MINUTES / 2)) *
           60_000,
         launchDeadlineMs: e.LAUNCH_DEADLINE_MINUTES * 60_000,
+        spriteMinFreeMb: e.SPRITE_MIN_FREE_MB,
         waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
         spritesLongTimeoutMs: e.SPRITES_LONG_TIMEOUT_MINUTES * 60_000,
         baseProfiles: e.SKY_BASE_PROFILES,

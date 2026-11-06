@@ -17,7 +17,17 @@ import {
   runTransitions,
   type Usage,
 } from "@sky/shared";
-import { and, count, desc, eq, inArray, isNull, lt, sql } from "drizzle-orm";
+import {
+  and,
+  count,
+  desc,
+  eq,
+  inArray,
+  isNull,
+  lt,
+  type SQL,
+  sql,
+} from "drizzle-orm";
 import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { enqueueDeliveries } from "./deliveries.js";
 import { runEvents } from "./run-events.js";
@@ -310,13 +320,32 @@ export function silentRuns(
   db: Db,
   silentMs: number,
   now = Date.now(),
-): {
+): RunningRun[] {
+  const cutoff = new Date(now - silentMs).toISOString();
+  return runningRuns(db, (last) => sql`${last} < ${cutoff}`, now);
+}
+
+/** The `running` runs whose runner is on `spriteName`, silent or not; for a probe an exec's SIGKILL calls for. */
+export function runningRunsOn(
+  db: Db,
+  spriteName: string,
+  now = Date.now(),
+): RunningRun[] {
+  return runningRuns(db, () => eq(environments.spriteName, spriteName), now);
+}
+
+type RunningRun = {
   runId: RunId;
   spriteName: string;
   silentMs: number;
   lastEventId: number;
-}[] {
-  const cutoff = new Date(now - silentMs).toISOString();
+};
+
+function runningRuns(
+  db: Db,
+  condition: (last: ReturnType<typeof lastEventAt>) => SQL,
+  now: number,
+): RunningRun[] {
   const last = lastEventAt();
   const lastId = sql<number>`coalesce((select max(${events.id}) from ${events} where ${events.runId} = ${runs.id}), 0)`;
   return db
@@ -329,7 +358,7 @@ export function silentRuns(
     .from(runs)
     .innerJoin(agents, eq(runs.agentId, agents.id))
     .innerJoin(environments, eq(agents.envId, environments.id))
-    .where(and(eq(runs.status, "running"), sql`${last} < ${cutoff}`))
+    .where(and(eq(runs.status, "running"), condition(last)))
     .all()
     .map(({ runId, spriteName, lastAt, lastEventId }) => ({
       runId,
@@ -360,17 +389,20 @@ export function recordProbe(
 }
 
 /**
- * Fails, with `runner_lost` naming the sprite, a run that is still `running` and has no event past
- * `lastEventId`, the latest it had when the probe began: the probe found its runner gone. A later
- * event means the runner spoke meanwhile, and the sweep's next window judges it. Event ids, not
- * clock times: a fast host can stamp the last event and the probe's start in the same millisecond.
+ * Fails, with `error` (`runner_lost` or `runner_killed`), a run that is still `running` and has no
+ * event past `lastEventId`, the latest it had when the probe began: the probe found its runner gone.
+ * A later event means the runner spoke meanwhile, and the sweep's next window judges it. Event ids,
+ * not clock times: a fast host can stamp the last event and the probe's start in the same millisecond.
+ * The sprite's `diagnostics`, when collected, are recorded as a `runner.warning` just before the
+ * failure, in the same transaction, so the guard above can't be tripped by it.
  * False when the run was left alone.
  */
 export function failLostRun(
   db: Db,
   runId: RunId,
-  spriteName: string,
   lastEventId: number,
+  error: string,
+  diagnostics?: string,
 ): boolean {
   return db.transaction(
     (tx) => {
@@ -389,11 +421,10 @@ export function failLostRun(
         )
         .get();
       if (!silent) return false;
-      failRun(
-        tx,
-        runId,
-        `runner_lost: its runner is gone from sprite ${spriteName}`,
-      );
+      if (diagnostics) {
+        recordEvent(tx, runId, "runner.warning", { message: diagnostics });
+      }
+      failRun(tx, runId, error);
       return true;
     },
     { behavior: "immediate" },

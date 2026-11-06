@@ -47,11 +47,13 @@ export function boot(config: Config, log: (line: string) => void) {
     secrets,
     timeoutMs: SPRITES_TIMEOUT_MS,
     longTimeoutMs: config.spritesLongTimeoutMs,
+    onExecKilled: (spriteName) => void prober.probeSprite(spriteName),
   };
   const prober = createRunProber({
     db,
     sprites: spriteOps,
     probeMs: config.runProbeMs,
+    lowMemoryMb: config.spriteMinFreeMb,
     log,
     nudgeDeliveries: dispatcher.nudge,
   });
@@ -103,6 +105,7 @@ export function boot(config: Config, log: (line: string) => void) {
       sprites,
       log,
       nudgeDeliveries: dispatcher.nudge,
+      onExecKilled: spriteOps.onExecKilled,
       secrets,
       closing: closing.signal,
     }),

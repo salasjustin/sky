@@ -84,6 +84,8 @@ setup: |
 
 Provisioning fails at the setup step, naming the plugin and its marketplace, if a plugin's marketplace is neither declared nor added.
 
+**Memory and `concurrency`.** Every agent of an environment runs on its one sprite, and a sprite has a fixed amount of memory and no swap. A large monorepo (thousands of files, with a typecheck or test run per agent) can use several GB at a time, so set `concurrency` to 1–2 there; the default of 3 suits small repos. When a sprite runs out of memory the kernel kills processes, often the runner, and the run is lost with the work since its last commit. Sky guards against this two ways. Before it starts a run, it reads the sprite's available memory (`free -m`) and, below `SPRITE_MIN_FREE_MB` (an environment variable of the API; default `1024`, `0` turns the check off), refuses the launch with `sprite_low_memory`. And when a run ends, the runner ends every process the run's session started (dev servers, watchers, test workers, a nested `claude -p`), so they don't hold memory for the next run; other runs' processes on the sprite are left alone.
+
 ```
 sky secret set web NPM_TOKEN < token.txt
 ```
@@ -256,20 +258,23 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 
 A run the API fails ends with `run.failed`, and its `error` is one of:
 
-| error             | means                                                                                                                                                                      |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `launch_failed`   | the runner couldn't be started on the sprite; the detail follows the colon                                                                                                 |
-| `launch_timeout`  | the runner never reported in within `LAUNCH_DEADLINE_MINUTES` (default 15); a `runner.warning` or heartbeat doesn't count as reporting in                                  |
-| `runner_lost`     | the run went quiet, the API woke its sprite, and the runner was no longer running there; the error names the sprite                                                        |
-| `runner_timeout`  | no event for `RUN_TIMEOUT_MINUTES` (default 30), though the runner was still running (or its sprite couldn't be reached to tell); names the tool call when one was running |
-| `waiting_timeout` | the run waited on an answer or approval past its limit and its runner is gone                                                                                              |
+| error               | means                                                                                                                                                                                                                               |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `launch_failed`     | the runner couldn't be started on the sprite; the detail follows the colon                                                                                                                                                          |
+| `launch_timeout`    | the runner never reported in within `LAUNCH_DEADLINE_MINUTES` (default 15); a `runner.warning` or heartbeat doesn't count as reporting in                                                                                           |
+| `sprite_low_memory` | the launch was refused: the sprite had less memory available than `SPRITE_MIN_FREE_MB` (default 1024); the error says how much was free. Wait for a run on the sprite to end, or lower `concurrency`                                |
+| `runner_lost`       | the run went quiet, the API woke its sprite, and the runner was no longer running there; the error names the sprite                                                                                                                 |
+| `runner_killed`     | as `runner_lost`, and the sprite's diagnostics show the sprite killed the runner, likely out of memory: the kernel logged a kill, or less than `SPRITE_MIN_FREE_MB` was available; the error names the sprite and the memory it had |
+| `runner_timeout`    | no event for `RUN_TIMEOUT_MINUTES` (default 30), though the runner was still running (or its sprite couldn't be reached to tell); names the tool call when one was running                                                          |
+| `waiting_timeout`   | the run waited on an answer or approval past its limit and its runner is gone                                                                                                                                                       |
 
 **The probe.** A sprite can go to sleep under a run and lose its runner. Once a `running` run has had no event for `RUN_PROBE_MINUTES` (default 5, and always below `RUN_TIMEOUT_MINUTES`; when the timeout is under 10 minutes the default is half of it), the API wakes its sprite and looks for the run's runner:
 
 - **Heartbeats arriving:** while a tool call runs, the runner posts `runner.heartbeat` about every 60 seconds with the tool's name and how long it has run. A heartbeating run is alive, so it isn't probed, however long the call takes. A heartbeat isn't progress: a tool call still running past `RUN_TIMEOUT_MINUTES` fails with `runner_timeout: <tool> was still running after <time> with no result, past the <limit> limit`, or with `runner_timeout: the runner went quiet during <tool> after it had run <time>` when the heartbeats stopped. A `runner.warning` isn't progress either.
 - **Runner alive:** the API records a `run.probed` event and the run carries on. A probe is not runner activity, so a runner that is alive but wedged still fails with `runner_timeout`.
-- **Runner gone:** the run fails at once with `runner_lost`, instead of waiting out `runner_timeout`. The agent is free for a follow-up, which resumes the session and worktree as any follow-up does.
+- **Runner gone:** the API first collects the sprite's diagnostics (`free -m`, uptime, the top processes by memory with their command lines, and the kernel's out-of-memory and kill lines where `dmesg` is readable), logs them, and stores a bounded, redacted copy on the run as a `runner.warning` event just before `run.failed`. Then the run fails at once, instead of waiting out `runner_timeout`: with `runner_killed` when the diagnostics show a kernel kill or less than `SPRITE_MIN_FREE_MB` available, else `runner_lost`. The agent is free for a follow-up, which resumes the session and worktree as any follow-up does.
 - **Sprite can't answer:** the API logs it and leaves the run alone; `runner_timeout` is the backstop. If the sprite no longer exists, the run fails at once with `runner_lost`.
+- **An exec exits 137:** a command the API ran on a sprite (a wake, a check, a setup step) ended with SIGKILL, so something there is being killed. The API doesn't wait for the window: it probes every `running` run on that sprite at once. A runner found alive is left alone and nothing is recorded.
 
 A run is probed at most once per window, and a slow sprite never holds up the API's sweep. Only `running` runs are probed; a run waiting on a request has its own deadline.
 
