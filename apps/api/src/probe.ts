@@ -14,6 +14,29 @@ type Deps = {
 };
 
 /**
+ * Wakes the sprite of a launch that never reported in, by looking for its runner: a sprite that
+ * paused before the runner held it froze the runner, and any exec unfreezes it. Only logs: a live
+ * runner is left alone, a missing one is left to the launch deadline. Never throws.
+ */
+export async function wakeLaunch(
+  sprites: SpriteOps,
+  runId: RunId,
+  spriteName: string,
+  log: (line: string) => void,
+): Promise<void> {
+  try {
+    const alive = await isRunnerAlive(sprites, spriteName, runId);
+    log(
+      alive
+        ? `woke ${spriteName} for ${runId}: its runner is alive`
+        : `woke ${spriteName} for ${runId}: no runner found; the launch deadline decides`,
+    );
+  } catch (err) {
+    log(`waking ${spriteName} for ${runId} failed: ${err}`);
+  }
+}
+
+/**
  * Checks the runner of each `running` run silent for `probeMs`, so a sprite that slept through a
  * run is found in minutes, not at `runner_timeout`. The check wakes the sprite: a live runner gets a
  * `run.probed` event (which also starts its next window), a gone one fails the run with `runner_lost`,

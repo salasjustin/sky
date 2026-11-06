@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
 import { request } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
+import { spriteTaskNameFor } from "@sky/shared";
 
 /** The sprite's management socket; the Tasks API answers on it under virtual host `sprite`. */
 const SPRITE_API_SOCKET = "/.sprite/api.sock";
@@ -30,13 +30,6 @@ export const spriteApiFrom = (env: NodeJS.ProcessEnv) => {
 };
 
 /**
- * The run's task name, hashed into the lowercase letters, digits and hyphens the Sprites API takes
- * for a sprite's name: a run id's capitals and underscore fall outside them.
- */
-const taskNameFor = (runId: string) =>
-  `sky-run-${createHash("sha256").update(runId).digest("hex").slice(0, 24)}`;
-
-/**
  * Keeps the sprite from pausing while the runner lives: a sprite pauses once idle and drops
  * open connections even on a warm pause, so the runner holds a Tasks API task, refreshed on an
  * interval (a task lives an hour at most), and deletes it on `release`. Never throws: a failed
@@ -63,7 +56,7 @@ export function holdSprite(options: {
 }): SpriteHold {
   const socketPath = options.socketPath ?? SPRITE_API_SOCKET;
   const onSprite = options.onSprite ?? options.socketPath === undefined;
-  const path = `/v1/tasks/${taskNameFor(options.runId)}`;
+  const path = `/v1/tasks/${spriteTaskNameFor(options.runId)}`;
   const { signal } = options;
   let timer: NodeJS.Timeout | undefined;
   let stopped = false;

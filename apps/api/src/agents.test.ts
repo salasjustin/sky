@@ -10,6 +10,7 @@ import {
   type EnvironmentId,
   EVENT_TEXT_MAX,
   type RunId,
+  spriteTaskNameFor,
   truncationMarker,
 } from "@sky/shared";
 import { eq } from "drizzle-orm";
@@ -160,6 +161,7 @@ test("launch uploads the bundle, then starts the runner as a detached session an
     `exec ${sprite} - mv -f /opt/sky/runner.mjs.${run.id} /opt/sky/runner.mjs`,
     `write ${sprite} /workspace/runs/${run.id}.prompt`,
     `write ${sprite} /workspace/runs/${run.id}.env`,
+    expect.stringMatching(`^exec ${sprite} - curl .* PUT `),
     expect.stringMatching(`^session ${sprite} /workspace/repo bash -c `),
   ]);
   expect(new TextDecoder().decode(wire.files.get("/opt/sky/runner.mjs"))).toBe(
@@ -1660,6 +1662,98 @@ test("a runner.warning or runner.heartbeat before run.started doesn't prove the 
     status: "failed",
     error: "launch_timeout",
   });
+});
+
+const holdCalls = () => wire.calls.filter((c) => c.includes(" curl "));
+
+test("launch holds the sprite under the runner's task name before it starts the runner", async () => {
+  const envId = readyEnv();
+  const { run } = await launched(envId);
+  await sessionOpened();
+  const sprite = spriteNameFor(envId);
+  const hold = wire.calls.findIndex((c) =>
+    c.startsWith(`exec ${sprite} - curl`),
+  );
+  const start = wire.calls.findIndex((c) => c.startsWith(`session ${sprite}`));
+  expect(hold).toBeGreaterThan(-1);
+  expect(hold).toBeLessThan(start);
+  const call = wire.calls[hold] ?? "";
+  expect(call).toContain("--unix-socket /.sprite/api.sock");
+  expect(call).toContain(`-X PUT`);
+  expect(call).toContain(`http://sprite/v1/tasks/${spriteTaskNameFor(run.id)}`);
+  expect(call).toContain(`{"expire":"2m"}`);
+});
+
+test("a hold that fails is logged and the launch goes on", async () => {
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "curl"
+      ? { exitCode: 7, stderr: "curl: (7) couldn't connect\n" }
+      : exec(argv);
+  const { agent, run } = await runningRun();
+  expect(holdCalls()).toHaveLength(1);
+  expect(
+    logs.some((l) => l.includes(run.id) && l.includes("hold sprite failed")),
+  ).toBe(true);
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    status: "starting",
+  });
+});
+
+/** An app whose launches wake a silent run's sprite after `ms`. */
+function wakingAfter(ms: number) {
+  app = createApp({
+    db,
+    config,
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logs.push(line),
+    nudgeDeliveries: () => {},
+    launchWatchMs: 50,
+    launchWakeMs: ms,
+  });
+}
+const settle = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+test("a run still starting with only a warning and a heartbeat gets exactly one wake after the delay", async () => {
+  wakingAfter(150);
+  pgrepAnswers(0);
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "runner.warning",
+    payload: { message: "holding the sprite failed" },
+  });
+  await postEvent(token, {
+    runId: run.id,
+    type: "runner.heartbeat",
+    payload: { toolName: "Bash", toolUseId: "t1", elapsedMs: 61_000 },
+  });
+  expect(pgreps()).toEqual([]);
+  await vi.waitFor(() => expect(pgreps()).toHaveLength(1));
+  await settle(400);
+  expect(pgreps()).toHaveLength(1);
+  expect(logs.some((l) => l.includes(run.id) && l.includes("waking"))).toBe(
+    true,
+  );
+  expect(logs.some((l) => l.includes("its runner is alive"))).toBe(true);
+  // a live runner is left alone: no event, no failure
+  expect(eventsOf(run.id).map((e) => e.type)).toEqual([
+    "runner.warning",
+    "runner.heartbeat",
+  ]);
+});
+
+test("a run that has reported in is not woken", async () => {
+  wakingAfter(150);
+  pgrepAnswers(0);
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  await settle(450);
+  expect(pgreps()).toEqual([]);
 });
 
 /** A prober over the stub sprites; `nudges` counts its dispatcher nudges. */

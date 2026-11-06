@@ -1,10 +1,11 @@
 import { type Db, environments, runs } from "@sky/db";
-import type {
-  AgentId,
-  AutoApprove,
-  BaseProfile,
-  EnvironmentId,
-  RunId,
+import {
+  type AgentId,
+  type AutoApprove,
+  type BaseProfile,
+  type EnvironmentId,
+  type RunId,
+  spriteTaskNameFor,
 } from "@sky/shared";
 import { and, eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
@@ -19,7 +20,7 @@ import {
 } from "./provision.js";
 import { type KnownSecrets, redact } from "./redact.js";
 import type { BundleInstaller } from "./runner-bundle.js";
-import { failRun, isActive } from "./runs.js";
+import { failRun, isActive, isSilentLaunch } from "./runs.js";
 import {
   hasConnectorSecret,
   isReservedName,
@@ -33,6 +34,29 @@ import {
   startDetached,
   writeSpriteFile,
 } from "./sprites.js";
+
+// the sprite's own socket and the task's life before the runner's first PUT refreshes it: long enough
+// for a slow boot, short enough that a runner that never comes up lets the sprite pause again soon
+const SPRITE_API_SOCKET = "/.sprite/api.sock";
+const HOLD_EXPIRE = "2m";
+const HOLD_TIMEOUT_MS = 10_000;
+
+/** The exec that takes the run's keep-awake task; curl ships on every sprite image, and `-f` makes an HTTP error exit 22. */
+const holdArgv = (runId: RunId): [string, ...string[]] => [
+  "curl",
+  "-sSf",
+  "--max-time",
+  "5",
+  "--unix-socket",
+  SPRITE_API_SOCKET,
+  "-X",
+  "PUT",
+  "-H",
+  "content-type: application/json",
+  "-d",
+  JSON.stringify({ expire: HOLD_EXPIRE }),
+  `http://sprite/v1/tasks/${spriteTaskNameFor(runId)}`,
+];
 
 // the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
 // then deleted, and the prompt in PROMPT_FILE, which a query param is too short for;
@@ -165,6 +189,10 @@ type Deps = {
   nudgeDeliveries: () => void;
   /** How long a launch stays attached to catch a runner that dies at start. */
   watchMs: number;
+  /** How long after the runner starts a run that hasn't reported in gets its sprite woken. */
+  wakeAfterMs: number;
+  /** Wakes the run's sprite and looks for its runner (see `wakeLaunch`); never throws. */
+  wake: (runId: RunId, spriteName: string) => Promise<void>;
 };
 export type Launch = {
   envId: EnvironmentId;
@@ -195,6 +223,8 @@ export function createLauncher({
   log,
   nudgeDeliveries,
   watchMs,
+  wakeAfterMs,
+  wake,
 }: Deps) {
   /** The env's base profile, without its store when there is no connector to reach GitHub with. */
   function profileFor(
@@ -229,6 +259,45 @@ export function createLauncher({
     const result = await task();
     log(`launching ${launch.runId}: ${name} ok in ${Date.now() - started}ms`);
     return result;
+  }
+
+  /**
+   * Takes the run's keep-awake task before the runner exists: a sprite that pauses between the launch
+   * watch detaching and the runner's own hold freezes the runner. Never why a launch fails.
+   */
+  async function holdSprite(launch: Launch): Promise<void> {
+    try {
+      await step(launch, "hold sprite", async () => {
+        const out = await execInSprite(
+          sprites,
+          launch.spriteName,
+          holdArgv(launch.runId),
+          { op: "hold", timeoutMs: HOLD_TIMEOUT_MS },
+        );
+        if (out.exitCode !== 0) {
+          throw new Error(`curl exit ${out.exitCode}: ${out.stderr.trim()}`);
+        }
+      });
+    } catch (err) {
+      log(
+        `launching ${launch.runId}: hold sprite failed, starting the runner anyway: ${err}`,
+      );
+    }
+  }
+
+  /** One wake for a run that still hasn't reported in `wakeAfterMs` after its runner started. */
+  function wakeIfSilent(launch: Launch): void {
+    setTimeout(() => {
+      try {
+        if (!isSilentLaunch(db, launch.runId)) return;
+        log(
+          `run ${launch.runId} still starting ${Math.round(wakeAfterMs / 1000)}s after its runner started; waking ${launch.spriteName}`,
+        );
+        void wake(launch.runId, launch.spriteName);
+      } catch (err) {
+        log(`checking whether ${launch.runId} needs a wake failed: ${err}`);
+      }
+    }, wakeAfterMs).unref();
   }
 
   async function run(launch: Launch, agentToken: string): Promise<void> {
@@ -301,6 +370,7 @@ export function createLauncher({
         { op: "write-env-file", mode: 0o600, known },
       ),
     );
+    await holdSprite(launch);
     await step(launch, "start runner", () =>
       startDetached(
         sprites,
@@ -342,6 +412,7 @@ export function createLauncher({
         throw err;
       }),
     );
+    wakeIfSilent(launch);
   }
 
   /**
