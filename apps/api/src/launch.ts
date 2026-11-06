@@ -243,7 +243,14 @@ export function createLauncher({
   async function checkMemory(launch: Launch): Promise<void> {
     const floorMb = config.spriteMinFreeMb;
     if (floorMb <= 0) return;
-    const memory = await readMemory(sprites, launch.spriteName);
+    const memory = await readMemory(sprites, launch.spriteName).catch(
+      (err: unknown) => {
+        log(
+          `launching ${launch.runId}: reading the memory of ${launch.spriteName} failed: ${err}`,
+        );
+        return undefined;
+      },
+    );
     if (!memory) {
       log(
         `launching ${launch.runId}: the memory of ${launch.spriteName} could not be read; launching anyway`,

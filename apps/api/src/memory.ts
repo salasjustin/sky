@@ -11,8 +11,12 @@ export type Memory = {
   swapUsedMb: number;
 };
 
-/** The Mem row's total, used and available columns and the Swap row's total and used; undefined when `free` printed neither. */
+/**
+ * The Mem row's total, used and available columns and the Swap row's total and used; undefined when
+ * `free` printed no Mem row, or a header not ending in `available` (procps before 3.3.10 ends in `cached`).
+ */
 export function parseFree(stdout: string): Memory | undefined {
+  if (!/^\s+total\s.*\savailable$/m.test(stdout)) return undefined;
   const mem = /^Mem:\s+(\d+)\s+(\d+)\s+\d+\s+\d+\s+\d+\s+(\d+)/m.exec(stdout);
   if (!mem) return undefined;
   const swap = /^Swap:\s+(\d+)\s+(\d+)/m.exec(stdout);
@@ -41,16 +45,46 @@ export async function readMemory(
 
 // the lines the kernel logs when it kills a process for memory
 const KERNEL_KILL = "out of memory|oom-kill|oom_reaper|killed process";
+const KERNEL_KILL_LINE = new RegExp(KERNEL_KILL, "i");
 const KERNEL_MARK = "== kernel kills";
+const UPTIME_MARK = "== seconds since boot";
 
 // into a file rather than back over the exec: its frames carry no length, and a few KB re-chunked by an
 // intermediary is misread (see `execLogged`); each command's failure is part of the report, never the script's
 const DIAGNOSTICS_SCRIPT = `{
 echo "== free -m"; free -m
 echo "== uptime"; uptime
+echo "${UPTIME_MARK}"; cut -d' ' -f1 /proc/uptime
 echo "== top processes by RSS (pid ppid rss_kb elapsed command)"; ps -eo pid=,ppid=,rss=,etime=,args= --sort=-rss | head -n 12 | cut -c1-240
 echo "${KERNEL_MARK}"; if k=$(dmesg 2>&1); then printf '%s\\n' "$k" | grep -iE '${KERNEL_KILL}' | tail -n 8 | cut -c1-240; else echo "dmesg not readable"; fi
 } >"$1" 2>&1; exit 0`;
+
+/**
+ * The kernel's kill lines in a diagnostics report logged within the last `withinSec` seconds: `dmesg`
+ * stamps each line in seconds since boot, which the report's own uptime turns into an age, so no clock
+ * is compared across machines. A line without a stamp, or a report without the uptime or the kernel
+ * section, can't be placed in the window and counts as no kill.
+ */
+export function killLinesWithin(report: string, withinSec: number): string[] {
+  const kernel = report.search(new RegExp(`^${KERNEL_MARK}$`, "m"));
+  const uptime = new RegExp(`^${UPTIME_MARK}\n(\\d+(?:\\.\\d+)?)$`, "m").exec(
+    report,
+  );
+  if (kernel < 0 || !uptime) return [];
+  const uptimeSec = Number(uptime[1]);
+  return report
+    .slice(kernel)
+    .split("\n")
+    .slice(1)
+    .filter((line) => {
+      const stamp = /^\[\s*(\d+(?:\.\d+)?)\]/.exec(line);
+      return (
+        stamp !== null &&
+        uptimeSec - Number(stamp[1]) <= withinSec &&
+        KERNEL_KILL_LINE.test(line)
+      );
+    });
+}
 
 /** The most of a sprite's diagnostics kept: under `EVENT_TEXT_MAX`, with room for the event's own heading. */
 export const DIAGNOSTICS_MAX = 3_400;
@@ -59,7 +93,7 @@ export type Diagnostics = {
   /** The report, redacted and bounded; says why when it couldn't be collected. */
   text: string;
   memory?: Memory;
-  /** The kernel's kill lines: it killed a process for memory. */
+  /** The kernel's kill lines since the run began: it killed a process for memory meanwhile. */
   killLines: string[];
 };
 
@@ -70,13 +104,16 @@ const bounded = (text: string) =>
 
 /**
  * What a sprite looked like when a run's runner was found gone: memory and swap, the biggest processes
- * by RSS with their command lines, uptime, and the kernel's kill lines where `dmesg` is readable.
+ * by RSS with their command lines, uptime, and the kernel's kill lines where `dmesg` is readable. Only
+ * kill lines logged since `startedAt` (epoch ms, the run's creation) are `killLines`: the kernel's
+ * buffer outlives runs, and a kill from before this one says nothing of its runner.
  * Never throws: a sprite that can't answer is reported in `text`, and the caller fails the run anyway.
  */
 export async function collectDiagnostics(
   ops: SpriteOps,
   spriteName: string,
   runId: RunId,
+  startedAt: number,
 ): Promise<Diagnostics> {
   const path = `/tmp/sky-diagnostics-${runId}.txt`;
   try {
@@ -92,27 +129,25 @@ export async function collectDiagnostics(
         killLines: [],
       };
     }
-    const raw = await spriteCall(
-      ops,
-      spriteName,
-      { op: "read-diagnostics" },
-      () =>
+    // the report is taken by now, so this window reaches back at least to `startedAt`
+    const withinSec = (Date.now() - startedAt) / 1000;
+    let raw: string;
+    try {
+      raw = await spriteCall(ops, spriteName, { op: "read-diagnostics" }, () =>
         ops.client.sprite(spriteName).filesystem("/").readFile(path, "utf8"),
-    );
-    // best effort: a file left in /tmp holds nothing the sprite's own `ps` doesn't
-    void execInSprite(ops, spriteName, ["rm", "-f", path], {
-      op: "rm-diagnostics",
-    }).catch(() => {});
+      );
+    } finally {
+      // best effort: a file left in /tmp holds nothing the sprite's own `ps` doesn't
+      void execInSprite(ops, spriteName, ["rm", "-f", path], {
+        op: "rm-diagnostics",
+      }).catch(() => {});
+    }
     // command lines can carry a secret
     const text = redact(raw, [...ops.secrets.values()]);
-    const kernel = text.slice(Math.max(0, text.indexOf(KERNEL_MARK)));
     return {
       text: bounded(text.trim()),
       memory: parseFree(text),
-      killLines: kernel
-        .split("\n")
-        .slice(1)
-        .filter((line) => new RegExp(KERNEL_KILL, "i").test(line)),
+      killLines: killLinesWithin(text, withinSec),
     };
   } catch (err) {
     return {
@@ -121,12 +156,3 @@ export async function collectDiagnostics(
     };
   }
 }
-
-/**
- * Whether the diagnostics show the sprite killed a process for memory, or had less than `floorMb`
- * available: a runner found gone then was most likely killed, not lost. Memory is read after the kill
- * freed what it did, so the kernel's own lines are the stronger sign.
- */
-export const showsMemoryKill = (d: Diagnostics, floorMb: number): boolean =>
-  d.killLines.length > 0 ||
-  (d.memory !== undefined && d.memory.availableMb < floorMb);

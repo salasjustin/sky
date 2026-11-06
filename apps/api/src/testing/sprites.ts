@@ -223,7 +223,9 @@ export function stubSprites() {
         }
         outcome = { exitCode: outcome.exitCode };
       }
-      // one frame per chunk: a stream-id byte, then the payload; exit is [3, code]
+      // one frame per chunk: a stream-id byte, then the payload; exit is [3, code]. A kill (137) is
+      // modelled as this exit frame; a real SIGKILLed exec may instead drop the stream with no exit
+      // frame, which the SDK raises as an error, not an exit 137 (unverified against the live API)
       const frames = [
         ...(outcome.stdout ? [[1, ...enc.encode(outcome.stdout)]] : []),
         ...(outcome.stderr ? [[2, ...enc.encode(outcome.stderr)]] : []),

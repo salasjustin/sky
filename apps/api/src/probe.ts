@@ -1,11 +1,8 @@
-import type { Db } from "@sky/db";
+import { type Db, runs } from "@sky/db";
 import type { RunId } from "@sky/shared";
+import { eq } from "drizzle-orm";
 import { isRunnerAlive } from "./launch.js";
-import {
-  collectDiagnostics,
-  type Diagnostics,
-  showsMemoryKill,
-} from "./memory.js";
+import { collectDiagnostics, type Diagnostics } from "./memory.js";
 import { failLostRun, recordProbe, runningRunsOn, silentRuns } from "./runs.js";
 import { type SpriteOps, spriteExists } from "./sprites.js";
 
@@ -34,22 +31,27 @@ function killedError(spriteName: string, { memory }: Diagnostics): string {
  * `run.probed` event (which also starts its next window), a gone one fails the run, as does a sprite
  * that no longer exists. A sprite that can't answer is logged and retried a window later, never held
  * against the run. Before failing a run whose runner is gone, the sprite's memory, biggest processes
- * and kernel kill lines are collected, logged and stored on the run; when they show a memory kill the
- * run fails with `runner_killed`, else `runner_lost`. An exec on a sprite exiting 137 probes its
- * running runs at once (`probeSprite`).
+ * and kernel kill lines are collected, logged and stored on the run; when the kernel logged a memory
+ * kill since the run began, or the sprite has less than `lowMemoryMb` available, the run fails with
+ * `runner_killed`, else `runner_lost`. An exec on a sprite exiting 137 probes its running runs at
+ * once (`probeSprite`).
  */
 export function createRunProber({
   db,
-  sprites,
+  sprites: ops,
   probeMs,
   lowMemoryMb,
   log,
   nudgeDeliveries,
 }: Deps) {
+  // a probe's own exec killed with 137 never probes again, or probes would ping-pong on a starving sprite
+  const sprites: SpriteOps = { ...ops, onExecKilled: undefined };
   // when each run was last probed, so a probe that records no event (a sprite that didn't answer, or
   // is still waking) isn't repeated every sweep; in memory, as a restart costs at most one extra probe
   const attempts = new Map<RunId, number>();
   const inFlight = new Set<RunId>();
+  // sprites with a `probeSprite` underway: the kills that follow one 137 on a starving sprite start no more
+  const spritesInFlight = new Set<string>();
 
   // a lookup that fails says nothing of the sprite, so it counts as still there
   async function spriteGone(runId: RunId, spriteName: string) {
@@ -63,6 +65,16 @@ export function createRunProber({
     }
   }
 
+  // a run with no row is past failing; now then counts no kill line
+  function startedAt(runId: RunId): number {
+    const row = db
+      .select({ createdAt: runs.createdAt })
+      .from(runs)
+      .where(eq(runs.id, runId))
+      .get();
+    return row ? Date.parse(row.createdAt) : Date.now();
+  }
+
   /** Fails the run whose runner is gone; a sprite that is gone too skips the diagnostics, as there is nothing to read. */
   async function failGone(
     runId: RunId,
@@ -71,14 +83,19 @@ export function createRunProber({
     spriteIsThere: boolean,
   ): Promise<void> {
     const diagnostics = spriteIsThere
-      ? await collectDiagnostics(sprites, spriteName, runId)
+      ? await collectDiagnostics(sprites, spriteName, runId, startedAt(runId))
       : undefined;
-    const killed = diagnostics && showsMemoryKill(diagnostics, lowMemoryMb);
+    // a sprite that can't read its kernel log (dmesg is often closed to the sprite's user) still shows
+    // memory exhaustion by what's left: a runner gone from a sprite below the launch floor was likely killed
+    const killed =
+      diagnostics !== undefined &&
+      (diagnostics.killLines.length > 0 ||
+        (diagnostics.memory !== undefined &&
+          diagnostics.memory.availableMb < lowMemoryMb));
     const code = killed ? "runner_killed" : "runner_lost";
-    const error =
-      killed && diagnostics
-        ? killedError(spriteName, diagnostics)
-        : `runner_lost: its runner is gone from sprite ${spriteName}`;
+    const error = killed
+      ? killedError(spriteName, diagnostics)
+      : `runner_lost: its runner is gone from sprite ${spriteName}`;
     const report =
       diagnostics &&
       `diagnostics of sprite ${spriteName}, collected when its runner was found gone:\n${diagnostics.text}`;
@@ -154,10 +171,11 @@ export function createRunProber({
     /**
      * Probes every `running` run on the sprite now, silent or not, because an exec there exited 137:
      * a runner the kernel killed is found in seconds, not a window later. A run already being probed
-     * is left to that probe, which is what keeps a probe's own killed `pgrep` from probing again.
-     * Resolves once they settle; never throws or rejects.
+     * is left to that probe, and a sprite already being probed this way isn't probed again until that
+     * settles. Resolves once they settle; never throws or rejects.
      */
     probeSprite(spriteName: string, now = Date.now()): Promise<void> {
+      if (spritesInFlight.has(spriteName)) return Promise.resolve();
       let running: ReturnType<typeof runningRunsOn>;
       try {
         running = runningRunsOn(db, spriteName, now);
@@ -174,7 +192,10 @@ export function createRunProber({
         );
         probes.push(probe(runId, spriteName, silentMs, lastEventId, false));
       }
-      return Promise.all(probes).then(() => {});
+      spritesInFlight.add(spriteName);
+      return Promise.all(probes).then(() => {
+        spritesInFlight.delete(spriteName);
+      });
     },
   };
 }

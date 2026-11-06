@@ -18,6 +18,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
 import { BASE_ENV_NAMES } from "./base-profile.js";
+import { boot } from "./boot.js";
 import type { Config } from "./config.js";
 import { envSecretAad, seal } from "./crypto.js";
 import { createRunProber } from "./probe.js";
@@ -1671,17 +1672,23 @@ test("a runner.warning or runner.heartbeat before run.started doesn't prove the 
 
 /**
  * A prober over the stub sprites; `nudges` counts its dispatcher nudges. `sprites` is the ops it
- * probes through, wired as `boot` wires them: an exec on it that exits 137 probes the sprite's runs.
+ * probes through, wired as `boot` wires them: an exec on it that exits 137 probes the sprite's runs,
+ * and names the sprite in `execsKilled`; `probed` holds each such probe, to await its settling.
  */
 function proberOver(secrets = new KnownSecrets()) {
   const nudges = { count: 0 };
+  const execsKilled: string[] = [];
+  const probed: Promise<void>[] = [];
   const sprites: SpriteOps = {
     client: new SpritesClient(spritesToken),
     log: () => {},
     secrets,
     timeoutMs: SPRITES_TIMEOUT_MS,
     longTimeoutMs: config.spritesLongTimeoutMs,
-    onExecKilled: (name) => void prober.probeSprite(name),
+    onExecKilled: (name) => {
+      execsKilled.push(name);
+      probed.push(prober.probeSprite(name));
+    },
   };
   const prober = createRunProber({
     db,
@@ -1693,7 +1700,7 @@ function proberOver(secrets = new KnownSecrets()) {
       nudges.count++;
     },
   });
-  return { prober, nudges, sprites };
+  return { prober, nudges, sprites, execsKilled, probed };
 }
 
 /** Makes `pgrep` on the stub sprite answer `exitCode` (0 found a runner, 1 none, 2 an error of its own). */
@@ -1957,6 +1964,8 @@ test("a probe on a sprite that no longer exists fails the run at once with runne
   expect(logs).toContain(
     `run ${run.id} failed: runner_lost on sprite ${sprite}`,
   );
+  // there is nothing to read from a sprite that is gone, so no diagnostics report is stored
+  expect(warningsOf(run.id)).toEqual([]);
 });
 
 const freeOutput = (availableMb: number, totalMb = 16_000) =>
@@ -1964,6 +1973,12 @@ const freeOutput = (availableMb: number, totalMb = 16_000) =>
 Mem:           ${totalMb}        9019        1500         100        5000        ${availableMb}
 Swap:              0           0           0
 `;
+
+// the stub sprite's uptime when its diagnostics are taken; `dmesg` stamps kill lines in seconds since boot
+const SPRITE_UPTIME_SEC = 90_000;
+/** A kill line as `dmesg` prints it, `agoSec` before the diagnostics were taken. */
+const kernelLine = (agoSec: number, text: string) =>
+  `[${(SPRITE_UPTIME_SEC - agoSec).toFixed(6)}] ${text}`;
 
 /** What the sprite's diagnostics script writes for a sprite with `availableMb` free. */
 const diagnosticsReport = ({
@@ -1977,10 +1992,12 @@ const diagnosticsReport = ({
 }) =>
   `== free -m
 ${freeOutput(availableMb)}== uptime
- 17:03:01 up 2 min,  0 users,  load average: 9.10, 4.20, 1.70
+ 17:03:01 up 1 day,  1:00,  0 users,  load average: 9.10, 4.20, 1.70
+== seconds since boot
+${SPRITE_UPTIME_SEC}.00
 == top processes by RSS (pid ppid rss_kb elapsed command)
 ${ps}
-== kernel kills (dmesg)
+== kernel kills
 ${kernel.join("\n")}
 `;
 
@@ -2112,7 +2129,12 @@ test("a runner gone after the kernel logged a kill fails as runner_killed, namin
   diagnosticsAnswer(
     diagnosticsReport({
       availableMb: 5_000,
-      kernel: ["Out of memory: Killed process 3912 (node) total-vm:9012344kB"],
+      kernel: [
+        kernelLine(
+          0,
+          "Out of memory: Killed process 3912 (node) total-vm:9012344kB",
+        ),
+      ],
     }),
   );
   const { prober, nudges } = proberOver();
@@ -2131,8 +2153,33 @@ test("a runner gone after the kernel logged a kill fails as runner_killed, namin
   expect(nudges.count).toBe(1);
 });
 
+test("a runner gone after an earlier run's process was killed for memory is runner_lost: only a kill since the run began counts", async () => {
+  const envId = readyEnv();
+  const { run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  const old = kernelLine(
+    5 * 3600,
+    "Out of memory: Killed process 812 (node) total-vm:9012344kB",
+  );
+  diagnosticsAnswer(diagnosticsReport({ availableMb: 5_000, kernel: [old] }));
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  expect(runFailure(run.id)).toBe(
+    `runner_lost: its runner is gone from sprite ${spriteNameFor(envId)}`,
+  );
+  // still in the stored report, for whoever reads it
+  expect(warningsOf(run.id)[0]).toContain(old);
+});
+
 test("a runner gone from a sprite with less memory available than the floor is runner_killed though dmesg can't be read", async () => {
-  const { run, token } = await runningRun();
+  const envId = readyEnv();
+  const { run, token } = await runningRun(envId);
   await postEvent(token, {
     runId: run.id,
     type: "run.started",
@@ -2148,10 +2195,60 @@ test("a runner gone from a sprite with less memory available than the floor is r
   const { prober } = proberOver();
   await prober.sweep(silentFor(config.runProbeMs + 1000));
 
-  expect(runFailure(run.id)).toContain(
-    `runner_killed: the sprite killed the runner, likely out of memory`,
+  expect(runFailure(run.id)).toMatch(
+    /^runner_killed: the sprite killed the runner, likely out of memory/,
   );
+  expect(runFailure(run.id)).toContain(spriteNameFor(envId));
   expect(runFailure(run.id)).toContain(`${config.spriteMinFreeMb - 1} MB of`);
+});
+
+test("a runner gone from a sprite with memory at the floor and no kill line is runner_lost", async () => {
+  const envId = readyEnv();
+  const { run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  diagnosticsAnswer(
+    diagnosticsReport({
+      availableMb: config.spriteMinFreeMb,
+      kernel: ["dmesg not readable"],
+    }),
+  );
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+  expect(runFailure(run.id)).toBe(
+    `runner_lost: its runner is gone from sprite ${spriteNameFor(envId)}`,
+  );
+});
+
+test("the diagnostics file is removed from the sprite even when reading it back fails", async () => {
+  const envId = readyEnv();
+  const { run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  const exec = wire.exec;
+  // the script exits 0 but the file can't be read: the read answers 404
+  wire.exec = (argv) =>
+    argv[0] === "bash" && argv[2]?.includes("== free -m")
+      ? { exitCode: 0 }
+      : exec(argv);
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  expect(warningsOf(run.id)[0]).toContain("diagnostics unavailable");
+  const path = `/tmp/sky-diagnostics-${run.id}.txt`;
+  await vi.waitFor(() =>
+    expect(wire.calls).toContain(
+      `exec ${spriteNameFor(envId)} - rm -f ${path}`,
+    ),
+  );
 });
 
 test("an exec on a sprite exiting 137 probes its running runs at once: a run whose runner is gone fails as runner_killed without waiting out the window", async () => {
@@ -2170,13 +2267,13 @@ test("an exec on a sprite exiting 137 probes its running runs at once: a run who
   diagnosticsAnswer(
     diagnosticsReport({
       availableMb: 200,
-      kernel: ["Out of memory: Killed process 77 (node)"],
+      kernel: [kernelLine(0, "Out of memory: Killed process 77 (node)")],
     }),
   );
   const exec = wire.exec;
   // the wake exec of the incident, as the kernel's kill leaves it
   wire.exec = (argv) => (argv[0] === "true" ? { exitCode: 137 } : exec(argv));
-  const { prober, sprites } = proberOver();
+  const { prober, sprites, probed } = proberOver();
   // nothing has been silent for a window yet, so a sweep probes nothing
   await prober.sweep();
   expect(pgreps()).toEqual([]);
@@ -2186,10 +2283,9 @@ test("an exec on a sprite exiting 137 probes its running runs at once: a run who
   });
   expect(woken.exitCode).toBe(137);
 
-  await vi.waitFor(() => {
-    expect(runStatus(first.run.id)).toEqual({ status: "failed" });
-    expect(runStatus(second.run.id)).toEqual({ status: "failed" });
-  });
+  await Promise.all(probed);
+  expect(runStatus(first.run.id)).toEqual({ status: "failed" });
+  expect(runStatus(second.run.id)).toEqual({ status: "failed" });
   expect(runFailure(first.run.id)).toMatch(/^runner_killed: /);
   expect(runFailure(second.run.id)).toContain(spriteNameFor(envId));
   // the run on another sprite was not probed
@@ -2213,14 +2309,77 @@ test("an exec exiting 137 that finds the runner alive leaves the run alone and r
   pgrepAnswers(0);
   const exec = wire.exec;
   wire.exec = (argv) => (argv[0] === "true" ? { exitCode: 137 } : exec(argv));
-  const { sprites, nudges } = proberOver();
+  const { sprites, nudges, probed } = proberOver();
   const before = eventsOf(run.id).length;
   await execInSprite(sprites, spriteNameFor(envId), ["true"], { op: "wake" });
-  await vi.waitFor(() => expect(pgreps()).toHaveLength(1));
+  // the probe has handled pgrep's answer, not just sent the request, before anything is asserted
+  expect(probed).toHaveLength(1);
+  await Promise.all(probed);
+  expect(pgreps()).toHaveLength(1);
 
   expect((await getRun(agent.id, run.id)).body.status).toBe("running");
   expect(eventsOf(run.id)).toHaveLength(before);
   expect(nudges.count).toBe(0);
+});
+
+test("a probe's own exec exiting 137 never starts another probe", async () => {
+  const envId = readyEnv({ concurrency: 2 });
+  const first = await runningRun(envId);
+  const second = await runningRun(envId);
+  for (const { run, token } of [first, second]) {
+    await postEvent(token, {
+      runId: run.id,
+      type: "run.started",
+      payload: { sessionId: "s" },
+    });
+  }
+  const exec = wire.exec;
+  // the first run's pgrep is killed; the second's runner is gone and its diagnostics are killed
+  wire.exec = (argv) => {
+    if (argv[0] === "pgrep") {
+      return {
+        exitCode:
+          argv.at(-1) === runnerPattern(first.run.id as RunId) ? 137 : 1,
+      };
+    }
+    if (argv[0] === "bash" && argv[2]?.includes("== free -m")) {
+      return { exitCode: 137 };
+    }
+    return exec(argv);
+  };
+  const { prober, execsKilled } = proberOver();
+  await prober.probeSprite(spriteNameFor(envId));
+
+  expect(execsKilled).toEqual([]);
+  expect(pgreps()).toHaveLength(2);
+  expect(runStatus(first.run.id)).toEqual({ status: "running" });
+  expect(runFailure(second.run.id)).toMatch(/^runner_lost: /);
+});
+
+test("a sprite is probed for a killed exec once at a time: another 137 while that probe runs starts none", async () => {
+  const envId = readyEnv({ concurrency: 2 });
+  const first = await runningRun(envId);
+  await postEvent(first.token, {
+    runId: first.run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const second = await runningRun(envId);
+  pgrepAnswers(0);
+  wire.hangs = (call) => call.includes(" pgrep ");
+  wire.hangMs = 300;
+  const { prober } = proberOver();
+  const sprite = spriteNameFor(envId);
+  const probing = prober.probeSprite(sprite);
+  await vi.waitFor(() => expect(pgreps()).toHaveLength(1));
+  await postEvent(second.token, {
+    runId: second.run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  await prober.probeSprite(sprite);
+  await probing;
+  expect(pgreps()).toHaveLength(1);
 });
 
 test("an exec exiting 137 probes only running runs: a starting run is left to its launch deadline", async () => {
@@ -2264,6 +2423,110 @@ test("a launch on a sprite with less memory available than the floor is refused 
   await sessionOpened();
 });
 
+test("a runner gone after a kill line, from a sprite whose memory the report can't give, fails as runner_killed saying so", async () => {
+  const envId = readyEnv();
+  const { run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  diagnosticsAnswer(
+    diagnosticsReport({
+      availableMb: 5_000,
+      kernel: [kernelLine(0, "Out of memory: Killed process 3912 (node)")],
+    }).replace(freeOutput(5_000), "free: not found\n"),
+  );
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  expect(runFailure(run.id)).toBe(
+    `runner_killed: the sprite killed the runner, likely out of memory (sprite ${spriteNameFor(envId)}: its free memory could not be read)`,
+  );
+});
+
+test("a runner gone from a sprite that can't run the diagnostics at all is runner_lost, the report saying why", async () => {
+  const envId = readyEnv();
+  const { run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  pgrepAnswers(1);
+  // the Sprites API hangs on the diagnostics exec only, then answers 503
+  wire.hangs = (call) => call.includes(" bash ");
+  wire.hangMs = 10;
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  expect(warningsOf(run.id)[0]).toMatch(/diagnostics unavailable: .+/);
+  expect(runFailure(run.id)).toBe(
+    `runner_lost: its runner is gone from sprite ${spriteNameFor(envId)}`,
+  );
+});
+
+test("a launch exec exiting 137 on a booted app probes the sprite's running runs, so a runner the kernel killed fails as runner_killed", async () => {
+  mkdirSync(join(dir, "data"));
+  const booted = boot(
+    testConfig({
+      dataDir: join(dir, "data"),
+      runnerBundlePath: join(dir, "runner.mjs"),
+    }),
+    (line) => logs.push(line),
+  );
+  try {
+    // the helpers drive `app` and read `db`: both are now the booted ones
+    db.$client.close();
+    db = booted.db;
+    app = booted.app;
+    const envId = readyEnv({ concurrency: 2 });
+    const first = await runningRun(envId);
+    await postEvent(first.token, {
+      runId: first.run.id,
+      type: "run.started",
+      payload: { sessionId: "s" },
+    });
+    pgrepAnswers(1);
+    diagnosticsAnswer(
+      diagnosticsReport({
+        availableMb: 200,
+        kernel: [kernelLine(0, "Out of memory: Killed process 77 (node)")],
+      }),
+    );
+    const exec = wire.exec;
+    wire.exec = (argv) => (argv[0] === "free" ? { exitCode: 137 } : exec(argv));
+    // a second launch on the sprite: its memory check is the exec the kernel kills
+    await launched(envId);
+
+    await vi.waitFor(() =>
+      expect(runStatus(first.run.id)).toEqual({ status: "failed" }),
+    );
+    expect(runFailure(first.run.id)).toMatch(/^runner_killed: /);
+    expect(pgreps()).toEqual([
+      `exec ${spriteNameFor(envId)} - pgrep -f ${runnerPattern(first.run.id as RunId)}`,
+    ]);
+  } finally {
+    booted.stopSweeping();
+    booted.stopDelivering();
+  }
+});
+
+test("a launch on a sprite with one MB less than the floor is refused, where the floor itself is not", async () => {
+  const envId = readyEnv();
+  freeAnswers(config.spriteMinFreeMb - 1);
+  const { agent, run } = await launched(envId);
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
+  );
+  expect(runFailure(run.id)).toContain(
+    `${config.spriteMinFreeMb - 1} MB of memory available`,
+  );
+  expect(runFailure(run.id)).toMatch(/^sprite_low_memory: /);
+  expect(wire.sessions).toHaveLength(0);
+});
+
 test("a launch on a sprite with memory at or above the floor goes ahead", async () => {
   const envId = readyEnv();
   freeAnswers(config.spriteMinFreeMb);
@@ -2305,6 +2568,27 @@ test("a launch on a sprite whose memory can't be read goes ahead and logs it", a
   expect(logs).toContain(
     `launching ${run.id}: the memory of ${spriteNameFor(envId)} could not be read; launching anyway`,
   );
+});
+
+test("a launch whose memory read fails at the Sprites API goes ahead and logs it", async () => {
+  const envId = readyEnv();
+  server.use(
+    http.post("https://api.sprites.dev/v1/sprites/:name/exec", ({ request }) =>
+      new URL(request.url).searchParams.get("cmd") === "free"
+        ? HttpResponse.json({ error: "upstream unavailable" }, { status: 503 })
+        : undefined,
+    ),
+  );
+  const { run } = await launched(envId);
+  await sessionOpened();
+  expect(runStatus(run.id)).toEqual({ status: "starting" });
+  expect(
+    logs.some((l) =>
+      l.startsWith(
+        `launching ${run.id}: reading the memory of ${spriteNameFor(envId)} failed: `,
+      ),
+    ),
+  ).toBe(true);
 });
 
 test("a probe that fails while the sprite lookup also fails is logged and leaves the run running", async () => {

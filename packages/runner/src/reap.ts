@@ -69,7 +69,7 @@ function sessionProcesses(
   }
   const entry = `RUN_ID=${runId}`;
   const mine = new Map<number, Proc>();
-  // descendants whatever their environment (`env -i` clears the mark, not the parent), and the marked
+  // descendants whatever their environment: `env -i` clears the mark, not the parent
   const queue = [self];
   for (const parent of queue) {
     for (const pid of children.get(parent) ?? []) {
@@ -91,17 +91,34 @@ const isAlive = (procRoot: string, pid: number) => {
   return proc !== undefined && !proc.zombie;
 };
 
-const signal = (pids: Iterable<number>, sig: NodeJS.Signals) => {
+type Kill = (pid: number, signal: NodeJS.Signals) => unknown;
+
+/** Sends `sig` to each pid; returns those it was not permitted to signal (EPERM, e.g. a process started through sudo). */
+const signal = (kill: Kill, pids: Iterable<number>, sig: NodeJS.Signals) => {
+  const refused: number[] = [];
   for (const pid of pids) {
     try {
-      process.kill(pid, sig);
-    } catch {
-      // gone already, or not ours to signal
+      kill(pid, sig);
+    } catch (error) {
+      // ESRCH is a process gone already
+      if ((error as NodeJS.ErrnoException).code === "EPERM") refused.push(pid);
     }
   }
+  return refused;
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Waits up to `ms` for every pid to be gone. */
+async function awaitGone(procRoot: string, pids: number[], ms: number) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline && pids.some((id) => isAlive(procRoot, id))) {
+    await sleep(50);
+  }
+}
+
+/** How long a SIGKILLed process has to disappear; one stuck past it (uninterruptible sleep) is not waited on again. */
+const KILL_WAIT_MS = 500;
 
 export type ReapOptions = {
   runId: string;
@@ -111,6 +128,8 @@ export type ReapOptions = {
   procRoot?: string;
   /** How long a SIGTERMed process has to exit before SIGKILL; 3 s when absent. */
   graceMs?: number;
+  /** `process.kill` unless a test records the signals. */
+  kill?: Kill;
   warn: (line: string) => void;
 };
 
@@ -119,48 +138,54 @@ export type ReapOptions = {
  * `claude -p`. The Agent SDK ends only the `claude` process it spawned, so anything that process
  * started and that outlives it is reparented to init and keeps its memory until the sprite is reset.
  * SIGTERM first, then SIGKILL for what is still alive after `graceMs`, over up to three rounds, since
- * a dying process can start another. Another run's processes on the sprite are not touched (see
- * `sessionProcesses`). Never throws; a host with no `/proc` has nothing to scan, which warns once.
- * Returns how many processes it signalled.
+ * a dying process can start another; a process already SIGKILLed is not targeted again. Another run's
+ * processes on the sprite are not touched (see `sessionProcesses`). A process the runner may not signal
+ * is left out of the count and of every wait, and named in a warning of its own. Never throws; a host
+ * with no `/proc` has nothing to scan, which warns once. Returns how many processes it signalled.
  */
 export async function endSessionProcesses({
   runId,
   pid = process.pid,
   procRoot = "/proc",
   graceMs = 3_000,
+  kill = process.kill,
   warn,
 }: ReapOptions): Promise<number> {
   const ended = new Map<number, Proc>();
+  const refused = new Map<number, Proc>();
+  const killed = new Set<number>();
   try {
     for (let round = 0; round < 3; round++) {
-      const targets = sessionProcesses(runId, pid, procRoot);
-      if (targets.size === 0) break;
-      for (const [id, proc] of targets) ended.set(id, proc);
-      signal(targets.keys(), "SIGTERM");
-      const deadline = Date.now() + graceMs;
-      while (
-        Date.now() < deadline &&
-        [...targets.keys()].some((id) => isAlive(procRoot, id))
-      ) {
-        await sleep(50);
+      const found = sessionProcesses(runId, pid, procRoot);
+      for (const id of [...refused.keys(), ...killed]) found.delete(id);
+      if (found.size === 0) break;
+      for (const id of signal(kill, found.keys(), "SIGTERM")) {
+        refused.set(id, found.get(id) as Proc);
+        found.delete(id);
       }
-      signal(
-        [...targets.keys()].filter((id) => isAlive(procRoot, id)),
-        "SIGKILL",
-      );
+      for (const [id, proc] of found) ended.set(id, proc);
+      const targets = [...found.keys()];
+      await awaitGone(procRoot, targets, graceMs);
+      const stubborn = targets.filter((id) => isAlive(procRoot, id));
+      signal(kill, stubborn, "SIGKILL");
+      for (const id of stubborn) killed.add(id);
+      await awaitGone(procRoot, stubborn, KILL_WAIT_MS);
     }
   } catch (error) {
     warn(
       `runner: ending the session's processes failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+  const named = (procs: Map<number, Proc>) =>
+    [...procs].map(([id, proc]) => `${proc.comm}[${id}]`).join(" ");
   if (ended.size > 0) {
     warn(
-      `runner: ended ${ended.size} process(es) the session left running: ${[
-        ...ended,
-      ]
-        .map(([id, proc]) => `${proc.comm}[${id}]`)
-        .join(" ")}`,
+      `runner: ended ${ended.size} process(es) the session left running: ${named(ended)}`,
+    );
+  }
+  if (refused.size > 0) {
+    warn(
+      `runner: could not end ${refused.size} process(es) the session left running, not permitted to signal them: ${named(refused)}`,
     );
   }
   return ended.size;
