@@ -1700,6 +1700,20 @@ test("a hold that fails is logged and the launch goes on", async () => {
   });
 });
 
+test("a hold whose exec the Sprites API fails is logged and the launch goes on", async () => {
+  // a 503 for the curl call alone: the exec rejects instead of exiting non-zero
+  wire.hangs = (call) => call.includes(" curl ");
+  wire.hangMs = 10;
+  const { agent, run } = await runningRun();
+  expect(holdCalls()).toHaveLength(1);
+  expect(
+    logs.some((l) => l.includes(run.id) && l.includes("hold sprite failed")),
+  ).toBe(true);
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    status: "starting",
+  });
+});
+
 /** An app whose launches wake a silent run's sprite after `ms`. */
 function wakingAfter(ms: number) {
   app = createApp({
@@ -1714,8 +1728,26 @@ function wakingAfter(ms: number) {
 }
 const settle = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Launches a silent run after the one under test and resolves once its wake has run. Timers of
+ * equal delay fire in start order, so by then the earlier run's timer has fired, and had that run
+ * been woken its pgrep would be in `pgreps()`.
+ */
+async function untilLaterRunWoke() {
+  const { run } = await runningRun();
+  await vi.waitFor(
+    () =>
+      expect(
+        logs.some((l) => l.includes(`for ${run.id}: its runner is alive`)),
+      ).toBe(true),
+    { timeout: 5000 },
+  );
+}
+const pgrepsOf = (runId: string) =>
+  pgreps().filter((c) => c.includes(runnerPattern(runId)));
+
 test("a run still starting with only a warning and a heartbeat gets exactly one wake after the delay", async () => {
-  wakingAfter(150);
+  wakingAfter(500);
   pgrepAnswers(0);
   const { run, token } = await runningRun();
   await postEvent(token, {
@@ -1728,9 +1760,8 @@ test("a run still starting with only a warning and a heartbeat gets exactly one 
     type: "runner.heartbeat",
     payload: { toolName: "Bash", toolUseId: "t1", elapsedMs: 61_000 },
   });
-  expect(pgreps()).toEqual([]);
-  await vi.waitFor(() => expect(pgreps()).toHaveLength(1));
-  await settle(400);
+  await vi.waitFor(() => expect(pgreps()).toHaveLength(1), { timeout: 5000 });
+  await settle(600);
   expect(pgreps()).toHaveLength(1);
   expect(logs.some((l) => l.includes(run.id) && l.includes("waking"))).toBe(
     true,
@@ -1744,22 +1775,41 @@ test("a run still starting with only a warning and a heartbeat gets exactly one 
 });
 
 test("a run that has reported in is not woken", async () => {
-  wakingAfter(150);
+  wakingAfter(500);
   pgrepAnswers(0);
   const { run, token } = await runningRun();
-  await postEvent(token, {
+  const started = await postEvent(token, {
     runId: run.id,
     type: "run.started",
     payload: { sessionId: "s" },
   });
-  await settle(450);
-  expect(pgreps()).toEqual([]);
+  expect(started.status).toBe(201);
+  await untilLaterRunWoke();
+  expect(pgrepsOf(run.id)).toEqual([]);
+});
+
+// run.started also moves the run off `starting`; a claude.* event leaves the status alone
+test("a run still starting that has an event beyond a warning and a heartbeat is not woken", async () => {
+  wakingAfter(500);
+  pgrepAnswers(0);
+  const { agent, run, token } = await runningRun();
+  const message = await postEvent(token, {
+    runId: run.id,
+    type: "claude.Message",
+    payload: { text: "reading the test" },
+  });
+  expect(message.status).toBe(201);
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    status: "starting",
+  });
+  await untilLaterRunWoke();
+  expect(pgrepsOf(run.id)).toEqual([]);
 });
 
 test("a wake that finds no runner leaves the run to the launch deadline", async () => {
   wakingAfter(150);
   pgrepAnswers(1);
-  const { agent, run } = await runningRun();
+  const { agent, run, envId } = await runningRun();
   await vi.waitFor(() => expect(pgreps()).toHaveLength(1));
   await vi.waitFor(() =>
     expect(logs.some((l) => l.includes("no runner found"))).toBe(true),
@@ -1767,17 +1817,56 @@ test("a wake that finds no runner leaves the run to the launch deadline", async 
   expect((await getRun(agent.id, run.id)).body).toMatchObject({
     status: "starting",
   });
+  const deadline = config.launchDeadlineMs;
+  expect(
+    failUnlaunchedRuns(db, deadline, Date.now() + deadline - 60_000),
+  ).toEqual([]);
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    status: "starting",
+  });
+  expect(
+    failUnlaunchedRuns(db, deadline, Date.now() + deadline + 1000),
+  ).toEqual([{ runId: run.id, spriteName: spriteNameFor(envId) }]);
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    status: "failed",
+    error: "launch_timeout",
+  });
 });
 
 test("a run that ended before the delay is not woken", async () => {
-  wakingAfter(150);
+  wakingAfter(500);
   pgrepAnswers(0);
   const { run } = await runningRun();
   db.$client
     .prepare("update runs set status = 'failed' where id = ?")
     .run(run.id);
-  await settle(450);
-  expect(pgreps()).toEqual([]);
+  await untilLaterRunWoke();
+  expect(pgrepsOf(run.id)).toEqual([]);
+});
+
+test("a wake whose pgrep the Sprites API fails is logged and changes nothing", async () => {
+  const unhandled: unknown[] = [];
+  const onRejection = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onRejection);
+  try {
+    wakingAfter(150);
+    wire.hangs = (call) => call.includes(" pgrep ");
+    wire.hangMs = 10;
+    const { agent, run, envId } = await runningRun();
+    const failed = `waking ${spriteNameFor(envId)} for ${run.id} failed: `;
+    await vi.waitFor(() =>
+      expect(logs.some((l) => l.startsWith(failed))).toBe(true),
+    );
+    // unhandled rejections surface after the microtasks drain
+    await new Promise((r) => setImmediate(r));
+    expect(unhandled).toEqual([]);
+    expect(eventsOf(run.id)).toEqual([]);
+    expect((await getRun(agent.id, run.id)).body).toMatchObject({
+      status: "starting",
+    });
+  } finally {
+    process.off("unhandledRejection", onRejection);
+  }
 });
 
 /** A prober over the stub sprites; `nudges` counts its dispatcher nudges. */
