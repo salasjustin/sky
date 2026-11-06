@@ -1756,6 +1756,30 @@ test("a run that has reported in is not woken", async () => {
   expect(pgreps()).toEqual([]);
 });
 
+test("a wake that finds no runner leaves the run to the launch deadline", async () => {
+  wakingAfter(150);
+  pgrepAnswers(1);
+  const { agent, run } = await runningRun();
+  await vi.waitFor(() => expect(pgreps()).toHaveLength(1));
+  await vi.waitFor(() =>
+    expect(logs.some((l) => l.includes("no runner found"))).toBe(true),
+  );
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    status: "starting",
+  });
+});
+
+test("a run that ended before the delay is not woken", async () => {
+  wakingAfter(150);
+  pgrepAnswers(0);
+  const { run } = await runningRun();
+  db.$client
+    .prepare("update runs set status = 'failed' where id = ?")
+    .run(run.id);
+  await settle(450);
+  expect(pgreps()).toEqual([]);
+});
+
 /** A prober over the stub sprites; `nudges` counts its dispatcher nudges. */
 function proberOver() {
   const nudges = { count: 0 };

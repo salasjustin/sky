@@ -9,8 +9,9 @@ const EXPIRE = "5m";
 const REFRESH_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 
-// a sprite woken cold may not have its API up yet (the socket missing or refusing); until the first
-// hold lands the sprite may pause and freeze the run, so the first PUT retries quickly
+// the API holds the sprite under the same task name before the runner starts; the quick retries
+// only matter when that hold didn't land and a sprite woken cold may not have its API up yet
+// (the socket missing or refusing), leaving the sprite free to pause and freeze the run
 const FIRST_HOLD_RETRY_MS = 1_000;
 const FIRST_HOLD_ATTEMPTS = 30;
 
@@ -31,11 +32,12 @@ export const spriteApiFrom = (env: NodeJS.ProcessEnv) => {
 
 /**
  * Keeps the sprite from pausing while the runner lives: a sprite pauses once idle and drops
- * open connections even on a warm pause, so the runner holds a Tasks API task, refreshed on an
- * interval (a task lives an hour at most), and deletes it on `release`. Never throws: a failed
- * call is one line on `warn`. `report`, which also never throws, sends the API what the runner's
- * local log can't show once the sprite is asleep: the first hold giving up on its quick retries
- * and, once a hold has landed, the first failure of each streak of failed refreshes.
+ * open connections even on a warm pause, so the run is held by a Tasks API task the API takes
+ * before the runner starts; the runner refreshes it on an interval (a task lives an hour at most)
+ * and deletes it on `release`. Never throws: a failed call is one line on `warn`. `report`, which
+ * also never throws, sends the API what the runner's local log can't show once the sprite is
+ * asleep: the first hold giving up on its quick retries and, once a hold has landed, the first
+ * failure of each streak of failed refreshes.
  */
 export function holdSprite(options: {
   runId: string;
