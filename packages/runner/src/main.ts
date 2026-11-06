@@ -6,6 +6,7 @@ import { createPoster, warningReporter } from "./events.js";
 import { holdSprite, spriteApiFrom } from "./keepalive.js";
 import { refreshPlugins } from "./plugins.js";
 import { publishMain } from "./publish.js";
+import { endSessionProcesses } from "./reap.js";
 import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
 import { claimRunLog } from "./runlog.js";
@@ -77,7 +78,8 @@ async function main(): Promise<void> {
     process.on("exit", release);
   }
 
-  // the first SIGTERM/SIGINT/SIGHUP aborts the session and lets the run report and commit; a second one kills at once
+  // the first SIGTERM/SIGINT/SIGHUP aborts the session and lets the run report and commit; a second one
+  // kills what the session left running and then the runner, at once
   const controller = new AbortController();
   let caught: NodeJS.Signals | undefined;
   // a hangup from the exec session that started the runner is a stop, not a death
@@ -91,8 +93,17 @@ async function main(): Promise<void> {
     release();
     process.kill(process.pid, signal);
   };
+  let dying = false;
   const onSignal = (signal: NodeJS.Signals) => {
-    if (caught) return dieBy(signal);
+    if (dying) return;
+    if (caught) {
+      // the session's leftovers get their SIGKILL first, with no grace; bounded, so later signals wait for it
+      dying = true;
+      void endSessionProcesses({ runId: config.runId, graceMs: 0, warn }).then(
+        () => dieBy(signal),
+      );
+      return;
+    }
     caught = signal;
     controller.abort(signal);
   };
@@ -121,9 +132,13 @@ async function main(): Promise<void> {
       warn,
     });
   } finally {
+    // the run is over, whatever way: nothing it started may keep its memory on a sprite other runs share
+    await endSessionProcesses({ runId: config.runId, warn });
     await syncStoreQuietly("push", process.env, warn);
     await hold.release();
   }
+  // a second signal's own reap ends in `dieBy`
+  if (dying) return;
   if (caught) dieBy(caught);
   else stopListening();
 }

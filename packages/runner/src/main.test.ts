@@ -418,3 +418,122 @@ test.each(["SKY_NO_STORE_SYNC", "KRU_NO_STORE_SYNC"])(
   },
   30_000,
 );
+
+/**
+ * A node left running by its shell, reparented to init as a daemonised dev server is, carrying `RUN_ID`.
+ * It notes each SIGTERM at `<dir>/termed`, ignoring it when `stubborn`; `<dir>/ready` exists once its handler is installed.
+ */
+async function leftover(runId: string, dir: string, stubborn = false) {
+  const onTerm = stubborn
+    ? `fs.writeFileSync("${join(dir, "termed")}", "")`
+    : "process.exit(0)";
+  const script = `const fs = require("node:fs"); process.on("SIGTERM", () => ${onTerm}); fs.writeFileSync("${join(dir, "ready")}", ""); setInterval(() => {}, 1000)`;
+  const shell = spawn(
+    "sh",
+    ["-c", `node -e '${script}' >/dev/null 2>&1 </dev/null & echo $!`],
+    {
+      env: { PATH: process.env.PATH ?? "", RUN_ID: runId },
+      stdio: ["ignore", "pipe", "ignore"],
+    },
+  );
+  let out = "";
+  for await (const chunk of shell.stdout) out += chunk;
+  const pid = Number(out.trim());
+  leftovers.push(pid);
+  await until(() => existsSync(join(dir, "ready")));
+  return pid;
+}
+const leftovers: number[] = [];
+afterEach(() => {
+  for (const pid of leftovers.splice(0)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  }
+});
+
+async function until(condition: () => boolean) {
+  for (let i = 0; i < 250 && !condition(); i++)
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(condition()).toBe(true);
+}
+
+const alive = (pid: number) => {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat[stat.lastIndexOf(")") + 2] !== "Z";
+  } catch {
+    return false;
+  }
+};
+
+const linux = existsSync("/proc/self/stat");
+
+test.skipIf(!linux)(
+  "once the run is over the runner ends what its session left running",
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runner-main-reap-"));
+    const { seen, base } = await apiAndGateway();
+    try {
+      const server = await leftover("run_reap1", dir);
+      const { code, stderr } = await runBundle({
+        ...runEnv(base, join(dir, "run_reap1.prompt")),
+        RUN_ID: "run_reap1",
+      });
+      expect(seen).toEqual(["api"]);
+      expect(code).toBe(1);
+      expect(alive(server)).toBe(false);
+      expect(stderr).toMatch(
+        new RegExp(`runner: ended 1 process\\(es\\) .*\\[${server}\\]`),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+  20_000,
+);
+
+test.skipIf(!linux)(
+  "a second stop signal while the runner waits on a leftover that ignores SIGTERM still kills it, then the runner dies by the signal",
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runner-main-reap-"));
+    let respond: (() => void) | undefined;
+    const api = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        respond = () => res.writeHead(204).end();
+      });
+    });
+    servers.push(api);
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    const { port } = api.address() as AddressInfo;
+    try {
+      const server = await leftover("run_reap2", dir, true);
+      const child = spawn(process.execPath, [bundle, "run_reap2"], {
+        env: {
+          PATH: process.env.PATH ?? "",
+          CLAUDE_CONFIG_DIR,
+          SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
+          ...runEnv(`http://127.0.0.1:${port}`, join(dir, "run_reap2.prompt")),
+          RUN_ID: "run_reap2",
+        },
+        stdio: "ignore",
+      });
+      const exited = once(child, "exit");
+      // the first stop, while the runner is mid-post of run.failed
+      await until(() => respond !== undefined);
+      child.kill("SIGTERM");
+      respond?.();
+      // the runner's reap has sent its SIGTERM and is waiting out the grace
+      await until(() => existsSync(join(dir, "termed")));
+      child.kill("SIGHUP");
+      const [code, signal] = await exited;
+      expect({ code, signal }).toEqual({ code: null, signal: "SIGHUP" });
+      await until(() => !alive(server));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+  20_000,
+);
