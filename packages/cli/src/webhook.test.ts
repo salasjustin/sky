@@ -85,6 +85,61 @@ test("--secret=- reads the secret from stdin", async () => {
   expect(posts[0]).toMatchObject({ secret });
 });
 
+test("--secret=- on a terminal prompts for the secret without echoing it", async () => {
+  server.use(...handlers);
+  const prompts: string[] = [];
+  const r = await runCli([...add, "--format=standard", "--secret=-"], {
+    stderrIsTTY: true,
+    stdin: {
+      isTTY: true,
+      readAll: async () => {
+        throw new Error("read a terminal stdin instead of prompting");
+      },
+      promptHidden: async (p) => {
+        prompts.push(p);
+        return secret;
+      },
+    },
+  });
+  expect(r.code).toBe(0);
+  expect(prompts).toEqual(["Secret for https://hooks.example.com/x: "]);
+  expect(posts[0]).toMatchObject({ secret });
+  expect(r.stdout + r.stderr).not.toContain(secret);
+});
+
+test.each([
+  ["stderr is not a terminal", { stderrIsTTY: false }],
+  ["CI is set", { stderrIsTTY: true, env: { CI: "true" } }],
+])("--secret=- on a terminal stdin where %s exits 2", async (_, opts) => {
+  const r = await runCli([...add, "--format=standard", "--secret=-"], {
+    ...opts,
+    stdin: { isTTY: true },
+  });
+  expect(r.code).toBe(2);
+  expect(r.stderr).toMatch(/pipe the secret on stdin/);
+  expect(posts).toEqual([]);
+});
+
+const blanks = ["", "\n", "  \n"];
+test.each(blanks)("empty stdin %j exits 2 as empty", async (input) => {
+  const r = await runCli([...add, "--format=standard", "--secret=-"], {
+    stdin: { readAll: async () => input },
+  });
+  expect(r.code).toBe(2);
+  expect(r.stderr).toMatch(/the secret from stdin is empty/);
+  expect(r.stderr).not.toMatch(/must be whsec_/);
+  expect(posts).toEqual([]);
+});
+
+test("an empty secret file exits 2 naming the file", async () => {
+  const file = join(mkdtempSync(join(tmpdir(), "sky-wh-")), "secret");
+  writeFileSync(file, "\n");
+  const r = await runCli([...add, "--format=standard", `--secret=@${file}`]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain(`the secret in ${file} is empty`);
+  expect(posts).toEqual([]);
+});
+
 test("a secret given as the argument value is refused without echoing it", async () => {
   const r = await runCli([...add, "--format=standard", `--secret=${secret}`]);
   expect(r.code).toBe(2);

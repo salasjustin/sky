@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { EventType, StandardWebhookSecret } from "@sky/shared";
 import type { AgentCommand } from "./agent.js";
 import type { Io } from "./cli.js";
+import { readStdinValue } from "./input.js";
 import { UsageError } from "./output.js";
 import { resolveEnvId } from "./secret.js";
 
@@ -22,13 +23,24 @@ const split = (list: string) =>
     .map((s) => s.trim())
     .filter((s) => s !== "");
 
-/** The secret never comes from argv, where `ps` and shell history would keep it: `-` reads stdin, `@path` a file. */
-async function readSecret(source: string, io: Io): Promise<string> {
+/** The secret never comes from argv, where `ps` and shell history would keep it: `-` reads stdin (a hidden prompt on a terminal), `@path` a file. */
+async function readSecret(
+  source: string,
+  url: string,
+  io: Io,
+): Promise<string> {
   let raw: string;
+  let from: string;
   if (source === "-") {
-    raw = await io.stdin.readAll();
+    from = "from stdin";
+    raw = await readStdinValue(io, {
+      prompt: `Secret for ${url}: `,
+      noun: "secret",
+      empty: `the secret ${from} is empty`,
+    });
   } else if (source.startsWith("@")) {
     const file = source.slice(1);
+    from = `in ${file}`;
     try {
       raw = readFileSync(file, "utf8");
     } catch (err) {
@@ -43,8 +55,11 @@ async function readSecret(source: string, io: Io): Promise<string> {
     );
   }
   const secret = raw.trim();
+  if (secret === "") throw new UsageError(`the secret ${from} is empty`);
   if (!StandardWebhookSecret.safeParse(secret).success) {
-    throw new UsageError("the secret must be whsec_ followed by base64");
+    throw new UsageError(
+      "the secret must be whsec_ followed by the base64 of a 24–64 byte key",
+    );
   }
   return secret;
 }
@@ -132,7 +147,7 @@ export const webhook: AgentCommand = {
         const secret =
           values.secret === undefined
             ? undefined
-            : await readSecret(values.secret, io);
+            : await readSecret(values.secret, url, io);
         let environmentIds: string[] | undefined;
         if (envRefs) {
           environmentIds = [];

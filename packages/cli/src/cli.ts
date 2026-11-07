@@ -61,7 +61,8 @@ const help = (io: Io) => `Usage:
       Subscribe an https URL to event types. --format=standard signs
       deliveries as Standard Webhooks and needs the whsec_<base64> secret,
       read from a file or stdin, never argv. --env limits it to events from
-      agents in those environments. Prints "<id> <format> <url> <types>".
+      agents in those environments. On a terminal, --secret=- prompts for
+      the secret without echoing it. Prints the line webhook list prints.
   sky webhook list [options]
       Print "<id> <format> <url> <types> [<env ids>]" per webhook; secrets
       are never printed.
@@ -107,8 +108,8 @@ Options:
   --api-key-env=<VAR>    read the API key from environment variable VAR
   --json                 print the API's object on stdout (inbox, wait and
                          status: the newest run; secret list: only each
-                         name and kind; env delete and secret delete:
-                         {"id"|"name": …, "deleted": true})
+                         name and kind; env delete, secret delete and
+                         webhook delete: {"id"|"name": …, "deleted": true})
   -h, --help             show this help
   -v, --version          print the version (on its own: sky --version)
 
