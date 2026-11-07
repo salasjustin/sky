@@ -350,11 +350,16 @@ export function environmentRoutes(
         .all()
         .filter((w) => w.environmentIds?.includes(id));
       if (filtering.length > 0) {
-        return apiError(
-          c,
+        const webhookIds = filtering.map((w) => w.id);
+        return c.json(
+          {
+            error: {
+              code: "webhooks_filter",
+              message: `webhooks filter on this environment: ${webhookIds.join(", ")}; delete them first`,
+              webhookIds,
+            },
+          },
           409,
-          "conflict",
-          `webhooks filter on this environment: ${filtering.map((w) => w.id).join(", ")}; delete them first (DELETE /v1/webhooks/:id)`,
         );
       }
       try {

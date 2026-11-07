@@ -100,6 +100,7 @@ sky env show web                # one env; a failed one shows its step and stder
 sky env retry web               # provision a failed env again
 sky env delete web              # destroy its sandbox, agents, runs and events; asks first
 sky env delete web --yes        # the same without asking; required off a terminal and with --json
+                                # refused while a webhook filters on web (--env=web); delete that webhook first
 sky webhook add https://example.com/hook --events=run.waiting,run.finished   # a Sky-format webhook
 sky webhook add https://example.com/hook --events=run.waiting --format=standard --secret=@secret.txt --env=web
 sky webhook list                # id, format, url, event types and environments; secrets are never printed
@@ -257,6 +258,7 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 | `provisioning`    | the environment is still provisioning; wait for it to finish                 |
 | `agents_exist`    | repo or setup can't change while unarchived agents exist                     |
 | `already_decided` | the request was already decided differently; that decision stands            |
+| `webhooks_filter` | webhooks filter on the environment; delete them first (ids in `webhookIds`)  |
 
 ### Run errors
 
@@ -318,7 +320,7 @@ Three ways to receive them:
 - **Stream:** `GET /v1/stream`, one SSE connection across every agent. Filter with `?types=claude.PostToolUse,run.waiting` and `?agentId=`. After a drop, reconnect with `Last-Event-ID` to receive what you missed. A `: ping` arrives every 15 seconds. When the server restarts, the stream ends with an `event: server.shutdown` frame whose `id` is your resume point and whose `retry: 2000` asks you to reconnect in 2 seconds; `EventSource` does this on its own. `GET /v1/events?after=&wait=` is the same feed as a long poll.
 - **Webhooks:** `POST /v1/webhooks` (or `sky webhook add`) with an `https` URL and the `eventTypes` you want. A failed delivery is retried with backoff, up to 30 attempts, and a `429` holds the webhook until its `Retry-After`. Two optional fields:
   - `format`: `"sky"` (the default) or `"standard"`, below.
-  - `environmentIds`: a non-empty array of environment ids. The webhook then receives only events from agents in those environments; an id that doesn't exist is `400 invalid_body`. Left out, it receives every environment's events.
+  - `environmentIds`: a non-empty array of environment ids. The webhook then receives only events from agents in those environments; an id that doesn't exist is `400 invalid_body`. Left out, it receives every environment's events. An environment a webhook filters on can't be deleted until that webhook is (`409 webhooks_filter`).
 
   `GET /v1/webhooks` returns each webhook's `format` and `environmentIds` when set. A secret is never returned.
 

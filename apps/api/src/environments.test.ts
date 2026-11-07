@@ -1690,7 +1690,7 @@ test("DELETE destroys the sprite, then the row and its agents' history", async (
   });
 });
 
-test("DELETE is 409 conflict naming the webhooks that filter on the env, and leaves its sprite alone", async () => {
+test("DELETE is 409 webhooks_filter listing the webhooks that filter on the env, and leaves its sprite alone", async () => {
   const id = await ready();
   const other = await ready({ ...kru, name: "other" });
   const insert = db.$client.prepare(
@@ -1702,9 +1702,10 @@ test("DELETE is 409 conflict naming the webhooks that filter on the env, and lea
   const res = await del(id);
   expect(res.status).toBe(409);
   const { error } = (await res.json()) as {
-    error: { code: string; message: string };
+    error: { code: string; message: string; webhookIds: string[] };
   };
-  expect(error.code).toBe("conflict");
+  expect(error.code).toBe("webhooks_filter");
+  expect(error.webhookIds).toEqual(["whk_a"]);
   expect(error.message).toContain("whk_a");
   expect(error.message).not.toContain("whk_b");
   expect(error.message).not.toContain("whk_c");
