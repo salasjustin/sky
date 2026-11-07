@@ -11,6 +11,7 @@ import { and, eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
 import { runEnv } from "./base-profile.js";
 import type { Config } from "./config.js";
+import { readMemory } from "./memory.js";
 import {
   envFile,
   REPO_DIR,
@@ -62,6 +63,9 @@ const holdArgv = (runId: RunId): [string, ...string[]] => [
 // then deleted, and the prompt in PROMPT_FILE, which a query param is too short for;
 // the run id in argv is what `runnerPattern` matches; the runner refuses to start unless it equals RUN_ID
 const RUNNER_COMMAND = `${WITH_PACKAGE_MANAGERS} && set -a && . "$ENV_FILE" && set +a && rm -f "$ENV_FILE" && PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
+
+/** A launch refused for want of memory on its sprite; its message is the run's error. */
+class LowMemoryError extends Error {}
 
 /**
  * `pgrep -f`/`pkill -f` pattern matching only this run's runner, never its Claude child. Unanchored,
@@ -262,6 +266,35 @@ export function createLauncher({
   }
 
   /**
+   * Refuses a launch on a sprite with less than the configured floor of memory available: a runner
+   * started there is killed mid-build, and the work since its last commit with it. A sprite whose
+   * memory can't be read is launched on, as the floor is a guard, not a gate.
+   */
+  async function checkMemory(launch: Launch): Promise<void> {
+    const floorMb = config.spriteMinFreeMb;
+    if (floorMb <= 0) return;
+    const memory = await readMemory(sprites, launch.spriteName).catch(
+      (err: unknown) => {
+        log(
+          `launching ${launch.runId}: reading the memory of ${launch.spriteName} failed: ${err}`,
+        );
+        return undefined;
+      },
+    );
+    if (!memory) {
+      log(
+        `launching ${launch.runId}: the memory of ${launch.spriteName} could not be read; launching anyway`,
+      );
+      return;
+    }
+    if (memory.availableMb < floorMb) {
+      throw new LowMemoryError(
+        `sprite_low_memory: sprite ${launch.spriteName} has ${memory.availableMb} MB of memory available (of ${memory.totalMb} MB), below the ${floorMb} MB floor; wait for a run on it to finish or lower the environment's concurrency, then retry`,
+      );
+    }
+  }
+
+  /**
    * Takes the run's keep-awake task before the runner exists: a sprite that pauses between the launch
    * watch detaching and the runner's own hold freezes the runner. Never why a launch fails.
    */
@@ -302,6 +335,7 @@ export function createLauncher({
 
   async function run(launch: Launch, agentToken: string): Promise<void> {
     const known = [agentToken];
+    await step(launch, "memory check", () => checkMemory(launch));
     await step(launch, "bundle", () =>
       ensureBundle(launch.spriteName, launch.runId),
     );
@@ -466,7 +500,15 @@ export function createLauncher({
           );
           log(`launching ${launch.runId} failed: ${detail}`);
           db.transaction(
-            (tx) => failRun(tx, launch.runId, `launch_failed: ${detail}`),
+            (tx) =>
+              failRun(
+                tx,
+                launch.runId,
+                // already worded as a run error, with its own code
+                err instanceof LowMemoryError
+                  ? detail
+                  : `launch_failed: ${detail}`,
+              ),
             { behavior: "immediate" },
           );
           nudgeDeliveries();

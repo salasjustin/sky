@@ -30,6 +30,7 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       runTimeoutMs: 30 * 60_000,
       runProbeMs: 5 * 60_000,
       launchDeadlineMs: 15 * 60_000,
+      spriteMinFreeMb: 1024,
       waitTimeoutMs: 120 * 60_000,
       baseProfiles: {},
       spritesLongTimeoutMs: 30 * 60_000,
@@ -57,6 +58,19 @@ test("RUNNER_BUNDLE_PATH, RUN_TIMEOUT_MINUTES, LAUNCH_DEADLINE_MINUTES, WAIT_TIM
       waitTimeoutMs: 900_000,
       spritesLongTimeoutMs: 2_700_000,
     },
+  });
+});
+
+test("SPRITE_MIN_FREE_MB overrides its default, and 0 turns the launch memory check off", () => {
+  expect(loadConfig({ ...required, SPRITE_MIN_FREE_MB: "2048" })).toMatchObject(
+    { ok: true, config: { spriteMinFreeMb: 2048 } },
+  );
+  expect(loadConfig({ ...required, SPRITE_MIN_FREE_MB: "0" })).toMatchObject({
+    ok: true,
+    config: { spriteMinFreeMb: 0 },
+  });
+  expect(loadConfig({ ...required, SPRITE_MIN_FREE_MB: "-1" })).toMatchObject({
+    ok: false,
   });
 });
 
