@@ -27,6 +27,12 @@ test("rejects a non-https url, an unknown event type and an empty subscription",
   expect(Webhook.safeParse({ ...hook, eventTypes: [] }).success).toBe(false);
 });
 
+test("rejects an unknown format and a missing hasSecret", () => {
+  expect(Webhook.safeParse({ ...hook, format: "svix" }).success).toBe(false);
+  const { hasSecret: _, ...noSecretFlag } = hook;
+  expect(Webhook.safeParse(noSecretFlag).success).toBe(false);
+});
+
 test("accepts an environment filter and a standard format, refusing an empty filter", () => {
   const filtered = { ...hook, format: "standard", hasSecret: true };
   expect(
@@ -37,12 +43,21 @@ test("accepts an environment filter and a standard format, refusing an empty fil
   );
 });
 
+const key = (bytes: number) => Buffer.alloc(bytes, 7).toString("base64");
+
 test.each([
-  ["whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw", true],
+  ["whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw", true], // 24 bytes
+  [`whsec_${key(32)}`, true], // 44 chars ending =
+  [`whsec_${key(64)}`, true],
   ["whsec_", false],
   ["MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw", false],
   ["whsec_not base64!", false],
   ["whsec_abc", false],
+  ["whsec_AAAA", false],
+  [`whsec_${key(16)}`, false],
+  [`whsec_${key(65)}`, false],
+  [`whsec_${key(32).replace(/=+$/, "")}`, false],
+  [`whsec_${Buffer.alloc(32, 250).toString("base64url")}=`, false],
 ])("secret %s is valid: %s", (secret, ok) => {
   expect(StandardWebhookSecret.safeParse(secret).success).toBe(ok);
 });

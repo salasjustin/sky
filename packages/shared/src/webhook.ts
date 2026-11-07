@@ -6,18 +6,22 @@ import { EnvironmentId, WebhookId } from "./ids.js";
 export const WebhookFormat = z.enum(["sky", "standard"]);
 export type WebhookFormat = z.infer<typeof WebhookFormat>;
 
-/** A Standard Webhooks secret: `whsec_` and the base64 of the key bytes. */
+/** A Standard Webhooks secret: `whsec_` and the base64 of a 24–64 byte key. */
 export const StandardWebhookSecret = z.string().refine(
   (s) => {
     if (!s.startsWith("whsec_")) return false;
     const b64 = s.slice("whsec_".length);
+    const key = Buffer.from(b64, "base64");
+    // Buffer's decoder skips bad characters and accepts url-safe and unpadded
+    // input; only canonical padded standard base64 re-encodes to itself
     return (
-      b64 !== "" &&
-      /^[A-Za-z0-9+/]+={0,2}$/.test(b64) &&
-      Buffer.from(b64, "base64").toString("base64") === b64
+      key.toString("base64") === b64 && key.length >= 24 && key.length <= 64
     );
   },
-  { message: "a standard secret is whsec_ followed by base64" },
+  {
+    message:
+      "a standard secret is whsec_ followed by the base64 of a 24–64 byte key",
+  },
 );
 
 export const Webhook = z.object({
