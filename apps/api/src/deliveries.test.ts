@@ -807,7 +807,6 @@ test("the secret of a standard webhook is stored sealed and never appears in a G
   expect(JSON.parse(read)).toMatchObject({
     id,
     format: "standard",
-    hasSecret: true,
   });
   expect(JSON.parse(read)).not.toHaveProperty("secret");
   const row = db.$client

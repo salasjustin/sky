@@ -44,7 +44,6 @@ test("POST creates a subscription: 201, its Location and the webhook", async () 
     id: expect.stringMatching(/^whk_[0-9A-Za-z]{22}$/),
     ...hook,
     format: "sky",
-    hasSecret: false,
     createdAt: expect.stringMatching(/Z$/),
   });
   expect(res.headers.get("location")).toBe(`/v1/webhooks/${body.id}`);
@@ -168,7 +167,7 @@ test.each([
 
 const whsec = `whsec_${Buffer.from("0123456789abcdef0123456789abcdef").toString("base64")}`;
 
-test("a standard webhook is created with its secret held back: format and hasSecret come back, the secret doesn't", async () => {
+test("a standard webhook is created with its secret held back: the format comes back, the secret doesn't", async () => {
   const res = await subscribe({ ...hook, format: "standard", secret: whsec });
   expect(res.status).toBe(201);
   const body = (await res.json()) as { id: string };
@@ -176,7 +175,6 @@ test("a standard webhook is created with its secret held back: format and hasSec
     id: expect.any(String),
     ...hook,
     format: "standard",
-    hasSecret: true,
     createdAt: expect.stringMatching(/Z$/),
   });
   expect(JSON.stringify(body)).not.toContain(whsec);

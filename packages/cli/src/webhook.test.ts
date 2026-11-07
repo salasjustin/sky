@@ -17,7 +17,6 @@ const created = {
   url: "https://hooks.example.com/x",
   eventTypes: ["run.waiting"],
   format: "standard",
-  hasSecret: true,
   environmentIds: ["env_1"],
 };
 const envRow = {

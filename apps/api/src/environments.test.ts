@@ -1690,6 +1690,43 @@ test("DELETE destroys the sprite, then the row and its agents' history", async (
   });
 });
 
+test("DELETE is 409 conflict naming the webhooks that filter on the env, and leaves its sprite alone", async () => {
+  const id = await ready();
+  const other = await ready({ ...kru, name: "other" });
+  const insert = db.$client.prepare(
+    "insert into webhooks (id, url, event_types, environment_ids) values (?, 'https://hooks.example.com/x', '[\"run.waiting\"]', ?)",
+  );
+  insert.run("whk_a", JSON.stringify([id, other]));
+  insert.run("whk_b", JSON.stringify([other]));
+  insert.run("whk_c", null);
+  const res = await del(id);
+  expect(res.status).toBe(409);
+  const { error } = (await res.json()) as {
+    error: { code: string; message: string };
+  };
+  expect(error.code).toBe("conflict");
+  expect(error.message).toContain("whk_a");
+  expect(error.message).not.toContain("whk_b");
+  expect(error.message).not.toContain("whk_c");
+  expect(wire.calls).toEqual([]);
+  expect((await get(id)).status).toBe(200);
+
+  db.$client.prepare("delete from webhooks where id = 'whk_a'").run();
+  expect((await del(id)).status).toBe(204);
+});
+
+test("DELETE of an env that no webhook filters on still works beside webhooks that filter on others", async () => {
+  const id = await ready();
+  const other = await ready({ ...kru, name: "other" });
+  db.$client
+    .prepare(
+      "insert into webhooks (id, url, event_types, environment_ids) values ('whk_b', 'https://hooks.example.com/x', '[\"run.waiting\"]', ?)",
+    )
+    .run(JSON.stringify([other]));
+  expect((await del(id)).status).toBe(204);
+  expect((await get(other)).status).toBe(200);
+});
+
 test("DELETE removes the env's webhook deliveries and run requests with its runs", async () => {
   const id = await ready();
   seedRun(id, "finished");

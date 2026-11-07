@@ -33,7 +33,6 @@ const present = (row: typeof webhooks.$inferSelect) => ({
     url: row.url,
     eventTypes: row.eventTypes,
     format: row.format,
-    hasSecret: row.secretCiphertext !== null,
     ...(row.environmentIds === null
       ? {}
       : { environmentIds: row.environmentIds }),

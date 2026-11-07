@@ -320,7 +320,7 @@ Three ways to receive them:
   - `format`: `"sky"` (the default) or `"standard"`, below.
   - `environmentIds`: a non-empty array of environment ids. The webhook then receives only events from agents in those environments; an id that doesn't exist is `400 invalid_body`. Left out, it receives every environment's events.
 
-  `GET /v1/webhooks` returns each webhook's `format`, `environmentIds` when set, and `hasSecret`. A secret is never returned.
+  `GET /v1/webhooks` returns each webhook's `format` and `environmentIds` when set. A secret is never returned.
 
 **`sky` format.** The body is the event itself. Each delivery carries `Sky-Event-Type`, `Sky-Event-Id`, and
 

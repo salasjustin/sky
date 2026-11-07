@@ -6,7 +6,6 @@ const hook = {
   url: "https://grok.example/hooks/sky",
   eventTypes: ["run.waiting", "run.finished"],
   format: "sky",
-  hasSecret: false,
 };
 
 test("accepts a webhook subscribed to known event types", () => {
@@ -27,14 +26,12 @@ test("rejects a non-https url, an unknown event type and an empty subscription",
   expect(Webhook.safeParse({ ...hook, eventTypes: [] }).success).toBe(false);
 });
 
-test("rejects an unknown format and a missing hasSecret", () => {
+test("rejects an unknown format", () => {
   expect(Webhook.safeParse({ ...hook, format: "svix" }).success).toBe(false);
-  const { hasSecret: _, ...noSecretFlag } = hook;
-  expect(Webhook.safeParse(noSecretFlag).success).toBe(false);
 });
 
 test("accepts an environment filter and a standard format, refusing an empty filter", () => {
-  const filtered = { ...hook, format: "standard", hasSecret: true };
+  const filtered = { ...hook, format: "standard" };
   expect(
     Webhook.safeParse({ ...filtered, environmentIds: ["env_1"] }).success,
   ).toBe(true);
