@@ -30,7 +30,6 @@ export const Webhook = z.object({
   url: z.url({ protocol: /^https$/, hostname: z.regexes.domain }),
   eventTypes: z.array(EventType).nonempty(),
   format: WebhookFormat,
-  /** the secret itself is never returned */
   /** only events from agents in these environments are delivered; absent means all */
   environmentIds: z.array(EnvironmentId).nonempty().optional(),
 });
