@@ -68,7 +68,7 @@ function runningRun() {
     })
     .run();
   db.insert(runs).values({ id: runId, agentId, status: "running" }).run();
-  return { agentId, runId, token: mintAgentToken(config.apiKey, runId) };
+  return { agentId, envId, runId, token: mintAgentToken(config.apiKey, runId) };
 }
 
 async function post(runId: RunId, type: string, payload: object) {
@@ -105,7 +105,7 @@ const until = async (check: () => boolean) => {
 };
 
 test("a reconnect with Last-Event-ID continues at the next event with no gap or duplicate", async () => {
-  const { agentId, runId } = runningRun();
+  const { agentId, envId, runId } = runningRun();
   const ids = [];
   for (const m of ["one", "two", "three", "four", "five"]) {
     ids.push(await say(runId, m));
@@ -132,6 +132,7 @@ test("a reconnect with Last-Event-ID continues at the next event with no gap or 
   expect(JSON.parse(fourth?.data ?? "")).toEqual({
     id: `evt_${ids[3]}`,
     agentId,
+    environmentId: envId,
     runId,
     ts: expect.any(String),
     type: "claude.Message",

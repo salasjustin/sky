@@ -85,6 +85,13 @@
       "when": 1793811950459,
       "tag": "0011_odd_spot",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1794069381861,
+      "tag": "0012_funny_lady_mastermind",
+      "breakpoints": true
     }
   ]
 }

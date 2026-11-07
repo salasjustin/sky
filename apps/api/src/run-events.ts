@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { events } from "@sky/db";
-import type { AgentId, Event, RunId } from "@sky/shared";
+import type { AgentId, EnvironmentId, Event, RunId } from "@sky/shared";
 
 const emitter = new EventEmitter().setMaxListeners(0);
 
@@ -26,14 +26,15 @@ export const runEvents = {
   listenerCount: (runId: RunId | typeof anyRun) => emitter.listenerCount(runId),
 };
 
-/** The shared Event shape webhooks, the event streams and the long poll send for a stored row of `agentId`'s run. */
+/** The shared Event shape webhooks, the event streams and the long poll send for a stored row of `agent`'s run. */
 export const presentEvent = (
   row: typeof events.$inferSelect,
-  agentId: AgentId,
+  agent: { agentId: AgentId; environmentId: EnvironmentId },
 ): Event =>
   ({
     id: `evt_${row.id}`,
-    agentId,
+    agentId: agent.agentId,
+    environmentId: agent.environmentId,
     runId: row.runId,
     ts: row.ts,
     type: row.type,

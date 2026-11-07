@@ -89,7 +89,7 @@ function runningRun() {
     })
     .run();
   db.insert(runs).values({ id: runId, agentId, status: "running" }).run();
-  return { agentId, runId };
+  return { agentId, envId, runId };
 }
 
 async function post(runId: RunId, type: string, payload: object) {
@@ -145,6 +145,7 @@ test("the stream delivers new events from every agent in id order", async () => 
   expect(JSON.parse(frames[1]?.data ?? "")).toEqual({
     id: `evt_${ids[1]}`,
     agentId: b.agentId,
+    environmentId: b.envId,
     runId: b.runId,
     ts: expect.any(String),
     type: "claude.Message",

@@ -1,8 +1,16 @@
 import { zValidator } from "@hono/zod-validator";
-import { webhooks } from "@sky/db";
-import { EventType, Webhook, WebhookId } from "@sky/shared";
-import { asc, eq, sql } from "drizzle-orm";
+import { environments, webhooks } from "@sky/db";
+import {
+  EnvironmentId,
+  EventType,
+  StandardWebhookSecret,
+  Webhook,
+  WebhookFormat,
+  WebhookId,
+} from "@sky/shared";
+import { asc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
+import { seal, webhookSecretAad } from "./crypto.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
@@ -14,6 +22,9 @@ const WebhookInput = z.strictObject({
   url: z.url({ protocol: /^https$/ }),
   // the shared schema's nonempty() infers a plain array; the column wants the non-empty tuple
   eventTypes: z.tuple([EventType], EventType),
+  format: WebhookFormat.default("sky"),
+  secret: z.string().optional(),
+  environmentIds: z.tuple([EnvironmentId], EnvironmentId).optional(),
 });
 
 const present = (row: typeof webhooks.$inferSelect) => ({
@@ -21,6 +32,11 @@ const present = (row: typeof webhooks.$inferSelect) => ({
     id: row.id,
     url: row.url,
     eventTypes: row.eventTypes,
+    format: row.format,
+    hasSecret: row.secretCiphertext !== null,
+    ...(row.environmentIds === null
+      ? {}
+      : { environmentIds: row.environmentIds }),
   } satisfies Webhook),
   createdAt: row.createdAt,
 });
@@ -65,9 +81,61 @@ export function webhookRoutes() {
           "url must be an https URL whose host is a domain name",
         );
       }
+      const { secret, ...fields } = input;
+      if (fields.format === "standard") {
+        if (!StandardWebhookSecret.safeParse(secret).success) {
+          return apiError(
+            c,
+            400,
+            "invalid_body",
+            "a standard webhook needs a secret of the form whsec_<base64>",
+          );
+        }
+      } else if (secret !== undefined) {
+        return apiError(
+          c,
+          400,
+          "invalid_body",
+          'secret only goes with format "standard"',
+        );
+      }
+      const environmentIds = fields.environmentIds && [
+        ...new Set(fields.environmentIds),
+      ];
+      if (environmentIds) {
+        const known = c.var.db
+          .select({ id: environments.id })
+          .from(environments)
+          .where(inArray(environments.id, environmentIds))
+          .all();
+        const unknown = environmentIds.filter(
+          (id) => !known.some((e) => e.id === id),
+        );
+        if (unknown.length > 0) {
+          return apiError(
+            c,
+            400,
+            "invalid_body",
+            `no such environment: ${unknown.join(", ")}`,
+          );
+        }
+      }
+      const id = mintId("whk");
+      const sealed = secret
+        ? seal(c.var.config.secretEncryptionKey, secret, webhookSecretAad(id))
+        : undefined;
       const row = c.var.db
         .insert(webhooks)
-        .values({ ...input, id: mintId("whk") })
+        .values({
+          ...fields,
+          id,
+          environmentIds: environmentIds as typeof fields.environmentIds,
+          ...(sealed && {
+            secretCiphertext: sealed.ciphertext,
+            secretNonce: sealed.nonce,
+            secretKeyVersion: sealed.keyVersion,
+          }),
+        })
         .returning()
         .get();
       c.header("Location", `/v1/webhooks/${row.id}`);

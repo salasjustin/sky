@@ -96,6 +96,7 @@ beforeEach(() => {
   dispatcher = createDispatcher({
     db,
     signingKey: config.webhookSigningKey,
+    secretEncryptionKey: config.secretEncryptionKey,
     log: (line) => logs.push(line),
     now: () => clock,
     random: () => 0.5,
@@ -120,28 +121,32 @@ const advance = (ms: number) => {
 
 const auth = { Authorization: `Bearer ${config.apiKey}` };
 
-async function subscribe(eventTypes: string[], url = subscriberUrl) {
+async function subscribe(
+  eventTypes: string[],
+  url = subscriberUrl,
+  extra: Record<string, unknown> = {},
+) {
   const res = await app.request("/v1/webhooks", {
     method: "POST",
     headers: { ...auth, "Content-Type": "application/json" },
-    body: JSON.stringify({ url, eventTypes }),
+    body: JSON.stringify({ url, eventTypes, ...extra }),
   });
   expect(res.status).toBe(201);
   return ((await res.json()) as { id: string }).id;
 }
 
-function runningRun() {
-  const envId = "env_test" as EnvironmentId;
-  const agentId = "agt_test" as AgentId;
-  const runId = "run_test" as RunId;
+function runningRun(name = "test") {
+  const envId = `env_${name}` as EnvironmentId;
+  const agentId = `agt_${name}` as AgentId;
+  const runId = `run_${name}` as RunId;
   db.insert(environments)
     .values({
       id: envId,
-      name: "e",
+      name: `e-${name}`,
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: "sky-env_test",
+      spriteName: `sky-env_${name}`,
       checkpointId: "v1",
     })
     .run();
@@ -154,7 +159,12 @@ function runningRun() {
     })
     .run();
   db.insert(runs).values({ id: runId, agentId, status: "running" }).run();
-  return { agentId, runId, token: mintAgentToken(config.apiKey, runId) };
+  return {
+    agentId,
+    envId,
+    runId,
+    token: mintAgentToken(config.apiKey, runId),
+  };
 }
 
 const postEvent = (token: string, event: unknown) =>
@@ -253,6 +263,7 @@ test("a subscriber answering 500, 500, 200 gets three signed attempts of one eve
     expect(JSON.parse(body)).toEqual({
       id: `evt_${eventId}`,
       agentId,
+      environmentId: "env_test",
       runId,
       ts: expect.stringMatching(/Z$/),
       type: "run.finished",
@@ -595,6 +606,7 @@ test("a 429 holds the webhook's other pending deliveries, without spending their
   dispatcher = createDispatcher({
     db,
     signingKey: config.webhookSigningKey,
+    secretEncryptionKey: config.secretEncryptionKey,
     log: () => {},
     now: () => clock,
     random: () => 0.5,
@@ -635,6 +647,7 @@ test("pending deliveries left by a previous process are sent once a dispatcher s
   dispatcher = createDispatcher({
     db,
     signingKey: config.webhookSigningKey,
+    secretEncryptionKey: config.secretEncryptionKey,
     log: () => {},
     now: () => clock,
   });
@@ -674,4 +687,184 @@ test("a run the sweep times out delivers its run.failed event to a subscriber", 
       payload: { error: "runner_timeout" },
     }),
   ]);
+});
+
+const secret = `whsec_${Buffer.from("0123456789abcdef0123456789abcdef").toString("base64")}`;
+
+/** A Standard Webhooks receiver's check, written from the spec with WebCrypto rather than the sender's code. */
+async function verifyStandard(
+  headers: Headers,
+  body: string,
+  nowSeconds: number,
+): Promise<boolean> {
+  const id = headers.get("webhook-id");
+  const timestamp = headers.get("webhook-timestamp");
+  const signatures = headers.get("webhook-signature");
+  if (!id || !timestamp || !signatures) return false;
+  if (!/^\d+$/.test(timestamp)) return false;
+  if (Math.abs(nowSeconds - Number(timestamp)) > 300) return false;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    Buffer.from(secret.slice("whsec_".length), "base64"),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const expected = Buffer.from(
+    await crypto.subtle.sign(
+      "HMAC",
+      key,
+      new TextEncoder().encode(`${id}.${timestamp}.${body}`),
+    ),
+  ).toString("base64");
+  return signatures.split(" ").some((s) => s === `v1,${expected}`);
+}
+
+const finish = (token: string, runId: RunId, summary = "done") =>
+  postEvent(token, {
+    runId,
+    type: "run.finished",
+    payload: { summary, usage },
+  });
+
+test("a standard delivery carries the Standard Webhooks headers and body, verifies, and keeps its id across retries", async () => {
+  await subscribe(["run.finished"], subscriberUrl, {
+    format: "standard",
+    secret,
+  });
+  const received: Received[] = [];
+  const statuses = [500, 200];
+  const sentAt: number[] = [];
+  server.use(
+    http.post(subscriberUrl, async ({ request }) => {
+      sentAt.push(Math.floor(clock.getTime() / 1000));
+      received.push({ headers: request.headers, body: await request.text() });
+      return new HttpResponse(null, { status: statuses.shift() ?? 599 });
+    }),
+  );
+  const { agentId, envId, runId, token } = runningRun();
+  const posted = await finish(token, runId);
+  const { id: eventId } = (await posted.json()) as { id: number };
+
+  await dispatcher.drain();
+  advance(10_000);
+  await dispatcher.drain();
+
+  expect(received).toHaveLength(2);
+  for (const [i, { headers, body }] of received.entries()) {
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(headers.get("webhook-id")).toBe(`evt_${eventId}`);
+    expect(headers.get("webhook-timestamp")).toBe(String(sentAt[i]));
+    expect(headers.get("webhook-signature")).toMatch(/^v1,[A-Za-z0-9+/]+=*$/);
+    expect(headers.has("sky-signature")).toBe(false);
+    expect(await verifyStandard(headers, body, sentAt[i] ?? 0)).toBe(true);
+    expect(await verifyStandard(headers, `${body} `, sentAt[i] ?? 0)).toBe(
+      false,
+    );
+    const parsed = JSON.parse(body);
+    expect(Object.keys(parsed)).toEqual(["type", "timestamp", "data"]);
+    expect(parsed).toEqual({
+      type: "run.finished",
+      timestamp: parsed.data.ts,
+      data: {
+        id: `evt_${eventId}`,
+        agentId,
+        environmentId: envId,
+        runId,
+        ts: expect.stringMatching(/Z$/),
+        type: "run.finished",
+        payload: { summary: "done", usage },
+      },
+    });
+  }
+  // a retry is a new attempt: the timestamp and so the signature move, the id and the body don't
+  expect(sentAt[1]).toBeGreaterThan(sentAt[0] ?? 0);
+  expect(received[1]?.body).toBe(received[0]?.body);
+  expect(received[1]?.headers.get("webhook-signature")).not.toBe(
+    received[0]?.headers.get("webhook-signature"),
+  );
+});
+
+test("the secret of a standard webhook is stored sealed and never appears in a GET or a log line", async () => {
+  const id = await subscribe(["run.finished"], subscriberUrl, {
+    format: "standard",
+    secret,
+  });
+  subscriber([500, 599, 599]);
+  const { runId, token } = runningRun();
+  await finish(token, runId);
+  await dispatcher.drain();
+  expect(logs.length).toBeGreaterThan(0);
+
+  const list = await app.request("/v1/webhooks", { headers: auth });
+  const one = await app.request(`/v1/webhooks/${id}`, { headers: auth });
+  const listed = await list.text();
+  const read = await one.text();
+  for (const text of [listed, read, ...logs]) {
+    expect(text).not.toContain(secret);
+    expect(text).not.toContain(secret.slice("whsec_".length));
+  }
+  expect(JSON.parse(read)).toMatchObject({
+    id,
+    format: "standard",
+    hasSecret: true,
+  });
+  expect(JSON.parse(read)).not.toHaveProperty("secret");
+  const row = db.$client
+    .prepare("select * from webhooks where id = ?")
+    .get(id) as Record<string, Buffer | string | number | null>;
+  expect(JSON.stringify(row)).not.toContain(secret.slice("whsec_".length));
+  expect(Buffer.isBuffer(row.secret_ciphertext)).toBe(true);
+});
+
+test("a webhook with environmentIds receives only events of agents in those environments", async () => {
+  const a = runningRun("a");
+  const b = runningRun("b");
+  await subscribe(["run.finished"], subscriberUrl, {
+    environmentIds: [a.envId],
+  });
+  const everything = "https://hooks.example.com/all";
+  await subscribe(["run.finished"], everything);
+  const filtered = subscriber([200, 200]);
+  const unfiltered = subscriber([200, 200], everything);
+
+  await finish(b.token, b.runId, "from b");
+  await dispatcher.drain();
+  expect(filtered).toHaveLength(0);
+  expect(unfiltered).toHaveLength(1);
+
+  await finish(a.token, a.runId, "from a");
+  await dispatcher.drain();
+  expect(filtered.map((r) => JSON.parse(r.body).environmentId)).toEqual([
+    a.envId,
+  ]);
+  expect(unfiltered).toHaveLength(2);
+  expect(deliveries()).toHaveLength(3);
+});
+
+test("a sky delivery keeps its headers, signature and body shape", async () => {
+  await subscribe(["run.finished"]);
+  const received = subscriber([200]);
+  const { agentId, envId, runId, token } = runningRun();
+  const posted = await finish(token, runId);
+  const { id: eventId } = (await posted.json()) as { id: number };
+  await dispatcher.drain();
+
+  const [only] = received;
+  const stored = db.$client
+    .prepare("select ts from events where id = ?")
+    .get(eventId) as { ts: string };
+  // the exact bytes: key order is part of what a receiver signs over
+  const body = `{"id":"evt_${eventId}","agentId":"${agentId}","environmentId":"${envId}","runId":"${runId}","ts":"${stored.ts}","type":"run.finished","payload":{"summary":"done","usage":{"inputTokens":1,"outputTokens":1,"costUsd":0,"turns":1,"durationMs":1}}}`;
+  expect(only?.body).toBe(body);
+  const t = Math.floor(clock.getTime() / 1000);
+  expect(only?.headers.get("content-type")).toBe("application/json");
+  expect(only?.headers.get("sky-event-id")).toBe(`evt_${eventId}`);
+  expect(only?.headers.get("sky-event-type")).toBe("run.finished");
+  expect(only?.headers.get("sky-signature")).toBe(
+    signatureHeader(key, body, t),
+  );
+  for (const name of ["webhook-id", "webhook-timestamp", "webhook-signature"]) {
+    expect(only?.headers.has(name)).toBe(false);
+  }
 });

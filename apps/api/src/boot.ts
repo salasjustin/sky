@@ -36,6 +36,7 @@ export function boot(config: Config, log: (line: string) => void) {
   const dispatcher = createDispatcher({
     db,
     signingKey: config.webhookSigningKey,
+    secretEncryptionKey: config.secretEncryptionKey,
     log,
   });
   // the app redacts with it; the sweep drops each envVar it purges

@@ -43,6 +43,8 @@ test("POST creates a subscription: 201, its Location and the webhook", async () 
   expect(body).toEqual({
     id: expect.stringMatching(/^whk_[0-9A-Za-z]{22}$/),
     ...hook,
+    format: "sky",
+    hasSecret: false,
     createdAt: expect.stringMatching(/Z$/),
   });
   expect(res.headers.get("location")).toBe(`/v1/webhooks/${body.id}`);
@@ -162,4 +164,58 @@ test.each([
     body: method === "POST" ? JSON.stringify(hook) : undefined,
   });
   expect(res.status).toBe(401);
+});
+
+const whsec = `whsec_${Buffer.from("0123456789abcdef0123456789abcdef").toString("base64")}`;
+
+test("a standard webhook is created with its secret held back: format and hasSecret come back, the secret doesn't", async () => {
+  const res = await subscribe({ ...hook, format: "standard", secret: whsec });
+  expect(res.status).toBe(201);
+  const body = (await res.json()) as { id: string };
+  expect(body).toEqual({
+    id: expect.any(String),
+    ...hook,
+    format: "standard",
+    hasSecret: true,
+    createdAt: expect.stringMatching(/Z$/),
+  });
+  expect(JSON.stringify(body)).not.toContain(whsec);
+});
+
+test("environmentIds of existing environments are stored and returned, duplicates collapsed", async () => {
+  db.$client
+    .prepare(
+      "insert into environments (id, name, repo, setup, status, sprite_name) values ('env_1', 'one', 'a/b', '', 'ready', 's')",
+    )
+    .run();
+  const res = await subscribe({
+    ...hook,
+    environmentIds: ["env_1", "env_1"],
+  });
+  expect(res.status).toBe(201);
+  expect(await res.json()).toMatchObject({ environmentIds: ["env_1"] });
+});
+
+test.each([
+  ["a standard format without a secret", { format: "standard" }],
+  [
+    "a secret without the whsec_ prefix",
+    { format: "standard", secret: "MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw" },
+  ],
+  ["a secret that is not base64", { format: "standard", secret: "whsec_%%%" }],
+  ["an empty secret key", { format: "standard", secret: "whsec_" }],
+  ["a secret on a sky webhook", { secret: whsec }],
+  ["an unknown format", { format: "svix", secret: whsec }],
+  ["an unknown environment", { environmentIds: ["env_missing"] }],
+  ["an empty environmentIds", { environmentIds: [] }],
+  ["a malformed environment id", { environmentIds: ["nope"] }],
+])("%s is 400 invalid_body and stores nothing", async (_, extra) => {
+  const res = await subscribe({ ...hook, ...extra });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toEqual({
+    error: { code: "invalid_body", message: expect.any(String) },
+  });
+  expect(db.$client.prepare("select count(*) n from webhooks").get()).toEqual({
+    n: 0,
+  });
 });

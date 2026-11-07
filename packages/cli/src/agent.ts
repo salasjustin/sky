@@ -11,6 +11,10 @@ type Values = {
   reason?: string;
   yes?: boolean;
   branch?: string;
+  events?: string;
+  format?: string;
+  secret?: string;
+  env?: string;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;

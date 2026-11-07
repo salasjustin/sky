@@ -30,9 +30,14 @@ function readEvents(
   // read in the same tick as the rows, so the cursor never falls behind them
   const latest = latestEventId(db);
   const rows = db
-    .select({ event: events, agentId: runs.agentId })
+    .select({
+      event: events,
+      agentId: runs.agentId,
+      environmentId: agents.envId,
+    })
     .from(events)
     .innerJoin(runs, eq(runs.id, events.runId))
+    .innerJoin(agents, eq(agents.id, runs.agentId))
     .where(
       and(
         gt(events.id, after),
@@ -45,7 +50,7 @@ function readEvents(
     .all();
   const last = rows.at(-1);
   return {
-    data: rows.map((r) => presentEvent(r.event, r.agentId)),
+    data: rows.map((r) => presentEvent(r.event, r)),
     cursor:
       rows.length === PAGE && last ? last.event.id : Math.max(after, latest),
   };

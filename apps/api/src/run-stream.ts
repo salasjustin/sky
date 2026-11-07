@@ -1,4 +1,4 @@
-import { events, runs } from "@sky/db";
+import { agents, events, runs } from "@sky/db";
 import type { RunId } from "@sky/shared";
 import { and, asc, eq, gt } from "drizzle-orm";
 import type { Context } from "hono";
@@ -114,8 +114,13 @@ export function streamRunEvents(
       .orderBy(asc(events.id))
       .all();
     const run = db
-      .select({ agentId: runs.agentId, status: runs.status })
+      .select({
+        agentId: runs.agentId,
+        environmentId: agents.envId,
+        status: runs.status,
+      })
       .from(runs)
+      .innerJoin(agents, eq(agents.id, runs.agentId))
       .where(eq(runs.id, runId))
       .get();
     if (!run) return { frames: [], done: true };
@@ -124,7 +129,7 @@ export function streamRunEvents(
       frames: rows.map((row) => ({
         id: String(row.id),
         event: row.type,
-        data: JSON.stringify(presentEvent(row, run.agentId)),
+        data: JSON.stringify(presentEvent(row, run)),
       })),
       // an ended run's terminal event is its last row, so it went out in `rows` or before `after`
       done: !isActive(run.status),

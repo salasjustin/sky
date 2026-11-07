@@ -1,7 +1,15 @@
 import { createHmac } from "node:crypto";
-import { type Db, events, runs, webhookDeliveries, webhooks } from "@sky/db";
-import type { AgentId, EventType } from "@sky/shared";
+import {
+  agents,
+  type Db,
+  events,
+  runs,
+  webhookDeliveries,
+  webhooks,
+} from "@sky/db";
+import type { AgentId, EnvironmentId, Event, EventType } from "@sky/shared";
 import { and, asc, eq, lt, lte, ne } from "drizzle-orm";
+import { open, type Sealed, webhookSecretAad } from "./crypto.js";
 import { presentEvent } from "./run-events.js";
 import type { Tx } from "./runs.js";
 
@@ -25,6 +33,24 @@ export function signatureHeader(key: string, body: string, t: number): string {
   const v1 = createHmac("sha256", key).update(`${t}.${body}`).digest("hex");
   return `t=${t},v1=${v1}`;
 }
+
+/**
+ * The `webhook-signature` header of a Standard Webhooks delivery: `v1,<base64>`, the base64 of
+ * HMAC-SHA256 keyed with the secret's decoded bytes over `<webhook-id>.<webhook-timestamp>.<body>`.
+ */
+export function standardSignature(
+  key: Buffer,
+  id: string,
+  t: number,
+  body: string,
+): string {
+  const v1 = createHmac("sha256", key).update(`${id}.${t}.${body}`).digest();
+  return `v1,${v1.toString("base64")}`;
+}
+
+/** The key bytes of a `whsec_<base64>` secret. */
+export const secretBytes = (secret: string): Buffer =>
+  Buffer.from(secret.slice("whsec_".length), "base64");
 
 /** Backoff before the next try after `attempts` failures: 10s doubling to a 1h cap, ±20% by `random` in [0, 1). */
 export function retryDelayMs(attempts: number, random: number): number {
@@ -56,14 +82,30 @@ export function enqueueDeliveries(
   at: string,
 ): number {
   const subscribers = tx
-    .select({ id: webhooks.id, eventTypes: webhooks.eventTypes })
+    .select({
+      id: webhooks.id,
+      eventTypes: webhooks.eventTypes,
+      environmentIds: webhooks.environmentIds,
+    })
     .from(webhooks)
     .all()
     .filter((w) => w.eventTypes.includes(type));
   if (subscribers.length === 0) return 0;
+  const env = tx
+    .select({ id: agents.envId })
+    .from(events)
+    .innerJoin(runs, eq(runs.id, events.runId))
+    .innerJoin(agents, eq(agents.id, runs.agentId))
+    .where(eq(events.id, eventId))
+    .get();
+  const matching = subscribers.filter(
+    (w) =>
+      w.environmentIds === null || (env && w.environmentIds.includes(env.id)),
+  );
+  if (matching.length === 0) return 0;
   tx.insert(webhookDeliveries)
     .values(
-      subscribers.map((w) => ({
+      matching.map((w) => ({
         webhookId: w.id,
         eventId,
         status: "pending" as const,
@@ -74,7 +116,7 @@ export function enqueueDeliveries(
       target: [webhookDeliveries.webhookId, webhookDeliveries.eventId],
     })
     .run();
-  return subscribers.length;
+  return matching.length;
 }
 
 const describeError = (err: unknown): string => {
@@ -99,12 +141,15 @@ export type Dispatcher = ReturnType<typeof createDispatcher>;
 export function createDispatcher({
   db,
   signingKey,
+  secretEncryptionKey,
   log,
   now = () => new Date(),
   random = Math.random,
 }: {
   db: Db;
   signingKey: string;
+  /** opens the sealed secrets of `standard` webhooks */
+  secretEncryptionKey: Buffer;
   log: (line: string) => void;
   now?: () => Date;
   random?: () => number;
@@ -119,28 +164,81 @@ export function createDispatcher({
     webhookId: (typeof webhookDeliveries.$inferSelect)["webhookId"];
     attempts: number;
     url: string;
+    format: "sky" | "standard";
+    secret: Sealed | null;
     agentId: AgentId;
+    environmentId: EnvironmentId;
     event: typeof events.$inferSelect;
   };
+
+  /** The body and headers of one attempt; a `standard` delivery's timestamp and signature are per attempt, its id and body are not. */
+  function buildRequest(
+    row: Due,
+    id: string,
+    presented: Event,
+    t: number,
+  ): { body: string; headers: Record<string, string> } {
+    if (row.format === "sky") {
+      const body = JSON.stringify(presented);
+      return {
+        body,
+        headers: {
+          "Content-Type": "application/json",
+          "Sky-Event-Id": id,
+          "Sky-Event-Type": presented.type,
+          "Sky-Signature": signatureHeader(signingKey, body, t),
+        },
+      };
+    }
+    const body = JSON.stringify({
+      type: presented.type,
+      timestamp: presented.ts,
+      data: presented,
+    });
+    return {
+      body,
+      headers: {
+        "Content-Type": "application/json",
+        "webhook-id": id,
+        "webhook-timestamp": String(t),
+        "webhook-signature": standardSignature(
+          secretBytes(openSecret(row)),
+          id,
+          t,
+          body,
+        ),
+      },
+    };
+  }
+
+  function openSecret(row: Due): string {
+    if (!row.secret) throw new Error("webhook has no secret");
+    try {
+      return open(
+        secretEncryptionKey,
+        row.secret,
+        webhookSecretAad(row.webhookId),
+      );
+    } catch {
+      // the cause could echo key material; say only what failed
+      throw new Error("cannot open the webhook's secret");
+    }
+  }
 
   async function attempt(row: Due): Promise<void> {
     const { event } = row;
     const id = `evt_${event.id}` as const;
-    const body = JSON.stringify(presentEvent(event, row.agentId));
+    const presented = presentEvent(event, row);
     const t = Math.floor(now().getTime() / 1000);
     let status: number | null = null;
     let error: string | null = null;
     let retryAfter: number | null = null;
     try {
+      const request = buildRequest(row, id, presented, t);
       const res = await fetch(row.url, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Sky-Event-Id": id,
-          "Sky-Event-Type": event.type,
-          "Sky-Signature": signatureHeader(signingKey, body, t),
-        },
-        body,
+        headers: request.headers,
+        body: request.body,
         redirect: "manual",
         signal: AbortSignal.any([
           AbortSignal.timeout(TIMEOUT_MS),
@@ -206,13 +304,19 @@ export function createDispatcher({
         webhookId: webhookDeliveries.webhookId,
         attempts: webhookDeliveries.attempts,
         url: webhooks.url,
+        format: webhooks.format,
+        ciphertext: webhooks.secretCiphertext,
+        nonce: webhooks.secretNonce,
+        keyVersion: webhooks.secretKeyVersion,
         agentId: runs.agentId,
+        environmentId: agents.envId,
         event: events,
       })
       .from(webhookDeliveries)
       .innerJoin(webhooks, eq(webhookDeliveries.webhookId, webhooks.id))
       .innerJoin(events, eq(webhookDeliveries.eventId, events.id))
       .innerJoin(runs, eq(events.runId, runs.id))
+      .innerJoin(agents, eq(runs.agentId, agents.id))
       .where(
         and(
           eq(webhookDeliveries.status, "pending"),
@@ -222,7 +326,17 @@ export function createDispatcher({
       .orderBy(asc(webhookDeliveries.nextAttemptAt), asc(webhookDeliveries.id))
       .limit(BATCH)
       .all();
-    await Promise.all(due.map(attempt));
+    await Promise.all(
+      due.map(({ ciphertext, nonce, keyVersion, ...row }) =>
+        attempt({
+          ...row,
+          secret:
+            ciphertext && nonce && keyVersion !== null
+              ? { ciphertext, nonce, keyVersion }
+              : null,
+        }),
+      ),
+    );
     return due.length === BATCH;
   }
 
