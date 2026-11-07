@@ -278,6 +278,8 @@ A run the API fails ends with `run.failed`, and its `error` is one of:
 
 A run is probed at most once per window, and a slow sprite never holds up the API's sweep. Only `running` runs are probed; a run waiting on a request has its own deadline.
 
+**Launch.** A sprite that pauses before the runner holds it freezes the runner, and the run sits in `starting` until `launch_timeout`. Two things guard against it. The API takes the run's keep-awake task on the sprite just before it starts the runner (a 2-minute task the runner's own hold then refreshes; if the runner never comes up it lapses by itself, and a failure of this step is logged and never fails the launch). And a run still `starting` 90 seconds after its runner started, with no event but a `runner.warning` or heartbeat, gets one wake: the API looks for its runner on the sprite, which unfreezes it. A runner found alive is left alone; one that is missing waits for `launch_timeout`.
+
 **The run log.** On the sprite, `/workspace/runs/<runId>.log` is written only by the run's own runner, which holds `<runId>.lock` while it runs. The runner starts only when the API launches it with the run's id as its argument. Started any other way, by hand or from an agent's shell (which inherits the log's location), it refuses with one line on stderr and never touches the log. An agent's own command is `node /opt/sky/runner.mjs publish`.
 
 ## MCP

@@ -15,6 +15,7 @@ import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { internalRoutes } from "./internal.js";
 import { createLauncher } from "./launch.js";
+import { wakeLaunch } from "./probe.js";
 import { createProvisioner } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
 import { createBundleInstaller } from "./runner-bundle.js";
@@ -35,6 +36,8 @@ export type AppDeps = {
   longPollMs?: number;
   /** How long a launch watches its runner for an exit at start; 3 s unless a test shortens it. */
   launchWatchMs?: number;
+  /** How long after its runner starts a run that hasn't reported in gets its sprite woken; 90 s unless a test shortens it. */
+  launchWakeMs?: number;
   /** The bound on a Sprites call that should answer promptly; 60 s unless a test shortens it. */
   spritesTimeoutMs?: number;
   /** Called with a sprite's name when an exec on it exits 137; `boot` probes that sprite's running runs. */
@@ -54,6 +57,7 @@ export function createApp({
   heartbeatMs = 15_000,
   longPollMs = 25_000,
   launchWatchMs = 3_000,
+  launchWakeMs = 90_000,
   spritesTimeoutMs = SPRITES_TIMEOUT_MS,
   onExecKilled,
   secrets = KnownSecrets.fromConfig(config),
@@ -94,6 +98,8 @@ export function createApp({
     log,
     nudgeDeliveries,
     watchMs: launchWatchMs,
+    wakeAfterMs: launchWakeMs,
+    wake: (runId, spriteName) => wakeLaunch(spriteOps, runId, spriteName, log),
   });
   const checkBranch = createBranchChecker({
     db,

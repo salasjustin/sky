@@ -312,6 +312,26 @@ export function failUnlaunchedRuns(
 }
 
 /**
+ * Whether the run is still `starting` with no event but a `runner.warning` or `runner.heartbeat`:
+ * its runner hasn't reported in, which `failUnlaunchedRuns` judges at the launch deadline.
+ */
+export function isSilentLaunch(db: Db, runId: RunId): boolean {
+  return (
+    db
+      .select({ id: runs.id })
+      .from(runs)
+      .where(
+        and(
+          eq(runs.id, runId),
+          eq(runs.status, "starting"),
+          sql`not exists (select 1 from ${events} where ${events.runId} = ${runs.id} and ${events.type} not in ('runner.warning', 'runner.heartbeat'))`,
+        ),
+      )
+      .get() !== undefined
+  );
+}
+
+/**
  * The `running` runs with no event of any kind (a `run.probed` included, so a probed run is next
  * due a window later) since `silentMs` ago, each with the sprite its runner is on and the id of its
  * latest event (0 when it has none), which `failLostRun` judges the run by.
