@@ -257,7 +257,7 @@ export function createApi(config: Config) {
       );
       return env(status, json);
     },
-    /** Destroys the env's sprite, then its agents, runs and events; 409 while a run is active or it is provisioning. */
+    /** Destroys the env's sprite, then its agents, runs and events; 409 `run_active`, `provisioning`, or `webhooks_filter` while a webhook filters on it. */
     async deleteEnvironment(id: string): Promise<void> {
       await request("DELETE", `/v1/environments/${encodeURIComponent(id)}`);
     },
