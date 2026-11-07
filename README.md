@@ -100,7 +100,7 @@ sky env show web                # one env; a failed one shows its step and stder
 sky env retry web               # provision a failed env again
 sky env delete web              # destroy its sandbox, agents, runs and events; asks first
 sky env delete web --yes        # the same without asking; required off a terminal and with --json
-                                # refused while a webhook filters on web (--env=web); delete that webhook first
+                                # refused while a webhook added with --env=web exists; sky webhook delete it first
 sky webhook add https://example.com/hook --events=run.waiting,run.finished   # a Sky-format webhook
 sky webhook add https://example.com/hook --events=run.waiting --format=standard --secret=@secret.txt --env=web
 sky webhook list                # id, format, url, event types and environments; secrets are never printed
