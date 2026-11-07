@@ -330,7 +330,7 @@ Sky-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<body>">
 
 keyed with your `WEBHOOK_SIGNING_KEY`.
 
-**`standard` format** follows [Standard Webhooks](https://www.standardwebhooks.com), for receivers such as OpenBot routines. Create it with a `secret` of the form `whsec_<base64>` (the key is the base64-decoded bytes); a missing or malformed one is `400 invalid_body`. Sky stores it encrypted, like environment secrets. `sky webhook add --format=standard --secret=@file` (or `--secret=-` for stdin) reads it from a file or stdin, never from an argument.
+**`standard` format** follows [Standard Webhooks](https://www.standardwebhooks.com), for receivers such as OpenBot routines. Create it with a `secret` of the form `whsec_<base64>`, where the base64 decodes to a 24-64 byte key; a missing or malformed one is `400 invalid_body`. Sky stores it encrypted, like environment secrets. `sky webhook add --format=standard` reads it with `--secret=@file` or `--secret=-` (stdin), never from an argument.
 
 ```json
 POST /hook

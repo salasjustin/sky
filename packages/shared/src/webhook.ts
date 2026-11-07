@@ -20,7 +20,7 @@ export const StandardWebhookSecret = z.string().refine(
   },
   {
     message:
-      "a standard secret is whsec_ followed by the base64 of a 24–64 byte key",
+      "a standard secret is whsec_ followed by the base64 of a 24-64 byte key",
   },
 );
 

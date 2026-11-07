@@ -88,7 +88,7 @@ export function webhookRoutes() {
             c,
             400,
             "invalid_body",
-            "a standard webhook needs a secret of the form whsec_<base64>",
+            "a standard webhook needs a secret: whsec_ followed by the base64 of a 24-64 byte key",
           );
         }
       } else if (secret !== undefined) {

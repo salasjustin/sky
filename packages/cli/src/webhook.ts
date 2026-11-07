@@ -58,7 +58,7 @@ async function readSecret(
   if (secret === "") throw new UsageError(`the secret ${from} is empty`);
   if (!StandardWebhookSecret.safeParse(secret).success) {
     throw new UsageError(
-      "the secret must be whsec_ followed by the base64 of a 24–64 byte key",
+      "the secret must be whsec_ followed by the base64 of a 24-64 byte key",
     );
   }
   return secret;
