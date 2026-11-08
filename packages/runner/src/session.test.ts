@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -17,7 +18,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { RUNNER_TEXT_MAX, type RunnerEventPost } from "@sky/shared";
 import { delay, HttpResponse, http } from "msw";
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
@@ -62,6 +63,7 @@ beforeEach(() => {
     autoApprove: { defaults: true, commands: [] },
     sessionEnv: {},
     checks: [],
+    mcpServers: {},
     waitTimeoutMs: 60_000,
     startBranch: undefined,
   };
@@ -2643,4 +2645,198 @@ test("a heartbeat the API refuses gets one attempt, so an outage never queues it
   // a retry would resend the same beat, its elapsedMs repeated
   expect(new Set(beats).size).toBe(beats.length);
   expect(sent.at(-1)).toBe("run.finished");
+});
+
+describe("the base profile's MCP servers", () => {
+  const profile: Config["mcpServers"] = {
+    doop: {
+      url: "https://doop.test/mcp",
+      headers: { Authorization: "DOOP_KEY" },
+    },
+    notes: {
+      command: "notes-mcp",
+      args: ["--stdio"],
+      env: { NOTES_TOKEN: "NOTES_SECRET" },
+    },
+  };
+  const secrets = {
+    DOOP_KEY: "Bearer doop-secret-value",
+    NOTES_SECRET: "n-secret-value",
+  };
+  let home: string;
+  let claudeDir: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "sky-home-"));
+    claudeDir = mkdtempSync(join(tmpdir(), "sky-claude-dir-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(claudeDir, { recursive: true, force: true });
+  });
+
+  const userConfig = (servers: object) =>
+    writeFileSync(
+      join(home, ".claude.json"),
+      JSON.stringify({ mcpServers: servers }),
+    );
+  const run = async (extraEnv: NodeJS.ProcessEnv = {}) => {
+    const query = scripted([init, success]);
+    const rec = recorder();
+    const warn = vi.fn();
+    await runSession(
+      { ...config, mcpServers: profile },
+      {
+        query,
+        post: rec.post,
+        warn,
+        signal: new AbortController().signal,
+        awaitDecision: noDecision,
+        env: { HOME: home, ...secrets, ...extraEnv },
+      },
+    );
+    return { query, rec, warn };
+  };
+  const warnings = (rec: ReturnType<typeof recorder>) =>
+    rec.posted.filter((e) => e.type === "runner.warning");
+  const firstWarning = (rec: ReturnType<typeof recorder>): string => {
+    const [event] = warnings(rec);
+    return event?.type === "runner.warning" ? event.payload.message : "";
+  };
+
+  test("the session gets them with each secret resolved from the run's env", async () => {
+    userConfig({ doop: {}, notes: {} });
+    const { query } = await run();
+    expect(query.calls[0]?.options.mcpServers).toEqual({
+      doop: {
+        type: "http",
+        url: "https://doop.test/mcp",
+        headers: { Authorization: "Bearer doop-secret-value" },
+      },
+      notes: {
+        type: "stdio",
+        command: "notes-mcp",
+        args: ["--stdio"],
+        env: { NOTES_TOKEN: "n-secret-value" },
+      },
+    });
+  });
+
+  test("one removed from the config is in the next session, with one warning that names it and no value", async () => {
+    userConfig({ notes: {} });
+    const { query, rec, warn } = await run();
+    expect(Object.keys(query.calls[0]?.options.mcpServers ?? {})).toEqual([
+      "doop",
+      "notes",
+    ]);
+    const posted = warnings(rec);
+    expect(posted).toHaveLength(1);
+    expect(firstWarning(rec)).toBe(
+      "base-profile MCP server missing from the sprite's config: doop; passed to this session directly. Reprovision the sprite to restore it.",
+    );
+    const everything = JSON.stringify([rec.posted, warn.mock.calls]);
+    for (const value of Object.values(secrets))
+      expect(everything).not.toContain(value);
+    expect(everything).not.toContain("Authorization");
+  });
+
+  test("all present: no warning, and the config file is left as it was", async () => {
+    userConfig({ doop: { marker: 1 }, notes: {} });
+    const before = readFileSync(join(home, ".claude.json"), "utf8");
+    const { rec } = await run();
+    expect(warnings(rec)).toEqual([]);
+    expect(readFileSync(join(home, ".claude.json"), "utf8")).toBe(before);
+  });
+
+  const bothMissing =
+    "base-profile MCP servers missing from the sprite's config: doop, notes; passed to this session directly. Reprovision the sprite to restore them.";
+
+  test("an unreadable config counts every server as missing", async () => {
+    writeFileSync(join(home, ".claude.json"), "{ half a wri");
+    const { rec } = await run();
+    expect(firstWarning(rec)).toBe(bothMissing);
+  });
+
+  test("no config file counts every server as missing", async () => {
+    const { rec } = await run();
+    expect(firstWarning(rec)).toBe(bothMissing);
+  });
+
+  test("CLAUDE_CONFIG_DIR, not HOME, is where the config is read", async () => {
+    userConfig({});
+    writeFileSync(
+      join(claudeDir, ".claude.json"),
+      JSON.stringify({ mcpServers: { doop: {}, notes: {} } }),
+    );
+    const { rec } = await run({ CLAUDE_CONFIG_DIR: claudeDir });
+    expect(warnings(rec)).toEqual([]);
+  });
+
+  test("a CLAUDE_CONFIG_DIR without a config file does not fall back to HOME's", async () => {
+    userConfig({ doop: {}, notes: {} });
+    const { rec } = await run({ CLAUDE_CONFIG_DIR: claudeDir });
+    expect(firstWarning(rec)).toBe(bothMissing);
+  });
+
+  const runWithoutDoopKey = async () => {
+    const query = scripted([init, success]);
+    const rec = recorder();
+    const warn = vi.fn();
+    await runSession(
+      { ...config, mcpServers: profile },
+      {
+        query,
+        post: rec.post,
+        warn,
+        signal: new AbortController().signal,
+        awaitDecision: noDecision,
+        env: { HOME: home, NOTES_SECRET: "n-secret-value" },
+      },
+    );
+    return { query, rec, warn };
+  };
+  const doopUnresolved =
+    "base-profile MCP server not passed to this session, secret not set in this run: doop (DOOP_KEY). Set each named secret on the environment with sky secret set. If the sprite's config lists the server, the session still loads it from there with a credential that doesn't work.";
+
+  test("a server whose secret the run lacks is left out of the session, and the warning says the sprite's entry connects without it", async () => {
+    userConfig({ doop: {}, notes: {} });
+    const { query, rec, warn } = await runWithoutDoopKey();
+    expect(Object.keys(query.calls[0]?.options.mcpServers ?? {})).toEqual([
+      "notes",
+    ]);
+    expect(warnings(rec)).toHaveLength(1);
+    expect(firstWarning(rec)).toBe(doopUnresolved);
+    // the session does carry the resolved server's value, so its absence below is a live read
+    expect(JSON.stringify(query.calls[0]?.options.mcpServers)).toContain(
+      secrets.NOTES_SECRET,
+    );
+    const everything = JSON.stringify([rec.posted, warn.mock.calls]);
+    expect(everything).not.toContain(secrets.NOTES_SECRET);
+  });
+
+  test("a server both missing from the config and lacking its secret is named only as unresolved", async () => {
+    userConfig({ notes: {} });
+    const { query, rec } = await runWithoutDoopKey();
+    expect(Object.keys(query.calls[0]?.options.mcpServers ?? {})).toEqual([
+      "notes",
+    ]);
+    expect(
+      warnings(rec).map((e) =>
+        e.type === "runner.warning" ? e.payload.message : "",
+      ),
+    ).toEqual([doopUnresolved]);
+  });
+
+  test("no profile servers: an empty option and no warning", async () => {
+    const query = scripted([init, success]);
+    const rec = recorder();
+    await runSession(config, {
+      query,
+      post: rec.post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+      env: { HOME: home },
+    });
+    expect(query.calls[0]?.options.mcpServers).toEqual({});
+    expect(warnings(rec)).toEqual([]);
+  });
 });

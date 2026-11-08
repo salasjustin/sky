@@ -1,4 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -10,12 +17,21 @@ const listing = JSON.stringify([
   { id: "other@kru", scope: "user" },
 ]);
 
+// each test gets its own lock file, so none takes the sprite-wide one in the temp dir
+let lockDir: string;
+beforeEach(() => {
+  lockDir = mkdtempSync(join(tmpdir(), "sky-lock-"));
+});
+afterEach(() => rmSync(lockDir, { recursive: true, force: true }));
+const refresh = (options: Parameters<typeof refreshPlugins>[0]) =>
+  refreshPlugins({ lockFile: join(lockDir, "lock"), ...options });
+
 describe("refreshPlugins", () => {
   test("refreshes the marketplaces, updates each user-scope plugin once, and logs the duration", async () => {
     const calls: string[][] = [];
     const warn = vi.fn();
     let t = 0;
-    await refreshPlugins({
+    await refresh({
       env: { A: "b" },
       warn,
       claude: "claude-bin",
@@ -41,7 +57,7 @@ describe("refreshPlugins", () => {
 
   test("a failing command is one warning and does not throw", async () => {
     const warn = vi.fn();
-    await refreshPlugins({
+    await refresh({
       env: {},
       warn,
       claude: "c",
@@ -58,7 +74,7 @@ describe("refreshPlugins", () => {
 
   test("a hung command is cut at the timeout and the session continues", async () => {
     const warn = vi.fn();
-    await refreshPlugins({
+    await refresh({
       env: {},
       warn,
       claude: "c",
@@ -75,7 +91,7 @@ describe("refreshPlugins", () => {
   test("a failing plugin update leaves the rest updating and is named in the warning", async () => {
     const calls: string[][] = [];
     const warn = vi.fn();
-    await refreshPlugins({
+    await refresh({
       env: {},
       warn,
       claude: "c",
@@ -101,7 +117,7 @@ describe("refreshPlugins", () => {
   test("a timeout during one plugin update ends the whole refresh", async () => {
     const calls: string[][] = [];
     const warn = vi.fn();
-    await refreshPlugins({
+    await refresh({
       env: {},
       warn,
       claude: "c",
@@ -123,7 +139,7 @@ describe("refreshPlugins", () => {
   test("a stop mid-refresh ends it promptly and says it was stopped", async () => {
     const warn = vi.fn();
     const stop = new AbortController();
-    const done = refreshPlugins({
+    const done = refresh({
       env: {},
       warn,
       claude: "c",
@@ -143,7 +159,7 @@ describe("refreshPlugins", () => {
   test("an already-stopped run spawns no claude", async () => {
     const warn = vi.fn();
     const run = vi.fn();
-    await refreshPlugins({
+    await refresh({
       env: {},
       warn,
       claude: "c",
@@ -161,7 +177,7 @@ describe("refreshPlugins", () => {
 describe("refreshPlugins on odd listings", () => {
   test("a plugin listed twice at user scope is updated once", async () => {
     const calls: string[][] = [];
-    await refreshPlugins({
+    await refresh({
       env: {},
       warn: vi.fn(),
       claude: "c",
@@ -192,7 +208,7 @@ describe("refreshPlugins on odd listings", () => {
     async (_name, stdout) => {
       const calls: string[][] = [];
       const warn = vi.fn();
-      await refreshPlugins({
+      await refresh({
         env: {},
         warn,
         claude: "c",
@@ -212,7 +228,7 @@ describe("refreshPlugins on odd listings", () => {
   test("with no user-scope plugins nothing is updated and the warning says none installed", async () => {
     const calls: string[][] = [];
     const warn = vi.fn();
-    await refreshPlugins({
+    await refresh({
       env: {},
       warn,
       claude: "c",
@@ -283,5 +299,154 @@ describe("claudeBinary", () => {
 
   test("no SDK beside the runner falls back to claude on the PATH", () => {
     expect(claudeBinary({}, "/nonexistent/runner.mjs")).toBe("claude");
+  });
+});
+
+describe("refresh lock", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "sky-lock-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("three runs starting together: one refreshes, the two that waited skip theirs", async () => {
+    const lockFile = join(dir, "lock");
+    let active = 0;
+    let peak = 0;
+    const calls: string[][] = [];
+    const run = async (_f: string, args: string[]) => {
+      active++;
+      peak = Math.max(peak, active);
+      calls.push(args);
+      await new Promise((r) => setTimeout(r, 30));
+      active--;
+      return { stdout: args[1] === "list" ? listing : "" };
+    };
+    const warn = vi.fn();
+    await Promise.all(
+      [1, 2, 3].map(() =>
+        refreshPlugins({ env: {}, warn, claude: "c", lockFile, run }),
+      ),
+    );
+    expect(peak).toBe(1);
+    expect(calls.filter((a) => a[1] === "list")).toHaveLength(1);
+    const lines = warn.mock.calls.map((c) => String(c[0]));
+    const refreshed = lines.filter((l) => /plugins refreshed in/.test(l));
+    const skipped = lines.filter((l) => /another run refreshed/.test(l));
+    expect(refreshed).toHaveLength(1);
+    expect(skipped).toHaveLength(2);
+    expect(existsSync(lockFile)).toBe(false);
+  });
+
+  test("a run that waited on a live holder skips its refresh once the holder releases", async () => {
+    const lockFile = join(dir, "lock");
+    writeFileSync(lockFile, String(process.pid));
+    setTimeout(() => rmSync(lockFile), 50);
+    const warn = vi.fn();
+    const run = vi.fn();
+    await refreshPlugins({ env: {}, warn, claude: "c", lockFile, run });
+    expect(run).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0]?.[0]).toMatch(
+      /^runner: plugin refresh skipped, another run refreshed the plugins \(waited \d+\.\ds\)$/,
+    );
+    expect(existsSync(lockFile)).toBe(false);
+  });
+
+  test("a run that waited on a holder that then died takes the lock over and refreshes", async () => {
+    const lockFile = join(dir, "lock");
+    writeFileSync(lockFile, String(process.pid));
+    setTimeout(() => writeFileSync(lockFile, "2147483646"), 50);
+    const warn = vi.fn();
+    const calls: string[][] = [];
+    await refreshPlugins({
+      env: {},
+      warn,
+      claude: "c",
+      lockFile,
+      run: async (_f, args) => {
+        calls.push(args);
+        return { stdout: "[]" };
+      },
+    });
+    expect(calls).toEqual([["plugin", "list", "--json"]]);
+    expect(warn.mock.calls[0]?.[0]).toMatch(/plugins refreshed in/);
+    expect(existsSync(lockFile)).toBe(false);
+  });
+
+  test("a refresh whose claude fails still releases the lock for the next one", async () => {
+    const lockFile = join(dir, "lock");
+    const warn = vi.fn();
+    await refreshPlugins({
+      env: {},
+      warn,
+      claude: "c",
+      lockFile,
+      run: async () => {
+        throw new Error("spawn c ENOENT");
+      },
+    });
+    expect(warn.mock.calls[0]?.[0]).toMatch(
+      /plugin refresh failed \(spawn c ENOENT\)/,
+    );
+    expect(existsSync(lockFile)).toBe(false);
+    const next = vi.fn(async () => ({ stdout: "[]" }));
+    await refreshPlugins({ env: {}, warn, claude: "c", lockFile, run: next });
+    expect(next).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[1]?.[0]).toMatch(/plugins refreshed in/);
+  });
+
+  test("a lock left by a dead process is taken over", async () => {
+    const lockFile = join(dir, "lock");
+    writeFileSync(lockFile, "2147483646");
+    const warn = vi.fn();
+    await refreshPlugins({
+      env: {},
+      warn,
+      claude: "c",
+      lockFile,
+      run: async () => ({ stdout: "[]" }),
+    });
+    expect(warn.mock.calls[0]?.[0]).toMatch(/plugins refreshed/);
+  });
+
+  test("a lock held past the budget skips the refresh and lets the session start", async () => {
+    const lockFile = join(dir, "lock");
+    writeFileSync(lockFile, String(process.pid));
+    const warn = vi.fn();
+    const run = vi.fn();
+    await refreshPlugins({
+      env: {},
+      warn,
+      claude: "c",
+      lockFile,
+      run,
+      timeoutMs: 50,
+    });
+    expect(run).not.toHaveBeenCalled();
+    expect(warn.mock.calls[0]?.[0]).toMatch(/plugin refresh failed/);
+    expect(readFileSync(lockFile, "utf8")).toBe(String(process.pid));
+  });
+
+  test("a stop while another run holds the lock ends the wait as stopped, not failed, and leaves the holder's lock", async () => {
+    const lockFile = join(dir, "lock");
+    writeFileSync(lockFile, String(process.pid));
+    const stop = new AbortController();
+    setTimeout(() => stop.abort("SIGTERM"), 50);
+    const warn = vi.fn();
+    const run = vi.fn();
+    await refreshPlugins({
+      env: {},
+      warn,
+      claude: "c",
+      lockFile,
+      run,
+      signal: stop.signal,
+    });
+    expect(run).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0]?.[0]).toMatch(/plugin refresh stopped after/);
+    expect(warn.mock.calls[0]?.[0]).not.toMatch(/failed/);
+    expect(readFileSync(lockFile, "utf8")).toBe(String(process.pid));
   });
 });

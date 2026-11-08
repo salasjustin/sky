@@ -7,6 +7,7 @@ export const BASE_ENV_NAMES = [
   "SKY_STORE_LAYOUT",
   "SKY_SESSION_ENV",
   "SKY_CHECKS",
+  "SKY_MCP_SERVERS",
 ] as const;
 
 type Vars = (readonly [string, string])[];
@@ -22,7 +23,11 @@ export function storeEnv(profile: BaseProfile | undefined): Vars {
   ];
 }
 
-/** What a run's session reads: the store, extra session variables and the checks to run. */
+/**
+ * What a run's session reads: the store, extra session variables, the checks to run and the profile's
+ * MCP servers. The servers name each secret by its bare env name (`DOOP_KEY`), never its value; the
+ * runner resolves the names from the run's env.
+ */
 export function runEnv(profile: BaseProfile | undefined): Vars {
   if (!profile) return [];
   return [
@@ -32,6 +37,9 @@ export function runEnv(profile: BaseProfile | undefined): Vars {
       : []),
     ...(profile.checks.length > 0
       ? [["SKY_CHECKS", JSON.stringify(profile.checks)] as const]
+      : []),
+    ...(Object.keys(profile.mcpServers).length > 0
+      ? [["SKY_MCP_SERVERS", JSON.stringify(profile.mcpServers)] as const]
       : []),
   ];
 }

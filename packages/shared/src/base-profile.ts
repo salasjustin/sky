@@ -50,6 +50,7 @@ const RUNNER_ENV_NAMES: ReadonlySet<string> = new Set([
   "SKY_STORE_LAYOUT",
   "SKY_SESSION_ENV",
   "SKY_CHECKS",
+  "SKY_MCP_SERVERS",
   "AGENT_ID",
   "RUN_ID",
   "API_BASE_URL",
@@ -86,7 +87,9 @@ const McpEnv = z.record(
 
 /**
  * A user-scope MCP server. Credentials are never inline: `env` (stdio) and `headers` (http) map a
- * variable or header name to the NAME of an env secret, which the session expands at run time.
+ * variable or header name to the NAME of an env secret. A run's runner resolves each name from the
+ * run's env and passes the session the resolved server; provisioning writes it into the sprite's
+ * `~/.claude.json` as a `${NAME}` reference.
  */
 export const BaseProfileMcpServer = z.union([
   z.strictObject({

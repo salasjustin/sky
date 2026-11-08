@@ -60,7 +60,7 @@ beforeEach(() => {
   logs = [];
   config = testConfig({
     runnerBundlePath: join(dir, "runner.mjs"),
-    baseProfiles: { team },
+    baseProfiles: { team, bare },
   });
   app = createApp({
     db,
@@ -292,6 +292,20 @@ const team = BaseProfile.parse({
   storeLayout: { home: ".store" },
   sessionEnv: { PLUGIN_SWITCH: "1" },
   checks: ["run the linter", "update the changelog"],
+  mcpServers: {
+    doop: {
+      url: "https://doop.test/mcp",
+      headers: { Authorization: "DOOP_KEY" },
+    },
+  },
+});
+
+/** `team` without MCP servers. */
+const bare = BaseProfile.parse({
+  storeRepo: "acme/store",
+  storeLayout: { home: ".store" },
+  sessionEnv: { PLUGIN_SWITCH: "1" },
+  checks: ["run the linter", "update the changelog"],
 });
 
 const BASE_NAMES = [
@@ -300,6 +314,7 @@ const BASE_NAMES = [
   "SKY_STORE_LAYOUT",
   "SKY_SESSION_ENV",
   "SKY_CHECKS",
+  "SKY_MCP_SERVERS",
 ];
 const profileEnv: Record<string, string> = {
   SKY_STORE_REPO: "acme/store",
@@ -307,6 +322,7 @@ const profileEnv: Record<string, string> = {
   SKY_STORE_LAYOUT: JSON.stringify(team.storeLayout),
   SKY_SESSION_ENV: '{"PLUGIN_SWITCH":"1"}',
   SKY_CHECKS: '["run the linter","update the changelog"]',
+  SKY_MCP_SERVERS: JSON.stringify(team.mcpServers),
 };
 
 const putSecret = (envId: string, name: string, body: unknown) =>
@@ -369,7 +385,20 @@ test("an env with a base profile and a GITHUB_CONNECTOR connector gives every se
     SKY_STORE_LAYOUT: JSON.stringify(team.storeLayout),
     SKY_SESSION_ENV: '{"PLUGIN_SWITCH":"1"}',
     SKY_CHECKS: '["run the linter","update the changelog"]',
+    // secret names only: the runner resolves them from the run's env
+    SKY_MCP_SERVERS:
+      '{"doop":{"url":"https://doop.test/mcp","headers":{"Authorization":"DOOP_KEY"}}}',
   });
+});
+
+test("a base profile with no MCP servers gives the session no SKY_MCP_SERVERS, while its other variables still arrive", async () => {
+  const envId = readyEnv({ base: "bare" });
+  await connect(envId);
+  await launched(envId);
+  await sessionOpened();
+  const file = envFileOf(wire, wire.sessions[0]);
+  expect(file).toHaveProperty("SKY_SESSION_ENV", '{"PLUGIN_SWITCH":"1"}');
+  expect(file).not.toHaveProperty("SKY_MCP_SERVERS");
 });
 
 test.each(BASE_NAMES)(

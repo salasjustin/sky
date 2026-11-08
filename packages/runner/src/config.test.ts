@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import { ConfigError, loadConfig } from "./config.js";
+import { sessionMcpServers } from "./mcp.js";
 
 const env = {
   AGENT_ID: "agt_1",
@@ -24,6 +25,7 @@ test("reads a run from env, defaulting the sprite paths", () => {
     autoApprove: { defaults: true, commands: [] },
     sessionEnv: {},
     checks: [],
+    mcpServers: {},
     waitTimeoutMs: 120 * 60_000,
     startBranch: undefined,
   });
@@ -46,6 +48,42 @@ test("reads the profile's session variables and checks, and refuses ones that ar
   expect(() => loadConfig({ ...env, SKY_SESSION_ENV: '["A"]' })).toThrow(
     "SKY_SESSION_ENV",
   );
+});
+
+test("reads the profile's MCP servers, defaults the optional parts, and refuses a malformed one", () => {
+  expect(
+    loadConfig({
+      ...env,
+      SKY_MCP_SERVERS:
+        '{"doop":{"url":"https://doop.test/mcp","headers":{"Authorization":"DOOP_KEY"}}}',
+    }).mcpServers,
+  ).toEqual({
+    doop: {
+      url: "https://doop.test/mcp",
+      headers: { Authorization: "DOOP_KEY" },
+    },
+  });
+  expect(() =>
+    loadConfig({ ...env, SKY_MCP_SERVERS: '{"doop":{"token":"x"}}' }),
+  ).toThrow("SKY_MCP_SERVERS");
+});
+
+test("an http server without headers and a stdio server without args or env load with empty ones, which resolve with no secrets", () => {
+  const { mcpServers } = loadConfig({
+    ...env,
+    SKY_MCP_SERVERS: '{"a":{"url":"https://x.test/mcp"},"b":{"command":"x"}}',
+  });
+  expect(mcpServers).toEqual({
+    a: { url: "https://x.test/mcp", headers: {} },
+    b: { command: "x", args: [], env: {} },
+  });
+  expect(sessionMcpServers(mcpServers, {})).toEqual({
+    servers: {
+      a: { type: "http", url: "https://x.test/mcp", headers: {} },
+      b: { type: "stdio", command: "x", args: [], env: {} },
+    },
+    unresolved: [],
+  });
 });
 
 test.each([

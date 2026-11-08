@@ -857,6 +857,7 @@ async function runOnce(
       autoApprove: { defaults: true, commands: [] },
       sessionEnv,
       checks: [],
+      mcpServers: {},
       waitTimeoutMs: 60_000,
       startBranch: extra.startBranch,
     },

@@ -27,6 +27,13 @@ import {
 import type { Config } from "./config.js";
 import { type PostEvent, RunEndedError } from "./events.js";
 import { createHeartbeat } from "./heartbeat.js";
+import {
+  missingServersWarning,
+  type SessionMcpServer,
+  sessionMcpServers,
+  unresolvedServersWarning,
+  userScopeServers,
+} from "./mcp.js";
 import { policyOutcome } from "./policy.js";
 import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
@@ -142,6 +149,7 @@ function sessionOptions(
   canUseTool: CanUseTool,
   /** What the worktree's refresh from GitHub did, for the agent; see `prepareWorktree`. */
   notes: string[],
+  mcpServers: Record<string, SessionMcpServer>,
 ): Options {
   // `env` replaces the subprocess env rather than adding to it, so it carries the project's own
   // secrets (an ANTHROPIC_API_KEY among them) to the session's commands; the event token stays with
@@ -172,6 +180,8 @@ function sessionOptions(
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
     hooks,
+    // the base profile's servers, so a run has them whatever the sprite's shared user config holds
+    mcpServers,
     // reached only by what bypassPermissions can't approve, AskUserQuestion among them
     canUseTool,
   };
@@ -387,6 +397,8 @@ export async function runSession(
     awaitDecision: AwaitDecision;
     signal: AbortSignal;
     warn?: (line: string) => void;
+    /** Where the base profile's MCP secrets and the user config are read from; `process.env` when absent. */
+    env?: NodeJS.ProcessEnv;
     /** How often a tool call in flight is reported; `HEARTBEAT_INTERVAL_MS` when absent. */
     heartbeatMs?: number;
     /** `BACKGROUND_HOLD_MS` when absent. */
@@ -604,6 +616,23 @@ export async function runSession(
     };
   };
 
+  // the base profile's servers go to the session itself: the user config they were provisioned into
+  // is rewritten by every `claude` on the sprite, and a write can lose an entry
+  const env = deps.env ?? process.env;
+  const mcp = sessionMcpServers(config.mcpServers, env);
+  const inConfig = new Set(userScopeServers(env));
+  const missing = Object.keys(mcp.servers).filter((n) => !inConfig.has(n));
+  if (missing.length > 0) {
+    const message = missingServersWarning(missing);
+    warn(`runner: ${message}`);
+    void post({ type: "runner.warning", payload: { message } }).catch(() => {});
+  }
+  if (mcp.unresolved.length > 0) {
+    const message = unresolvedServersWarning(mcp.unresolved);
+    warn(`runner: ${message}`);
+    void post({ type: "runner.warning", payload: { message } }).catch(() => {});
+  }
+
   let result: SDKResultMessage | undefined;
   let streamError: string | undefined;
   let started = false;
@@ -649,6 +678,7 @@ export async function runSession(
         hooks,
         canUseTool,
         notes,
+        mcp.servers,
       ),
     });
     for await (const message of stream) {
