@@ -1,4 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -283,5 +289,66 @@ describe("claudeBinary", () => {
 
   test("no SDK beside the runner falls back to claude on the PATH", () => {
     expect(claudeBinary({}, "/nonexistent/runner.mjs")).toBe("claude");
+  });
+});
+
+describe("refresh lock", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "sky-lock-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("two refreshes on one sprite run one after the other, never together", async () => {
+    const lockFile = join(dir, "lock");
+    let active = 0;
+    let peak = 0;
+    const run = async (_f: string, args: string[]) => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 30));
+      active--;
+      return { stdout: args[1] === "list" ? listing : "" };
+    };
+    const warn = vi.fn();
+    await Promise.all(
+      [1, 2, 3].map(() =>
+        refreshPlugins({ env: {}, warn, claude: "c", lockFile, run }),
+      ),
+    );
+    expect(peak).toBe(1);
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(existsSync(lockFile)).toBe(false);
+  });
+
+  test("a lock left by a dead process is taken over", async () => {
+    const lockFile = join(dir, "lock");
+    writeFileSync(lockFile, "2147483646");
+    const warn = vi.fn();
+    await refreshPlugins({
+      env: {},
+      warn,
+      claude: "c",
+      lockFile,
+      run: async () => ({ stdout: "[]" }),
+    });
+    expect(warn.mock.calls[0]?.[0]).toMatch(/plugins refreshed/);
+  });
+
+  test("a lock held past the budget skips the refresh and lets the session start", async () => {
+    const lockFile = join(dir, "lock");
+    writeFileSync(lockFile, String(process.pid));
+    const warn = vi.fn();
+    const run = vi.fn();
+    await refreshPlugins({
+      env: {},
+      warn,
+      claude: "c",
+      lockFile,
+      run,
+      timeoutMs: 50,
+    });
+    expect(run).not.toHaveBeenCalled();
+    expect(warn.mock.calls[0]?.[0]).toMatch(/plugin refresh failed/);
   });
 });

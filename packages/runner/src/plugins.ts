@@ -1,6 +1,16 @@
 import { execFile } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -36,6 +46,68 @@ export function claudeBinary(
   return "claude";
 }
 
+/** One refresh at a time per sprite: each `claude` it runs rewrites the shared `~/.claude.json`. */
+const LOCK_POLL_MS = 200;
+
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+/**
+ * Runs `task` holding a lock file, so concurrent runs on a sprite refresh in turn rather than
+ * together. A lock whose holder is gone is taken over. Resolves to false, without running `task`,
+ * when `signal` aborts first; a lock that can't be made at all runs `task` unlocked.
+ */
+export async function withRefreshLock(
+  lockFile: string,
+  signal: AbortSignal,
+  task: () => Promise<void>,
+): Promise<boolean> {
+  for (;;) {
+    let fd: number;
+    try {
+      fd = openSync(lockFile, "wx", 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        await task();
+        return true;
+      }
+      let holder = NaN;
+      try {
+        holder = Number(readFileSync(lockFile, "utf8"));
+      } catch {}
+      // an empty file is a holder between creating the lock and writing its pid: not stale yet
+      if (!Number.isNaN(holder) && holder > 0 && !alive(holder)) {
+        try {
+          unlinkSync(lockFile);
+        } catch {}
+        continue;
+      }
+      try {
+        await sleep(LOCK_POLL_MS, undefined, { signal });
+      } catch {
+        return false;
+      }
+      continue;
+    }
+    try {
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+      await task();
+      return true;
+    } finally {
+      try {
+        unlinkSync(lockFile);
+      } catch {}
+    }
+  }
+}
+
 /**
  * Refreshes the plugin marketplaces and updates the user-scope plugins installed in them, so a
  * sandbox doesn't keep the versions its env setup installed. The marketplaces are reached the way
@@ -50,6 +122,8 @@ export async function refreshPlugins(options: {
   signal?: AbortSignal;
   timeoutMs?: number;
   claude?: string;
+  /** The sprite-wide lock one refresh at a time holds; in the temp dir when absent. */
+  lockFile?: string;
   run?: Exec;
   now?: () => number;
 }): Promise<void> {
@@ -66,32 +140,42 @@ export async function refreshPlugins(options: {
   );
   const signal = stop ? AbortSignal.any([stop, timeout]) : timeout;
   const started = now();
+  // the wait for another run's refresh counts against this one's budget; ending it skips ours
+  const lockFile =
+    options.lockFile ?? join(tmpdir(), "sky-plugin-refresh.lock");
   try {
-    const claudeRun = (...args: string[]) => run(claude, args, { env, signal });
-    const { stdout } = await claudeRun("plugin", "list", "--json");
-    const installed = JSON.parse(stdout) as { id: string; scope: string }[];
-    const plugins = [
-      ...new Set(installed.filter((p) => p.scope === "user").map((p) => p.id)),
-    ];
-    const updated: string[] = [];
-    const failed: string[] = [];
-    if (plugins.length > 0) {
-      await claudeRun("plugin", "marketplace", "update");
-      for (const plugin of plugins) {
-        try {
-          await claudeRun("plugin", "update", plugin, "--scope", "user");
-          updated.push(plugin);
-        } catch (error) {
-          if (signal.aborted) throw error;
-          failed.push(`${plugin} (${firstLine(error)})`);
+    const ran = await withRefreshLock(lockFile, signal, async () => {
+      const claudeRun = (...args: string[]) =>
+        run(claude, args, { env, signal });
+      const { stdout } = await claudeRun("plugin", "list", "--json");
+      const installed = JSON.parse(stdout) as { id: string; scope: string }[];
+      const plugins = [
+        ...new Set(
+          installed.filter((p) => p.scope === "user").map((p) => p.id),
+        ),
+      ];
+      const updated: string[] = [];
+      const failed: string[] = [];
+      if (plugins.length > 0) {
+        await claudeRun("plugin", "marketplace", "update");
+        for (const plugin of plugins) {
+          try {
+            await claudeRun("plugin", "update", plugin, "--scope", "user");
+            updated.push(plugin);
+          } catch (error) {
+            if (signal.aborted) throw error;
+            failed.push(`${plugin} (${firstLine(error)})`);
+          }
         }
       }
-    }
-    const failures =
-      failed.length > 0 ? `; update failed for ${failed.join(", ")}` : "";
-    warn(
-      `runner: plugins refreshed in ${seconds(now() - started)}s (${updated.join(", ") || (plugins.length > 0 ? "none updated" : "none installed")})${failures}`,
-    );
+      const failures =
+        failed.length > 0 ? `; update failed for ${failed.join(", ")}` : "";
+      warn(
+        `runner: plugins refreshed in ${seconds(now() - started)}s (${updated.join(", ") || (plugins.length > 0 ? "none updated" : "none installed")})${failures}`,
+      );
+    });
+    // ended while another run held the lock
+    if (!ran) throw new Error("waiting for another run's refresh");
   } catch (error) {
     if (stop?.aborted) {
       warn(`runner: plugin refresh stopped after ${seconds(now() - started)}s`);

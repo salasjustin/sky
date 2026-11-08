@@ -2,6 +2,7 @@ import {
   AgentId,
   type AutoApprove,
   AutoApproveConfig,
+  BaseProfileMcpServer,
   RunId,
 } from "@sky/shared";
 import { z } from "zod";
@@ -39,6 +40,9 @@ const Env = z.object({
   // the env's base profile: variables for the session, and the lines it is told to follow before finishing
   SKY_SESSION_ENV: json.pipe(z.record(z.string(), z.string())).default({}),
   SKY_CHECKS: json.pipe(z.array(z.string().min(1))).default([]),
+  SKY_MCP_SERVERS: json
+    .pipe(z.record(z.string(), BaseProfileMcpServer))
+    .default({}),
   START_BRANCH: z
     .string()
     .optional()
@@ -62,6 +66,8 @@ export type Config = {
   sessionEnv: Record<string, string>;
   /** Instruction lines or commands the agent is told to run before it finishes; none when empty. */
   checks: string[];
+  /** The base profile's MCP servers, secrets as names; passed to every session whatever the sprite's config holds. */
+  mcpServers: Record<string, BaseProfileMcpServer>;
   /** How long one wait for an answer or approval may last before the run fails. */
   waitTimeoutMs: number;
   /** An existing GitHub branch the agent's work continues; `publish` updates it instead of `claude/<agentId>`. */
@@ -93,6 +99,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     autoApprove: e.AUTO_APPROVE,
     sessionEnv: e.SKY_SESSION_ENV,
     checks: e.SKY_CHECKS,
+    mcpServers: e.SKY_MCP_SERVERS,
     waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
     startBranch: e.START_BRANCH,
   };

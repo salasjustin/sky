@@ -292,6 +292,12 @@ const team = BaseProfile.parse({
   storeLayout: { home: ".store" },
   sessionEnv: { PLUGIN_SWITCH: "1" },
   checks: ["run the linter", "update the changelog"],
+  mcpServers: {
+    doop: {
+      url: "https://doop.test/mcp",
+      headers: { Authorization: "DOOP_KEY" },
+    },
+  },
 });
 
 const BASE_NAMES = [
@@ -300,6 +306,7 @@ const BASE_NAMES = [
   "SKY_STORE_LAYOUT",
   "SKY_SESSION_ENV",
   "SKY_CHECKS",
+  "SKY_MCP_SERVERS",
 ];
 const profileEnv: Record<string, string> = {
   SKY_STORE_REPO: "acme/store",
@@ -307,6 +314,7 @@ const profileEnv: Record<string, string> = {
   SKY_STORE_LAYOUT: JSON.stringify(team.storeLayout),
   SKY_SESSION_ENV: '{"PLUGIN_SWITCH":"1"}',
   SKY_CHECKS: '["run the linter","update the changelog"]',
+  SKY_MCP_SERVERS: JSON.stringify(team.mcpServers),
 };
 
 const putSecret = (envId: string, name: string, body: unknown) =>
@@ -369,6 +377,9 @@ test("an env with a base profile and a GITHUB_CONNECTOR connector gives every se
     SKY_STORE_LAYOUT: JSON.stringify(team.storeLayout),
     SKY_SESSION_ENV: '{"PLUGIN_SWITCH":"1"}',
     SKY_CHECKS: '["run the linter","update the changelog"]',
+    // secret names only: the runner resolves them from the run's env
+    SKY_MCP_SERVERS:
+      '{"doop":{"url":"https://doop.test/mcp","headers":{"Authorization":"DOOP_KEY"}}}',
   });
 });
 
