@@ -33,6 +33,7 @@ beforeEach(() => {
   dispatcher = createDispatcher({
     db,
     signingKey: config.webhookSigningKey,
+    secretEncryptionKey: config.secretEncryptionKey,
     log: () => {},
     now: () => clock,
   });

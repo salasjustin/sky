@@ -22,6 +22,7 @@ const usage = {
 const meta = {
   id: "evt_1",
   agentId: "agt_1",
+  environmentId: "env_1",
   runId: "run_1",
   ts: "2026-10-29T12:00:00.000Z",
 };
@@ -294,6 +295,8 @@ test("a stored event names its agent, so a run.waiting can be answered from the 
   expect(Event.parse(waiting)).toEqual(waiting);
   const { agentId: _, ...anonymous } = waiting;
   expect(Event.safeParse(anonymous).success).toBe(false);
+  const { environmentId: __, ...unplaced } = waiting;
+  expect(Event.safeParse(unplaced).success).toBe(false);
 });
 
 const claudeTypes = [

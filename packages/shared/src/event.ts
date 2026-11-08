@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AgentId, EventId, RequestId, RunId } from "./ids.js";
+import { AgentId, EnvironmentId, EventId, RequestId, RunId } from "./ids.js";
 import { Usage } from "./run.js";
 
 const pendingRequest = (toolSummary: z.ZodString) =>
@@ -265,6 +265,8 @@ const stored = <T extends EventType>(type: T) =>
   z.object({
     id: EventId,
     agentId: AgentId,
+    /** the environment the agent belongs to */
+    environmentId: EnvironmentId,
     runId: RunId,
     ts: z.iso.datetime(),
     type: z.literal(type),

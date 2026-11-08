@@ -1690,6 +1690,119 @@ test("DELETE destroys the sprite, then the row and its agents' history", async (
   });
 });
 
+test("DELETE is 409 webhooks_filter listing the webhooks that filter on the env, and leaves its sprite alone", async () => {
+  const id = await ready();
+  const other = await ready({ ...kru, name: "other" });
+  const insert = db.$client.prepare(
+    "insert into webhooks (id, url, event_types, environment_ids) values (?, 'https://hooks.example.com/x', '[\"run.waiting\"]', ?)",
+  );
+  insert.run("whk_a", JSON.stringify([id, other]));
+  insert.run("whk_b", JSON.stringify([other]));
+  insert.run("whk_c", null);
+  const res = await del(id);
+  expect(res.status).toBe(409);
+  const { error } = (await res.json()) as {
+    error: { code: string; message: string; webhookIds: string[] };
+  };
+  expect(error.code).toBe("webhooks_filter");
+  expect(error.webhookIds).toEqual(["whk_a"]);
+  expect(error.message).toContain("whk_a");
+  expect(error.message).not.toContain("whk_b");
+  expect(error.message).not.toContain("whk_c");
+  expect(wire.calls).toEqual([]);
+  expect((await get(id)).body).toMatchObject({ status: "ready" });
+
+  db.$client.prepare("delete from webhooks where id = 'whk_a'").run();
+  expect((await del(id)).status).toBe(204);
+});
+
+const subscribeFiltered = (environmentIds: string[]) =>
+  app.request("/v1/webhooks", {
+    method: "POST",
+    headers: json,
+    body: JSON.stringify({
+      url: "https://hooks.example.com/sky",
+      eventTypes: ["run.finished"],
+      environmentIds,
+    }),
+  });
+
+const unsubscribe = (id: string) =>
+  app.request(`/v1/webhooks/${id}`, { method: "DELETE", headers: auth });
+
+test("DELETE names every webhook subscribed through the API with a filter on the env, and succeeds once each is unsubscribed", async () => {
+  const id = await ready();
+  const first = (await (await subscribeFiltered([id])).json()) as {
+    id: string;
+  };
+  const second = (await (await subscribeFiltered([id])).json()) as {
+    id: string;
+  };
+
+  const res = await del(id);
+  expect(res.status).toBe(409);
+  const { error } = (await res.json()) as {
+    error: { code: string; message: string; webhookIds: string[] };
+  };
+  expect(error.code).toBe("webhooks_filter");
+  expect([...error.webhookIds].sort()).toEqual([first.id, second.id].sort());
+  expect(error.message).toContain(first.id);
+  expect(error.message).toContain(second.id);
+  expect(wire.calls).toEqual([]);
+  expect((await get(id)).body).toMatchObject({ status: "ready" });
+
+  expect((await unsubscribe(first.id)).status).toBe(204);
+  const stillBlocked = await del(id);
+  expect(stillBlocked.status).toBe(409);
+  expect(
+    (
+      (await stillBlocked.json()) as {
+        error: { webhookIds: string[] };
+      }
+    ).error.webhookIds,
+  ).toEqual([second.id]);
+
+  expect((await unsubscribe(second.id)).status).toBe(204);
+  expect((await del(id)).status).toBe(204);
+  expect(wire.calls).toEqual([`delete ${spriteNameFor(id)}`]);
+});
+
+test("DELETE answers run_active, not webhooks_filter, for an env with an active run and a filtering webhook", async () => {
+  const id = await ready();
+  seedRun(id, "running");
+  await subscribeFiltered([id]);
+  const res = await del(id);
+  expect(res.status).toBe(409);
+  expect(await res.json()).toEqual({
+    error: { code: "run_active", message: expect.any(String) },
+  });
+  expect(wire.calls).toEqual([]);
+});
+
+test("DELETE answers provisioning, not webhooks_filter, for a provisioning env with a filtering webhook", async () => {
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  expect((await subscribeFiltered([id])).status).toBe(201);
+  const res = await del(id);
+  expect(res.status).toBe(409);
+  expect(await res.json()).toEqual({
+    error: { code: "provisioning", message: expect.any(String) },
+  });
+  await settled(id);
+  expect(wire.calls.filter((c) => c.startsWith("delete"))).toEqual([]);
+});
+
+test("DELETE of an env that no webhook filters on still works beside webhooks that filter on others", async () => {
+  const id = await ready();
+  const other = await ready({ ...kru, name: "other" });
+  db.$client
+    .prepare(
+      "insert into webhooks (id, url, event_types, environment_ids) values ('whk_b', 'https://hooks.example.com/x', '[\"run.waiting\"]', ?)",
+    )
+    .run(JSON.stringify([other]));
+  expect((await del(id)).status).toBe(204);
+  expect((await get(other)).status).toBe(200);
+});
+
 test("DELETE removes the env's webhook deliveries and run requests with its runs", async () => {
   const id = await ready();
   seedRun(id, "finished");

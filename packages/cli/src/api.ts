@@ -43,6 +43,18 @@ const SecretList = z.object({
 });
 export type SecretSummary = z.infer<typeof SecretList>["data"][number];
 
+/** Loose, so `--json` passes through fields this CLI doesn't read; there is no secret field to read. */
+const ApiWebhook = z
+  .object({
+    id: z.string(),
+    url: z.string(),
+    format: z.string(),
+    eventTypes: z.array(z.string()),
+    environmentIds: z.array(z.string()).optional(),
+  })
+  .loose();
+export type ApiWebhook = z.infer<typeof ApiWebhook>;
+
 const Launched = z.object({
   agent: z.object({ id: z.string() }),
   run: z.object({ id: z.string() }),
@@ -245,7 +257,7 @@ export function createApi(config: Config) {
       );
       return env(status, json);
     },
-    /** Destroys the env's sprite, then its agents, runs and events; 409 while a run is active or it is provisioning. */
+    /** Destroys the env's sprite, then its agents, runs and events; 409 `run_active` while a run is active, `provisioning` while it provisions, `webhooks_filter` while a webhook filters on it. */
     async deleteEnvironment(id: string): Promise<void> {
       await request("DELETE", `/v1/environments/${encodeURIComponent(id)}`);
     },
@@ -256,6 +268,33 @@ export function createApi(config: Config) {
         `/v1/environments/${encodeURIComponent(id)}/retry`,
       );
       return env(status, json);
+    },
+    async createWebhook(body: unknown) {
+      const { status, json } = await request("POST", "/v1/webhooks", body);
+      const parsed = ApiWebhook.safeParse(json);
+      if (!parsed.success) {
+        throw new ApiError(
+          status,
+          "bad_response",
+          "the API returned a webhook this CLI can't read",
+        );
+      }
+      return { raw: json, webhook: parsed.data };
+    },
+    async listWebhooks() {
+      const { status, json } = await request("GET", "/v1/webhooks");
+      const parsed = z.object({ data: z.array(ApiWebhook) }).safeParse(json);
+      if (!parsed.success) {
+        throw new ApiError(
+          status,
+          "bad_response",
+          "the API returned a webhook list this CLI can't read",
+        );
+      }
+      return { raw: json, webhooks: parsed.data.data };
+    },
+    async deleteWebhook(id: string): Promise<void> {
+      await request("DELETE", `/v1/webhooks/${encodeURIComponent(id)}`);
     },
     async listSecrets(envId: string): Promise<SecretSummary[]> {
       const { status, json } = await request(

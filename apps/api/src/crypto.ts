@@ -11,6 +11,7 @@ export type Sealed = { ciphertext: Buffer; nonce: Buffer; keyVersion: number };
 /** The AAD binding a sealed value to its row, so a ciphertext copied to another row won't open. */
 export const envSecretAad = (envId: string, name: string) =>
   `env:${envId}:${name}`;
+export const webhookSecretAad = (webhookId: string) => `webhook:${webhookId}`;
 export const runEnvVarAad = (runId: string, name: string) =>
   `run:${runId}:${name}`;
 

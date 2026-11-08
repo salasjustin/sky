@@ -1,23 +1,15 @@
 import { EnvironmentId } from "@sky/shared";
 import type { Api, ApiEnvironment } from "./api.js";
 import type { Io } from "./cli.js";
-import { type Output, UsageError } from "./output.js";
+import { readStdinValue } from "./input.js";
+import type { Output } from "./output.js";
 
-/** The value never comes from argv, where `ps` and shell history would keep it. */
-async function readValue(name: string, io: Io): Promise<string> {
-  let raw: string;
-  if (!io.stdin.isTTY) {
-    raw = await io.stdin.readAll();
-  } else if (io.stderrIsTTY && !io.env.CI) {
-    raw = await io.stdin.promptHidden(`Value for ${name}: `);
-  } else {
-    throw new UsageError("no terminal to prompt on; pipe the value on stdin");
-  }
-  // `echo value |` and a heredoc both end in one newline that isn't part of the value
-  const value = raw.replace(/\r?\n$/, "");
-  if (value === "") throw new UsageError(`the value for ${name} is empty`);
-  return value;
-}
+const readValue = (name: string, io: Io) =>
+  readStdinValue(io, {
+    prompt: `Value for ${name}: `,
+    noun: "value",
+    empty: `the value for ${name} is empty`,
+  });
 
 /** Always lists: a name may itself be shaped like an id, so an id-shaped ref matches an id first, then a name. */
 export async function resolveEnv(

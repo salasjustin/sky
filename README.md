@@ -100,6 +100,11 @@ sky env show web                # one env; a failed one shows its step and stder
 sky env retry web               # provision a failed env again
 sky env delete web              # destroy its sandbox, agents, runs and events; asks first
 sky env delete web --yes        # the same without asking; required off a terminal and with --json
+                                # refused while a webhook added with --env=web exists; sky webhook delete it first
+sky webhook add https://example.com/hook --events=run.waiting,run.finished   # a Sky-format webhook
+sky webhook add https://example.com/hook --events=run.waiting --format=standard --secret=@secret.txt --env=web
+sky webhook list                # id, format, url, event types and environments; secrets are never printed
+sky webhook delete whk_…
 ```
 
 `<env>` is an environment's name or id.
@@ -241,7 +246,7 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | `GET /v1/agents/:id/runs/:runId` · `…/stream`                           | a run's result, or its events as SSE                   |
 | `POST /v1/agents/:id/answers` · `…/approvals`                           | answer a waiting question; approve or deny a tool call |
 | `POST /v1/agents/:id/stop` · `…/archive`                                | stop the current run; archive the agent                |
-| `POST /v1/webhooks`                                                     | subscribe an https URL to events                       |
+| `POST`, `GET /v1/webhooks` · `GET`, `DELETE /v1/webhooks/:id`           | subscribe an https URL to events; list, read, remove   |
 
 Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you'll meet:
 
@@ -253,6 +258,7 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 | `provisioning`    | the environment is still provisioning; wait for it to finish                 |
 | `agents_exist`    | repo or setup can't change while unarchived agents exist                     |
 | `already_decided` | the request was already decided differently; that decision stands            |
+| `webhooks_filter` | webhooks filter on the environment; delete them first (ids in `webhookIds`)  |
 
 ### Run errors
 
@@ -290,7 +296,7 @@ A run is probed at most once per window, and a slow sprite never holds up the AP
 
 ## Events
 
-What an agent does arrives as events, each with `agentId` and `runId`:
+What an agent does arrives as events, each with `agentId`, `environmentId` (the environment the agent belongs to) and `runId`:
 
 | event                                                                  | when                                                                  |
 | ---------------------------------------------------------------------- | --------------------------------------------------------------------- |
@@ -312,13 +318,71 @@ Three ways to receive them:
 
 - **MCP:** `wait_for_events`, above.
 - **Stream:** `GET /v1/stream`, one SSE connection across every agent. Filter with `?types=claude.PostToolUse,run.waiting` and `?agentId=`. After a drop, reconnect with `Last-Event-ID` to receive what you missed. A `: ping` arrives every 15 seconds. When the server restarts, the stream ends with an `event: server.shutdown` frame whose `id` is your resume point and whose `retry: 2000` asks you to reconnect in 2 seconds; `EventSource` does this on its own. `GET /v1/events?after=&wait=` is the same feed as a long poll.
-- **Webhooks:** `POST /v1/webhooks` with an `https` URL and the `eventTypes` you want. Each delivery carries `Sky-Event-Type`, `Sky-Event-Id`, and
+- **Webhooks:** `POST /v1/webhooks` (or `sky webhook add`) with an `https` URL and the `eventTypes` you want. A failed delivery is retried with backoff, up to 30 attempts, and a `429` holds the webhook until its `Retry-After`. Two optional fields:
+  - `format`: `"sky"` (the default) or `"standard"`, below.
+  - `environmentIds`: a non-empty array of environment ids. The webhook then receives only events from agents in those environments; an id that doesn't exist is `400 invalid_body`. Left out, it receives every environment's events. An environment a webhook filters on can't be deleted until that webhook is (`409 webhooks_filter`).
+
+  `GET /v1/webhooks` returns each webhook's `format` and `environmentIds` when set. A secret is never returned.
+
+**`sky` format.** The body is the event itself. Each delivery carries `Sky-Event-Type`, `Sky-Event-Id`, and
 
 ```
 Sky-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<body>">
 ```
 
-keyed with your `WEBHOOK_SIGNING_KEY`. A failed delivery is retried with backoff, up to 30 attempts.
+keyed with your `WEBHOOK_SIGNING_KEY`.
+
+**`standard` format** follows [Standard Webhooks](https://www.standardwebhooks.com), for receivers such as OpenBot routines. Create it with a `secret` of the form `whsec_<base64>`, where the base64 decodes to a 24-64 byte key; a missing or malformed one is `400 invalid_body`. Sky stores it encrypted, like environment secrets. `sky webhook add --format=standard` reads it with `--secret=@file` or `--secret=-` (stdin), never from an argument.
+
+```json
+POST /hook
+Content-Type: application/json
+webhook-id: evt_1042
+webhook-timestamp: 1794070000
+webhook-signature: v1,<base64 HMAC-SHA256 of "<webhook-id>.<webhook-timestamp>.<body>">
+
+{
+  "type": "run.waiting",
+  "timestamp": "2026-11-07T17:26:40.123Z",
+  "data": {
+    "id": "evt_1042",
+    "agentId": "agt_…",
+    "environmentId": "env_…",
+    "runId": "run_…",
+    "ts": "2026-11-07T17:26:40.123Z",
+    "type": "run.waiting",
+    "payload": { "request": { "kind": "approval", "requestId": "req_…", "toolName": "Bash", "toolSummary": "…" } }
+  }
+}
+```
+
+`webhook-id` is the same on every retry of a delivery, so a receiver can drop duplicates by it; `webhook-timestamp` and so the signature are fresh on each attempt. `data` is the same event the stream and `GET /v1/events` return, and a receiver can filter on JSON Pointers into it, such as `/environmentId`.
+
+To verify, recompute the signature over the exact bytes received and reject a timestamp too far from your clock:
+
+```js
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+function verify(secret, headers, rawBody, now = Date.now() / 1000) {
+  const id = headers["webhook-id"];
+  const timestamp = headers["webhook-timestamp"];
+  if (Math.abs(now - Number(timestamp)) > 300) return false;
+  const key = Buffer.from(secret.slice("whsec_".length), "base64");
+  const expected = createHmac("sha256", key)
+    .update(`${id}.${timestamp}.${rawBody}`)
+    .digest();
+  // the header may hold several space-separated "v1,<base64>" signatures
+  return headers["webhook-signature"].split(" ").some((s) => {
+    const [version, sig] = s.split(",");
+    const got = Buffer.from(sig ?? "", "base64");
+    return (
+      version === "v1" &&
+      got.length === expected.length &&
+      timingSafeEqual(got, expected)
+    );
+  });
+}
+```
 
 ## License
 

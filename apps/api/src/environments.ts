@@ -7,6 +7,7 @@ import {
   runRequests,
   runs,
   webhookDeliveries,
+  webhooks,
 } from "@sky/db";
 import { Environment, EnvironmentId } from "@sky/shared";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
@@ -342,6 +343,24 @@ export function environmentRoutes(
       }
       if (env.status === "provisioning") {
         return apiError(c, 409, "provisioning", stillProvisioning);
+      }
+      const filtering = db
+        .select({ id: webhooks.id, environmentIds: webhooks.environmentIds })
+        .from(webhooks)
+        .all()
+        .filter((w) => w.environmentIds?.includes(id));
+      if (filtering.length > 0) {
+        const webhookIds = filtering.map((w) => w.id);
+        return c.json(
+          {
+            error: {
+              code: "webhooks_filter",
+              message: `webhooks filter on this environment: ${webhookIds.join(", ")}; delete them first`,
+              webhookIds,
+            },
+          },
+          409,
+        );
       }
       try {
         await destroySprite(sprites, env.spriteName);

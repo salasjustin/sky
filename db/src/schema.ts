@@ -222,6 +222,17 @@ export const webhooks = sqliteTable(
     eventTypes: text("event_types", { mode: "json" })
       .$type<[EventType, ...EventType[]]>()
       .notNull(),
+    format: text({ enum: ["sky", "standard"] })
+      .notNull()
+      .default("sky"),
+    // the Standard Webhooks secret, sealed like an env secret; all three or none
+    secretCiphertext: blob("secret_ciphertext", { mode: "buffer" }),
+    secretNonce: blob("secret_nonce", { mode: "buffer" }),
+    secretKeyVersion: integer("secret_key_version"),
+    // only events from agents in these environments are delivered; null means all. No CHECK: the API validates it
+    environmentIds: text("environment_ids", { mode: "json" }).$type<
+      [EnvironmentId, ...EnvironmentId[]]
+    >(),
     createdAt: createdAt(),
   },
   (t) => [
@@ -229,6 +240,7 @@ export const webhooks = sqliteTable(
       "webhooks_event_types",
       sql`json_type(${c(t.eventTypes)}) = 'array' and json_array_length(${c(t.eventTypes)}) > 0`,
     ),
+    check("webhooks_format", sql`${c(t.format)} in ('sky', 'standard')`),
     check("webhooks_created_at", isoUtc(t.createdAt)),
   ],
 );

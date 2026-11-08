@@ -7,6 +7,7 @@ import { env } from "./env.js";
 import { createOutput, type Output, UsageError } from "./output.js";
 import { secretDelete, secretList, secretSet } from "./secret.js";
 import { version } from "./version.js";
+import { webhook } from "./webhook.js";
 
 export interface Io {
   argv: string[];
@@ -55,6 +56,18 @@ const help = (io: Io) => `Usage:
   sky env retry <env> [options]
       Provision a failed environment again. Prints its line, now
       provisioning; sky env show reports when it's ready.
+  sky webhook add <url> --events=<types,...> [options]
+      [--format=standard --secret=@file|-] [--env=<id|name>,...]
+      Subscribe an https URL to event types. --format=standard signs
+      deliveries as Standard Webhooks and needs the whsec_<base64> secret,
+      read from a file or stdin, never argv. --env limits it to events from
+      agents in those environments. On a terminal, --secret=- prompts for
+      the secret without echoing it. Prints the line webhook list prints.
+  sky webhook list [options]
+      Print "<id> <format> <url> <types> [<env ids>]" per webhook; secrets
+      are never printed.
+  sky webhook delete <id> [options]
+      Remove a webhook.
   sky agent start <env> [--branch=<name>] --prompt=<text|@file> [options]
   sky agent follow-up <agent> --prompt=<text|@file> [options]
       Start an agent on an environment (<env> is its id or name), or start
@@ -95,8 +108,8 @@ Options:
   --api-key-env=<VAR>    read the API key from environment variable VAR
   --json                 print the API's object on stdout (inbox, wait and
                          status: the newest run; secret list: only each
-                         name and kind; env delete and secret delete:
-                         {"id"|"name": …, "deleted": true})
+                         name and kind; env delete, secret delete and
+                         webhook delete: {"id"|"name": …, "deleted": true})
   -h, --help             show this help
   -v, --version          print the version (on its own: sky --version)
 
@@ -261,7 +274,11 @@ async function runSecret(args: string[], io: Io): Promise<number> {
   );
 }
 
-const commands: Record<string, AgentCommand> = { ...agentCommands, env };
+const commands: Record<string, AgentCommand> = {
+  ...agentCommands,
+  env,
+  webhook,
+};
 
 async function runCommand(
   command: string,
@@ -289,6 +306,10 @@ async function runCommand(
     reason: text(values.reason),
     yes: values.yes === true,
     branch: text(values.branch),
+    events: text(values.events),
+    format: text(values.format),
+    secret: text(values.secret),
+    env: text(values.env),
   });
   return await withApi(values, io, (api, out) => action(api, io, out));
 }

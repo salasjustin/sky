@@ -1,5 +1,5 @@
 import type { AgentCommand } from "./agent.js";
-import type { ApiEnvironment } from "./api.js";
+import { type ApiEnvironment, ApiError } from "./api.js";
 import { UsageError } from "./output.js";
 import { resolveEnv, resolveEnvId } from "./secret.js";
 
@@ -16,6 +16,23 @@ function onlyEnv(sub: string, rest: string[]): string {
     );
   }
   return ref;
+}
+
+/** The ids from a 409 `webhooks_filter` delete refusal; undefined for any other error. */
+function filteringWebhookIds(err: unknown): string[] | undefined {
+  if (
+    !(err instanceof ApiError) ||
+    err.status !== 409 ||
+    err.code !== "webhooks_filter"
+  ) {
+    return undefined;
+  }
+  const ids = err.details.webhookIds;
+  return Array.isArray(ids) &&
+    ids.length > 0 &&
+    ids.every((id) => typeof id === "string")
+    ? ids
+    : undefined;
 }
 
 export const env: AgentCommand = {
@@ -76,7 +93,16 @@ export const env: AgentCommand = {
             return 1;
           }
         }
-        await api.deleteEnvironment(envId);
+        try {
+          await api.deleteEnvironment(envId);
+        } catch (err) {
+          const webhookIds = filteringWebhookIds(err);
+          if (webhookIds === undefined || out.json) throw err;
+          return out.fail(
+            "webhooks_filter",
+            `webhooks filter on ${target.name} (${envId}): ${webhookIds.join(", ")}; delete them first with sky webhook delete <id>`,
+          );
+        }
         // the API answers 204, so --json gets an object of its own rather than nothing
         out.result({ id: envId, deleted: true }, `deleted ${envId}`);
         return 0;

@@ -188,6 +188,55 @@ test("env delete refused by the API exits 1 with its message", async () => {
   expect(r.stderr).toBe("sky: a run is active (run_active)\n");
 });
 
+const webhooksFilter = (extra: Record<string, unknown>) =>
+  deleteEnv(() =>
+    HttpResponse.json(
+      {
+        error: {
+          code: "webhooks_filter",
+          message:
+            "webhooks filter on this environment: whk_a, whk_b; delete them first",
+          ...extra,
+        },
+      },
+      { status: 409 },
+    ),
+  );
+
+test("env delete blocked by filtering webhooks names them and the command that unblocks it", async () => {
+  server.use(list, webhooksFilter({ webhookIds: ["whk_a", "whk_b"] }));
+  const r = await runCli(["env", "delete", "web", "--yes"]);
+  expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toBe(
+    "sky: webhooks filter on web (env_1): whk_a, whk_b; delete them first with sky webhook delete <id>\n",
+  );
+});
+
+test("env delete --json blocked by filtering webhooks keeps the API error", async () => {
+  server.use(list, webhooksFilter({ webhookIds: ["whk_a", "whk_b"] }));
+  const r = await runCli(["env", "delete", "env_1", "--json", "--yes"]);
+  expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
+  expect(JSON.parse(r.stderr)).toEqual({
+    error: {
+      code: "webhooks_filter",
+      message:
+        "webhooks filter on this environment: whk_a, whk_b; delete them first",
+    },
+  });
+});
+
+test("env delete blocked by filtering webhooks without their ids prints the API message", async () => {
+  server.use(list, webhooksFilter({ webhookIds: "whk_a" }));
+  const r = await runCli(["env", "delete", "env_1", "--yes"]);
+  expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toBe(
+    "sky: webhooks filter on this environment: whk_a, whk_b; delete them first (webhooks_filter)\n",
+  );
+});
+
 const terminal = (answer: string, prompts: string[]) => ({
   stderrIsTTY: true,
   stdin: {
