@@ -46,7 +46,7 @@ export function claudeBinary(
   return "claude";
 }
 
-/** One refresh at a time per sprite: each `claude` it runs rewrites the shared `~/.claude.json`. */
+/** How often a run waiting on another run's refresh checks the lock again. */
 const LOCK_POLL_MS = 200;
 
 const alive = (pid: number) => {
@@ -59,11 +59,11 @@ const alive = (pid: number) => {
 };
 
 /**
- * Runs `task` holding a lock file, so concurrent runs on a sprite refresh one at a time. A run that
- * waited on a live holder and then saw the lock released doesn't run `task`: the holder just ran
- * the same refresh. A lock whose holder is gone is taken over and `task` runs. Resolves to "aborted",
- * without running `task`, when `signal` aborts first; a lock that can't be made at all runs `task`
- * unlocked.
+ * Runs `task` holding a lock file, so concurrent runs on a sprite refresh one at a time: each
+ * `claude` a refresh runs rewrites the shared `~/.claude.json`. A run that waited on a live holder
+ * and then saw the lock released doesn't run `task`: the holder just ran the same refresh. A lock
+ * whose holder is gone is taken over and `task` runs. Resolves to "aborted", without running `task`,
+ * when `signal` aborts while it waits; a lock that can't be made at all runs `task` unlocked.
  */
 export async function withRefreshLock(
   lockFile: string,
@@ -133,7 +133,7 @@ export async function refreshPlugins(options: {
   signal?: AbortSignal;
   timeoutMs?: number;
   claude?: string;
-  /** The sprite-wide lock one refresh at a time holds; in the temp dir when absent. */
+  /** The sprite-wide lock file a refresh holds while it runs; in the temp dir when absent. */
   lockFile?: string;
   run?: Exec;
   now?: () => number;
@@ -151,10 +151,10 @@ export async function refreshPlugins(options: {
   );
   const signal = stop ? AbortSignal.any([stop, timeout]) : timeout;
   const started = now();
-  // the wait for another run's refresh counts against this one's budget; ending it skips ours
   const lockFile =
     options.lockFile ?? join(tmpdir(), "sky-plugin-refresh.lock");
   try {
+    // the wait for another run's refresh counts against this one's budget; ending it skips ours
     const outcome = await withRefreshLock(lockFile, signal, async () => {
       const claudeRun = (...args: string[]) =>
         run(claude, args, { env, signal });

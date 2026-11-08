@@ -25,7 +25,8 @@ export function storeEnv(profile: BaseProfile | undefined): Vars {
 
 /**
  * What a run's session reads: the store, extra session variables, the checks to run and the profile's
- * MCP servers. The servers hold `${NAME}`-style secret names, never values.
+ * MCP servers. The servers name each secret by its bare env name (`DOOP_KEY`), never its value; the
+ * runner resolves the names from the run's env.
  */
 export function runEnv(profile: BaseProfile | undefined): Vars {
   if (!profile) return [];

@@ -89,5 +89,5 @@ export const unresolvedServersWarning = (
   unresolved: { server: string; secrets: string[] }[],
 ): string => {
   const one = unresolved.length === 1;
-  return `base-profile MCP server${one ? "" : "s"} not passed to this session, secret not set in this run: ${unresolved.map((u) => `${u.server} (${u.secrets.join(", ")})`).join("; ")}. If the sprite's config lists ${one ? "it, it connects" : "them, they connect"} there without ${one ? "its secret" : "their secrets"}.`;
+  return `base-profile MCP server${one ? "" : "s"} not passed to this session, secret not set in this run: ${unresolved.map((u) => `${u.server} (${u.secrets.join(", ")})`).join("; ")}. Set each named secret on the environment with sky secret set. If the sprite's config lists ${one ? "the server, the session still loads it" : "them, the session still loads them"} from there with ${one ? "a credential that doesn't" : "credentials that don't"} work.`;
 };

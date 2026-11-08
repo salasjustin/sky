@@ -2795,7 +2795,7 @@ describe("the base profile's MCP servers", () => {
     return { query, rec, warn };
   };
   const doopUnresolved =
-    "base-profile MCP server not passed to this session, secret not set in this run: doop (DOOP_KEY). If the sprite's config lists it, it connects there without its secret.";
+    "base-profile MCP server not passed to this session, secret not set in this run: doop (DOOP_KEY). Set each named secret on the environment with sky secret set. If the sprite's config lists the server, the session still loads it from there with a credential that doesn't work.";
 
   test("a server whose secret the run lacks is left out of the session, and the warning says the sprite's entry connects without it", async () => {
     userConfig({ doop: {}, notes: {} });
