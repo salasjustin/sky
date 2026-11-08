@@ -2725,9 +2725,9 @@ describe("the base profile's MCP servers", () => {
     ]);
     const posted = warnings(rec);
     expect(posted).toHaveLength(1);
-    const message = firstWarning(rec);
-    expect(message).toContain("doop");
-    expect(message).not.toContain("notes,");
+    expect(firstWarning(rec)).toBe(
+      "base-profile MCP server missing from the sprite's config: doop; passed to this session directly. Reprovision the sprite to restore it.",
+    );
     const everything = JSON.stringify([rec.posted, warn.mock.calls]);
     for (const value of Object.values(secrets))
       expect(everything).not.toContain(value);
@@ -2748,8 +2748,7 @@ describe("the base profile's MCP servers", () => {
     expect(firstWarning(rec)).toMatch(/doop, notes/);
   });
 
-  test("a server whose secret the run lacks is left out and named, never started with a blank", async () => {
-    userConfig({ doop: {}, notes: {} });
+  const runWithoutDoopKey = async () => {
     const query = scripted([init, success]);
     const rec = recorder();
     await runSession(
@@ -2762,12 +2761,32 @@ describe("the base profile's MCP servers", () => {
         env: { HOME: home, NOTES_SECRET: "n-secret-value" },
       },
     );
+    return { query, rec };
+  };
+  const doopUnresolved =
+    "base-profile MCP server not passed to this session, secret not set in this run: doop (DOOP_KEY). If the sprite's config lists it, it connects there without its secret.";
+
+  test("a server whose secret the run lacks is left out of the session, and the warning says the sprite's entry connects without it", async () => {
+    userConfig({ doop: {}, notes: {} });
+    const { query, rec } = await runWithoutDoopKey();
     expect(Object.keys(query.calls[0]?.options.mcpServers ?? {})).toEqual([
       "notes",
     ]);
-    expect(firstWarning(rec)).toBe(
-      "base-profile MCP server(s) not started, secret not set in this run: doop (DOOP_KEY)",
-    );
+    expect(warnings(rec)).toHaveLength(1);
+    expect(firstWarning(rec)).toBe(doopUnresolved);
+  });
+
+  test("a server both missing from the config and lacking its secret is named only as unresolved", async () => {
+    userConfig({ notes: {} });
+    const { query, rec } = await runWithoutDoopKey();
+    expect(Object.keys(query.calls[0]?.options.mcpServers ?? {})).toEqual([
+      "notes",
+    ]);
+    expect(
+      warnings(rec).map((e) =>
+        e.type === "runner.warning" ? e.payload.message : "",
+      ),
+    ).toEqual([doopUnresolved]);
   });
 
   test("no profile servers: an empty option and no warning", async () => {

@@ -34,8 +34,9 @@ export function userScopeServers(env: NodeJS.ProcessEnv): string[] {
 }
 
 /**
- * The base profile's MCP servers as the session takes them, each `${NAME}` secret reference replaced
- * by the run's env value, so the session has them whatever `~/.claude.json` holds. The values live
+ * The base profile's MCP servers as the session takes them, so the session has them whatever
+ * `~/.claude.json` holds. The profile names each secret by its bare env name (`DOOP_KEY`), and each
+ * `env` (stdio) or `headers` (http) value is that name's value in the run's env. The values live
  * in this process and the session's launch arguments only, never in a file or event. A server whose
  * secret the run doesn't have is left out and named in `unresolved`, with the secret's name.
  */
@@ -78,8 +79,15 @@ export function sessionMcpServers(
 export const missingServersWarning = (missing: string[]): string =>
   `base-profile MCP server${missing.length === 1 ? "" : "s"} missing from the sprite's config: ${missing.join(", ")}; passed to this session directly. Reprovision the sprite to restore ${missing.length === 1 ? "it" : "them"}.`;
 
-/** The warning for servers left out because a secret they name isn't in the run's env: names only. */
+/**
+ * The warning for servers left out because a secret they name isn't in the run's env: names only.
+ * The sprite's own entry for such a server references the secret as `${NAME}`, and Claude Code loads
+ * an unset one as that literal text, so the server can still start there with a credential that
+ * doesn't work.
+ */
 export const unresolvedServersWarning = (
   unresolved: { server: string; secrets: string[] }[],
-): string =>
-  `base-profile MCP server(s) not started, secret not set in this run: ${unresolved.map((u) => `${u.server} (${u.secrets.join(", ")})`).join("; ")}`;
+): string => {
+  const one = unresolved.length === 1;
+  return `base-profile MCP server${one ? "" : "s"} not passed to this session, secret not set in this run: ${unresolved.map((u) => `${u.server} (${u.secrets.join(", ")})`).join("; ")}. If the sprite's config lists ${one ? "it, it connects" : "them, they connect"} there without ${one ? "its secret" : "their secrets"}.`;
+};
