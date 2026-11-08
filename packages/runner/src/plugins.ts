@@ -59,15 +59,18 @@ const alive = (pid: number) => {
 };
 
 /**
- * Runs `task` holding a lock file, so concurrent runs on a sprite refresh in turn rather than
- * together. A lock whose holder is gone is taken over. Resolves to false, without running `task`,
- * when `signal` aborts first; a lock that can't be made at all runs `task` unlocked.
+ * Runs `task` holding a lock file, so concurrent runs on a sprite refresh one at a time. A run that
+ * waited on a live holder and then saw the lock released doesn't run `task`: the holder just ran
+ * the same refresh. A lock whose holder is gone is taken over and `task` runs. Resolves to "aborted",
+ * without running `task`, when `signal` aborts first; a lock that can't be made at all runs `task`
+ * unlocked.
  */
 export async function withRefreshLock(
   lockFile: string,
   signal: AbortSignal,
   task: () => Promise<void>,
-): Promise<boolean> {
+): Promise<"ran" | "done-by-holder" | "aborted"> {
+  let waitedOnLiveHolder = false;
   for (;;) {
     let fd: number;
     try {
@@ -75,7 +78,7 @@ export async function withRefreshLock(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
         await task();
-        return true;
+        return "ran";
       }
       let holder = NaN;
       try {
@@ -86,20 +89,27 @@ export async function withRefreshLock(
         try {
           unlinkSync(lockFile);
         } catch {}
+        // a holder that died may not have finished its refresh
+        waitedOnLiveHolder = false;
         continue;
       }
+      waitedOnLiveHolder = true;
       try {
         await sleep(LOCK_POLL_MS, undefined, { signal });
       } catch {
-        return false;
+        return "aborted";
       }
       continue;
     }
     try {
+      if (waitedOnLiveHolder) {
+        closeSync(fd);
+        return "done-by-holder";
+      }
       writeSync(fd, String(process.pid));
       closeSync(fd);
       await task();
-      return true;
+      return "ran";
     } finally {
       try {
         unlinkSync(lockFile);
@@ -111,7 +121,8 @@ export async function withRefreshLock(
 /**
  * Refreshes the plugin marketplaces and updates the user-scope plugins installed in them, so a
  * sandbox doesn't keep the versions its env setup installed. The marketplaces are reached the way
- * provisioning added them, by the same `claude` and env. Best effort: one overall timeout, a
+ * provisioning added them, by the same `claude` and env. A run that waited out another run's
+ * refresh on the sprite skips its own and says so on `warn`. Best effort: one overall timeout, a
  * failure is one line on `warn`, and the session carries on with the cached versions. `signal` is
  * the run's stop: aborting it ends the refresh at once, and an already-aborted one spawns nothing.
  * Never throws.
@@ -144,7 +155,7 @@ export async function refreshPlugins(options: {
   const lockFile =
     options.lockFile ?? join(tmpdir(), "sky-plugin-refresh.lock");
   try {
-    const ran = await withRefreshLock(lockFile, signal, async () => {
+    const outcome = await withRefreshLock(lockFile, signal, async () => {
       const claudeRun = (...args: string[]) =>
         run(claude, args, { env, signal });
       const { stdout } = await claudeRun("plugin", "list", "--json");
@@ -174,8 +185,13 @@ export async function refreshPlugins(options: {
         `runner: plugins refreshed in ${seconds(now() - started)}s (${updated.join(", ") || (plugins.length > 0 ? "none updated" : "none installed")})${failures}`,
       );
     });
+    if (outcome === "done-by-holder")
+      warn(
+        `runner: plugin refresh skipped, another run refreshed the plugins (waited ${seconds(now() - started)}s)`,
+      );
     // ended while another run held the lock
-    if (!ran) throw new Error("waiting for another run's refresh");
+    if (outcome === "aborted")
+      throw new Error("waiting for another run's refresh");
   } catch (error) {
     if (stop?.aborted) {
       warn(`runner: plugin refresh stopped after ${seconds(now() - started)}s`);
