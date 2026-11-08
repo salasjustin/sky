@@ -2664,17 +2664,22 @@ describe("the base profile's MCP servers", () => {
     NOTES_SECRET: "n-secret-value",
   };
   let home: string;
+  let claudeDir: string;
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "sky-home-"));
+    claudeDir = mkdtempSync(join(tmpdir(), "sky-claude-dir-"));
   });
-  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(claudeDir, { recursive: true, force: true });
+  });
 
   const userConfig = (servers: object) =>
     writeFileSync(
       join(home, ".claude.json"),
       JSON.stringify({ mcpServers: servers }),
     );
-  const run = async () => {
+  const run = async (extraEnv: NodeJS.ProcessEnv = {}) => {
     const query = scripted([init, success]);
     const rec = recorder();
     const warn = vi.fn();
@@ -2686,7 +2691,7 @@ describe("the base profile's MCP servers", () => {
         warn,
         signal: new AbortController().signal,
         awaitDecision: noDecision,
-        env: { HOME: home, ...secrets },
+        env: { HOME: home, ...secrets, ...extraEnv },
       },
     );
     return { query, rec, warn };
@@ -2742,38 +2747,70 @@ describe("the base profile's MCP servers", () => {
     expect(readFileSync(join(home, ".claude.json"), "utf8")).toBe(before);
   });
 
-  test("a missing or unreadable config counts every server as missing", async () => {
+  const bothMissing =
+    "base-profile MCP servers missing from the sprite's config: doop, notes; passed to this session directly. Reprovision the sprite to restore them.";
+
+  test("an unreadable config counts every server as missing", async () => {
     writeFileSync(join(home, ".claude.json"), "{ half a wri");
     const { rec } = await run();
-    expect(firstWarning(rec)).toMatch(/doop, notes/);
+    expect(firstWarning(rec)).toBe(bothMissing);
+  });
+
+  test("no config file counts every server as missing", async () => {
+    const { rec } = await run();
+    expect(firstWarning(rec)).toBe(bothMissing);
+  });
+
+  test("CLAUDE_CONFIG_DIR, not HOME, is where the config is read", async () => {
+    userConfig({});
+    writeFileSync(
+      join(claudeDir, ".claude.json"),
+      JSON.stringify({ mcpServers: { doop: {}, notes: {} } }),
+    );
+    const { rec } = await run({ CLAUDE_CONFIG_DIR: claudeDir });
+    expect(warnings(rec)).toEqual([]);
+  });
+
+  test("a CLAUDE_CONFIG_DIR without a config file does not fall back to HOME's", async () => {
+    userConfig({ doop: {}, notes: {} });
+    const { rec } = await run({ CLAUDE_CONFIG_DIR: claudeDir });
+    expect(firstWarning(rec)).toBe(bothMissing);
   });
 
   const runWithoutDoopKey = async () => {
     const query = scripted([init, success]);
     const rec = recorder();
+    const warn = vi.fn();
     await runSession(
       { ...config, mcpServers: profile },
       {
         query,
         post: rec.post,
+        warn,
         signal: new AbortController().signal,
         awaitDecision: noDecision,
         env: { HOME: home, NOTES_SECRET: "n-secret-value" },
       },
     );
-    return { query, rec };
+    return { query, rec, warn };
   };
   const doopUnresolved =
     "base-profile MCP server not passed to this session, secret not set in this run: doop (DOOP_KEY). If the sprite's config lists it, it connects there without its secret.";
 
   test("a server whose secret the run lacks is left out of the session, and the warning says the sprite's entry connects without it", async () => {
     userConfig({ doop: {}, notes: {} });
-    const { query, rec } = await runWithoutDoopKey();
+    const { query, rec, warn } = await runWithoutDoopKey();
     expect(Object.keys(query.calls[0]?.options.mcpServers ?? {})).toEqual([
       "notes",
     ]);
     expect(warnings(rec)).toHaveLength(1);
     expect(firstWarning(rec)).toBe(doopUnresolved);
+    // the session does carry the resolved server's value, so its absence below is a live read
+    expect(JSON.stringify(query.calls[0]?.options.mcpServers)).toContain(
+      secrets.NOTES_SECRET,
+    );
+    const everything = JSON.stringify([rec.posted, warn.mock.calls]);
+    expect(everything).not.toContain(secrets.NOTES_SECRET);
   });
 
   test("a server both missing from the config and lacking its secret is named only as unresolved", async () => {
