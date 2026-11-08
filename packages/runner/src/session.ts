@@ -621,9 +621,7 @@ export async function runSession(
   const env = deps.env ?? process.env;
   const mcp = sessionMcpServers(config.mcpServers, env);
   const inConfig = new Set(userScopeServers(env));
-  const missing = Object.keys(mcp.servers).filter(
-    (n) => !inConfig.has(n),
-  );
+  const missing = Object.keys(mcp.servers).filter((n) => !inConfig.has(n));
   if (missing.length > 0) {
     const message = missingServersWarning(missing);
     warn(`runner: ${message}`);

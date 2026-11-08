@@ -71,8 +71,7 @@ test("reads the profile's MCP servers, defaults the optional parts, and refuses 
 test("an http server without headers and a stdio server without args or env load with empty ones, which resolve with no secrets", () => {
   const { mcpServers } = loadConfig({
     ...env,
-    SKY_MCP_SERVERS:
-      '{"a":{"url":"https://x.test/mcp"},"b":{"command":"x"}}',
+    SKY_MCP_SERVERS: '{"a":{"url":"https://x.test/mcp"},"b":{"command":"x"}}',
   });
   expect(mcpServers).toEqual({
     a: { url: "https://x.test/mcp", headers: {} },
