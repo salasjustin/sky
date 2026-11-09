@@ -15,10 +15,9 @@ export const REQUEST_TIMEOUT_MS = 5_000;
 // deadline, not a count: a missing or refusing socket fails at once and is retried every
 // FIRST_HOLD_RETRY_MS for the whole budget, while a socket that accepts and says nothing idles out at
 // REQUEST_TIMEOUT_MS per attempt. No attempt starts past the budget, so setup gives up within the
-// budget plus one REQUEST_TIMEOUT_MS (an idle timeout, so a slow but steady reply can run longer). The
-// budget starts after the runner's boot and the failure report's POST follows the give-up, so boot,
-// budget, that last attempt and the POST must fit well inside HOLD_EXPIRE for the report to be sent
-// while the sprite is held
+// budget plus one REQUEST_TIMEOUT_MS (an idle timeout, so a slow but steady reply can run longer).
+// Boot, budget, that last attempt and the give-up report's POST must all fit well inside HOLD_EXPIRE,
+// so the report is sent while the sprite is held
 const FIRST_HOLD_RETRY_MS = 1_000;
 export const FIRST_HOLD_BUDGET_MS = 80_000;
 

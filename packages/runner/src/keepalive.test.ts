@@ -252,7 +252,7 @@ test("on a sprite, a socket that never appears is retried for the whole budget, 
   await expect(hold.ready).resolves.toBe(false);
   const tookMs = performance.now() - started;
   await hold.release();
-  // a missing socket fails at once, so a deadline, unlike a count of attempts, keeps it retried
+  // a missing socket fails at once, so only the deadline ends its retries
   expect(
     warnings.filter((w) => /sprite task PUT failed: .*ENOENT/.test(w)).length,
   ).toBeGreaterThan(15);
