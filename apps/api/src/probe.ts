@@ -27,15 +27,16 @@ function killedError(spriteName: string, { memory }: Diagnostics): string {
 
 /**
  * Wakes the sprite of a launch that never reported in, by looking for its runner: a sprite that
- * paused before the runner held it froze the runner, and any exec unfreezes it. Only logs: a live
- * runner is left alone, a missing one is left to the launch deadline. Never throws.
+ * paused before the runner held it froze the runner, and any exec unfreezes it. A live runner is
+ * left alone, a missing one is left to the launch deadline. Resolves to whether the runner is alive,
+ * or `undefined` when the check failed; never throws.
  */
 export async function wakeLaunch(
   sprites: SpriteOps,
   runId: RunId,
   spriteName: string,
   log: (line: string) => void,
-): Promise<void> {
+): Promise<boolean | undefined> {
   try {
     const alive = await isRunnerAlive(sprites, spriteName, runId);
     log(
@@ -43,8 +44,10 @@ export async function wakeLaunch(
         ? `woke ${spriteName} for ${runId}: its runner is alive`
         : `woke ${spriteName} for ${runId}: no runner found; the launch deadline decides`,
     );
+    return alive;
   } catch (err) {
     log(`waking ${spriteName} for ${runId} failed: ${err}`);
+    return undefined;
   }
 }
 

@@ -37,27 +37,51 @@ import {
 } from "./sprites.js";
 
 // the sprite's own socket and the task's life before the runner's first PUT refreshes it: long enough
-// for a slow boot, short enough that a runner that never comes up lets the sprite pause again soon
+// for a slow boot, short enough that a runner that never comes up lets the sprite pause again soon.
+// The runner's first-hold retries give up within this expiry (keepalive.ts), so their failure report
+// still lands while the sprite is held. `HOLD_TIMEOUT_MS` is the curl's `--max-time` plus the exec's
+// own start; a hold that outlasts it is given up on, and the sprite is left to the runner's hold, if any
 const SPRITE_API_SOCKET = "/.sprite/api.sock";
 const HOLD_EXPIRE = "2m";
+const CURL_MAX_TIME_S = 5;
 const HOLD_TIMEOUT_MS = 10_000;
 
-/** The exec that takes the run's keep-awake task; curl ships on every sprite image, and `-f` makes an HTTP error exit 22. */
-const holdArgv = (runId: RunId): [string, ...string[]] => [
+/** A curl to the run's keep-awake task; curl ships on every sprite image, and `-f` makes an HTTP error exit 22. */
+const taskArgv = (
+  runId: RunId,
+  method: "PUT" | "DELETE",
+  body: string[],
+): [string, ...string[]] => [
   "curl",
   "-sSf",
   "--max-time",
-  "5",
+  String(CURL_MAX_TIME_S),
   "--unix-socket",
   SPRITE_API_SOCKET,
   "-X",
-  "PUT",
-  "-H",
-  "content-type: application/json",
-  "-d",
-  JSON.stringify({ expire: HOLD_EXPIRE }),
+  method,
+  ...body,
   `http://sprite/v1/tasks/${spriteTaskNameFor(runId)}`,
 ];
+
+/** The exec that takes the run's keep-awake task. */
+export const holdArgv = (runId: RunId) =>
+  taskArgv(runId, "PUT", [
+    "-H",
+    "content-type: application/json",
+    "-d",
+    JSON.stringify({ expire: HOLD_EXPIRE }),
+  ]);
+
+/** The exec that deletes the run's keep-awake task. */
+export const releaseArgv = (runId: RunId) => taskArgv(runId, "DELETE", []);
+
+/**
+ * Whether a task curl failed on a 404, the Tasks API's answer for a task that doesn't exist. `-f`
+ * gives every HTTP error exit 22, so the status comes from the `-S` message on stderr.
+ */
+const isMissingTask = (out: { exitCode: number; stderr: string }) =>
+  out.exitCode === 22 && /returned error: 404\b/.test(out.stderr);
 
 // the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
 // then deleted, and the prompt in PROMPT_FILE, which a query param is too short for;
@@ -195,8 +219,11 @@ type Deps = {
   watchMs: number;
   /** How long after the runner starts a run that hasn't reported in gets its sprite woken. */
   wakeAfterMs: number;
-  /** Wakes the run's sprite and looks for its runner (see `wakeLaunch`); never throws. */
-  wake: (runId: RunId, spriteName: string) => Promise<void>;
+  /**
+   * Wakes the run's sprite and looks for its runner (see `wakeLaunch`): whether it is alive, or
+   * `undefined` when the check failed; never throws.
+   */
+  wake: (runId: RunId, spriteName: string) => Promise<boolean | undefined>;
 };
 export type Launch = {
   envId: EnvironmentId;
@@ -295,10 +322,11 @@ export function createLauncher({
   }
 
   /**
-   * Takes the run's keep-awake task before the runner exists: a sprite that pauses between the launch
-   * watch detaching and the runner's own hold freezes the runner. Never why a launch fails.
+   * Takes the run's keep-awake task: before the runner exists, since a sprite that pauses between the
+   * launch watch detaching and the runner's own hold freezes the runner, and again on a wake, since a
+   * woken launch can pause once more before that hold lands. Never why a launch fails.
    */
-  async function holdSprite(launch: Launch): Promise<void> {
+  async function holdSprite(launch: Launch, onFail: string): Promise<void> {
     try {
       await step(launch, "hold sprite", async () => {
         const out = await execInSprite(
@@ -312,13 +340,38 @@ export function createLauncher({
         }
       });
     } catch (err) {
+      log(`launching ${launch.runId}: hold sprite failed, ${onFail}: ${err}`);
+    }
+  }
+
+  /**
+   * Deletes the run's keep-awake task so its sprite is free to pause on its next idle window, not
+   * held for the rest of the expiry. A task that is already gone counts as released; any other
+   * failure is logged, never thrown.
+   */
+  async function releaseSprite(launch: Launch): Promise<void> {
+    try {
+      const out = await execInSprite(
+        sprites,
+        launch.spriteName,
+        releaseArgv(launch.runId),
+        { op: "release", timeoutMs: HOLD_TIMEOUT_MS },
+      );
+      if (out.exitCode !== 0 && !isMissingTask(out)) {
+        throw new Error(`curl exit ${out.exitCode}: ${out.stderr.trim()}`);
+      }
+    } catch (err) {
       log(
-        `launching ${launch.runId}: hold sprite failed, starting the runner anyway: ${err}`,
+        `launching ${launch.runId}: releasing the sprite hold failed: ${err}`,
       );
     }
   }
 
-  /** One wake for a run that still hasn't reported in `wakeAfterMs` after its runner started. */
+  /**
+   * One wake for a run that still hasn't reported in `wakeAfterMs` after its runner started, which
+   * then takes the run's hold again, so the sprite stays up until the runner refreshes it, unless the
+   * wake found no runner to keep awake.
+   */
   function wakeIfSilent(launch: Launch): void {
     setTimeout(() => {
       try {
@@ -326,7 +379,14 @@ export function createLauncher({
         log(
           `run ${launch.runId} still starting ${Math.round(wakeAfterMs / 1000)}s after its runner started; waking ${launch.spriteName}`,
         );
-        void wake(launch.runId, launch.spriteName);
+        // after the wake, not beside it: its exec is what resumes the sprite, and a resuming sprite's
+        // socket may not answer yet. A failed check still holds: a sprite that couldn't be read may
+        // hold a frozen runner, and the hold expires on its own. Neither call throws.
+        void wake(launch.runId, launch.spriteName).then((alive) =>
+          alive === false
+            ? undefined
+            : holdSprite(launch, "nothing more is tried"),
+        );
       } catch (err) {
         log(`checking whether ${launch.runId} needs a wake failed: ${err}`);
       }
@@ -404,7 +464,7 @@ export function createLauncher({
         { op: "write-env-file", mode: 0o600, known },
       ),
     );
-    await holdSprite(launch);
+    await holdSprite(launch, "starting the runner anyway");
     await step(launch, "start runner", () =>
       startDetached(
         sprites,
@@ -433,16 +493,15 @@ export function createLauncher({
           known,
         },
       ).catch(async (err: unknown) => {
-        // the runner never started, so nothing else deletes the file its secrets sit in
-        await execInSprite(
-          sprites,
-          launch.spriteName,
-          ["rm", "-f", envFilePath],
-          {
+        // the runner never started, so nothing else deletes the file its secrets sit in or the task
+        // that keeps its sprite awake until the expiry; neither cleanup replaces `err`
+        await Promise.all([
+          execInSprite(sprites, launch.spriteName, ["rm", "-f", envFilePath], {
             op: "rm-env-file",
             known,
-          },
-        ).catch(() => {});
+          }).catch(() => {}),
+          releaseSprite(launch),
+        ]);
         throw err;
       }),
     );
