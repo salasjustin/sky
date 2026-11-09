@@ -1503,6 +1503,30 @@ test("workflow add, edit, delete and rename are held back while other files publ
   expect(treePaths(second).sort()).toEqual(["a.txt", "b.txt"]);
 });
 
+test("publishing from a subdirectory holds back, lists and patches workflows as from the root", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  mkdirSync(join(work, "sub"));
+  writeFileSync(join(work, "sub/a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+
+  const result = await run({ cwd: join(work, "sub") });
+
+  expect(treePaths(gh)).toEqual(["sub/a.txt"]);
+  expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
+  expect(readFileSync(result.held?.patchPath ?? "", "utf8")).toBe(
+    result.held?.patch,
+  );
+  const published = join(root, "published");
+  execFileSync("git", ["clone", "-q", work, published]);
+  git(published, "checkout", "-q", baseSha);
+  git(published, "apply", result.held?.patchPath ?? "");
+  expect(
+    readFileSync(join(published, ".github/workflows/ci.yml"), "utf8"),
+  ).toBe("name: changed\n");
+});
+
 test("a workflow deleted on the branch is held back, and a commit touching only a workflow is skipped", async () => {
   baseWithWorkflows();
   const gh = fakeGitHub();

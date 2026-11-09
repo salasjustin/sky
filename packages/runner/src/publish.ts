@@ -525,7 +525,9 @@ export async function publish(options: {
   /** Replaces the author and committer of each commit sent; their dates stay. */
   identity?: { author: PersonName; committer: PersonName };
 }): Promise<PublishResult> {
-  const { cwd } = options;
+  // git takes a pathspec (`-- .github/workflows`, `ls-files`'s implicit one) relative to the
+  // directory it runs in, while `<rev>:<path>` is from the top, so every call runs from the top
+  const cwd = (await git(options.cwd, "rev-parse", "--show-toplevel")).trim();
   const rebasing = await rebaseInProgress(cwd);
   if (rebasing !== undefined) {
     // a rebase detaches HEAD until it finishes, so this is checked before the branch is read
