@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
 import { fetchCommit } from "./repo.js";
 import { git as repoGit } from "./store.js";
@@ -794,7 +794,7 @@ export async function publish(options: {
 }
 
 export const PUBLISH_USAGE =
-  "publish --title <title> [--body <text>] [--base <branch>] [--branch <name>]";
+  "publish --title <title> [--body <text|@file>] [--base <branch>] [--branch <name>]";
 
 /** The env var naming the GitHub branch to publish to when `--branch` isn't given. */
 export const BRANCH_ENV = "SKY_PUBLISH_BRANCH";
@@ -856,6 +856,20 @@ export async function publishMain(
   if (values.help) {
     io.stdout(`usage: ${PUBLISH_USAGE}\n`);
     return 0;
+  }
+  // `--body @path` reads the body from a file, like the CLI's `--prompt=@file`; a relative path is
+  // from the working directory
+  if (values.body?.startsWith("@")) {
+    const file = resolve(io.cwd, values.body.slice(1));
+    try {
+      values.body = await readFile(file, "utf8");
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      io.stderr(
+        `sky publish: cannot read the --body file ${file}${code ? ` (${code})` : ""}\nusage: ${PUBLISH_USAGE}\n`,
+      );
+      return 2;
+    }
   }
   const connectorId = env[CONNECTOR_ENV];
   if (!connectorId) {

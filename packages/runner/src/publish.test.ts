@@ -1140,6 +1140,41 @@ const publishMainWith = async (args: string[], env: Record<string, string>) => {
   return { status, stderr };
 };
 
+test("--body @path reads the pull request body from that file", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const file = join(root, "pr-body.md");
+  writeFileSync(file, "## Summary\n\nFrom a file.\n");
+
+  const { status } = await publishMainWith(
+    ["--title", "T", "--body", `@${file}`],
+    {},
+  );
+
+  expect(status).toBe(0);
+  expect(gh.pullCreates).toMatchObject([
+    { body: "## Summary\n\nFrom a file.\n" },
+  ]);
+});
+
+test("--body @path that can't be read exits 2 naming the file, and publishes nothing", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const file = join(root, "missing.md");
+
+  const { status, stderr } = await publishMainWith(
+    ["--title", "T", "--body", `@${file}`],
+    {},
+  );
+
+  expect(status).toBe(2);
+  expect(stderr).toContain(`cannot read the --body file ${file} (ENOENT)`);
+  expect(gh.pullCreates).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+});
+
 test("SKY_PUBLISH_BRANCH is the command's default branch", async () => {
   const gh = fakeGitHub({ branch: "from/env" });
   writeFileSync(join(work, "a.txt"), "first\n");
