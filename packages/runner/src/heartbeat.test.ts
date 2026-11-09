@@ -80,3 +80,132 @@ test("a beat that throws doesn't stop the next, and stop silences everything", (
   vi.advanceTimersByTime(5_000);
   expect(calls).toBe(3);
 });
+
+test("a call read in an earlier response stops being beaten for once the next begins, end hook or no", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.assistantMessage("m1", ["t1"]);
+  heartbeat.started("t1", "ToolSearch");
+  heartbeat.assistantMessage("m2", ["t2"]);
+  vi.advanceTimersByTime(120_000);
+  expect(beats).toEqual([]);
+  heartbeat.started("t2", "Bash");
+  vi.advanceTimersByTime(60_000);
+  expect(beats).toEqual([
+    { toolName: "Bash", toolUseId: "t2", elapsedMs: 60_000 },
+  ]);
+  heartbeat.stop();
+});
+
+test("parallel calls of one response stay tracked across its split messages", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.assistantMessage("m1", ["t1"]);
+  heartbeat.started("t1", "Bash");
+  heartbeat.assistantMessage("m1", ["t2"]);
+  heartbeat.started("t2", "Read");
+  vi.advanceTimersByTime(60_000);
+  expect(beats).toEqual([
+    { toolName: "Bash", toolUseId: "t1", elapsedMs: 60_000 },
+  ]);
+  heartbeat.stop();
+});
+
+test("a call started before the session reads the response that made it survives the turn changes ahead of it", () => {
+  const { beats, heartbeat } = setup();
+  // the hooks ran while the session's loop was still behind, before it had read m1
+  heartbeat.started("t1", "Read");
+  heartbeat.ended("t1");
+  heartbeat.started("t2", "Bash");
+  heartbeat.assistantMessage("m1", ["t1"]);
+  heartbeat.assistantMessage("m2", ["t2"]);
+  vi.advanceTimersByTime(60_000);
+  expect(beats).toEqual([
+    { toolName: "Bash", toolUseId: "t2", elapsedMs: 60_000 },
+  ]);
+  heartbeat.assistantMessage("m3", []);
+  vi.advanceTimersByTime(60_000);
+  expect(beats).toHaveLength(1);
+  heartbeat.stop();
+});
+
+test("an agent's new response drops only that agent's earlier calls", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.assistantMessage("s1", ["t2"], "sub_1");
+  heartbeat.started("t2", "ToolSearch");
+  vi.advanceTimersByTime(1_000);
+  heartbeat.assistantMessage("m1", ["t1"]);
+  heartbeat.started("t1", "Bash");
+  // the subagent's next response: its own ToolSearch has ended, the main thread's Bash hasn't
+  heartbeat.assistantMessage("s2", ["t3"], "sub_1");
+  vi.advanceTimersByTime(59_000);
+  expect(beats).toEqual([
+    { toolName: "Bash", toolUseId: "t1", elapsedMs: 59_000 },
+  ]);
+  heartbeat.started("t3", "Read");
+  heartbeat.assistantMessage("m2", []);
+  vi.advanceTimersByTime(60_000);
+  expect(beats.at(-1)).toEqual({
+    toolName: "Read",
+    toolUseId: "t3",
+    elapsedMs: 60_000,
+  });
+  heartbeat.stop();
+});
+
+test("a background task survives a new turn and is beaten for under its own name, behind any call in flight", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.setBackground([{ taskId: "b1", taskType: "local_bash" }]);
+  heartbeat.assistantMessage("m1", []);
+  vi.advanceTimersByTime(60_000);
+  heartbeat.started("t1", "Read");
+  vi.advanceTimersByTime(60_000);
+  heartbeat.ended("t1");
+  heartbeat.setBackground([]);
+  vi.advanceTimersByTime(120_000);
+  expect(beats).toEqual([
+    { toolName: "Bash (background)", toolUseId: "b1", elapsedMs: 60_000 },
+    { toolName: "Read", toolUseId: "t1", elapsedMs: 60_000 },
+  ]);
+  heartbeat.stop();
+});
+
+test.each([
+  ["local_bash", "Bash (background)"],
+  ["local_agent", "Agent (background)"],
+  ["local_workflow", "local_workflow (background)"],
+])("a %s background task is beaten for as %s", (taskType, toolName) => {
+  const { beats, heartbeat } = setup();
+  heartbeat.setBackground([{ taskId: "b1", taskType }]);
+  vi.advanceTimersByTime(60_000);
+  expect(beats).toEqual([{ toolName, toolUseId: "b1", elapsedMs: 60_000 }]);
+  heartbeat.stop();
+});
+
+test("a report of the live set replaces it: a task left out stops being beaten for, one kept keeps its start", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.setBackground([
+    { taskId: "b1", taskType: "local_bash" },
+    { taskId: "b2", taskType: "local_agent" },
+  ]);
+  vi.advanceTimersByTime(30_000);
+  heartbeat.setBackground([{ taskId: "b2", taskType: "local_agent" }]);
+  vi.advanceTimersByTime(30_000);
+  expect(beats).toEqual([
+    { toolName: "Agent (background)", toolUseId: "b2", elapsedMs: 60_000 },
+  ]);
+  heartbeat.stop();
+});
+
+test("a task reported again keeps counting from when it was first seen, ahead of one that joined later", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.setBackground([{ taskId: "b1", taskType: "local_bash" }]);
+  vi.advanceTimersByTime(30_000);
+  heartbeat.setBackground([
+    { taskId: "b2", taskType: "local_agent" },
+    { taskId: "b1", taskType: "local_bash" },
+  ]);
+  vi.advanceTimersByTime(30_000);
+  expect(beats).toEqual([
+    { toolName: "Bash (background)", toolUseId: "b1", elapsedMs: 60_000 },
+  ]);
+  heartbeat.stop();
+});

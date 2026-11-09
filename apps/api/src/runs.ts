@@ -187,12 +187,16 @@ const lastEventAt = (excluding: EventType[] = []) =>
 // a heartbeat older than this says the runner stopped reporting, not that the tool is still running
 const HEARTBEAT_FRESH_MS = 3 * HEARTBEAT_INTERVAL_MS;
 
+// the name the runner's heartbeat gives a background task the session is waiting on
+const BACKGROUND_SUFFIX = " (background)";
+
 type ToolInFlight = { toolName: string; ranMs: number; beatFresh: boolean };
 
 /**
- * The tool call the run's latest `runner.heartbeat` reports, when that heartbeat came after every
- * event but a `run.probed` or `runner.warning` (so no result has been seen since), and how long it
- * has run: up to now while the heartbeat is fresh, else up to that heartbeat.
+ * The tool call, or background task the session waits on, that the run's latest `runner.heartbeat`
+ * reports, when that heartbeat came after every event but a `run.probed` or `runner.warning` (so no
+ * result has been seen since), and how long it has run: up to now while the heartbeat is fresh,
+ * else up to that heartbeat.
  */
 function toolInFlight(
   tx: Tx,
@@ -228,8 +232,17 @@ function toolInFlight(
 const duration = (ms: number) =>
   ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)}m`;
 
-const timeoutError = (tool: ToolInFlight | undefined, timeoutMs: number) => {
+// a background task's ranMs is its age, which can predate the quiet window by however long the session kept working
+const timeoutError = (
+  tool: ToolInFlight | undefined,
+  quietMs: number,
+  timeoutMs: number,
+) => {
   if (!tool) return "runner_timeout";
+  if (tool.toolName.endsWith(BACKGROUND_SUFFIX))
+    return tool.beatFresh
+      ? `runner_timeout: the session waited on ${tool.toolName} with nothing else happening for ${duration(quietMs)}, past the ${duration(timeoutMs)} limit; the task had run ${duration(tool.ranMs)}`
+      : `runner_timeout: the runner went quiet while the session waited on ${tool.toolName}; the task had run ${duration(tool.ranMs)}`;
   return tool.beatFresh
     ? `runner_timeout: ${tool.toolName} was still running after ${duration(tool.ranMs)} with no result, past the ${duration(timeoutMs)} limit`
     : `runner_timeout: the runner went quiet during ${tool.toolName} after it had run ${duration(tool.ranMs)}`;
@@ -240,8 +253,9 @@ const timeoutError = (tool: ToolInFlight | undefined, timeoutMs: number) => {
  * `timeoutMs` ago, so a runner that died can't hold a concurrency slot. A `run.probed`, a
  * `runner.heartbeat` or a `runner.warning` doesn't count as an event: a runner that is alive but
  * wedged, a tool call that never returns, or a sprite hold that keeps failing, still times out. A
- * run that went quiet with a tool call in flight is failed naming it and how long it ran. Returns
- * the ids it failed.
+ * run that went quiet with a tool call in flight is failed naming it and how long it ran; one whose
+ * heartbeat names a background task the session waits on, naming the task, how long the session was
+ * quiet and how long the task had run. Returns the ids it failed.
  */
 export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
   const cutoff = new Date(now - timeoutMs).toISOString();
@@ -254,8 +268,10 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
   return db.transaction(
     (tx) => {
       const stale = tx
-        .select({ id: runs.id })
+        .select({ id: runs.id, lastActivityAt: lastActivity })
         .from(runs)
+        // the join keeps the subquery's `runs.id` qualified: on one table drizzle drops the prefix in a select list, and `id` would read events.id
+        .innerJoin(agents, eq(runs.agentId, agents.id))
         .where(
           and(
             inArray(
@@ -265,12 +281,16 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
             sql`${lastActivity} < ${cutoff}`,
           ),
         )
-        .all()
-        .map((r) => r.id);
-      for (const id of stale) {
-        failRun(tx, id, timeoutError(toolInFlight(tx, id, now), timeoutMs));
+        .all();
+      for (const { id, lastActivityAt } of stale) {
+        const quietMs = now - Date.parse(lastActivityAt);
+        failRun(
+          tx,
+          id,
+          timeoutError(toolInFlight(tx, id, now), quietMs, timeoutMs),
+        );
       }
-      return stale;
+      return stale.map((r) => r.id);
     },
     { behavior: "immediate" },
   );

@@ -690,6 +690,13 @@ export async function runSession(
         });
       } else if (message.type === "assistant") {
         const parent = message.parent_tool_use_id;
+        // a subagent's responses interleave with the main thread's, so each agent's turns are its own;
+        // agent_id outlives a resumed subagent's new parent call, and older producers lack it
+        heartbeat.assistantMessage(
+          message.message.id,
+          toolUseIdsOf(message.message.content),
+          message.agent_id ?? parent ?? undefined,
+        );
         // queued, not awaited: the post waits behind every hook event already queued, and a slow API must not hold the loop
         for (const text of textOf(message.message.content))
           void post(
@@ -703,7 +710,14 @@ export async function runSession(
         message.type === "system" &&
         message.subtype === "background_tasks_changed"
       ) {
-        liveTasks = message.tasks.filter((task) => !task.ambient).length;
+        const live = message.tasks.filter((task) => !task.ambient);
+        liveTasks = live.length;
+        heartbeat.setBackground(
+          live.map((task) => ({
+            taskId: task.task_id,
+            taskType: task.task_type,
+          })),
+        );
       } else if (
         message.type === "system" &&
         message.subtype === "task_notification"
@@ -789,6 +803,12 @@ function textOf(content: AssistantContent): string[] {
     block.type === "text" && block.text.trim()
       ? [bound(block.text.trim())]
       : [],
+  );
+}
+
+function toolUseIdsOf(content: AssistantContent): string[] {
+  return content.flatMap((block) =>
+    block.type === "tool_use" ? [block.id] : [],
   );
 }
 
