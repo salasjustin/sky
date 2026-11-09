@@ -608,8 +608,8 @@ async function forkPoint(
  * first-parent history is replayed, so a merge commit arrives as a plain commit with the same
  * content, and a merge from the base shows the base's changes in the pull request's diff as the
  * branch's own. A branch on GitHub whose head this branch held before a rebase or amend here is
- * force-updated to the rewritten history; one holding a commit this branch never had is refused
- * before anything is sent, and the GitHub branch a continued agent works on is only ever
+ * force-updated to the rewritten history; one holding a commit neither this branch nor the base has
+ * is refused before anything is sent, and the GitHub branch a continued agent works on is only ever
  * fast-forwarded. The connector can't write under `.github/workflows/`, so sent trees keep that
  * directory as the base has it, or as GitHub's head of the branch has it once the branch exists,
  * and the paths there the branch itself changed come back as `held`.
@@ -813,7 +813,7 @@ export async function publish(options: {
 
   // replay from the last local commit GitHub already holds: the same sha, or else the same tree
   // outside .github/workflows (a recreated commit's sha differs once its date's offset is dropped,
-  // and its workflows are the base's, or whatever was pushed there since; its tree can't differ
+  // and its workflows are the baseline's, or whatever was pushed there since; its tree can't differ
   // elsewhere)
   const known = [mergeBase, ...commits];
   let start = 0;
@@ -944,8 +944,8 @@ export async function publish(options: {
     if (at === -1 && baseline !== baseWorkflows) {
       if (rewritten) {
         // GitHub's head's workflows are the branch's own changes where they differ from those of
-        // the base it forks from; where they don't, they are an older base's, which the base's
-        // replace
+        // the base it forks from; where they don't, they are an older base's, and the rewrite sends
+        // the current base's instead
         const fork = await forkPoint(cwd, call, remote, mergeBase);
         if (fork === undefined || (await workflowsOf(fork)) !== baseline) {
           throw new PublishError(
@@ -953,7 +953,7 @@ export async function publish(options: {
           );
         }
       }
-      // a rewrite, or a fast-forward from a head on the base's history, sends the base's
+      // a rewrite, or a fast-forward from a head on the base's history, sends the base's workflows
       baseline = baseWorkflows;
     }
     if (at !== -1) {
@@ -985,9 +985,8 @@ export async function publish(options: {
   const patchPath = join(skyDir, "held-workflows.patch");
   let held: PublishResult["held"];
   const tip = commits[commits.length - 1] as string;
-  // what the tip's workflows differ from GitHub's head's (the base's, before the branch exists) by,
-  // at the paths the branch changed: one only GitHub's head changed was pushed there by someone
-  // else, and is kept, not reverted
+  // what the tip's workflows differ from the baseline's by, at the paths the branch changed: a path
+  // only GitHub's head changed was pushed there by someone else, and is kept, not reverted
   const branchPaths =
     (await workflowsOf(tip)) === baseline
       ? []
