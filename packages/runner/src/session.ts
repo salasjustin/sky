@@ -690,12 +690,13 @@ export async function runSession(
         });
       } else if (message.type === "assistant") {
         const parent = message.parent_tool_use_id;
-        // a subagent's responses interleave with the main thread's, so only main-thread ones mark its turns
-        if (!parent)
-          heartbeat.assistantMessage(
-            message.message.id,
-            toolUseIdsOf(message.message.content),
-          );
+        // a subagent's responses interleave with the main thread's, so each agent's turns are its own;
+        // agent_id outlives a resumed subagent's new parent call, and older producers lack it
+        heartbeat.assistantMessage(
+          message.message.id,
+          toolUseIdsOf(message.message.content),
+          message.agent_id ?? parent ?? undefined,
+        );
         // queued, not awaited: the post waits behind every hook event already queued, and a slow API must not hold the loop
         for (const text of textOf(message.message.content))
           void post(

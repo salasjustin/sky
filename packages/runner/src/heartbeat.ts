@@ -33,9 +33,13 @@ export function createHeartbeat(options: {
   const now = options.now ?? Date.now;
   const inFlight = new Map<string, InFlight>();
   const background = new Map<string, InFlight>();
-  let turn: string | undefined;
-  // the turn whose message carried each tool call the session has read so far
-  const turnOfCall = new Map<string, string>();
+  // each agent's current model response, keyed by subagent; the main thread's is under undefined
+  const turnOf = new Map<string | undefined, string>();
+  // the agent and response whose message carried each tool call the session has read so far
+  const turnOfCall = new Map<
+    string,
+    { agent: string | undefined; turn: string }
+  >();
   let timer: NodeJS.Timeout | undefined;
 
   const longest = (calls: Map<string, InFlight>) => {
@@ -72,6 +76,7 @@ export function createHeartbeat(options: {
   const stop = () => {
     inFlight.clear();
     background.clear();
+    turnOf.clear();
     turnOfCall.clear();
     idle();
   };
@@ -86,19 +91,22 @@ export function createHeartbeat(options: {
       idle();
     },
     /**
-     * The session read an assistant message: model response `id`, carrying the tool calls
-     * `toolUseIds`. A response the SDK splits into several messages shares one id. Once a new
-     * response begins, a call the session read in an earlier one has ended, whether or not its end
-     * hook fired, so it stops being beaten for. A call whose message the session hasn't read yet is
-     * kept: the SDK runs hooks as it reads them but queues messages behind the session's loop, so a
-     * call can be `started` before the loop reaches the response that made it.
+     * The session read an assistant message: model response `id` of `agent` (a subagent's id, or
+     * undefined for the main thread), carrying the tool calls `toolUseIds`. A response the SDK
+     * splits into several messages shares one id. Once an agent begins a new response, a call the
+     * session read in one of its earlier responses has ended, whether or not its end hook fired, so
+     * it stops being beaten for; other agents' calls are untouched, since subagents and the main
+     * thread take turns independently. A call whose message the session hasn't read yet is kept: the
+     * SDK runs hooks as it reads them but queues messages behind the session's loop, so a call can be
+     * `started` before the loop reaches the response that made it.
      */
-    assistantMessage(id: string, toolUseIds: string[]): void {
-      for (const toolUseId of toolUseIds) turnOfCall.set(toolUseId, id);
-      if (id === turn) return;
-      turn = id;
-      for (const [toolUseId, callTurn] of turnOfCall) {
-        if (callTurn === id) continue;
+    assistantMessage(id: string, toolUseIds: string[], agent?: string): void {
+      for (const toolUseId of toolUseIds)
+        turnOfCall.set(toolUseId, { agent, turn: id });
+      if (turnOf.get(agent) === id) return;
+      turnOf.set(agent, id);
+      for (const [toolUseId, call] of turnOfCall) {
+        if (call.agent !== agent || call.turn === id) continue;
         inFlight.delete(toolUseId);
         turnOfCall.delete(toolUseId);
       }

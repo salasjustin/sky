@@ -127,6 +127,30 @@ test("a call started before the session reads the response that made it survives
   heartbeat.stop();
 });
 
+test("an agent's new response drops only that agent's earlier calls", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.assistantMessage("s1", ["t2"], "sub_1");
+  heartbeat.started("t2", "ToolSearch");
+  vi.advanceTimersByTime(1_000);
+  heartbeat.assistantMessage("m1", ["t1"]);
+  heartbeat.started("t1", "Bash");
+  // the subagent's next response: its own ToolSearch has ended, the main thread's Bash hasn't
+  heartbeat.assistantMessage("s2", ["t3"], "sub_1");
+  vi.advanceTimersByTime(59_000);
+  expect(beats).toEqual([
+    { toolName: "Bash", toolUseId: "t1", elapsedMs: 59_000 },
+  ]);
+  heartbeat.started("t3", "Read");
+  heartbeat.assistantMessage("m2", []);
+  vi.advanceTimersByTime(60_000);
+  expect(beats.at(-1)).toEqual({
+    toolName: "Read",
+    toolUseId: "t3",
+    elapsedMs: 60_000,
+  });
+  heartbeat.stop();
+});
+
 test("a background task survives a new turn and is beaten for under its own name, behind any call in flight", () => {
   const { beats, heartbeat } = setup();
   heartbeat.setBackground([{ taskId: "b1", taskType: "local_bash" }]);

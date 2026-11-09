@@ -2524,6 +2524,17 @@ const turn = (id: string, ...toolUseIds: string[]) => ({
   },
 });
 
+/** An assistant message of subagent `agentId`'s model response `id`, as the SDK emits it. */
+const subagentTurn = (
+  agentId: string,
+  id: string,
+  ...toolUseIds: string[]
+) => ({
+  ...turn(id, ...toolUseIds),
+  parent_tool_use_id: "agent-call",
+  agent_id: agentId,
+});
+
 test("a call that never gets an end hook stops being beaten for once the session starts its next turn", async () => {
   const { posted, post } = recorder();
   let beatsBefore = 0;
@@ -2602,6 +2613,80 @@ test("a call whose hook runs before the session reads the response that made it 
   });
   expect(code).toBe(0);
   expect(beatsIn(posted).map((b) => b.toolUseId)).toContain("t2");
+});
+
+test("a subagent's responses mid-call don't end a main-thread call", async () => {
+  const { posted, post } = recorder();
+  let beatsBefore = 0;
+  const query = scripted([
+    init,
+    turn("m1", "t1"),
+    hook("PreToolUse", bash("t1")),
+    until(() => expect(beatsIn(posted).length).toBeGreaterThanOrEqual(1)),
+    subagentTurn("sub_1", "s1"),
+    subagentSays("agent-call", "looking"),
+    subagentTurn("sub_1", "s2"),
+    async () => {
+      beatsBefore = beatsIn(posted).length;
+    },
+    until(() =>
+      expect(beatsIn(posted).length).toBeGreaterThanOrEqual(beatsBefore + 2),
+    ),
+    hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
+    success,
+  ]);
+  const code = await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    heartbeatMs: 25,
+  });
+  expect(code).toBe(0);
+  expect(new Set(beatsIn(posted).map((b) => b.toolUseId))).toEqual(
+    new Set(["t1"]),
+  );
+});
+
+test("a background subagent's call that never gets an end hook stops being beaten for at the subagent's next turn", async () => {
+  const { posted, post } = recorder();
+  let beatsBefore = 0;
+  const toolSearch = {
+    ...bash("t1"),
+    tool_name: "ToolSearch",
+    agent_id: "sub_1",
+  };
+  const query = scripted([
+    init,
+    backgroundTasks(1),
+    subagentTurn("sub_1", "s1", "t1"),
+    hook("PreToolUse", toolSearch),
+    until(() =>
+      expect(
+        beatsIn(posted).filter((b) => b.toolName === "ToolSearch").length,
+      ).toBeGreaterThanOrEqual(2),
+    ),
+    subagentTurn("sub_1", "s2"),
+    async () => {
+      beatsBefore = beatsIn(posted).length;
+    },
+    until(() =>
+      expect(beatsIn(posted).length).toBeGreaterThanOrEqual(beatsBefore + 2),
+    ),
+    backgroundTasks(0),
+    success,
+  ]);
+  await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    heartbeatMs: 25,
+  });
+  // the session is waiting on the subagent's task now, not on the call it lost the end of
+  expect(
+    new Set(beatsIn(posted).slice(beatsBefore).map((b) => b.toolName)),
+  ).toEqual(new Set(["Bash (background)"]));
 });
 
 test("a run waiting on a background task beats as 'Bash (background)' until the task ends", async () => {
