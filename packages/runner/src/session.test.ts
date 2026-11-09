@@ -2687,6 +2687,9 @@ test("a background subagent's call that never gets an end hook stops being beate
   expect(
     new Set(beatsIn(posted).slice(beatsBefore).map((b) => b.toolName)),
   ).toEqual(new Set(["Bash (background)"]));
+  expect(
+    new Set(beatsIn(posted).slice(beatsBefore).map((b) => b.toolUseId)),
+  ).toEqual(new Set(["t0"]));
 });
 
 test("a run waiting on a background task beats as 'Bash (background)' until the task ends", async () => {
@@ -2716,7 +2719,30 @@ test("a run waiting on a background task beats as 'Bash (background)' until the 
   expect(new Set(beatsIn(posted).map((b) => b.toolName))).toEqual(
     new Set(["Bash (background)"]),
   );
+  // the beat names the task itself (backgroundTasks ids it t0), not the finished call t1
+  expect(new Set(beatsIn(posted).map((b) => b.toolUseId))).toEqual(
+    new Set(["t0"]),
+  );
   expect(beatsIn(posted).length).toBe(beatsBefore);
+});
+
+test("an ambient background task, which the run doesn't wait on, is not beaten for", async () => {
+  const { posted, post } = recorder();
+  const query = scripted([
+    init,
+    backgroundTasks(1, true),
+    pause(QUIET_MS),
+    success,
+  ]);
+  const code = await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    heartbeatMs: 25,
+  });
+  expect(code).toBe(0);
+  expect(beatsIn(posted)).toEqual([]);
 });
 
 test("a call held for approval is not beaten for until it is approved and runs", async () => {

@@ -161,6 +161,51 @@ test("a background task survives a new turn and is beaten for under its own name
   heartbeat.ended("t1");
   heartbeat.setBackground([]);
   vi.advanceTimersByTime(120_000);
-  expect(beats.map((b) => b.toolName)).toEqual(["Bash (background)", "Read"]);
+  expect(beats).toEqual([
+    { toolName: "Bash (background)", toolUseId: "b1", elapsedMs: 60_000 },
+    { toolName: "Read", toolUseId: "t1", elapsedMs: 60_000 },
+  ]);
+  heartbeat.stop();
+});
+
+test.each([
+  ["local_bash", "Bash (background)"],
+  ["local_agent", "Agent (background)"],
+  ["local_workflow", "local_workflow (background)"],
+])("a %s background task is beaten for as %s", (taskType, toolName) => {
+  const { beats, heartbeat } = setup();
+  heartbeat.setBackground([{ taskId: "b1", taskType }]);
+  vi.advanceTimersByTime(60_000);
+  expect(beats).toEqual([{ toolName, toolUseId: "b1", elapsedMs: 60_000 }]);
+  heartbeat.stop();
+});
+
+test("a report of the live set replaces it: a task left out stops being beaten for, one kept keeps its start", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.setBackground([
+    { taskId: "b1", taskType: "local_bash" },
+    { taskId: "b2", taskType: "local_agent" },
+  ]);
+  vi.advanceTimersByTime(30_000);
+  heartbeat.setBackground([{ taskId: "b2", taskType: "local_agent" }]);
+  vi.advanceTimersByTime(30_000);
+  expect(beats).toEqual([
+    { toolName: "Agent (background)", toolUseId: "b2", elapsedMs: 60_000 },
+  ]);
+  heartbeat.stop();
+});
+
+test("a task reported again keeps counting from when it was first seen, ahead of one that joined later", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.setBackground([{ taskId: "b1", taskType: "local_bash" }]);
+  vi.advanceTimersByTime(30_000);
+  heartbeat.setBackground([
+    { taskId: "b2", taskType: "local_agent" },
+    { taskId: "b1", taskType: "local_bash" },
+  ]);
+  vi.advanceTimersByTime(30_000);
+  expect(beats).toEqual([
+    { toolName: "Bash (background)", toolUseId: "b1", elapsedMs: 60_000 },
+  ]);
   heartbeat.stop();
 });
