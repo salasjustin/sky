@@ -1953,6 +1953,83 @@ test("the PM pushes only part of the patch: the next publish holds only the rest
   ]);
 });
 
+test("someone pushes a change to a workflow the branch never touched: the next publish keeps it in what is sent and holds only the branch's own workflow change", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+  await run();
+  // a CI fix pushed to the PR's branch from outside, to a file the branch leaves as the base has it
+  const theirs = pmPush("", {
+    "a.txt": "first\n",
+    ".github/workflows/old.yml": "name: old, fixed\n",
+  });
+
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Review fix");
+  const gh = fakeGitHub({
+    ref: "their_head",
+    commitTrees: { their_head: theirs.tree },
+    objectsFrom: theirs.dir,
+    pulls: [OPEN_PR],
+    allowPullUpdates: true,
+  });
+
+  const result = await run();
+
+  expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
+  expect(result.held?.patch).not.toContain("old.yml");
+  git(theirs.dir, "apply", result.held?.patchPath ?? "");
+  expect(
+    readFileSync(join(theirs.dir, ".github/workflows/old.yml"), "utf8"),
+  ).toBe("name: old, fixed\n");
+  expect(
+    readFileSync(join(theirs.dir, ".github/workflows/ci.yml"), "utf8"),
+  ).toBe("name: changed\n");
+  // on GitHub's head's tree, with nothing sent under .github/workflows
+  expect(gh.trees[0]).toMatchObject({ base_tree: theirs.tree });
+  expect(treePaths(gh)).toEqual(["b.txt"]);
+  expect(gh.commits.map((c) => c.parents)).toEqual([["their_head"]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("the PM pushes an edited version of a held workflow: the next publish still holds it, from GitHub's version to the branch's, and only it", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+  commit("Add a, change CI");
+  await run();
+  // new.yml as the branch has it, ci.yml as the PM edited it
+  const pm = pmPush("", {
+    "a.txt": "first\n",
+    ".github/workflows/ci.yml": "name: changed by the PM\n",
+    ".github/workflows/new.yml": "name: new\n",
+  });
+
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Review fix");
+  const gh = fakeGitHub({
+    ref: "pm_head",
+    commitTrees: { pm_head: pm.tree },
+    objectsFrom: pm.dir,
+    pulls: [OPEN_PR],
+    allowPullUpdates: true,
+  });
+
+  const result = await run();
+
+  expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
+  expect(result.held?.patch).toContain("-name: changed by the PM");
+  expect(result.held?.patch).not.toContain("new.yml");
+  expect(treePaths(gh)).toEqual(["b.txt"]);
+  expect(gh.commits.map((c) => c.parents)).toEqual([["pm_head"]]);
+});
+
 test("continuing a branch whose GitHub commits already change workflows sends the new work on GitHub's tree and holds nothing", async () => {
   baseWithWorkflows();
   git(work, "config", "branch.claude/agt_1.sky-remote-branch", "feature/x");
@@ -2165,4 +2242,32 @@ test("after the PM pushes the held workflows, a re-publish once the base moves i
   expect(gh.trees).toEqual([]);
   expect(gh.commits).toEqual([]);
   expect(gh.refWrites).toEqual([]);
+});
+
+test("a GitHub head that is someone else's, neither this branch's history nor the base's, is refused before anything is held or sent", async () => {
+  baseWithWorkflows();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+  // a branch of the same name someone else pushed, with a tree this branch never had
+  const theirs = pmPush("", { "theirs.txt": "theirs\n" });
+  // what an earlier publish held, which this one must leave as it is
+  mkdirSync(dirname(heldPatchPath()), { recursive: true });
+  writeFileSync(heldPatchPath(), "an earlier publish's patch\n");
+  const gh = fakeGitHub({
+    ref: "their_head",
+    commitTrees: { their_head: theirs.tree },
+    objectsFrom: theirs.dir,
+  });
+
+  await expect(run()).rejects.toThrow(
+    "claude/agt_1 on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten, so nothing was sent",
+  );
+  expect(gh.blobs).toEqual([]);
+  expect(gh.trees).toEqual([]);
+  expect(gh.commits).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+  expect(readFileSync(heldPatchPath(), "utf8")).toBe(
+    "an earlier publish's patch\n",
+  );
 });

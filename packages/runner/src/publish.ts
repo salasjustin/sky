@@ -41,8 +41,9 @@ export type PublishResult = {
   pullRequest: { number: number; url: string };
   /**
    * Set when the commits change `.github/workflows/`, which the connector's token may not write:
-   * what was sent keeps the base's version there, and the changes are held in `patch`, also saved
-   * at `patchPath`.
+   * what was sent keeps GitHub's head's version there once the branch exists (the base's before
+   * that, and on a rewrite), and the paths the branch changed that differ from it are held in
+   * `patch`, also saved at `patchPath`.
    */
   held?: { files: string[]; patch: string; patchPath: string };
 };
@@ -296,8 +297,13 @@ async function fetchTree(
   }
 }
 
-/** Each workflow path that differs between the trees `base` and `tip`, as `<status> <path>`; a rename names both. */
-async function heldFiles(cwd: string, base: string, tip: string) {
+/** Each path of `paths` that differs between the trees `base` and `tip`, as `<status> <path>`; a rename names both. */
+async function heldFiles(
+  cwd: string,
+  base: string,
+  tip: string,
+  paths: string[],
+) {
   const out = await git(
     cwd,
     "diff",
@@ -307,7 +313,7 @@ async function heldFiles(cwd: string, base: string, tip: string) {
     base,
     tip,
     "--",
-    WORKFLOWS_DIR,
+    ...paths,
   );
   const fields = out.split("\0").filter(Boolean);
   const files: string[] = [];
@@ -602,10 +608,11 @@ async function forkPoint(
  * first-parent history is replayed, so a merge commit arrives as a plain commit with the same
  * content, and a merge from the base shows the base's changes in the pull request's diff as the
  * branch's own. A branch on GitHub whose head this branch held before a rebase or amend here is
- * force-updated to the rewritten history; one holding a commit this branch never had, or the GitHub
- * branch a continued agent works on, is only ever fast-forwarded. The connector can't write under
- * `.github/workflows/`, so sent trees keep that directory as the base has it, or as GitHub's head of
- * the branch has it once the branch exists, and the branch's changes there come back as `held`.
+ * force-updated to the rewritten history; one holding a commit this branch never had is refused
+ * before anything is sent, and the GitHub branch a continued agent works on is only ever
+ * fast-forwarded. The connector can't write under `.github/workflows/`, so sent trees keep that
+ * directory as the base has it, or as GitHub's head of the branch has it once the branch exists,
+ * and the paths there the branch itself changed come back as `held`.
  * GitHub's head is matched against local commits outside that directory, so workflows pushed to the
  * branch from elsewhere are kept, and a rewrite that would drop them is refused.
  */
@@ -778,6 +785,7 @@ export async function publish(options: {
     );
   }
   const refPath = `heads/${remoteBranch.split("/").map(encodeURIComponent).join("/")}`;
+  const notFastForward = `${remoteBranch} on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten`;
   const treeOf = async (sha: string) =>
     (await git(cwd, "rev-parse", `${sha}^{tree}`)).trim();
   const workflowsOf = async (sha: string) =>
@@ -915,6 +923,24 @@ export async function publish(options: {
         `${remoteBranch} on GitHub is at ${remote}, which this branch doesn't build on (as after an amend or rebase here, or a push there); a branch this agent continues is only ever fast-forwarded, so nothing was sent. Put your work back on top of it: \`git reset --soft ${remote}\` and \`git commit\` keep your files as they are in a new commit on it (when git doesn't know ${remote}, it was pushed during this run, and the next run brings it in), then publish again`,
       );
     }
+    // the replay goes onto the base, so a fast-forward from a head that is neither this branch's
+    // history nor on the base's is refused: it fails here, before anything is held or sent
+    if (at === -1 && !rewritten) {
+      // false as well for a commit that isn't here
+      const onBase = await git(
+        cwd,
+        "merge-base",
+        "--is-ancestor",
+        remote,
+        mergeBase,
+      ).then(
+        () => true,
+        () => false,
+      );
+      if (!onBase) {
+        throw new PublishError(`${notFastForward}, so nothing was sent`);
+      }
+    }
     if (at === -1 && baseline !== baseWorkflows) {
       if (rewritten) {
         // GitHub's head's workflows are the branch's own changes where they differ from those of
@@ -927,8 +953,7 @@ export async function publish(options: {
           );
         }
       }
-      // a rewrite sends the base's; for a head that isn't this branch's to update, the ref update
-      // below is refused
+      // a rewrite, or a fast-forward from a head on the base's history, sends the base's
       baseline = baseWorkflows;
     }
     if (at !== -1) {
@@ -960,13 +985,35 @@ export async function publish(options: {
   const patchPath = join(skyDir, "held-workflows.patch");
   let held: PublishResult["held"];
   const tip = commits[commits.length - 1] as string;
-  // what the tip's workflows differ from GitHub's head's (the base's, before the branch exists) by
-  if ((await workflowsOf(tip)) !== baseline) {
+  // what the tip's workflows differ from GitHub's head's (the base's, before the branch exists) by,
+  // at the paths the branch changed: one only GitHub's head changed was pushed there by someone
+  // else, and is kept, not reverted
+  const branchPaths =
+    (await workflowsOf(tip)) === baseline
+      ? []
+      : (
+          await git(
+            cwd,
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            mergeBase,
+            tip,
+            "--",
+            WORKFLOWS_DIR,
+          )
+        )
+          .split("\0")
+          .filter(Boolean)
+          .map((path) => `:(literal)${path}`);
+  // empty where the branch's workflow changes cancel out
+  if (branchPaths.length > 0) {
     if (baseline) await fetchTree(cwd, call, baseline);
     const sent = await shownTree(tip);
     const tipTree = await treeOf(tip);
-    // empty where the branch's workflow changes cancel out
-    const files = await heldFiles(cwd, sent, tipTree);
+    // empty where GitHub's head already has the branch's versions
+    const files = await heldFiles(cwd, sent, tipTree, branchPaths);
     if (files.length > 0) {
       const patch = (
         await gitBytes(
@@ -978,7 +1025,7 @@ export async function publish(options: {
           sent,
           tipTree,
           "--",
-          WORKFLOWS_DIR,
+          ...branchPaths,
         )
       ).toString("utf8");
       await mkdir(skyDir, { recursive: true });
@@ -1090,9 +1137,7 @@ export async function publish(options: {
       force: false,
     }).catch((error: unknown) => {
       if (error instanceof GatewayError && error.status === 422) {
-        throw new PublishError(
-          `${remoteBranch} on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten (${error.message})`,
-        );
+        throw new PublishError(`${notFastForward} (${error.message})`);
       }
       throw error;
     });
