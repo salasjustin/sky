@@ -38,11 +38,9 @@ import {
 
 // the sprite's own socket and the task's life before the runner's first PUT refreshes it: long enough
 // for a slow boot, short enough that a runner that never comes up lets the sprite pause again soon.
-// The API's hold only bridges the gap before the runner's own (keepalive.ts, whose first-hold retries
-// give up within this expiry, so their report still reaches the API while the hold keeps the sprite
-// awake); `HOLD_TIMEOUT_MS` is the curl's `--max-time` plus the exec's own start, and a hold that
-// outlasts it is given up on: before the runner starts, the runner holds the sprite itself; after a
-// wake, the sprite is left to whatever hold the runner has, if any
+// The runner's first-hold retries give up within this expiry (keepalive.ts), so their failure report
+// still lands while the sprite is held. `HOLD_TIMEOUT_MS` is the curl's `--max-time` plus the exec's
+// own start; a hold that outlasts it is given up on, and the sprite is left to the runner's hold, if any
 const SPRITE_API_SOCKET = "/.sprite/api.sock";
 const HOLD_EXPIRE = "2m";
 const CURL_MAX_TIME_S = 5;

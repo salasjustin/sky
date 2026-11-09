@@ -12,11 +12,11 @@ const REQUEST_TIMEOUT_MS = 5_000;
 // the API holds the sprite under the same task name before the runner starts (for 2m, launch.ts), so
 // against a pause the quick retries only matter when that hold didn't land and a sprite woken cold may
 // not have its API up yet (the socket missing or refusing), leaving the sprite free to pause and
-// freeze the run. They also bound how long setup waits on the first hold, and give up inside the API's
-// hold: 15 attempts with a retry wait between each come to 89s when every attempt idles out at
-// REQUEST_TIMEOUT_MS (an idle timeout, so a slow but steady reply can run longer). That budget starts at
-// the runner's first PUT, after its boot, and the failure report's POST follows it, so it must stay well
-// inside the API's 2m hold (HOLD_EXPIRE, launch.ts) for the report to be sent while the sprite is held
+// freeze the run. They also bound how long setup waits on the first hold: 15 attempts with a retry wait
+// between each come to 89s when every attempt idles out at REQUEST_TIMEOUT_MS (an idle timeout, so a
+// slow but steady reply can run longer). The budget starts after the runner's boot and the failure
+// report's POST follows it, so it must stay well inside the API's 2m hold (HOLD_EXPIRE, launch.ts) for
+// the report to be sent while the sprite is held
 const FIRST_HOLD_RETRY_MS = 1_000;
 const FIRST_HOLD_ATTEMPTS = 15;
 
