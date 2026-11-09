@@ -1587,6 +1587,25 @@ test("the publish command names each held-back file on stderr and prints the pat
   expect(out[1]?.endsWith(`\n${HELD_PATCH_END}\n`)).toBe(true);
 });
 
+test("workflow changes the branch reverts hold nothing back and remove the earlier patch", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+  const first = await run();
+  expect(existsSync(first.held?.patchPath ?? "")).toBe(true);
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: ci\non: push\n");
+  commit("Revert CI");
+
+  const second = fakeGitHub();
+  const result = await run();
+
+  expect(result.held).toBeUndefined();
+  expect(existsSync(first.held?.patchPath ?? "")).toBe(false);
+  expect(treePaths(second)).toEqual(["a.txt"]);
+});
+
 test("without workflow changes, no held result is returned and a stale patch is removed", async () => {
   baseWithWorkflows();
   const gh = fakeGitHub();

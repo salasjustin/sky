@@ -705,9 +705,15 @@ export async function publish(options: {
     }
     return tree;
   };
+  const skyDir = join(
+    (await git(cwd, "rev-parse", "--absolute-git-dir")).trim(),
+    "sky",
+  );
+  const patchPath = join(skyDir, "held-workflows.patch");
   let held: PublishResult["held"];
   if (holding) {
     const tip = commits[commits.length - 1] as string;
+    // empty where the branch's workflow changes cancel out
     const files = await heldFiles(cwd, mergeBase, tip);
     if (files.length > 0) {
       const patch = (
@@ -723,18 +729,13 @@ export async function publish(options: {
           WORKFLOWS_DIR,
         )
       ).toString("utf8");
-      const gitDir = (await git(cwd, "rev-parse", "--absolute-git-dir")).trim();
-      const patchPath = join(gitDir, "sky", "held-workflows.patch");
-      await mkdir(join(gitDir, "sky"), { recursive: true });
+      await mkdir(skyDir, { recursive: true });
       await writeFile(patchPath, patch);
       held = { files, patch, patchPath };
     }
   }
-  if (!holding) {
-    // a patch an earlier publish left must not outlive the changes it held
-    const gitDir = (await git(cwd, "rev-parse", "--absolute-git-dir")).trim();
-    await rm(join(gitDir, "sky", "held-workflows.patch"), { force: true });
-  }
+  // a patch an earlier publish left must not outlive the changes it held
+  if (!held) await rm(patchPath, { force: true });
 
   const remote = await call<{ object: { sha: string } }>(
     "GET",
@@ -976,7 +977,8 @@ export function configuredIdentity(env: NodeJS.ProcessEnv) {
 
 /**
  * `runner.mjs publish …`, run by the agent from its worktree: prints the pull request's URL on
- * stdout and returns the exit status, 2 for a usage or config error.
+ * stdout, then any held-back workflow patch between `HELD_PATCH_BEGIN` and `HELD_PATCH_END`, and
+ * returns the exit status, 2 for a usage or config error.
  */
 export async function publishMain(
   argv: string[],
