@@ -1553,9 +1553,23 @@ test("a branch whose only change is a workflow sends nothing and fails naming th
   writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
   commit("Add a workflow");
 
-  await expect(run()).rejects.toThrow(/held-workflows\.patch/);
+  const error = await run().catch((e: unknown) => e);
+
+  expect(error).toBeInstanceOf(Error);
+  const named = /are held in (.+held-workflows\.patch): apply them/.exec(
+    (error as Error).message,
+  )?.[1];
+  expect(named).toBe(
+    join(
+      git(work, "rev-parse", "--absolute-git-dir"),
+      "sky",
+      "held-workflows.patch",
+    ),
+  );
+  expect(readFileSync(named ?? "", "utf8")).toContain("+name: new");
   expect(gh.commits).toEqual([]);
   expect(gh.refWrites).toEqual([]);
+  expect(gh.pullCreates).toEqual([]);
 });
 
 test("the publish command names each held-back file on stderr and prints the patch after the PR URL", async () => {
@@ -1620,4 +1634,176 @@ test("without workflow changes, no held result is returned and a stale patch is 
   expect(result.held).toBeUndefined();
   expect(existsSync(join(dir, "held-workflows.patch"))).toBe(false);
   expect(treePaths(gh)).toEqual(["a.txt"]);
+});
+
+const heldPatchPath = () =>
+  join(
+    git(work, "rev-parse", "--absolute-git-dir"),
+    "sky",
+    "held-workflows.patch",
+  );
+
+test("a re-publish to a branch GitHub already holds, with its PR open and workflows still held, sends nothing and still returns the held changes", async () => {
+  baseWithWorkflows();
+  // what GitHub holds after the first publish: a.txt added, workflows as the base has them
+  git(work, "checkout", "-qb", "expected");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const publishedTree = git(work, "rev-parse", "HEAD^{tree}");
+  git(work, "checkout", "-q", "claude/agt_1");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+  const gh = fakeGitHub({
+    ref: "gh_head",
+    commitTrees: { gh_head: publishedTree },
+    pulls: [OPEN_PR],
+  });
+
+  const result = await run({ title: undefined });
+
+  expect(gh.blobs).toEqual([]);
+  expect(gh.trees).toEqual([]);
+  expect(gh.commits).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+  expect(result).toMatchObject({
+    sha: "gh_head",
+    created: false,
+    updated: false,
+    pullRequest: { number: 3, url: "https://github.com/acme/widgets/pull/3" },
+  });
+  expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
+  expect(result.held?.patchPath).toBe(heldPatchPath());
+  expect(existsSync(heldPatchPath())).toBe(true);
+});
+
+test("the tree sent sits on the base's own tree, so the workflows GitHub holds are the base's", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+
+  await run();
+
+  expect(gh.trees).toEqual([
+    {
+      base_tree: git(work, "rev-parse", `${baseSha}^{tree}`),
+      tree: [{ path: "a.txt", mode: "100644", type: "blob", sha: "blob1" }],
+    },
+  ]);
+});
+
+test("on a base with no .github/workflows, a workflow the branch adds is held back and the patch applies to the base", async () => {
+  const gh = fakeGitHub();
+  mkdirSync(join(work, ".github/workflows"), { recursive: true });
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: ci\n");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a and CI");
+
+  const result = await run();
+
+  expect(treePaths(gh)).toEqual(["a.txt"]);
+  expect(gh.trees[0]?.base_tree).toBe(
+    git(work, "rev-parse", `${baseSha}^{tree}`),
+  );
+  expect(result.held?.files).toEqual(["A .github/workflows/ci.yml"]);
+  const published = join(root, "published");
+  execFileSync("git", ["clone", "-q", work, published]);
+  git(published, "checkout", "-q", baseSha);
+  git(published, "apply", result.held?.patchPath ?? "");
+  expect(
+    readFileSync(join(published, ".github/workflows/ci.yml"), "utf8"),
+  ).toBe("name: ci\n");
+});
+
+test("a holding publish leaves the worktree clean, with the workflow files on disk as the branch has them", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+  commit("Add a, change CI, add new");
+
+  const result = await run();
+
+  expect(result.held).toBeDefined();
+  expect(git(work, "status", "--porcelain")).toBe("");
+  expect(readFileSync(join(work, ".github/workflows/ci.yml"), "utf8")).toBe(
+    "name: changed\n",
+  );
+  expect(readFileSync(join(work, ".github/workflows/new.yml"), "utf8")).toBe(
+    "name: new\n",
+  );
+});
+
+test("the publish command, with two workflows held, names both and the patch on stderr and prints the URL, then exactly the patch between its markers on stdout", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+  commit("Add a, change CI, add new");
+  const out: string[] = [];
+  const err: string[] = [];
+
+  const status = await publishMain(
+    ["--title", "T"],
+    { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY },
+    {
+      cwd: work,
+      stdout: (s) => void out.push(s),
+      stderr: (s) => void err.push(s),
+    },
+  );
+
+  expect(status).toBe(0);
+  const stderr = err.join("");
+  expect(stderr).toContain("held back 2 changes");
+  expect(stderr).toContain("M .github/workflows/ci.yml");
+  expect(stderr).toContain("A .github/workflows/new.yml");
+  expect(stderr).toContain(`the patch is at ${heldPatchPath()}`);
+  expect(stderr).toContain(
+    "the PM must push these files from outside the sandbox",
+  );
+  const patch = readFileSync(heldPatchPath(), "utf8");
+  expect(patch).toContain("+name: changed");
+  expect(patch).toContain("+name: new");
+  expect(out.join("")).toBe(
+    `https://github.com/acme/widgets/pull/7\n${HELD_PATCH_BEGIN}\n${patch}${HELD_PATCH_END}\n`,
+  );
+});
+
+test("a file moved into .github/workflows is deleted where it was and held back as an addition", async () => {
+  writeFileSync(join(work, "deploy.yml"), "name: deploy\n");
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  git(work, "mv", "deploy.yml", ".github/workflows/deploy.yml");
+  commit("Move deploy into workflows");
+
+  const result = await run();
+
+  expect(gh.blobs).toEqual([]);
+  expect(gh.trees[0]?.tree).toEqual([
+    { path: "deploy.yml", mode: "100644", type: "blob", sha: null },
+  ]);
+  expect(treePaths(gh)).toEqual(["deploy.yml"]);
+  expect(result.held?.files).toEqual(["A .github/workflows/deploy.yml"]);
+});
+
+test("a file moved out of .github/workflows is sent where it landed and held back as a deletion", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  git(work, "mv", ".github/workflows/old.yml", "old.yml");
+  commit("Move old out of workflows");
+
+  const result = await run();
+
+  expect(gh.blobs).toEqual([
+    { content: b64("name: old\n"), encoding: "base64" },
+  ]);
+  expect(gh.trees[0]?.tree).toEqual([
+    { path: "old.yml", mode: "100644", type: "blob", sha: "blob1" },
+  ]);
+  expect(result.held?.files).toEqual(["D .github/workflows/old.yml"]);
 });
