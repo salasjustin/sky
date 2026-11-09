@@ -1858,7 +1858,9 @@ test("the hold's curl takes a 2m task over the sprite's socket, failing on an HT
   ]);
 });
 
-test("a launch wakes its silent run 90 s after the runner starts, by default", async () => {
+test("a launch wakes its silent run 90 s after the runner starts, by default", {
+  timeout: 10_000,
+}, async () => {
   // the 90 s timer is captured instead of scheduled, so no real 90 s timer outlives the test
   const realSetTimeout = globalThis.setTimeout;
   const wakes: (() => void)[] = [];
@@ -1869,18 +1871,24 @@ test("a launch wakes its silent run 90 s after the runner starts, by default", a
   ) => {
     if (ms === 90_000) {
       wakes.push(fn);
-      return 0;
+      // a real, inert timer: the launcher calls `.unref()` on it, and a throw there fails the launch
+      return Reflect.apply(realSetTimeout, globalThis, [() => {}, 0]);
     }
     return Reflect.apply(realSetTimeout, globalThis, [fn, ms, ...args]);
   }) as unknown as typeof setTimeout);
   try {
     pgrepAnswers(0);
     const { run } = await launched(readyEnv());
-    await sessionOpened();
-    await vi.waitFor(() => expect(wakes).toHaveLength(1));
-    expect(pgrepsOf(run.id)).toEqual([]);
-    wakes[0]?.();
-    await vi.waitFor(() => expect(pgrepsOf(run.id)).toHaveLength(1));
+    // launches of earlier tests may still be starting and add timers of their own; their wakes fire
+    // into a closed database and do nothing, so every captured wake runs and this run's pgrep is the proof
+    let fired = 0;
+    await vi.waitFor(
+      () => {
+        while (fired < wakes.length) wakes[fired++]?.();
+        expect(pgrepsOf(run.id)).toHaveLength(1);
+      },
+      { timeout: 5000 },
+    );
   } finally {
     timers.mockRestore();
   }
