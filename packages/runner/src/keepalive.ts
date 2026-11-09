@@ -7,18 +7,20 @@ const SPRITE_API_SOCKET = "/.sprite/api.sock";
 // a missed refresh or a runner killed outright leaves the task to lapse on its own
 const EXPIRE = "5m";
 const REFRESH_MS = 60_000;
-const REQUEST_TIMEOUT_MS = 5_000;
+export const REQUEST_TIMEOUT_MS = 5_000;
 
-// the API holds the sprite under the same task name before the runner starts (for 2m, launch.ts), so
-// against a pause the quick retries only matter when that hold didn't land and a sprite woken cold may
-// not have its API up yet (the socket missing or refusing), leaving the sprite free to pause and
-// freeze the run. They also bound how long setup waits on the first hold: 15 attempts with a retry wait
-// between each come to 89s when every attempt idles out at REQUEST_TIMEOUT_MS (an idle timeout, so a
-// slow but steady reply can run longer). The budget starts after the runner's boot and the failure
-// report's POST follows it, so it must stay well inside the API's 2m hold (HOLD_EXPIRE, launch.ts) for
-// the report to be sent while the sprite is held
+// the API holds the sprite under the same task name before the runner starts (HOLD_EXPIRE, launch.ts),
+// so against a pause the quick retries only matter when that hold didn't land and a sprite woken cold
+// may not have its API up yet, leaving the sprite free to pause and freeze the run. They run to a
+// deadline, not a count: a missing or refusing socket fails at once and is retried every
+// FIRST_HOLD_RETRY_MS for the whole budget, while a socket that accepts and says nothing idles out at
+// REQUEST_TIMEOUT_MS per attempt. No attempt starts past the budget, so setup gives up within the
+// budget plus one REQUEST_TIMEOUT_MS (an idle timeout, so a slow but steady reply can run longer). The
+// budget starts after the runner's boot and the failure report's POST follows the give-up, so boot,
+// budget, that last attempt and the POST must fit well inside HOLD_EXPIRE for the report to be sent
+// while the sprite is held
 const FIRST_HOLD_RETRY_MS = 1_000;
-const FIRST_HOLD_ATTEMPTS = 15;
+export const FIRST_HOLD_BUDGET_MS = 80_000;
 
 export type SpriteHold = {
   /** Settles once the first hold lands, its quick retries run out or the run stops: true when the sprite is held. */
@@ -57,7 +59,8 @@ export function holdSprite(options: {
   onSprite?: boolean;
   refreshMs?: number;
   firstRetryMs?: number;
-  firstAttempts?: number;
+  /** How long after the start the first hold may begin another attempt; one begun in time runs to its own timeout. */
+  firstBudgetMs?: number;
   /** The run's stop: abandons the first hold's retries and its in-flight PUT, settling `ready` unheld. */
   signal?: AbortSignal;
 }): SpriteHold {
@@ -126,17 +129,19 @@ export function holdSprite(options: {
   };
   // the first hold, retried every `firstRetryMs` until a PUT lands; then the normal refresh takes over
   const first = async (): Promise<boolean> => {
-    const attempts = options.firstAttempts ?? FIRST_HOLD_ATTEMPTS;
-    for (let attempt = 1; !signal?.aborted; attempt++) {
+    // monotonic, and not an AbortSignal: `call` reads an aborted signal as a stop, not a give-up
+    const giveUpAt =
+      performance.now() + (options.firstBudgetMs ?? FIRST_HOLD_BUDGET_MS);
+    const retryMs = options.firstRetryMs ?? FIRST_HOLD_RETRY_MS;
+    while (!signal?.aborted) {
       socketFound = await call(
         "PUT",
         JSON.stringify({ expire: EXPIRE }),
         signal,
       );
-      if (!socketFound || held || stopped || attempt >= attempts) break;
-      await sleep(options.firstRetryMs ?? FIRST_HOLD_RETRY_MS, undefined, {
-        signal,
-      }).catch(() => {});
+      const nextStartsLate = performance.now() + retryMs > giveUpAt;
+      if (!socketFound || held || stopped || nextStartsLate) break;
+      await sleep(retryMs, undefined, { signal }).catch(() => {});
     }
     if (signal?.aborted && !held)
       warn("runner: sprite hold abandoned: the run is stopping");

@@ -5,7 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { holdSprite, spriteApiFrom } from "./keepalive.js";
+import {
+  FIRST_HOLD_BUDGET_MS,
+  holdSprite,
+  REQUEST_TIMEOUT_MS,
+  spriteApiFrom,
+} from "./keepalive.js";
 
 let dir: string;
 let api: Server | undefined;
@@ -124,7 +129,7 @@ test("a first hold that never lands reports only that it gave up", async () => {
     socketPath,
     refreshMs: 10,
     firstRetryMs: 5,
-    firstAttempts: 3,
+    firstBudgetMs: 15,
     warn: (m) => warnings.push(m),
     report: (m) => reports.push(m),
   });
@@ -228,51 +233,82 @@ test("off a sprite, a missing socket means no sprite: logged once, never retried
   expect(reports).toEqual([]);
 });
 
-test("on a sprite, a socket that never appears is retried, then only the give-up is reported", async () => {
+test("on a sprite, a socket that never appears is retried for the whole budget, then only the give-up is reported", async () => {
   const reports: string[] = [];
   const warnings: string[] = [];
+  const budgetMs = 200;
+  const retryMs = 2;
+  const started = performance.now();
   const hold = holdSprite({
     runId: "run_1",
     socketPath: join(dir, "absent.sock"),
     onSprite: true,
     refreshMs: 60_000,
-    firstRetryMs: 5,
-    firstAttempts: 3,
+    firstRetryMs: retryMs,
+    firstBudgetMs: budgetMs,
     warn: (m) => warnings.push(m),
     report: (m) => reports.push(m),
   });
   await expect(hold.ready).resolves.toBe(false);
+  const tookMs = performance.now() - started;
   await hold.release();
+  // a missing socket fails at once, so a deadline, unlike a count of attempts, keeps it retried
   expect(
-    warnings.filter((w) => /sprite task PUT failed: .*ENOENT/.test(w)),
-  ).toHaveLength(3);
+    warnings.filter((w) => /sprite task PUT failed: .*ENOENT/.test(w)).length,
+  ).toBeGreaterThan(15);
+  expect(tookMs).toBeGreaterThanOrEqual(budgetMs - retryMs);
   expect(reports).toEqual([
     "runner: sprite not held after the first retries; it may pause the run",
   ]);
 });
 
-test("on a sprite whose API stays down, the default attempts fit the API's 2m hold with every attempt idling out", async () => {
-  const warnings: string[] = [];
+test("no first-hold attempt starts past the budget, so only the last, slow attempt runs past it", async () => {
+  const replyMs = 100;
+  const budgetMs = 150;
+  const arrivals: number[] = [];
+  let started = 0;
+  api = createServer((req, res) => {
+    arrivals.push(performance.now() - started);
+    req.resume();
+    req.on("end", () => {
+      setTimeout(() => res.writeHead(500).end(), replyMs);
+    });
+  });
+  const socketPath = join(dir, "api.sock");
+  api.listen(socketPath);
+  await once(api, "listening");
+  const reports: string[] = [];
+  started = performance.now();
   const hold = holdSprite({
     runId: "run_1",
-    socketPath: join(dir, "absent.sock"),
-    onSprite: true,
+    socketPath,
     refreshMs: 60_000,
-    // the retry wait is shortened for the test; the budget below uses the real one
-    firstRetryMs: 1,
-    warn: (m) => warnings.push(m),
+    firstRetryMs: 5,
+    firstBudgetMs: budgetMs,
+    warn: () => {},
+    report: (m) => reports.push(m),
   });
   await expect(hold.ready).resolves.toBe(false);
+  const tookMs = performance.now() - started;
+  // the second attempt starts inside the budget and runs past it; a third would start late
+  expect(arrivals).toHaveLength(2);
+  for (const at of arrivals) expect(at).toBeLessThanOrEqual(budgetMs);
+  // a slow reply stands in for REQUEST_TIMEOUT_MS, which the test can't wait out
+  expect(tookMs).toBeLessThan(budgetMs + replyMs + 50);
+  expect(reports).toEqual([
+    "runner: sprite not held after the first retries; it may pause the run",
+  ]);
   await hold.release();
-  const attempts = warnings.filter((w) => /sprite task PUT failed/.test(w));
-  expect(attempts.length).toBeGreaterThan(1);
-  // each attempt may idle out at 5s and wait 1s; the give-up report must still land with the
-  // runner's boot to spare inside the API's 2m hold (launch.ts HOLD_EXPIRE)
-  const worstCaseMs = attempts.length * (5_000 + 1_000);
-  expect(worstCaseMs).toBeLessThanOrEqual(100_000);
 });
 
-test("on a sprite, a socket that appears after the first attempt lands the hold and reports nothing", async () => {
+test("the default first-hold budget plus one idled-out attempt fits the API's hold with the runner's boot to spare", () => {
+  // inside launch.ts HOLD_EXPIRE (2m), with 20s left for the boot and the give-up report's POST
+  expect(FIRST_HOLD_BUDGET_MS + REQUEST_TIMEOUT_MS).toBeLessThanOrEqual(
+    100_000,
+  );
+});
+
+test("on a sprite, a socket that appears mid-budget lands the hold, stops the retries and reports nothing", async () => {
   const socketPath = join(dir, "api.sock");
   const reports: string[] = [];
   const hold = holdSprite({
@@ -281,7 +317,7 @@ test("on a sprite, a socket that appears after the first attempt lands the hold 
     onSprite: true,
     refreshMs: 60_000,
     firstRetryMs: 5,
-    firstAttempts: 200,
+    firstBudgetMs: 10_000,
     warn: () => {},
     report: (m) => reports.push(m),
   });
@@ -319,7 +355,7 @@ test("a report that throws never breaks the hold", async () => {
     runId: "run_1",
     socketPath,
     firstRetryMs: 5,
-    firstAttempts: 2,
+    firstBudgetMs: 10,
     warn: () => {},
     report: () => {
       throw new Error("post failed");
@@ -336,12 +372,12 @@ test("a warn that throws leaves the first hold and the refresh running", async (
     socketPath,
     refreshMs: 10,
     firstRetryMs: 5,
-    firstAttempts: 3,
+    firstBudgetMs: 15,
     warn: () => {
       throw new Error("log pipe closed");
     },
   });
-  // the first-hold loop ran out of attempts without rejecting
+  // the first-hold loop ran out of budget without rejecting
   await expect(hold.ready).resolves.toBe(false);
   answer(200);
   const before = calls.length;
@@ -409,7 +445,7 @@ test("a refused refresh is one warning per failure, and the hold keeps trying", 
     socketPath,
     refreshMs: 20,
     firstRetryMs: 5,
-    firstAttempts: 2,
+    firstBudgetMs: 10,
     warn: (m) => warnings.push(m),
   });
   await expect(hold.ready).resolves.toBe(false);
