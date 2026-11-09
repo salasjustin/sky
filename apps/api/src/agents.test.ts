@@ -9,6 +9,7 @@ import {
   BaseProfile,
   type EnvironmentId,
   EVENT_TEXT_MAX,
+  HEARTBEAT_INTERVAL_MS,
   type RunId,
   spriteTaskNameFor,
   truncationMarker,
@@ -3957,19 +3958,46 @@ test.each([
   },
 );
 
-test("a quiet run whose last heartbeat names a background task fails naming what the session waited on", async () => {
+test.each(["Bash (background)", "Agent (background)"])(
+  "a quiet run whose last heartbeat names %s fails stating how long the session was quiet and, apart, how long the task had run",
+  async (toolName) => {
+    const { agent, run } = await startedRun();
+    const limit = config.runTimeoutMs;
+    const now = Date.now() + 60 * 60_000;
+    // the session's last result came 31 minutes before the sweep; the task started 19 minutes before that
+    insertEvent(run.id, "claude.PostToolUse", now - limit - 60_000, {
+      toolName: "Read",
+      toolUseId: "t0",
+      input: "{}",
+      output: "ok",
+    });
+    insertEvent(
+      run.id,
+      "runner.heartbeat",
+      now - HEARTBEAT_INTERVAL_MS,
+      beat(toolName, 50 * 60_000 - HEARTBEAT_INTERVAL_MS),
+    );
+    expect(failStaleRuns(db, limit, now)).toEqual([run.id]);
+    expect((await getRun(agent.id, run.id)).body.error).toBe(
+      `runner_timeout: the session waited on ${toolName} with nothing else happening for 31m, past the 30m limit; the task had run 50m`,
+    );
+  },
+);
+
+test("a run whose heartbeats stopped while the session waited on a background task fails saying the runner went quiet, with how long the task had run", async () => {
   const { agent, run } = await startedRun();
   const limit = config.runTimeoutMs;
   const now = Date.now() + limit + 120_000;
+  // the last beat is past fresh by the sweep, 5 minutes into the task
   insertEvent(
     run.id,
     "runner.heartbeat",
-    now - 20_000,
-    beat("Bash (background)", limit + 60_000),
+    now - 4 * HEARTBEAT_INTERVAL_MS,
+    beat("Bash (background)", 300_000),
   );
   expect(failStaleRuns(db, limit, now)).toEqual([run.id]);
   expect((await getRun(agent.id, run.id)).body.error).toBe(
-    "runner_timeout: the session was waiting on Bash (background) for 31m with nothing else happening, past the 30m limit",
+    "runner_timeout: the runner went quiet while the session waited on Bash (background); the task had run 5m",
   );
 });
 
