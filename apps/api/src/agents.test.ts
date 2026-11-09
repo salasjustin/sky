@@ -668,12 +668,16 @@ test("a runner that exits at launch fails the run with its exit code and output 
 
 test("a runner that fails to start deletes the run's keep-awake task and still reports the start error", async () => {
   wire.sessionExit = { output: "node: bad option\r\n", code: 1 };
-  const { agent, run } = await launched(readyEnv());
+  const envId = readyEnv();
+  const { agent, run } = await launched(envId);
   await vi.waitFor(async () =>
     expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
   );
   const { error } = (await getRun(agent.id, run.id)).body;
   expect(error).toMatch(/^launch_failed: runner exited 1 at launch: /);
+  expect(wire.calls).toContain(
+    `exec ${spriteNameFor(envId)} - rm -f /workspace/runs/${run.id}.env`,
+  );
   const release = wire.calls.filter(
     (c) => c.includes(" curl ") && c.includes("-X DELETE"),
   );
@@ -687,10 +691,12 @@ test("a cleanup that fails after a failed start never masks the start error", as
   wire.exec = (argv) =>
     argv[0] === "curl" && argv.includes("DELETE")
       ? { exitCode: 7, stderr: "curl: (7) couldn't connect\n" }
-      : argv[0] === "rm"
-        ? { exitCode: 1, stderr: "rm: boom\n" }
-        : exec(argv);
-  const { agent, run } = await launched(readyEnv());
+      : exec(argv);
+  // a 503 for the env-file rm alone: the exec rejects instead of exiting non-zero
+  wire.hangs = (call) => call.includes(" rm -f ");
+  wire.hangMs = 10;
+  const envId = readyEnv();
+  const { agent, run } = await launched(envId);
   await vi.waitFor(async () =>
     expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
   );
@@ -699,6 +705,39 @@ test("a cleanup that fails after a failed start never masks the start error", as
   );
   expect(logs.some((l) => l.includes("releasing the sprite hold failed"))).toBe(
     true,
+  );
+  expect(wire.calls).toContain(
+    `exec ${spriteNameFor(envId)} - rm -f /workspace/runs/${run.id}.env`,
+  );
+});
+
+test.each([
+  {
+    name: "404, a task already gone, counts as released",
+    status: 404,
+    logged: false,
+  },
+  { name: "500 is a failed release", status: 500, logged: true },
+])("a release whose DELETE answers $name", async ({ status, logged }) => {
+  wire.sessionExit = { output: "node: bad option\r\n", code: 1 };
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "curl" && argv.includes("DELETE")
+      ? {
+          exitCode: 22,
+          stderr: `curl: (22) The requested URL returned error: ${status}\n`,
+        }
+      : exec(argv);
+  const { agent, run } = await launched(readyEnv());
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
+  );
+  // the release is awaited before the start error is thrown, so it has finished by now
+  expect(
+    wire.calls.filter((c) => c.includes(" curl ") && c.includes("-X DELETE")),
+  ).toHaveLength(1);
+  expect(logs.some((l) => l.includes("releasing the sprite hold failed"))).toBe(
+    logged,
   );
 });
 
@@ -1892,24 +1931,63 @@ test("a run still starting with only a warning and a heartbeat gets exactly one 
   ]);
 });
 
-test("a woken silent launch takes the run's hold again, and a run that has reported in does not", async () => {
+const holdsOf = (runId: string) =>
+  holdCalls().filter((c) => c.includes(spriteTaskNameFor(runId as RunId)));
+
+test("a woken silent launch takes the run's hold again, after the wake resolves", async () => {
   wakingAfter(150);
   pgrepAnswers(0);
   const { run } = await runningRun();
-  await vi.waitFor(() => expect(holdCalls()).toHaveLength(2), {
+  await vi.waitFor(() => expect(holdsOf(run.id)).toHaveLength(2), {
     timeout: 5000,
   });
-  const holds = holdCalls();
+  const holds = holdsOf(run.id);
   expect(holds[1]).toBe(holds[0]);
   expect(holds[1]).toContain(`-X PUT`);
-  expect(holds[1]).toContain(spriteTaskNameFor(run.id as RunId));
   expect(holds[1]).toContain(`{"expire":"2m"}`);
-  await vi.waitFor(() =>
-    expect(
-      logs.some((l) => l.includes(`for ${run.id}: its runner is alive`)),
-    ).toBe(true),
+  const pgrep = wire.calls.findIndex((c) => c.includes(runnerPattern(run.id)));
+  const rehold = wire.calls.lastIndexOf(holds[1] ?? "");
+  expect(pgrep).toBeGreaterThan(-1);
+  expect(rehold).toBeGreaterThan(pgrep);
+});
+
+test("a re-hold waits for a wake that is still resolving", async () => {
+  wakingAfter(150);
+  pgrepAnswers(0);
+  wire.hangs = (call) => call.includes(" pgrep ");
+  wire.hangMs = 400;
+  const { run } = await runningRun();
+  await vi.waitFor(
+    () =>
+      expect(wire.calls.some((c) => c.includes(runnerPattern(run.id)))).toBe(
+        true,
+      ),
+    { timeout: 5000 },
   );
-  expect(holdCalls()).toHaveLength(2);
+  // the pgrep is in flight and will fail at 400ms; no second hold may precede its settling
+  await settle(150);
+  expect(holdsOf(run.id)).toHaveLength(1);
+  await vi.waitFor(() => expect(holdsOf(run.id)).toHaveLength(2), {
+    timeout: 5000,
+  });
+});
+
+test("a run that has reported in is not held again by a wake it never gets", async () => {
+  wakingAfter(150);
+  pgrepAnswers(0);
+  const { run, token } = await runningRun();
+  const started = await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  expect(started.status).toBe(201);
+  // a silent run launched after it wakes, and takes its hold again: the read is live
+  const later = await runningRun();
+  await vi.waitFor(() => expect(holdsOf(later.run.id)).toHaveLength(2), {
+    timeout: 5000,
+  });
+  expect(holdsOf(run.id)).toHaveLength(1);
 });
 
 test("a re-hold that fails on a wake is logged and the run is left alone", async () => {
@@ -1927,7 +2005,7 @@ test("a re-hold that fails on a wake is logged and the run is left alone", async
       logs.some(
         (l) =>
           l.includes(run.id) &&
-          l.includes("hold sprite failed, the wake goes on"),
+          l.includes("hold sprite failed, nothing more is tried"),
       ),
     ).toBe(true),
   );

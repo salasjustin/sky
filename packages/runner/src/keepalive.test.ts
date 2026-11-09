@@ -251,6 +251,27 @@ test("on a sprite, a socket that never appears is retried, then only the give-up
   ]);
 });
 
+test("on a sprite whose API stays down, the default attempts fit the API's 2m hold with every attempt idling out", async () => {
+  const warnings: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath: join(dir, "absent.sock"),
+    onSprite: true,
+    refreshMs: 60_000,
+    // the retry wait is shortened for the test; the budget below uses the real one
+    firstRetryMs: 1,
+    warn: (m) => warnings.push(m),
+  });
+  await expect(hold.ready).resolves.toBe(false);
+  await hold.release();
+  const attempts = warnings.filter((w) => /sprite task PUT failed/.test(w));
+  expect(attempts.length).toBeGreaterThan(1);
+  // each attempt may idle out at 5s and wait 1s; the give-up report must still land with the
+  // runner's boot to spare inside the API's 2m hold (launch.ts HOLD_EXPIRE)
+  const worstCaseMs = attempts.length * (5_000 + 1_000);
+  expect(worstCaseMs).toBeLessThanOrEqual(100_000);
+});
+
 test("on a sprite, a socket that appears after the first attempt lands the hold and reports nothing", async () => {
   const socketPath = join(dir, "api.sock");
   const reports: string[] = [];

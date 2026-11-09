@@ -41,7 +41,8 @@ import {
 // The API's hold only bridges the gap before the runner's own (keepalive.ts, whose first-hold retries
 // give up within this expiry, so their report still reaches the API while the hold keeps the sprite
 // awake); `HOLD_TIMEOUT_MS` is the curl's `--max-time` plus the exec's own start, and a hold that
-// outlasts it is given up on, as the runner holds the sprite itself
+// outlasts it is given up on: before the runner starts, the runner holds the sprite itself; after a
+// wake, the sprite is left to whatever hold the runner has, if any
 const SPRITE_API_SOCKET = "/.sprite/api.sock";
 const HOLD_EXPIRE = "2m";
 const CURL_MAX_TIME_S = 5;
@@ -76,6 +77,13 @@ export const holdArgv = (runId: RunId) =>
 
 /** The exec that deletes the run's keep-awake task. */
 export const releaseArgv = (runId: RunId) => taskArgv(runId, "DELETE", []);
+
+/**
+ * Whether a task curl failed on a 404, the Tasks API's answer for a task that doesn't exist. `-f`
+ * gives every HTTP error exit 22, so the status comes from the `-S` message on stderr.
+ */
+const isMissingTask = (out: { exitCode: number; stderr: string }) =>
+  out.exitCode === 22 && /returned error: 404\b/.test(out.stderr);
 
 // the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
 // then deleted, and the prompt in PROMPT_FILE, which a query param is too short for;
@@ -335,7 +343,11 @@ export function createLauncher({
     }
   }
 
-  /** Deletes the run's keep-awake task so its sprite can sleep at once; a failure is logged, never thrown. */
+  /**
+   * Deletes the run's keep-awake task so its sprite is free to pause on its next idle window, not
+   * held for the rest of the expiry. A task that is already gone counts as released; any other
+   * failure is logged, never thrown.
+   */
   async function releaseSprite(launch: Launch): Promise<void> {
     try {
       const out = await execInSprite(
@@ -344,7 +356,7 @@ export function createLauncher({
         releaseArgv(launch.runId),
         { op: "release", timeoutMs: HOLD_TIMEOUT_MS },
       );
-      if (out.exitCode !== 0) {
+      if (out.exitCode !== 0 && !isMissingTask(out)) {
         throw new Error(`curl exit ${out.exitCode}: ${out.stderr.trim()}`);
       }
     } catch (err) {
@@ -356,7 +368,7 @@ export function createLauncher({
 
   /**
    * One wake for a run that still hasn't reported in `wakeAfterMs` after its runner started, which
-   * takes the run's hold again beside it, so the sprite stays up until the runner refreshes it.
+   * then takes the run's hold again, so the sprite stays up until the runner refreshes it.
    */
   function wakeIfSilent(launch: Launch): void {
     setTimeout(() => {
@@ -365,8 +377,11 @@ export function createLauncher({
         log(
           `run ${launch.runId} still starting ${Math.round(wakeAfterMs / 1000)}s after its runner started; waking ${launch.spriteName}`,
         );
-        void holdSprite(launch, "the wake goes on");
-        void wake(launch.runId, launch.spriteName);
+        // after the wake, not beside it: its exec is what resumes the sprite, and a resuming sprite's
+        // socket may not answer yet. Neither call throws.
+        void wake(launch.runId, launch.spriteName).then(() =>
+          holdSprite(launch, "nothing more is tried"),
+        );
       } catch (err) {
         log(`checking whether ${launch.runId} needs a wake failed: ${err}`);
       }
