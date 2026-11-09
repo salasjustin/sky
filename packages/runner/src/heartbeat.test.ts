@@ -80,3 +80,31 @@ test("a beat that throws doesn't stop the next, and stop silences everything", (
   vi.advanceTimersByTime(5_000);
   expect(calls).toBe(3);
 });
+
+test("newTurn drops calls still in flight, and the next turn's calls are tracked again", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.started("t1", "ToolSearch");
+  heartbeat.newTurn();
+  vi.advanceTimersByTime(120_000);
+  expect(beats).toEqual([]);
+  heartbeat.started("t2", "Bash");
+  vi.advanceTimersByTime(60_000);
+  expect(beats).toEqual([
+    { toolName: "Bash", toolUseId: "t2", elapsedMs: 60_000 },
+  ]);
+  heartbeat.stop();
+});
+
+test("a background task survives a new turn and is beaten for under its own name, behind any call in flight", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.setBackground([{ taskId: "b1", taskType: "local_bash" }]);
+  heartbeat.newTurn();
+  vi.advanceTimersByTime(60_000);
+  heartbeat.started("t1", "Read");
+  vi.advanceTimersByTime(60_000);
+  heartbeat.ended("t1");
+  heartbeat.setBackground([]);
+  vi.advanceTimersByTime(120_000);
+  expect(beats.map((b) => b.toolName)).toEqual(["Bash (background)", "Read"]);
+  heartbeat.stop();
+});

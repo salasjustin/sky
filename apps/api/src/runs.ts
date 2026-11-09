@@ -187,6 +187,9 @@ const lastEventAt = (excluding: EventType[] = []) =>
 // a heartbeat older than this says the runner stopped reporting, not that the tool is still running
 const HEARTBEAT_FRESH_MS = 3 * HEARTBEAT_INTERVAL_MS;
 
+// the name the runner's heartbeat gives a background task the session is waiting on
+const BACKGROUND_SUFFIX = " (background)";
+
 type ToolInFlight = { toolName: string; ranMs: number; beatFresh: boolean };
 
 /**
@@ -230,6 +233,10 @@ const duration = (ms: number) =>
 
 const timeoutError = (tool: ToolInFlight | undefined, timeoutMs: number) => {
   if (!tool) return "runner_timeout";
+  if (tool.toolName.endsWith(BACKGROUND_SUFFIX))
+    return tool.beatFresh
+      ? `runner_timeout: the session was waiting on ${tool.toolName} for ${duration(tool.ranMs)} with nothing else happening, past the ${duration(timeoutMs)} limit`
+      : `runner_timeout: the runner went quiet while the session waited on ${tool.toolName} after ${duration(tool.ranMs)}`;
   return tool.beatFresh
     ? `runner_timeout: ${tool.toolName} was still running after ${duration(tool.ranMs)} with no result, past the ${duration(timeoutMs)} limit`
     : `runner_timeout: the runner went quiet during ${tool.toolName} after it had run ${duration(tool.ranMs)}`;

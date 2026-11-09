@@ -666,6 +666,7 @@ export async function runSession(
   // background tasks still running, such as a nested `claude -p`: a `result` that arrives while any
   // are leaves the input open for the turn their notification wakes, for at most the hold
   let liveTasks = 0;
+  let turnId: string | undefined;
   let holdTimer: NodeJS.Timeout | undefined;
   const endHold = () => clearTimeout(holdTimer);
   try {
@@ -690,6 +691,12 @@ export async function runSession(
         });
       } else if (message.type === "assistant") {
         const parent = message.parent_tool_use_id;
+        // the SDK splits one model response into several messages sharing an id, and a response's
+        // parallel tool calls all belong to it; a new id means every earlier call has ended, hook or no
+        if (!parent && message.message.id !== turnId) {
+          turnId = message.message.id;
+          heartbeat.newTurn();
+        }
         // queued, not awaited: the post waits behind every hook event already queued, and a slow API must not hold the loop
         for (const text of textOf(message.message.content))
           void post(
@@ -703,7 +710,14 @@ export async function runSession(
         message.type === "system" &&
         message.subtype === "background_tasks_changed"
       ) {
-        liveTasks = message.tasks.filter((task) => !task.ambient).length;
+        const live = message.tasks.filter((task) => !task.ambient);
+        liveTasks = live.length;
+        heartbeat.setBackground(
+          live.map((task) => ({
+            taskId: task.task_id,
+            taskType: task.task_type,
+          })),
+        );
       } else if (
         message.type === "system" &&
         message.subtype === "task_notification"

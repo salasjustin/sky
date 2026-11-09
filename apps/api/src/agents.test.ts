@@ -3957,6 +3957,22 @@ test.each([
   },
 );
 
+test("a quiet run whose last heartbeat names a background task fails naming what the session waited on", async () => {
+  const { agent, run } = await startedRun();
+  const limit = config.runTimeoutMs;
+  const now = Date.now() + limit + 120_000;
+  insertEvent(
+    run.id,
+    "runner.heartbeat",
+    now - 20_000,
+    beat("Bash (background)", limit + 60_000),
+  );
+  expect(failStaleRuns(db, limit, now)).toEqual([run.id]);
+  expect((await getRun(agent.id, run.id)).body.error).toBe(
+    "runner_timeout: the session was waiting on Bash (background) for 31m with nothing else happening, past the 30m limit",
+  );
+});
+
 test("a run whose heartbeats stopped mid tool call fails as runner_timeout saying the runner went quiet, not that the tool ran on", async () => {
   const { agent, run } = await startedRun();
   insertEvent(run.id, "claude.PreToolUse", Date.now() + 1, {
