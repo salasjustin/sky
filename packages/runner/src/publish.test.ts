@@ -75,6 +75,24 @@ const commit = (message: string, date = "2026-10-30T12:00:00+02:00") => {
   return git(work, "rev-parse", "HEAD");
 };
 
+// amends HEAD as `commit` makes commits: CI has no git identity of its own
+const amend = (message: string) =>
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=Claude",
+      "-c",
+      "user.email=noreply@anthropic.com",
+      "commit",
+      "-q",
+      "--amend",
+      "-m",
+      message,
+    ],
+    { cwd: work, env: withoutHostIdentity() },
+  );
+
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "runner-publish-"));
   const origin = join(root, "origin");
@@ -2119,7 +2137,7 @@ test("a rewrite that would drop workflow changes already on GitHub is refused be
     "a.txt": "first\n",
     ".github/workflows/new.yml": "name: new\n",
   });
-  git(work, "commit", "-q", "--amend", "-m", "Add a, amended");
+  amend("Add a, amended");
   const gh = fakeGitHub({
     ref: old,
     commitTrees: { [old]: pm.tree, elsewhere: pm.tree },
@@ -2143,7 +2161,7 @@ test("a head this branch held before an amend, carrying workflow changes of its 
   });
   writeFileSync(join(work, "a.txt"), "first, amended\n");
   git(work, "add", "--all");
-  git(work, "commit", "-q", "--amend", "-m", "Add a, amended");
+  amend("Add a, amended");
   const gh = fakeGitHub({
     ref: old,
     commitTrees: { [old]: pm.tree },
@@ -2313,7 +2331,9 @@ test("after the PM pushes the held workflows, a re-publish once the base moves i
   });
   baseMovesTo(newBase);
 
-  await expect(run()).rejects.toThrow(/would drop/);
+  await expect(run()).rejects.toThrow(
+    /merge the pull request as it is.*from outside the sandbox.*publish again/,
+  );
   expect(gh.blobs).toEqual([]);
   expect(gh.trees).toEqual([]);
   expect(gh.commits).toEqual([]);

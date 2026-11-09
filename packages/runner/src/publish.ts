@@ -949,7 +949,7 @@ export async function publish(options: {
         const fork = await forkPoint(cwd, call, remote, mergeBase);
         if (fork === undefined || (await workflowsOf(fork)) !== baseline) {
           throw new PublishError(
-            `${remoteBranch} on GitHub holds workflow changes under ${WORKFLOWS_DIR}/ that publishing this branch's rewritten history would drop, so nothing was sent; put the branch's work on top of ${remote} instead, or have those changes removed from ${remoteBranch} first`,
+            `${remoteBranch} on GitHub holds workflow changes under ${WORKFLOWS_DIR}/ that publishing this branch's rewritten history (as after ${base} moved on) would drop, so nothing was sent; merge the pull request as it is, or have someone rebase ${remoteBranch} onto ${base}, or merge ${base} into it, from outside the sandbox, keeping those workflow changes, and then publish again`,
           );
         }
       }
