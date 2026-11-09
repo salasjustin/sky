@@ -14,6 +14,7 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { server } from "../../../test/msw.js";
 import {
   GatewayError,
+  PUBLISH_USAGE,
   publish,
   publishMain,
   stripAttribution,
@@ -1171,8 +1172,39 @@ test("--body @path that can't be read exits 2 naming the file, and publishes not
 
   expect(status).toBe(2);
   expect(stderr).toContain(`cannot read the --body file ${file} (ENOENT)`);
+  expect(stderr).toContain(`usage: ${PUBLISH_USAGE}`);
+  expect(gh.authorization).toEqual([]);
   expect(gh.pullCreates).toEqual([]);
   expect(gh.refWrites).toEqual([]);
+});
+
+test("--body @path with a relative path is read from the command's working directory", async () => {
+  const gh = fakeGitHub();
+  // committed with the rest: an untracked file would trip the clean-worktree check
+  writeFileSync(join(work, "pr-body.md"), "## Summary\n\nRelative.\n");
+  commit("Add the body file");
+
+  const { status } = await publishMainWith(
+    ["--title", "T", "--body", "@pr-body.md"],
+    {},
+  );
+
+  expect(status).toBe(0);
+  expect(gh.pullCreates).toMatchObject([{ body: "## Summary\n\nRelative.\n" }]);
+});
+
+test("a --body without @ is published as given", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const { status } = await publishMainWith(
+    ["--title", "T", "--body", "Why.\n"],
+    {},
+  );
+
+  expect(status).toBe(0);
+  expect(gh.pullCreates).toMatchObject([{ body: "Why.\n" }]);
 });
 
 test("SKY_PUBLISH_BRANCH is the command's default branch", async () => {
