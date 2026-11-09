@@ -561,6 +561,35 @@ async function sitsOn(
 }
 
 /**
+ * The base commit GitHub's commit `sha` forks from: the first on its first-parent line that is here
+ * and on `base`'s history, within a bounded walk; undefined where the walk finds none.
+ */
+async function forkPoint(
+  cwd: string,
+  call: ReturnType<typeof gateway>,
+  sha: string,
+  base: string,
+): Promise<string | undefined> {
+  // false as well for a commit that isn't here
+  const onBase = (commit: string) =>
+    git(cwd, "merge-base", "--is-ancestor", commit, base).then(
+      () => true,
+      () => false,
+    );
+  for (let steps = 0; steps < 500; steps++) {
+    if (await onBase(sha)) return sha;
+    const { parents } = await call<{ parents: { sha: string }[] }>(
+      "GET",
+      `/git/commits/${sha}`,
+    );
+    const next = parents[0]?.sha;
+    if (!next) return undefined;
+    sha = next;
+  }
+  return undefined;
+}
+
+/**
  * Publishes the worktree's branch, or `options.branch`, through the GitHub gateway, which carries
  * no git push: each commit past the base is recreated with GitHub's git data API (blobs, a tree on
  * its parent's tree, the commit with its own message and identities), then the branch ref is
@@ -785,7 +814,8 @@ export async function publish(options: {
   // history replaces it; a head this branch never held is someone else's, and is never overwritten
   let rewritten = false;
   // the .github/workflows tree sent trees keep: the base's, until the branch exists on GitHub, then
-  // GitHub's head's, so a push of the held workflows there is kept, not undone
+  // GitHub's head's, so a push of the held workflows there is kept, not undone; the base's again
+  // for a rewrite over a head whose workflows are only an older base's
   let baseline = baseWorkflows;
   // GitHub's tree for the commit replay resumes from
   let resumeTree: string | undefined;
@@ -799,6 +829,8 @@ export async function publish(options: {
         await call<{ tree: { sha: string } }>("GET", `/git/commits/${remote}`)
       ).tree.sha;
       const trees = await Promise.all(known.map(treeOf));
+      // GitHub's head's tree less .github/workflows, where the full trees match nowhere
+      let outside: string | undefined;
       at = trees.lastIndexOf(remoteTree);
       if (at !== -1) {
         baseline = await workflowsOf(known[at] as string);
@@ -832,7 +864,7 @@ export async function publish(options: {
         const remoteWorkflows =
           inner.find((e) => e.path === "workflows" && e.type === "tree")?.sha ??
           "";
-        const outside = await swapWorkflows(cwd, readRemote, remoteTree, "");
+        outside = await swapWorkflows(cwd, readRemote, remoteTree, "");
         const ours = await Promise.all(
           trees.map((t) =>
             swapWorkflows(cwd, (sha) => lsTree(cwd, sha), t, ""),
@@ -854,10 +886,25 @@ export async function publish(options: {
           "--format=%H %T",
           `refs/heads/${localBranch}`,
         ).catch(() => "");
-        rewritten = lines(reflog).some((line) => {
-          const [sha, heldTree] = line.split(" ");
-          return sha === remote || heldTree === remoteTree;
-        });
+        const entries = lines(reflog).map((line) => line.split(" "));
+        rewritten = entries.some(
+          ([sha, heldTree]) => sha === remote || heldTree === remoteTree,
+        );
+        // what GitHub got of a held tree carries the baseline's workflows, so it is matched outside
+        // them, as `known` is
+        const heldTrees = new Set(
+          entries.flatMap(([, tree]) => (tree ? [tree] : [])),
+        );
+        for (const heldTree of heldTrees) {
+          if (rewritten) break;
+          const heldOutside = await swapWorkflows(
+            cwd,
+            (sha) => lsTree(cwd, sha),
+            heldTree,
+            "",
+          );
+          rewritten = heldOutside === outside;
+        }
       }
       if (at !== -1) resumeTree = remoteTree;
     }
@@ -870,11 +917,18 @@ export async function publish(options: {
     }
     if (at === -1 && baseline !== baseWorkflows) {
       if (rewritten) {
-        throw new PublishError(
-          `${remoteBranch} on GitHub holds workflow changes under ${WORKFLOWS_DIR}/ that publishing this branch's rewritten history would drop, so nothing was sent; put the branch's work on top of ${remote} instead, or have those changes removed from ${remoteBranch} first`,
-        );
+        // GitHub's head's workflows are the branch's own changes where they differ from those of
+        // the base it forks from; where they don't, they are an older base's, which the base's
+        // replace
+        const fork = await forkPoint(cwd, call, remote, mergeBase);
+        if (fork === undefined || (await workflowsOf(fork)) !== baseline) {
+          throw new PublishError(
+            `${remoteBranch} on GitHub holds workflow changes under ${WORKFLOWS_DIR}/ that publishing this branch's rewritten history would drop, so nothing was sent; put the branch's work on top of ${remote} instead, or have those changes removed from ${remoteBranch} first`,
+          );
+        }
       }
-      // not this branch's to update: the ref update below is refused
+      // a rewrite sends the base's; for a head that isn't this branch's to update, the ref update
+      // below is refused
       baseline = baseWorkflows;
     }
     if (at !== -1) {

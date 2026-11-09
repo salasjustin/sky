@@ -2000,3 +2000,169 @@ test("a rewrite that would drop workflow changes already on GitHub is refused be
   expect(gh.commits).toEqual([]);
   expect(gh.refWrites).toEqual([]);
 });
+
+/** The fields GitHub's commit API gives for a commit here: dates in UTC, the message less its final newline. */
+const apiCommit = (sha: string) => {
+  const person = (who: "a" | "c") => {
+    const [name = "", email = "", at = "0"] = git(
+      work,
+      "show",
+      "-s",
+      `--format=%${who}n%x00%${who}e%x00%${who}d`,
+      "--date=unix",
+      sha,
+    ).split("\0");
+    return {
+      name,
+      email,
+      date: new Date(Number(at) * 1000).toISOString().replace(".000Z", "Z"),
+    };
+  };
+  return {
+    sha,
+    tree: { sha: git(work, "rev-parse", `${sha}^{tree}`) },
+    parents: git(work, "rev-list", "--parents", "-n1", sha)
+      .split(" ")
+      .slice(1)
+      .map((p) => ({ sha: p })),
+    author: person("a"),
+    committer: person("c"),
+    message: git(work, "show", "-s", "--format=%B", sha).replace(/\n+$/, ""),
+    verification: { verified: false, signature: null, payload: null },
+  };
+};
+
+/** A commit on top of the base with `files` written, made here off the branch, which stays checked out. */
+const nextBase = (files: Record<string, string>) => {
+  git(work, "checkout", "-q", "--detach", baseSha);
+  for (const [path, content] of Object.entries(files)) {
+    writeFileSync(join(work, path), content);
+  }
+  const next = commit("Base moves");
+  git(work, "checkout", "-q", "claude/agt_1");
+  return next;
+};
+
+/**
+ * The base moves on GitHub to `sha`, served with its tree as the commit and trees APIs give them, so
+ * publish rebases onto it. After `fakeGitHub`, whose routes would otherwise answer first.
+ */
+const baseMovesTo = (sha: string) => {
+  baseSha = sha;
+  const tree = git(work, "rev-parse", `${sha}^{tree}`);
+  server.use(
+    http.get(`${REPO}/git/commits/${sha}`, () =>
+      HttpResponse.json(apiCommit(sha)),
+    ),
+    http.get(`${REPO}/git/trees/${tree}`, () => {
+      const listing = git(work, "ls-tree", "-r", "-z", tree)
+        .split("\0")
+        .filter(Boolean)
+        .map((line) => {
+          const [meta = "", path = ""] = line.split("\t");
+          const [mode, type, entrySha] = meta.split(" ");
+          return { path, mode, type, sha: entrySha };
+        });
+      return HttpResponse.json({ sha: tree, tree: listing, truncated: false });
+    }),
+  );
+};
+
+test("the base changes a workflow between two publishes of a branch that changes none: the rewrite force-updates onto the new base's workflows and holds nothing", async () => {
+  baseWithWorkflows();
+  const oldBase = baseSha;
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  await run();
+  const newBase = nextBase({ ".github/workflows/ci.yml": "name: ci v2\n" });
+  const gh = fakeGitHub({
+    ref: "commit1",
+    commitTrees: {
+      commit1: git(work, "rev-parse", `${first}^{tree}`),
+      // the walk from GitHub's head stops at the old base
+      [oldBase]: git(work, "rev-parse", `${oldBase}^{tree}`),
+    },
+    commitParents: { commit1: [oldBase], [oldBase]: [] },
+    pulls: [OPEN_PR],
+    allowPullUpdates: true,
+  });
+  baseMovesTo(newBase);
+
+  const result = await run();
+
+  expect(result.held).toBeUndefined();
+  expect(existsSync(heldPatchPath())).toBe(false);
+  // on the new base's own tree, with nothing sent under .github/workflows
+  expect(gh.trees).toEqual([
+    {
+      base_tree: git(work, "rev-parse", `${newBase}^{tree}`),
+      tree: [{ path: "a.txt", mode: "100644", type: "blob", sha: "blob1" }],
+    },
+  ]);
+  expect(gh.commits.map((c) => c.parents)).toEqual([[newBase]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: true } },
+  ]);
+});
+
+test("a branch whose workflow change is held, re-published after the base moves, force-updates its rewritten history and still holds the change", async () => {
+  baseWithWorkflows();
+  const oldBase = baseSha;
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+  await run();
+  // the tree the first publish sent: the base's, with a.txt
+  const sent = pmPush("", { "a.txt": "first\n" });
+  const newBase = nextBase({ README: "hi again\n" });
+  const gh = fakeGitHub({
+    ref: "commit1",
+    commitTrees: { commit1: sent.tree },
+    commitParents: { commit1: [oldBase] },
+    objectsFrom: sent.dir,
+    pulls: [OPEN_PR],
+    allowPullUpdates: true,
+  });
+  baseMovesTo(newBase);
+
+  const result = await run();
+
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: true } },
+  ]);
+  expect(gh.trees[0]).toMatchObject({
+    base_tree: git(work, "rev-parse", `${newBase}^{tree}`),
+  });
+  expect(treePaths(gh)).toEqual(["a.txt"]);
+  expect(gh.commits.map((c) => c.parents)).toEqual([[newBase]]);
+  expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
+  expect(readFileSync(heldPatchPath(), "utf8")).toBe(result.held?.patch);
+});
+
+test("after the PM pushes the held workflows, a re-publish once the base moves is refused before anything is sent", async () => {
+  baseWithWorkflows();
+  const oldBase = baseSha;
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+  const first = await run();
+  const pm = pmPush(first.held?.patchPath ?? "", { "a.txt": "first\n" });
+  const newBase = nextBase({ README: "hi again\n" });
+  const gh = fakeGitHub({
+    ref: "pm_head",
+    commitTrees: { pm_head: pm.tree },
+    commitParents: { pm_head: [oldBase] },
+    pulls: [OPEN_PR],
+    allowPullUpdates: true,
+  });
+  baseMovesTo(newBase);
+
+  await expect(run()).rejects.toThrow(/would drop/);
+  expect(gh.blobs).toEqual([]);
+  expect(gh.trees).toEqual([]);
+  expect(gh.commits).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+});
