@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -121,6 +121,8 @@ function fakeGitHub(
     commitParents?: Record<string, string[]>;
     /** Whether a PATCH to a pull is expected; otherwise GitHub refuses it and the test fails. */
     allowPullUpdates?: boolean;
+    /** A repo holding objects GitHub has that this clone doesn't, served by the trees and blobs routes. */
+    objectsFrom?: string;
     /** The GitHub branch published to; the worktree's own, claude/agt_1, unless given. */
     branch?: string;
   } = {},
@@ -158,9 +160,44 @@ function fakeGitHub(
     }),
     http.get(`${REPO}/git/blobs/:sha`, ({ request, params }) => {
       seen(request);
-      return options.blobs?.includes(String(params.sha))
-        ? HttpResponse.json({ sha: params.sha })
+      const sha = String(params.sha);
+      if (options.objectsFrom) {
+        try {
+          const content = execFileSync("git", ["cat-file", "blob", sha], {
+            cwd: options.objectsFrom,
+            stdio: ["ignore", "pipe", "ignore"],
+          });
+          return HttpResponse.json({
+            sha,
+            content: content.toString("base64"),
+            encoding: "base64",
+          });
+        } catch {}
+      }
+      return options.blobs?.includes(sha)
+        ? HttpResponse.json({ sha })
         : HttpResponse.json({ message: "Not Found" }, { status: 404 });
+    }),
+    http.get(`${REPO}/git/trees/:sha`, ({ request, params }) => {
+      seen(request);
+      if (!options.objectsFrom) {
+        return HttpResponse.json({ message: "Not Found" }, { status: 404 });
+      }
+      const recursive = new URL(request.url).searchParams.has("recursive");
+      const out = execFileSync(
+        "git",
+        ["ls-tree", "-z", ...(recursive ? ["-r"] : []), String(params.sha)],
+        { cwd: options.objectsFrom, encoding: "utf8" },
+      );
+      const tree = out
+        .split("\0")
+        .filter(Boolean)
+        .map((line) => {
+          const [meta = "", path = ""] = line.split("\t");
+          const [mode, type, sha] = meta.split(" ");
+          return { path, mode, type, sha };
+        });
+      return HttpResponse.json({ sha: params.sha, tree, truncated: false });
     }),
     http.get(`${REPO}/git/commits/:sha`, ({ request, params }) => {
       seen(request);
@@ -1806,4 +1843,160 @@ test("a file moved out of .github/workflows is sent where it landed and held bac
     { path: "old.yml", mode: "100644", type: "blob", sha: "blob1" },
   ]);
   expect(result.held?.files).toEqual(["D .github/workflows/old.yml"]);
+});
+
+/** What the PM pushes from outside the sandbox: `files` of the branch's own work, then the held patch applied. */
+const pmPush = (patchPath: string, files: Record<string, string>) => {
+  const pm = join(root, "pm");
+  execFileSync("git", ["clone", "-q", work, pm]);
+  git(pm, "checkout", "-q", baseSha);
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(pm, path)), { recursive: true });
+    writeFileSync(join(pm, path), content);
+  }
+  if (patchPath) git(pm, "apply", patchPath);
+  git(pm, "add", "--all");
+  git(
+    pm,
+    "-c",
+    "user.name=PM",
+    "-c",
+    "user.email=pm@example.com",
+    "commit",
+    "-qm",
+    "Push held workflows",
+  );
+  return { dir: pm, tree: git(pm, "rev-parse", "HEAD^{tree}") };
+};
+
+test("publish, the PM pushes the held patch, a new commit: the next publish fast-forwards, keeps the PM's workflows and holds nothing", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+  const first = commit("Add a, change CI");
+  const firstResult = await run();
+  const pm = pmPush(firstResult.held?.patchPath ?? "", { "a.txt": "first\n" });
+  // the patch brings the published head to exactly the branch's own tree
+  expect(pm.tree).toBe(git(work, "rev-parse", `${first}^{tree}`));
+
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Review fix");
+  const gh = fakeGitHub({
+    ref: "pm_head",
+    commitTrees: { pm_head: pm.tree },
+    pulls: [OPEN_PR],
+    allowPullUpdates: true,
+  });
+
+  const result = await run();
+
+  expect(result.held).toBeUndefined();
+  expect(existsSync(heldPatchPath())).toBe(false);
+  expect(gh.trees).toHaveLength(1);
+  expect(gh.trees[0]).toMatchObject({ base_tree: pm.tree });
+  expect(treePaths(gh)).toEqual(["b.txt"]);
+  expect(gh.commits).toHaveLength(1);
+  expect(gh.commits[0]?.parents).toEqual(["pm_head"]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("the PM pushes only part of the patch: the next publish holds only the rest, from GitHub's own workflows", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+  commit("Add a, change CI");
+  await run();
+  // only the new workflow reaches GitHub; its objects are not in this clone
+  const pm = pmPush("", {
+    "a.txt": "first\n",
+    ".github/workflows/new.yml": "name: new\n",
+  });
+  expect(() =>
+    execFileSync("git", ["cat-file", "-e", `${pm.tree}^{tree}`], {
+      cwd: work,
+      stdio: "ignore",
+    }),
+  ).toThrow();
+
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Review fix");
+  const gh = fakeGitHub({
+    ref: "pm_head",
+    commitTrees: { pm_head: pm.tree },
+    objectsFrom: pm.dir,
+    pulls: [OPEN_PR],
+    allowPullUpdates: true,
+  });
+
+  const result = await run();
+
+  expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
+  // the rest of the patch brings GitHub's head to the branch's workflows
+  git(pm.dir, "apply", result.held?.patchPath ?? "");
+  expect(readFileSync(join(pm.dir, ".github/workflows/ci.yml"), "utf8")).toBe(
+    "name: changed\n",
+  );
+  expect(readFileSync(join(pm.dir, ".github/workflows/new.yml"), "utf8")).toBe(
+    "name: new\n",
+  );
+  expect(gh.trees[0]).toMatchObject({ base_tree: pm.tree });
+  expect(treePaths(gh)).toEqual(["b.txt"]);
+  expect(gh.commits.map((c) => c.parents)).toEqual([["pm_head"]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("continuing a branch whose GitHub commits already change workflows sends the new work on GitHub's tree and holds nothing", async () => {
+  baseWithWorkflows();
+  git(work, "config", "branch.claude/agt_1.sky-remote-branch", "feature/x");
+  writeFileSync(join(work, "theirs.txt"), "theirs\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: theirs\n");
+  const theirs = commit("Their change, with CI");
+  writeFileSync(join(work, "mine.txt"), "mine\n");
+  commit("Agent change");
+  const gh = fakeGitHub({
+    ref: theirs,
+    branch: "feature/x",
+    pulls: [{ ...OPEN_PR, head: "feature/x" }],
+    allowPullUpdates: true,
+  });
+
+  const result = await run();
+
+  expect(result.held).toBeUndefined();
+  expect(treePaths(gh)).toEqual(["mine.txt"]);
+  expect(gh.trees[0]).toMatchObject({
+    base_tree: git(work, "rev-parse", `${theirs}^{tree}`),
+  });
+  expect(gh.commits.map((c) => c.parents)).toEqual([[theirs]]);
+});
+
+test("a rewrite that would drop workflow changes already on GitHub is refused before anything is sent", async () => {
+  baseWithWorkflows();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const old = commit("Add a");
+  // GitHub holds the head this branch had before an amend, plus a workflow the PM pushed, on a history that
+  // doesn't pass through the base
+  const pm = pmPush("", {
+    "a.txt": "first\n",
+    ".github/workflows/new.yml": "name: new\n",
+  });
+  git(work, "commit", "-q", "--amend", "-m", "Add a, amended");
+  const gh = fakeGitHub({
+    ref: old,
+    commitTrees: { [old]: pm.tree, elsewhere: pm.tree },
+    commitParents: { [old]: ["elsewhere"], elsewhere: [] },
+    objectsFrom: pm.dir,
+  });
+
+  await expect(run()).rejects.toThrow(/would drop/);
+  expect(gh.commits).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
 });
