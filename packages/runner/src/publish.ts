@@ -41,7 +41,8 @@ export type PublishResult = {
   pullRequest: { number: number; url: string };
   /**
    * Set when the commits change `.github/workflows/`, which the connector's token may not write:
-   * those paths are left out of what was sent, and are held in `patch`, also saved at `patchPath`.
+   * what was sent keeps the base's version there, and the changes are held in `patch`, also saved
+   * at `patchPath`.
    */
   held?: { files: string[]; patch: string; patchPath: string };
 };
