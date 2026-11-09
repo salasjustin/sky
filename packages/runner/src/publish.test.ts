@@ -1,7 +1,10 @@
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
+  mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -14,6 +17,8 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { server } from "../../../test/msw.js";
 import {
   GatewayError,
+  HELD_PATCH_BEGIN,
+  HELD_PATCH_END,
   PUBLISH_USAGE,
   publish,
   publishMain,
@@ -1422,3 +1427,154 @@ test.each(identityCases)(
     });
   },
 );
+
+// the base as GitHub holds it, with workflow files already on it
+const baseWithWorkflows = () => {
+  mkdirSync(join(work, ".github/workflows"), { recursive: true });
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: ci\non: push\n");
+  writeFileSync(join(work, ".github/workflows/old.yml"), "name: old\n");
+  baseSha = commit("Base with CI");
+  git(work, "update-ref", "refs/remotes/origin/main", baseSha);
+};
+
+const treePaths = (gh: ReturnType<typeof fakeGitHub>) =>
+  gh.trees.flatMap((t) => (t.tree as { path: string }[]).map((e) => e.path));
+
+test("workflow add, edit, delete and rename are held back while other files publish, and the patch applies to the published head", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(
+    join(work, ".github/workflows/ci.yml"),
+    "name: ci\non: [push, pull_request]\n",
+  );
+  writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+  git(work, "mv", ".github/workflows/old.yml", ".github/workflows/renamed.yml");
+  commit("Add a and touch CI");
+  rmSync(join(work, ".github/workflows/new.yml"));
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Add b, drop new.yml");
+  writeFileSync(join(work, ".github/workflows/only.yml"), "name: only\n");
+  commit("Workflow only");
+  const head = git(work, "rev-parse", "HEAD");
+
+  const result = await run();
+
+  expect(treePaths(gh).sort()).toEqual(["a.txt", "b.txt"]);
+  expect(gh.commits.map((c) => c.message)).toEqual([
+    "Add a and touch CI\n",
+    "Add b, drop new.yml\n",
+  ]);
+  expect(result.held?.files).toEqual([
+    "M .github/workflows/ci.yml",
+    "A .github/workflows/only.yml",
+    "R .github/workflows/old.yml -> .github/workflows/renamed.yml",
+  ]);
+  expect(result.held?.patchPath).toBe(
+    join(
+      git(work, "rev-parse", "--absolute-git-dir"),
+      "sky",
+      "held-workflows.patch",
+    ),
+  );
+  expect(readFileSync(result.held?.patchPath ?? "", "utf8")).toBe(
+    result.held?.patch,
+  );
+  // the local branch is as it was
+  expect(git(work, "rev-parse", "HEAD")).toBe(head);
+
+  // the published head has the base's workflows; the patch brings them to the local ones
+  const published = join(root, "published");
+  execFileSync("git", ["clone", "-q", work, published]);
+  git(published, "checkout", "-q", baseSha);
+  git(published, "apply", "--check", result.held?.patchPath ?? "");
+  git(published, "apply", result.held?.patchPath ?? "");
+  for (const f of ["ci.yml", "only.yml", "renamed.yml"]) {
+    expect(readFileSync(join(published, ".github/workflows", f), "utf8")).toBe(
+      readFileSync(join(work, ".github/workflows", f), "utf8"),
+    );
+  }
+  expect(existsSync(join(published, ".github/workflows/old.yml"))).toBe(false);
+
+  // a later publish holds back the same files again
+  const second = fakeGitHub();
+  const again = await run();
+  expect(again.held?.files).toEqual(result.held?.files);
+  expect(treePaths(second).sort()).toEqual(["a.txt", "b.txt"]);
+});
+
+test("a workflow deleted on the branch is held back, and a commit touching only a workflow is skipped", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  rmSync(join(work, ".github/workflows/ci.yml"));
+  commit("Drop CI");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const result = await run();
+
+  expect(gh.commits).toHaveLength(1);
+  expect(gh.commits[0]).toMatchObject({
+    message: "Add a\n",
+    parents: [baseSha],
+  });
+  expect(treePaths(gh)).toEqual(["a.txt"]);
+  expect(result.held?.files).toEqual(["D .github/workflows/ci.yml"]);
+  expect(result.held?.patch).toContain("deleted file mode");
+});
+
+test("a branch whose only change is a workflow sends nothing and fails naming the patch", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+  commit("Add a workflow");
+
+  await expect(run()).rejects.toThrow(/held-workflows\.patch/);
+  expect(gh.commits).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+});
+
+test("the publish command names each held-back file on stderr and prints the patch after the PR URL", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+  const out: string[] = [];
+  const err: string[] = [];
+
+  const status = await publishMain(
+    ["--title", "T"],
+    { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY },
+    {
+      cwd: work,
+      stdout: (s) => void out.push(s),
+      stderr: (s) => void err.push(s),
+    },
+  );
+
+  expect(status).toBe(0);
+  expect(err.join("")).toMatch(/M \.github\/workflows\/ci\.yml/);
+  expect(err.join("")).toMatch(/held-workflows\.patch/);
+  expect(err.join("")).toMatch(/outside the sandbox/);
+  expect(out[0]).toBe("https://github.com/acme/widgets/pull/7\n");
+  expect(out[1]?.startsWith(`${HELD_PATCH_BEGIN}\n`)).toBe(true);
+  expect(out[1]).toContain("+name: changed");
+  expect(out[1]?.endsWith(`\n${HELD_PATCH_END}\n`)).toBe(true);
+});
+
+test("without workflow changes, no held result is returned and a stale patch is removed", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  const dir = join(git(work, "rev-parse", "--absolute-git-dir"), "sky");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "held-workflows.patch"), "stale\n");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  const result = await run();
+
+  expect(result.held).toBeUndefined();
+  expect(existsSync(join(dir, "held-workflows.patch"))).toBe(false);
+  expect(treePaths(gh)).toEqual(["a.txt"]);
+});
