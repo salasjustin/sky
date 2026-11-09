@@ -1871,7 +1871,7 @@ test("a launch wakes its silent run 90 s after the runner starts, by default", a
       wakes.push(fn);
       return 0;
     }
-    return realSetTimeout(fn, ms, ...args);
+    return Reflect.apply(realSetTimeout, globalThis, [fn, ms, ...args]);
   }) as unknown as typeof setTimeout);
   try {
     pgrepAnswers(0);
