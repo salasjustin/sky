@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
 import { fetchCommit } from "./repo.js";
-import { git as repoGit } from "./store.js";
+import { fetchMissing, git as repoGit, type TreeItem } from "./store.js";
 
 const run = promisify(execFile);
 
@@ -38,7 +39,21 @@ export type PublishResult = {
   /** True when an already-open pull request was sent a new title or body. */
   updated: boolean;
   pullRequest: { number: number; url: string };
+  /**
+   * Set when the commits change `.github/workflows/`, which the connector's token may not write:
+   * what was sent keeps GitHub's head's version there once the branch exists (the base's before
+   * that, and on a rewrite), and the paths the branch changed that differ from it are held in
+   * `patch`, also saved at `patchPath`.
+   */
+  held?: { files: string[]; patch: string; patchPath: string };
 };
+
+/** The directory GitHub refuses a tree change under without the `workflow` scope. */
+export const WORKFLOWS_DIR = ".github/workflows";
+/** Printed on stdout around the held-back patch, after the pull request's URL. */
+export const HELD_PATCH_BEGIN =
+  "----- held-back workflow changes (git apply) -----";
+export const HELD_PATCH_END = "----- end of held-back workflow changes -----";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await run("git", args, {
@@ -172,6 +187,145 @@ async function changes(cwd: string, from: string, to: string) {
     );
   }
   return result;
+}
+
+type TreeItemEntry = { mode: string; type: string; sha: string; path: string };
+
+/** The entries of a tree object that is in this clone. */
+async function lsTree(cwd: string, sha: string): Promise<TreeItemEntry[]> {
+  const out = await git(cwd, "ls-tree", "-z", sha);
+  return out
+    .split("\0")
+    .filter(Boolean)
+    .map((line) => {
+      const tab = line.indexOf("\t");
+      const [mode = "", type = "", entrySha = ""] = line
+        .slice(0, tab)
+        .split(" ");
+      return { mode, type, sha: entrySha, path: line.slice(tab + 1) };
+    });
+}
+
+/** Writes a tree of `entries`; the trees they name needn't be in this clone. */
+const mktree = (cwd: string, entries: TreeItemEntry[]) =>
+  repoGit(cwd)(["mktree", "--missing", "-z"], {
+    input: entries
+      .map((e) => `${e.mode} ${e.type} ${e.sha}\t${e.path}\0`)
+      .join(""),
+  });
+
+/**
+ * `tree` with `.github/workflows/` as the tree `workflows` has it, or left out where that is "":
+ * only the root and `.github` trees are rebuilt, so the workflows tree itself need not be here.
+ */
+async function swapWorkflows(
+  cwd: string,
+  read: (sha: string) => Promise<TreeItemEntry[]>,
+  tree: string,
+  workflows: string,
+): Promise<string> {
+  const root = await read(tree);
+  const github = root.find((e) => e.path === ".github" && e.type === "tree");
+  const inner = github
+    ? (await read(github.sha)).filter((e) => e.path !== "workflows")
+    : [];
+  if (workflows) {
+    inner.push({
+      mode: "040000",
+      type: "tree",
+      sha: workflows,
+      path: "workflows",
+    });
+  }
+  const rest = root.filter((e) => e.path !== ".github");
+  if (inner.length > 0) {
+    rest.push({
+      mode: "040000",
+      type: "tree",
+      sha: await mktree(cwd, inner),
+      path: ".github",
+    });
+  }
+  return mktree(cwd, rest);
+}
+
+/**
+ * Makes GitHub's tree `sha` and every blob under it resolvable here, when it isn't: a tree GitHub's
+ * head holds that no local commit has, as after someone pushed to the branch.
+ */
+async function fetchTree(
+  cwd: string,
+  call: ReturnType<typeof gateway>,
+  sha: string,
+): Promise<void> {
+  const g = repoGit(cwd);
+  const here = await g(["cat-file", "-e", `${sha}^{tree}`]).then(
+    () => true,
+    () => false,
+  );
+  if (here) return;
+  const listing = await call<{ tree: TreeItem[]; truncated: boolean }>(
+    "GET",
+    `/git/trees/${sha}?recursive=1`,
+  );
+  if (listing.truncated) {
+    throw new PublishError(`the tree ${sha} on GitHub is too large to fetch`);
+  }
+  const entries = listing.tree.filter(
+    (item) => item.type === "blob" || item.type === "commit",
+  );
+  await fetchMissing(
+    g,
+    call,
+    entries.filter((item) => item.type === "blob"),
+    () => {},
+    "publish",
+  );
+  const dir = await mkdtemp(join(tmpdir(), "sky-publish-"));
+  try {
+    const env = { GIT_INDEX_FILE: join(dir, "index") };
+    await g(["update-index", "-z", "--add", "--index-info"], {
+      env,
+      input: entries
+        .map((item) => `${item.mode} ${item.sha}\t${item.path}\0`)
+        .join(""),
+    });
+    const built = await g(["write-tree"], { env });
+    if (built !== sha) throw new Error(`tree ${sha} arrived as ${built}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** Each path of `paths` that differs between the trees `base` and `tip`, as `<status> <path>`; a rename names both. */
+async function heldFiles(
+  cwd: string,
+  base: string,
+  tip: string,
+  paths: string[],
+) {
+  const out = await git(
+    cwd,
+    "diff",
+    "--name-status",
+    "-z",
+    "-M",
+    base,
+    tip,
+    "--",
+    ...paths,
+  );
+  const fields = out.split("\0").filter(Boolean);
+  const files: string[] = [];
+  for (let i = 0; i < fields.length; ) {
+    const status = fields[i] ?? "";
+    const paths = /^[RC]/.test(status)
+      ? [fields[i + 1], fields[i + 2]]
+      : [fields[i + 1]];
+    files.push(`${status[0]} ${paths.join(" -> ")}`);
+    i += 1 + paths.length;
+  }
+  return files;
 }
 
 // GitHub's secondary rate limit answers 403 or 429 with a `retry-after`; a pause this long is waited out
@@ -413,6 +567,35 @@ async function sitsOn(
 }
 
 /**
+ * The base commit GitHub's commit `sha` forks from: the first on its first-parent line that is here
+ * and on `base`'s history, within a bounded walk; undefined where the walk finds none.
+ */
+async function forkPoint(
+  cwd: string,
+  call: ReturnType<typeof gateway>,
+  sha: string,
+  base: string,
+): Promise<string | undefined> {
+  // false as well for a commit that isn't here
+  const onBase = (commit: string) =>
+    git(cwd, "merge-base", "--is-ancestor", commit, base).then(
+      () => true,
+      () => false,
+    );
+  for (let steps = 0; steps < 500; steps++) {
+    if (await onBase(sha)) return sha;
+    const { parents } = await call<{ parents: { sha: string }[] }>(
+      "GET",
+      `/git/commits/${sha}`,
+    );
+    const next = parents[0]?.sha;
+    if (!next) return undefined;
+    sha = next;
+  }
+  return undefined;
+}
+
+/**
  * Publishes the worktree's branch, or `options.branch`, through the GitHub gateway, which carries
  * no git push: each commit past the base is recreated with GitHub's git data API (blobs, a tree on
  * its parent's tree, the commit with its own message and identities), then the branch ref is
@@ -425,8 +608,13 @@ async function sitsOn(
  * first-parent history is replayed, so a merge commit arrives as a plain commit with the same
  * content, and a merge from the base shows the base's changes in the pull request's diff as the
  * branch's own. A branch on GitHub whose head this branch held before a rebase or amend here is
- * force-updated to the rewritten history; one holding a commit this branch never had, or the GitHub
- * branch a continued agent works on, is only ever fast-forwarded.
+ * force-updated to the rewritten history; one holding a commit neither this branch nor the base has
+ * is refused before anything is sent, and the GitHub branch a continued agent works on is only ever
+ * fast-forwarded. The connector can't write under `.github/workflows/`, so sent trees keep that
+ * directory as the base has it, or as GitHub's head of the branch has it once the branch exists,
+ * and the paths there the branch itself changed come back as `held`.
+ * GitHub's head is matched against local commits outside that directory, so workflows pushed to the
+ * branch from elsewhere are kept, and a rewrite that would drop them is refused.
  */
 export async function publish(options: {
   cwd: string;
@@ -445,7 +633,9 @@ export async function publish(options: {
   /** Replaces the author and committer of each commit sent; their dates stay. */
   identity?: { author: PersonName; committer: PersonName };
 }): Promise<PublishResult> {
-  const { cwd } = options;
+  // git takes a pathspec (`-- .github/workflows`, `ls-files`'s implicit one) relative to the
+  // directory it runs in, while `<rev>:<path>` is from the top, so every call runs from the top
+  const cwd = (await git(options.cwd, "rev-parse", "--show-toplevel")).trim();
   const rebasing = await rebaseInProgress(cwd);
   if (rebasing !== undefined) {
     // a rebase detaches HEAD until it finishes, so this is checked before the branch is read
@@ -595,8 +785,20 @@ export async function publish(options: {
     );
   }
   const refPath = `heads/${remoteBranch.split("/").map(encodeURIComponent).join("/")}`;
+  const notFastForward = `${remoteBranch} on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten`;
   const treeOf = async (sha: string) =>
     (await git(cwd, "rev-parse", `${sha}^{tree}`)).trim();
+  const workflowsOf = async (sha: string) =>
+    (
+      await git(
+        cwd,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `${sha}:${WORKFLOWS_DIR}`,
+      ).catch(() => "")
+    ).trim();
+  const baseWorkflows = await workflowsOf(mergeBase);
 
   const remote = await call<{ object: { sha: string } }>(
     "GET",
@@ -610,40 +812,109 @@ export async function publish(options: {
   );
 
   // replay from the last local commit GitHub already holds: the same sha, or else the same tree
-  // (a recreated commit's sha differs once its date's offset is dropped; its tree can't)
+  // outside .github/workflows (a recreated commit's sha differs once its date's offset is dropped,
+  // and its workflows are the baseline's, or whatever was pushed there since; its tree can't differ
+  // elsewhere)
   const known = [mergeBase, ...commits];
   let start = 0;
   let parent = mergeBase;
   // GitHub's head is one this branch held before it was rebased or amended here, so the rewritten
   // history replaces it; a head this branch never held is someone else's, and is never overwritten
   let rewritten = false;
+  // the .github/workflows tree sent trees keep: the base's, until the branch exists on GitHub, then
+  // GitHub's head's, so a push of the held workflows there is kept, not undone; the base's again
+  // for a rewrite over a head whose workflows are only an older base's
+  let baseline = baseWorkflows;
+  // GitHub's tree for the commit replay resumes from
+  let resumeTree: string | undefined;
   if (remote) {
     let at = known.indexOf(remote);
-    if (at === -1) {
-      const { tree } = await call<{ tree: { sha: string } }>(
-        "GET",
-        `/git/commits/${remote}`,
-      );
+    if (at !== -1) {
+      baseline = await workflowsOf(remote);
+      resumeTree = await treeOf(remote);
+    } else {
+      const remoteTree = (
+        await call<{ tree: { sha: string } }>("GET", `/git/commits/${remote}`)
+      ).tree.sha;
       const trees = await Promise.all(known.map(treeOf));
-      at = trees.lastIndexOf(tree.sha);
+      // GitHub's head's tree less .github/workflows, where the full trees match nowhere
+      let outside: string | undefined;
+      at = trees.lastIndexOf(remoteTree);
+      if (at !== -1) {
+        baseline = await workflowsOf(known[at] as string);
+      } else {
+        // GitHub's head has workflow changes no local commit has: compare outside them. Its trees
+        // are read locally when they're here, else from GitHub
+        const asked = new Map<string, Promise<TreeItemEntry[]>>();
+        const readRemote = (sha: string) => {
+          let entries = asked.get(sha);
+          if (!entries) {
+            entries = git(cwd, "cat-file", "-e", `${sha}^{tree}`).then(
+              () => lsTree(cwd, sha),
+              async () =>
+                // a tree's own entries, not a recursive listing's
+                (
+                  await call<{ tree: TreeItemEntry[] }>(
+                    "GET",
+                    `/git/trees/${sha}`,
+                  )
+                ).tree.filter((e) => !e.path.includes("/")),
+            );
+            asked.set(sha, entries);
+          }
+          return entries;
+        };
+        const root = await readRemote(remoteTree);
+        const github = root.find(
+          (e) => e.path === ".github" && e.type === "tree",
+        );
+        const inner = github ? await readRemote(github.sha) : [];
+        const remoteWorkflows =
+          inner.find((e) => e.path === "workflows" && e.type === "tree")?.sha ??
+          "";
+        outside = await swapWorkflows(cwd, readRemote, remoteTree, "");
+        const ours = await Promise.all(
+          trees.map((t) =>
+            swapWorkflows(cwd, (sha) => lsTree(cwd, sha), t, ""),
+          ),
+        );
+        at = ours.lastIndexOf(outside);
+        baseline = remoteWorkflows;
+      }
       // a tree this branch also has, on a history that doesn't pass through the base as it is now
       // (published before the base moved), would keep that stale history under the new commits
       if (at !== -1 && !(await sitsOn(call, remote, mergeBase))) {
         at = -1;
         rewritten = true;
       } else if (at === -1) {
-        const held = await git(
+        const reflog = await git(
           cwd,
           "log",
           "--walk-reflogs",
           "--format=%H %T",
           `refs/heads/${localBranch}`,
         ).catch(() => "");
-        rewritten = lines(held).some((line) => {
-          const [sha, heldTree] = line.split(" ");
-          return sha === remote || heldTree === tree.sha;
-        });
+        const entries = lines(reflog).map((line) => line.split(" "));
+        rewritten = entries.some(
+          ([sha, heldTree]) => sha === remote || heldTree === remoteTree,
+        );
+        // what GitHub got of a held tree carries the baseline's workflows, so it is matched outside
+        // them, as `known` is
+        const heldTrees = new Set(
+          entries.flatMap(([, tree]) => (tree ? [tree] : [])),
+        );
+        for (const heldTree of heldTrees) {
+          if (rewritten) break;
+          const heldOutside = await swapWorkflows(
+            cwd,
+            (sha) => lsTree(cwd, sha),
+            heldTree,
+            "",
+          );
+          rewritten = heldOutside === outside;
+        }
       }
+      if (at !== -1) resumeTree = remoteTree;
     }
     // a continued branch is someone's pull request: its head is theirs even when it sits in this
     // branch's reflog, as the head the worktree was made from always does
@@ -652,11 +923,117 @@ export async function publish(options: {
         `${remoteBranch} on GitHub is at ${remote}, which this branch doesn't build on (as after an amend or rebase here, or a push there); a branch this agent continues is only ever fast-forwarded, so nothing was sent. Put your work back on top of it: \`git reset --soft ${remote}\` and \`git commit\` keep your files as they are in a new commit on it (when git doesn't know ${remote}, it was pushed during this run, and the next run brings it in), then publish again`,
       );
     }
+    // the replay goes onto the base, so a fast-forward from a head that is neither this branch's
+    // history nor on the base's is refused: it fails here, before anything is held or sent
+    if (at === -1 && !rewritten) {
+      // false as well for a commit that isn't here
+      const onBase = await git(
+        cwd,
+        "merge-base",
+        "--is-ancestor",
+        remote,
+        mergeBase,
+      ).then(
+        () => true,
+        () => false,
+      );
+      if (!onBase) {
+        throw new PublishError(`${notFastForward}, so nothing was sent`);
+      }
+    }
+    if (at === -1 && baseline !== baseWorkflows) {
+      if (rewritten) {
+        // GitHub's head's workflows are the branch's own changes where they differ from those of
+        // the base it forks from; where they don't, they are an older base's, and the rewrite sends
+        // the current base's instead
+        const fork = await forkPoint(cwd, call, remote, mergeBase);
+        if (fork === undefined || (await workflowsOf(fork)) !== baseline) {
+          throw new PublishError(
+            `${remoteBranch} on GitHub holds workflow changes under ${WORKFLOWS_DIR}/ that publishing this branch's rewritten history (as after ${base} moved on) would drop, so nothing was sent; merge the pull request as it is, or have someone rebase ${remoteBranch} onto ${base}, or merge ${base} into it, from outside the sandbox, keeping those workflow changes, and then publish again`,
+          );
+        }
+      }
+      // a rewrite, or a fast-forward from a head on the base's history, sends the base's workflows
+      baseline = baseWorkflows;
+    }
     if (at !== -1) {
       start = at;
       parent = remote;
     }
   }
+
+  // the connector can't write under .github/workflows/, so every commit is sent with the baseline's
+  // version of it; with no commit differing there, nothing differs from a plain publish
+  const holding = (await Promise.all(known.slice(start).map(workflowsOf))).some(
+    (id) => id !== baseline,
+  );
+  const richTrees = new Map<string, string>();
+  const shownTree = async (sha: string) => {
+    const raw = await treeOf(sha);
+    if (!holding) return raw;
+    let tree = richTrees.get(sha);
+    if (tree === undefined) {
+      tree = await swapWorkflows(cwd, (t) => lsTree(cwd, t), raw, baseline);
+      richTrees.set(sha, tree);
+    }
+    return tree;
+  };
+  const skyDir = join(
+    (await git(cwd, "rev-parse", "--absolute-git-dir")).trim(),
+    "sky",
+  );
+  const patchPath = join(skyDir, "held-workflows.patch");
+  let held: PublishResult["held"];
+  const tip = commits[commits.length - 1] as string;
+  // what the tip's workflows differ from the baseline's by, at the paths the branch changed: a path
+  // only GitHub's head changed was pushed there by someone else, and is kept, not reverted
+  const branchPaths =
+    (await workflowsOf(tip)) === baseline
+      ? []
+      : (
+          await git(
+            cwd,
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            mergeBase,
+            tip,
+            "--",
+            WORKFLOWS_DIR,
+          )
+        )
+          .split("\0")
+          .filter(Boolean)
+          .map((path) => `:(literal)${path}`);
+  // empty where the branch's workflow changes cancel out
+  if (branchPaths.length > 0) {
+    if (baseline) await fetchTree(cwd, call, baseline);
+    const sent = await shownTree(tip);
+    const tipTree = await treeOf(tip);
+    // empty where GitHub's head already has the branch's versions
+    const files = await heldFiles(cwd, sent, tipTree, branchPaths);
+    if (files.length > 0) {
+      const patch = (
+        await gitBytes(
+          cwd,
+          "diff",
+          "--binary",
+          "--full-index",
+          "-M",
+          sent,
+          tipTree,
+          "--",
+          ...branchPaths,
+        )
+      ).toString("utf8");
+      await mkdir(skyDir, { recursive: true });
+      await writeFile(patchPath, patch);
+      held = { files, patch, patchPath };
+    }
+  }
+  // a patch an earlier publish left must not outlive the changes it held
+  if (!held) await rm(patchPath, { force: true });
 
   // a blob's sha is the hash of its content, on GitHub as here, so one an earlier or failed publish
   // uploaded is found rather than sent again; a lookup costs less of the rate limit than a create
@@ -679,11 +1056,16 @@ export async function publish(options: {
   };
 
   let from = known[start] ?? mergeBase;
-  let tree = await treeOf(from);
+  // a tree GitHub has: the commit replay resumes from, or the base head
+  let tree = resumeTree ?? (await treeOf(mergeBase));
+  let fromShown = await shownTree(from);
+  let fromRaw = await treeOf(from);
   const blobs = new Map<string, string>();
   for (const sha of known.slice(start + 1)) {
+    const shown = await shownTree(sha);
+    const raw = await treeOf(sha);
     const entries: TreeEntry[] = [];
-    for (const change of await changes(cwd, from, sha)) {
+    for (const change of await changes(cwd, fromShown, shown)) {
       // a submodule is a commit sha in the tree, with no blob behind it
       const type = change.mode === "160000" ? "commit" : "blob";
       let remoteSha = change.sha;
@@ -698,6 +1080,12 @@ export async function publish(options: {
         sha: remoteSha,
       });
     }
+    const wasHeld = entries.length === 0 && raw !== fromRaw;
+    fromShown = shown;
+    fromRaw = raw;
+    from = sha;
+    // a commit that only touched held-back workflows has nothing left to send
+    if (wasHeld) continue;
     // an empty commit keeps its parent's tree; GitHub refuses a tree request with no entries
     if (entries.length > 0) {
       tree = (
@@ -717,7 +1105,11 @@ export async function publish(options: {
         committer: local.committer,
       })
     ).sha;
-    from = sha;
+  }
+  if (parent === mergeBase && remote === null && held) {
+    throw new PublishError(
+      `every change on ${localBranch} is under ${WORKFLOWS_DIR}/, which the connector can't write, so nothing was sent; the changes are held in ${held.patchPath}: apply them from outside the sandbox (${held.files.join(", ")})`,
+    );
   }
 
   if (remote === null) {
@@ -744,9 +1136,7 @@ export async function publish(options: {
       force: false,
     }).catch((error: unknown) => {
       if (error instanceof GatewayError && error.status === 422) {
-        throw new PublishError(
-          `${remoteBranch} on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten (${error.message})`,
-        );
+        throw new PublishError(`${notFastForward} (${error.message})`);
       }
       throw error;
     });
@@ -769,6 +1159,7 @@ export async function publish(options: {
       created: false,
       updated,
       pullRequest: { number: existing.number, url: existing.html_url },
+      ...(held && { held }),
     };
   }
   const pull = await call<{ number: number; html_url: string }>(
@@ -790,6 +1181,7 @@ export async function publish(options: {
     created: true,
     updated: false,
     pullRequest: { number: pull.number, url: pull.html_url },
+    ...(held && { held }),
   };
 }
 
@@ -822,7 +1214,8 @@ export function configuredIdentity(env: NodeJS.ProcessEnv) {
 
 /**
  * `runner.mjs publish …`, run by the agent from its worktree: prints the pull request's URL on
- * stdout and returns the exit status, 2 for a usage or config error.
+ * stdout, then any held-back workflow patch between `HELD_PATCH_BEGIN` and `HELD_PATCH_END`, and
+ * returns the exit status, 2 for a usage or config error.
  */
 export async function publishMain(
   argv: string[],
@@ -893,7 +1286,18 @@ export async function publishMain(
         ? `sky publish: opened pull request #${result.pullRequest.number}\n`
         : `sky publish: pull request #${result.pullRequest.number} was already open${result.updated ? " and updated" : ""}; ${result.branch} is now ${result.sha}\n`,
     );
+    if (result.held) {
+      io.stderr(
+        `sky publish: held back ${result.held.files.length} change${result.held.files.length === 1 ? "" : "s"} under ${WORKFLOWS_DIR}/, which this sandbox's token can't push: ${result.held.files.join(", ")}\n` +
+          `sky publish: the patch is at ${result.held.patchPath}; the PM must push these files from outside the sandbox (\`git apply\` it on the branch)\n`,
+      );
+    }
     io.stdout(`${result.pullRequest.url}\n`);
+    if (result.held) {
+      io.stdout(
+        `${HELD_PATCH_BEGIN}\n${result.held.patch}${result.held.patch.endsWith("\n") ? "" : "\n"}${HELD_PATCH_END}\n`,
+      );
+    }
     return 0;
   } catch (error) {
     io.stderr(
