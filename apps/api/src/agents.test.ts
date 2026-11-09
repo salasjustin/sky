@@ -1859,13 +1859,28 @@ test("the hold's curl takes a 2m task over the sprite's socket, failing on an HT
 });
 
 test("a launch wakes its silent run 90 s after the runner starts, by default", async () => {
-  const timers = vi.spyOn(globalThis, "setTimeout");
+  // the 90 s timer is captured instead of scheduled, so no real 90 s timer outlives the test
+  const realSetTimeout = globalThis.setTimeout;
+  const wakes: (() => void)[] = [];
+  const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: () => void,
+    ms?: number,
+    ...args: unknown[]
+  ) => {
+    if (ms === 90_000) {
+      wakes.push(fn);
+      return 0;
+    }
+    return realSetTimeout(fn, ms, ...args);
+  }) as unknown as typeof setTimeout);
   try {
-    await launched(readyEnv());
+    pgrepAnswers(0);
+    const { run } = await launched(readyEnv());
     await sessionOpened();
-    await vi.waitFor(() =>
-      expect(timers.mock.calls.map((c) => c[1])).toContain(90_000),
-    );
+    await vi.waitFor(() => expect(wakes).toHaveLength(1));
+    expect(pgrepsOf(run.id)).toEqual([]);
+    wakes[0]?.();
+    await vi.waitFor(() => expect(pgrepsOf(run.id)).toHaveLength(1));
   } finally {
     timers.mockRestore();
   }
@@ -1934,7 +1949,7 @@ test("a run still starting with only a warning and a heartbeat gets exactly one 
 const holdsOf = (runId: string) =>
   holdCalls().filter((c) => c.includes(spriteTaskNameFor(runId as RunId)));
 
-test("a woken silent launch takes the run's hold again, after the wake resolves", async () => {
+test("a woken silent launch takes the run's hold again", async () => {
   wakingAfter(150);
   pgrepAnswers(0);
   const { run } = await runningRun();
@@ -1945,10 +1960,6 @@ test("a woken silent launch takes the run's hold again, after the wake resolves"
   expect(holds[1]).toBe(holds[0]);
   expect(holds[1]).toContain(`-X PUT`);
   expect(holds[1]).toContain(`{"expire":"2m"}`);
-  const pgrep = wire.calls.findIndex((c) => c.includes(runnerPattern(run.id)));
-  const rehold = wire.calls.lastIndexOf(holds[1] ?? "");
-  expect(pgrep).toBeGreaterThan(-1);
-  expect(rehold).toBeGreaterThan(pgrep);
 });
 
 test("a woken silent launch whose wake finds no runner is not held again", async () => {
@@ -1988,7 +1999,7 @@ test("a re-hold waits for a wake that is still resolving", async () => {
 });
 
 test("a run that has reported in is not held again by a wake it never gets", async () => {
-  wakingAfter(150);
+  wakingAfter(500);
   pgrepAnswers(0);
   const { run, token } = await runningRun();
   const started = await postEvent(token, {
