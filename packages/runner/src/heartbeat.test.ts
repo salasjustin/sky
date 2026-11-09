@@ -81,10 +81,11 @@ test("a beat that throws doesn't stop the next, and stop silences everything", (
   expect(calls).toBe(3);
 });
 
-test("newTurn drops calls still in flight, and the next turn's calls are tracked again", () => {
+test("a call read in an earlier response stops being beaten for once the next begins, end hook or no", () => {
   const { beats, heartbeat } = setup();
+  heartbeat.assistantMessage("m1", ["t1"]);
   heartbeat.started("t1", "ToolSearch");
-  heartbeat.newTurn();
+  heartbeat.assistantMessage("m2", ["t2"]);
   vi.advanceTimersByTime(120_000);
   expect(beats).toEqual([]);
   heartbeat.started("t2", "Bash");
@@ -95,10 +96,41 @@ test("newTurn drops calls still in flight, and the next turn's calls are tracked
   heartbeat.stop();
 });
 
+test("parallel calls of one response stay tracked across its split messages", () => {
+  const { beats, heartbeat } = setup();
+  heartbeat.assistantMessage("m1", ["t1"]);
+  heartbeat.started("t1", "Bash");
+  heartbeat.assistantMessage("m1", ["t2"]);
+  heartbeat.started("t2", "Read");
+  vi.advanceTimersByTime(60_000);
+  expect(beats).toEqual([
+    { toolName: "Bash", toolUseId: "t1", elapsedMs: 60_000 },
+  ]);
+  heartbeat.stop();
+});
+
+test("a call started before the session reads the response that made it survives the turn changes ahead of it", () => {
+  const { beats, heartbeat } = setup();
+  // the hooks ran while the session's loop was still behind, before it had read m1
+  heartbeat.started("t1", "Read");
+  heartbeat.ended("t1");
+  heartbeat.started("t2", "Bash");
+  heartbeat.assistantMessage("m1", ["t1"]);
+  heartbeat.assistantMessage("m2", ["t2"]);
+  vi.advanceTimersByTime(60_000);
+  expect(beats).toEqual([
+    { toolName: "Bash", toolUseId: "t2", elapsedMs: 60_000 },
+  ]);
+  heartbeat.assistantMessage("m3", []);
+  vi.advanceTimersByTime(60_000);
+  expect(beats).toHaveLength(1);
+  heartbeat.stop();
+});
+
 test("a background task survives a new turn and is beaten for under its own name, behind any call in flight", () => {
   const { beats, heartbeat } = setup();
   heartbeat.setBackground([{ taskId: "b1", taskType: "local_bash" }]);
-  heartbeat.newTurn();
+  heartbeat.assistantMessage("m1", []);
   vi.advanceTimersByTime(60_000);
   heartbeat.started("t1", "Read");
   vi.advanceTimersByTime(60_000);

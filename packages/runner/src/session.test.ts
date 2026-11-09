@@ -2507,10 +2507,21 @@ test("with several tool calls in flight the heartbeat names the longest-running;
   );
 });
 
-/** An assistant message of the model response `id`, as the SDK emits it. */
-const turn = (id: string) => ({
-  ...assistant({ type: "text", text: "next" }),
-  message: { id, content: [{ type: "text", text: "next" }] },
+/** An assistant message of the model response `id` making the tool calls `toolUseIds`, as the SDK emits it. */
+const turn = (id: string, ...toolUseIds: string[]) => ({
+  ...assistant(),
+  message: {
+    id,
+    content: [
+      { type: "text", text: "next" },
+      ...toolUseIds.map((toolUseId) => ({
+        type: "tool_use",
+        id: toolUseId,
+        name: "Bash",
+        input: {},
+      })),
+    ],
+  },
 });
 
 test("a call that never gets an end hook stops being beaten for once the session starts its next turn", async () => {
@@ -2519,7 +2530,7 @@ test("a call that never gets an end hook stops being beaten for once the session
   const toolSearch = { ...bash("t1"), tool_name: "ToolSearch" };
   const query = scripted([
     init,
-    turn("m1"),
+    turn("m1", "t1"),
     hook("PreToolUse", toolSearch),
     until(() => expect(beatsIn(posted).length).toBeGreaterThanOrEqual(2)),
     turn("m2"),
@@ -2543,9 +2554,9 @@ test("parallel calls of one turn keep beating across its split messages", async 
   const { posted, post } = recorder();
   const query = scripted([
     init,
-    turn("m1"),
+    turn("m1", "t1"),
     hook("PreToolUse", bash("t1")),
-    turn("m1"),
+    turn("m1", "t2"),
     hook("PreToolUse", bash("t2")),
     hook("PostToolUse", { ...bash("t2"), tool_response: "ok" }),
     until(() => expect(beatsIn(posted).length).toBeGreaterThanOrEqual(3)),
@@ -2564,12 +2575,41 @@ test("parallel calls of one turn keep beating across its split messages", async 
   );
 });
 
+test("a call whose hook runs before the session reads the response that made it keeps beating through that turn change", async () => {
+  const { posted, post } = recorder();
+  const query = scripted([
+    init,
+    turn("m1", "t1"),
+    hook("PreToolUse", bash("t1")),
+    hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
+    // the SDK answers hooks as it reads them, but queues m2 behind the loop
+    hook("PreToolUse", bash("t2")),
+    turn("m2", "t2"),
+    until(() =>
+      expect(
+        beatsIn(posted).filter((b) => b.toolUseId === "t2").length,
+      ).toBeGreaterThanOrEqual(2),
+    ),
+    hook("PostToolUse", { ...bash("t2"), tool_response: "ok" }),
+    success,
+  ]);
+  const code = await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    heartbeatMs: 25,
+  });
+  expect(code).toBe(0);
+  expect(beatsIn(posted).map((b) => b.toolUseId)).toContain("t2");
+});
+
 test("a run waiting on a background task beats as 'Bash (background)' until the task ends", async () => {
   const { posted, post } = recorder();
   let beatsBefore = 0;
   const query = scripted([
     init,
-    turn("m1"),
+    turn("m1", "t1"),
     hook("PreToolUse", { ...bash("t1"), tool_input: { command: "pnpm test" } }),
     hook("PostToolUse", { ...bash("t1"), tool_response: "started" }),
     backgroundTasks(1),

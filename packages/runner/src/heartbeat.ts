@@ -33,6 +33,9 @@ export function createHeartbeat(options: {
   const now = options.now ?? Date.now;
   const inFlight = new Map<string, InFlight>();
   const background = new Map<string, InFlight>();
+  let turn: string | undefined;
+  // the turn whose message carried each tool call the session has read so far
+  const turnOfCall = new Map<string, string>();
   let timer: NodeJS.Timeout | undefined;
 
   const longest = (calls: Map<string, InFlight>) => {
@@ -69,6 +72,7 @@ export function createHeartbeat(options: {
   const stop = () => {
     inFlight.clear();
     background.clear();
+    turnOfCall.clear();
     idle();
   };
 
@@ -82,11 +86,22 @@ export function createHeartbeat(options: {
       idle();
     },
     /**
-     * The session began a new assistant turn, so every call from an earlier one has ended, whether
-     * or not its end hook fired. Calls the turn starts afterwards are tracked as usual.
+     * The session read an assistant message: model response `id`, carrying the tool calls
+     * `toolUseIds`. A response the SDK splits into several messages shares one id. Once a new
+     * response begins, a call the session read in an earlier one has ended, whether or not its end
+     * hook fired, so it stops being beaten for. A call whose message the session hasn't read yet is
+     * kept: the SDK runs hooks as it reads them but queues messages behind the session's loop, so a
+     * call can be `started` before the loop reaches the response that made it.
      */
-    newTurn(): void {
-      inFlight.clear();
+    assistantMessage(id: string, toolUseIds: string[]): void {
+      for (const toolUseId of toolUseIds) turnOfCall.set(toolUseId, id);
+      if (id === turn) return;
+      turn = id;
+      for (const [toolUseId, callTurn] of turnOfCall) {
+        if (callTurn === id) continue;
+        inFlight.delete(toolUseId);
+        turnOfCall.delete(toolUseId);
+      }
       idle();
     },
     /** The background tasks live now; the SDK reports the whole set each time, so this replaces it. */
