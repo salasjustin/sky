@@ -13,13 +13,13 @@ const backgroundName = (taskType: string) =>
   `${BACKGROUND_NAMES[taskType] ?? taskType} (background)`;
 
 /**
- * Tells the API a tool call is still running, so a long build or test run isn't probed as a silent
- * run, and a timeout names the tool. Heartbeats are not progress: the API still fails the run at
- * RUN_TIMEOUT_MINUTES. While any call is in flight, `beat` runs every `intervalMs` for the one that
- * has run the longest, with how long that is. With none in flight but a background task live, it
- * beats for the longest-running task as "<tool> (background)": the session is waiting on it, and a
- * timeout names it. Nothing is sent while neither runs, nor for a call held for approval, which isn't
- * `started` until it is let go.
+ * Tells the API a tool call or background task is still running, so a long build or test run isn't
+ * probed as a silent run, and a timeout names it. Heartbeats are not progress: the API still fails
+ * the run at RUN_TIMEOUT_MINUTES. While any call is in flight, `beat` runs every `intervalMs` for the
+ * one that has run the longest, with how long that is. With none in flight but a background task
+ * live, it beats for the longest-running task as "<tool> (background)", with the task id as
+ * `toolUseId`: the session is waiting on it, and a timeout names it. Nothing is sent while neither
+ * runs, nor for a call held for approval, which isn't `started` until it is let go.
  */
 export function createHeartbeat(options: {
   beat: (beat: {
