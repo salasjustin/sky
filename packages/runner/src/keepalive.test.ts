@@ -308,6 +308,29 @@ test("a report that throws never breaks the hold", async () => {
   await hold.release();
 });
 
+test("a warn that throws leaves the first hold and the refresh running", async () => {
+  const { calls, socketPath, answer } = await spriteApi(500);
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 10,
+    firstRetryMs: 5,
+    firstAttempts: 3,
+    warn: () => {
+      throw new Error("log pipe closed");
+    },
+  });
+  // the first-hold loop ran out of attempts without rejecting
+  await expect(hold.ready).resolves.toBe(false);
+  answer(200);
+  const before = calls.length;
+  await vi.waitFor(() =>
+    expect(calls.length).toBeGreaterThanOrEqual(before + 3),
+  );
+  await expect(hold.release()).resolves.toBeUndefined();
+  expect(calls.at(-1)?.method).toBe("DELETE");
+});
+
 test("two runs in one sprite hold tasks under distinct valid names", async () => {
   const { calls, socketPath } = await spriteApi();
   const warnings: string[] = [];

@@ -22,6 +22,7 @@ import { BASE_ENV_NAMES } from "./base-profile.js";
 import { boot } from "./boot.js";
 import type { Config } from "./config.js";
 import { envSecretAad, seal } from "./crypto.js";
+import { holdArgv, releaseArgv } from "./launch.js";
 import { createRunProber } from "./probe.js";
 import { KnownSecrets } from "./redact.js";
 import {
@@ -663,6 +664,42 @@ test("a runner that exits at launch fails the run with its exit code and output 
   expect(
     db.$client.prepare("select status from agents where id = ?").get(agent.id),
   ).toEqual({ status: "idle" });
+});
+
+test("a runner that fails to start deletes the run's keep-awake task and still reports the start error", async () => {
+  wire.sessionExit = { output: "node: bad option\r\n", code: 1 };
+  const { agent, run } = await launched(readyEnv());
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
+  );
+  const { error } = (await getRun(agent.id, run.id)).body;
+  expect(error).toMatch(/^launch_failed: runner exited 1 at launch: /);
+  const release = wire.calls.filter(
+    (c) => c.includes(" curl ") && c.includes("-X DELETE"),
+  );
+  expect(release).toHaveLength(1);
+  expect(release[0]).toContain(spriteTaskNameFor(run.id as RunId));
+});
+
+test("a cleanup that fails after a failed start never masks the start error", async () => {
+  wire.sessionExit = { output: "node: bad option\r\n", code: 1 };
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "curl" && argv.includes("DELETE")
+      ? { exitCode: 7, stderr: "curl: (7) couldn't connect\n" }
+      : argv[0] === "rm"
+        ? { exitCode: 1, stderr: "rm: boom\n" }
+        : exec(argv);
+  const { agent, run } = await launched(readyEnv());
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
+  );
+  expect((await getRun(agent.id, run.id)).body.error).toMatch(
+    /^launch_failed: runner exited 1 at launch: /,
+  );
+  expect(logs.some((l) => l.includes("releasing the sprite hold failed"))).toBe(
+    true,
+  );
 });
 
 test("a runner that outlives the launch window is left running, with an explicit run-after-disconnect", async () => {
@@ -1751,6 +1788,50 @@ test("a hold whose exec the Sprites API fails is logged and the launch goes on",
   });
 });
 
+test("the hold's curl takes a 2m task over the sprite's socket, failing on an HTTP error within 5 s", () => {
+  const runId = "run_1" as RunId;
+  const url = `http://sprite/v1/tasks/${spriteTaskNameFor(runId)}`;
+  expect(holdArgv(runId)).toEqual([
+    "curl",
+    "-sSf",
+    "--max-time",
+    "5",
+    "--unix-socket",
+    "/.sprite/api.sock",
+    "-X",
+    "PUT",
+    "-H",
+    "content-type: application/json",
+    "-d",
+    '{"expire":"2m"}',
+    url,
+  ]);
+  expect(releaseArgv(runId)).toEqual([
+    "curl",
+    "-sSf",
+    "--max-time",
+    "5",
+    "--unix-socket",
+    "/.sprite/api.sock",
+    "-X",
+    "DELETE",
+    url,
+  ]);
+});
+
+test("a launch wakes its silent run 90 s after the runner starts, by default", async () => {
+  const timers = vi.spyOn(globalThis, "setTimeout");
+  try {
+    await launched(readyEnv());
+    await sessionOpened();
+    await vi.waitFor(() =>
+      expect(timers.mock.calls.map((c) => c[1])).toContain(90_000),
+    );
+  } finally {
+    timers.mockRestore();
+  }
+});
+
 /** An app whose launches wake a silent run's sprite after `ms`. */
 function wakingAfter(ms: number) {
   app = createApp({
@@ -1809,6 +1890,55 @@ test("a run still starting with only a warning and a heartbeat gets exactly one 
     "runner.warning",
     "runner.heartbeat",
   ]);
+});
+
+test("a woken silent launch takes the run's hold again, and a run that has reported in does not", async () => {
+  wakingAfter(150);
+  pgrepAnswers(0);
+  const { run } = await runningRun();
+  await vi.waitFor(() => expect(holdCalls()).toHaveLength(2), {
+    timeout: 5000,
+  });
+  const holds = holdCalls();
+  expect(holds[1]).toBe(holds[0]);
+  expect(holds[1]).toContain(`-X PUT`);
+  expect(holds[1]).toContain(spriteTaskNameFor(run.id as RunId));
+  expect(holds[1]).toContain(`{"expire":"2m"}`);
+  await vi.waitFor(() =>
+    expect(
+      logs.some((l) => l.includes(`for ${run.id}: its runner is alive`)),
+    ).toBe(true),
+  );
+  expect(holdCalls()).toHaveLength(2);
+});
+
+test("a re-hold that fails on a wake is logged and the run is left alone", async () => {
+  const exec = wire.exec;
+  let holds = 0;
+  wire.exec = (argv) =>
+    argv[0] === "curl" && ++holds > 1
+      ? { exitCode: 7, stderr: "curl: (7) couldn't connect\n" }
+      : exec(argv);
+  wakingAfter(150);
+  pgrepAnswers(0);
+  const { agent, run } = await runningRun();
+  await vi.waitFor(() =>
+    expect(
+      logs.some(
+        (l) =>
+          l.includes(run.id) &&
+          l.includes("hold sprite failed, the wake goes on"),
+      ),
+    ).toBe(true),
+  );
+  await vi.waitFor(() =>
+    expect(
+      logs.some((l) => l.includes(`for ${run.id}: its runner is alive`)),
+    ).toBe(true),
+  );
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    status: "starting",
+  });
 });
 
 test("a run that has reported in is not woken", async () => {
