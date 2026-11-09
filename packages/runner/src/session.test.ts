@@ -2685,10 +2685,18 @@ test("a background subagent's call that never gets an end hook stops being beate
   });
   // the session is waiting on the subagent's task now, not on the call it lost the end of
   expect(
-    new Set(beatsIn(posted).slice(beatsBefore).map((b) => b.toolName)),
+    new Set(
+      beatsIn(posted)
+        .slice(beatsBefore)
+        .map((b) => b.toolName),
+    ),
   ).toEqual(new Set(["Bash (background)"]));
   expect(
-    new Set(beatsIn(posted).slice(beatsBefore).map((b) => b.toolUseId)),
+    new Set(
+      beatsIn(posted)
+        .slice(beatsBefore)
+        .map((b) => b.toolUseId),
+    ),
   ).toEqual(new Set(["t0"]));
 });
 

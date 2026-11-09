@@ -270,6 +270,8 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
       const stale = tx
         .select({ id: runs.id, lastActivityAt: lastActivity })
         .from(runs)
+        // the join keeps the subquery's `runs.id` qualified: on one table drizzle drops the prefix in a select list, and `id` would read events.id
+        .innerJoin(agents, eq(runs.agentId, agents.id))
         .where(
           and(
             inArray(
