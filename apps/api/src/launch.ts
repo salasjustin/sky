@@ -219,8 +219,11 @@ type Deps = {
   watchMs: number;
   /** How long after the runner starts a run that hasn't reported in gets its sprite woken. */
   wakeAfterMs: number;
-  /** Wakes the run's sprite and looks for its runner (see `wakeLaunch`); never throws. */
-  wake: (runId: RunId, spriteName: string) => Promise<void>;
+  /**
+   * Wakes the run's sprite and looks for its runner (see `wakeLaunch`): whether it is alive, or
+   * `undefined` when the check failed; never throws.
+   */
+  wake: (runId: RunId, spriteName: string) => Promise<boolean | undefined>;
 };
 export type Launch = {
   envId: EnvironmentId;
@@ -366,7 +369,8 @@ export function createLauncher({
 
   /**
    * One wake for a run that still hasn't reported in `wakeAfterMs` after its runner started, which
-   * then takes the run's hold again, so the sprite stays up until the runner refreshes it.
+   * then takes the run's hold again, so the sprite stays up until the runner refreshes it, unless the
+   * wake found no runner to keep awake.
    */
   function wakeIfSilent(launch: Launch): void {
     setTimeout(() => {
@@ -376,9 +380,12 @@ export function createLauncher({
           `run ${launch.runId} still starting ${Math.round(wakeAfterMs / 1000)}s after its runner started; waking ${launch.spriteName}`,
         );
         // after the wake, not beside it: its exec is what resumes the sprite, and a resuming sprite's
-        // socket may not answer yet. Neither call throws.
-        void wake(launch.runId, launch.spriteName).then(() =>
-          holdSprite(launch, "nothing more is tried"),
+        // socket may not answer yet. A failed check still holds: a sprite that couldn't be read may
+        // hold a frozen runner, and the hold expires on its own. Neither call throws.
+        void wake(launch.runId, launch.spriteName).then((alive) =>
+          alive === false
+            ? undefined
+            : holdSprite(launch, "nothing more is tried"),
         );
       } catch (err) {
         log(`checking whether ${launch.runId} needs a wake failed: ${err}`);

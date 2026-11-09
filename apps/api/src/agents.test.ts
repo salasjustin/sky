@@ -1951,6 +1951,21 @@ test("a woken silent launch takes the run's hold again, after the wake resolves"
   expect(rehold).toBeGreaterThan(pgrep);
 });
 
+test("a woken silent launch whose wake finds no runner is not held again", async () => {
+  wakingAfter(150);
+  pgrepAnswers(1);
+  const { run } = await runningRun();
+  await vi.waitFor(
+    () =>
+      expect(
+        logs.some((l) => l.includes(`for ${run.id}: no runner found`)),
+      ).toBe(true),
+    { timeout: 5000 },
+  );
+  await settle(300);
+  expect(holdsOf(run.id)).toHaveLength(1);
+});
+
 test("a re-hold waits for a wake that is still resolving", async () => {
   wakingAfter(150);
   pgrepAnswers(0);
@@ -2089,7 +2104,7 @@ test("a run that ended before the delay is not woken", async () => {
   expect(pgrepsOf(run.id)).toEqual([]);
 });
 
-test("a wake whose pgrep the Sprites API fails is logged and changes nothing", async () => {
+test("a wake whose pgrep the Sprites API fails is logged, holds the sprite again and leaves the run alone", async () => {
   const unhandled: unknown[] = [];
   const onRejection = (reason: unknown) => unhandled.push(reason);
   process.on("unhandledRejection", onRejection);
@@ -2102,6 +2117,10 @@ test("a wake whose pgrep the Sprites API fails is logged and changes nothing", a
     await vi.waitFor(() =>
       expect(logs.some((l) => l.startsWith(failed))).toBe(true),
     );
+    // a sprite that couldn't be read may still hold a frozen runner
+    await vi.waitFor(() => expect(holdsOf(run.id)).toHaveLength(2), {
+      timeout: 5000,
+    });
     // unhandled rejections surface after the microtasks drain
     await new Promise((r) => setImmediate(r));
     expect(unhandled).toEqual([]);
