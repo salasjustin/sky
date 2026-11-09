@@ -145,9 +145,17 @@ function fakeGitHub(
     pullCreates: [] as unknown[],
     pullUpdates: [] as { number: string; body: Record<string, unknown> }[],
     authorization: [] as (string | null)[],
+    /** The path of every GET answered, in order. */
+    gets: [] as string[],
   };
-  const seen = (request: Request) =>
+  const seen = (request: Request) => {
     state.authorization.push(request.headers.get("authorization"));
+    if (request.method === "GET") {
+      state.gets.push(new URL(request.url).pathname);
+    }
+  };
+  // a repo that isn't there would read as GitHub not holding any blob or tree, and fail far from the cause
+  if (options.objectsFrom) git(options.objectsFrom, "rev-parse", "--git-dir");
   server.use(
     http.get(REPO, ({ request }) => {
       seen(request);
@@ -172,7 +180,9 @@ function fakeGitHub(
             content: content.toString("base64"),
             encoding: "base64",
           });
-        } catch {}
+        } catch {
+          // a blob that repo lacks: GitHub's 404 below, as for any blob it doesn't hold
+        }
       }
       return options.blobs?.includes(sha)
         ? HttpResponse.json({ sha })
@@ -1477,6 +1487,18 @@ const baseWithWorkflows = () => {
 const treePaths = (gh: ReturnType<typeof fakeGitHub>) =>
   gh.trees.flatMap((t) => (t.tree as { path: string }[]).map((e) => e.path));
 
+const treeGets = (gh: ReturnType<typeof fakeGitHub>) =>
+  gh.gets.filter((path) => path.includes("/git/trees/"));
+
+const expectNothingSent = (gh: ReturnType<typeof fakeGitHub>) => {
+  expect(gh.blobs).toEqual([]);
+  expect(gh.trees).toEqual([]);
+  expect(gh.commits).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+  expect(gh.pullCreates).toEqual([]);
+  expect(gh.pullUpdates).toEqual([]);
+};
+
 test("workflow add, edit, delete and rename are held back while other files publish, and the patch applies to the published head", async () => {
   baseWithWorkflows();
   const gh = fakeGitHub();
@@ -1902,6 +1924,31 @@ test("publish, the PM pushes the held patch, a new commit: the next publish fast
   expect(gh.refWrites).toEqual([
     { method: "PATCH", body: { sha: "commit1", force: false } },
   ]);
+  // GitHub's head's trees are all here, so none is asked for
+  expect(treeGets(gh)).toEqual([]);
+});
+
+test("after the PM pushes the whole held patch, a re-publish with no new commit holds nothing, removes the patch and writes nothing", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+  commit("Add a, change CI");
+  const firstResult = await run();
+  const pm = pmPush(firstResult.held?.patchPath ?? "", { "a.txt": "first\n" });
+  expect(existsSync(heldPatchPath())).toBe(true);
+  const gh = fakeGitHub({
+    ref: "pm_head",
+    commitTrees: { pm_head: pm.tree },
+    pulls: [OPEN_PR],
+  });
+
+  const result = await run({ title: undefined });
+
+  expect(result.held).toBeUndefined();
+  expect(existsSync(heldPatchPath())).toBe(false);
+  expectNothingSent(gh);
 });
 
 test("the PM pushes only part of the patch: the next publish holds only the rest, from GitHub's own workflows", async () => {
@@ -1925,7 +1972,7 @@ test("the PM pushes only part of the patch: the next publish holds only the rest
   ).toThrow();
 
   writeFileSync(join(work, "b.txt"), "second\n");
-  commit("Review fix");
+  const tip = commit("Review fix");
   const gh = fakeGitHub({
     ref: "pm_head",
     commitTrees: { pm_head: pm.tree },
@@ -1936,6 +1983,10 @@ test("the PM pushes only part of the patch: the next publish holds only the rest
 
   const result = await run();
 
+  // GitHub's head's trees are not here, so they are asked for
+  expect(treeGets(gh).some((path) => path.endsWith(`/${pm.tree}`))).toBe(true);
+  expect(git(work, "rev-parse", "HEAD")).toBe(tip);
+  expect(git(work, "status", "--porcelain")).toBe("");
   expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
   // the rest of the patch brings GitHub's head to the branch's workflows
   git(pm.dir, "apply", result.held?.patchPath ?? "");
@@ -2053,6 +2104,9 @@ test("continuing a branch whose GitHub commits already change workflows sends th
     base_tree: git(work, "rev-parse", `${theirs}^{tree}`),
   });
   expect(gh.commits.map((c) => c.parents)).toEqual([[theirs]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
 });
 
 test("a rewrite that would drop workflow changes already on GitHub is refused before anything is sent", async () => {
@@ -2074,8 +2128,30 @@ test("a rewrite that would drop workflow changes already on GitHub is refused be
   });
 
   await expect(run()).rejects.toThrow(/would drop/);
-  expect(gh.commits).toEqual([]);
-  expect(gh.refWrites).toEqual([]);
+  expectNothingSent(gh);
+});
+
+test("a head this branch held before an amend, carrying workflow changes of its own that the amended history lacks, is refused before anything is sent", async () => {
+  baseWithWorkflows();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const old = commit("Add a");
+  // GitHub holds that head with a workflow added, on the base; the amend then changes a.txt, so no
+  // current commit matches it outside .github/workflows and only the reflog still knows it
+  const pm = pmPush("", {
+    "a.txt": "first\n",
+    ".github/workflows/new.yml": "name: new\n",
+  });
+  writeFileSync(join(work, "a.txt"), "first, amended\n");
+  git(work, "add", "--all");
+  git(work, "commit", "-q", "--amend", "-m", "Add a, amended");
+  const gh = fakeGitHub({
+    ref: old,
+    commitTrees: { [old]: pm.tree },
+    objectsFrom: pm.dir,
+  });
+
+  await expect(run()).rejects.toThrow(/would drop/);
+  expectNothingSent(gh);
 });
 
 /** The fields GitHub's commit API gives for a commit here: dates in UTC, the message less its final newline. */
