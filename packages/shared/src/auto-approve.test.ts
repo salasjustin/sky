@@ -456,6 +456,11 @@ describe("the realpath hook", () => {
   symlinkSync(join(outside, "dir"), join(root, "l"));
   symlinkSync("loop", join(root, "loop"));
   symlinkSync(root, join(base, "wt-link"));
+  mkdirSync(join(root, "s", "t", "u", "v", "w"), { recursive: true });
+  mkdirSync(join(root, "src"));
+  mkdirSync(join(root, "packages"));
+  symlinkSync("../../../../../src", join(root, "s", "t", "u", "v", "w", "l"));
+  symlinkSync("s/t/u", join(root, "deep"));
   afterAll(() => rmSync(base, { recursive: true, force: true }));
 
   const real = (command: string, where: { root?: string; cwd?: string } = {}) =>
@@ -484,6 +489,21 @@ describe("the realpath hook", () => {
     expect(real("cd l && ls")).toBe("outside-root");
     expect(real("cd l/.. && cat plain.txt")).toBe("outside-root");
     expect(real("cd docs && cat cfg")).toBe("sensitive-path");
+  });
+
+  test("asks when a cd target doesn't resolve, since bash then moves by the physical path", () => {
+    // lexically s/t/u/v/w/packages, missing; bash falls back to src/../packages, i.e. packages
+    expect(
+      real("cd s/t/u/v/w/l/../packages && cat ../../outside/plain.txt"),
+    ).toBe("unresolvable");
+    expect(real("cd missing && ls")).toBe("unresolvable");
+  });
+
+  test("after a cd through a symlink, `..` is taken lexically, as bash does", () => {
+    // bash's cwd is the root again, not s/t
+    expect(real("cd deep && cd .. && cat ../outside/plain.txt")).toBe(
+      "outside-root",
+    );
   });
 
   test("a root reached through a symlink still contains its files", () => {
@@ -847,6 +867,10 @@ describe("pipes", () => {
     "ls | awk '{getline x < \"/etc/passwd\"}'",
     "ls | awk 'BEGIN {ARGV[1] = \"/etc/passwd\"; ARGC = 2}'",
     "ls | awk 'BEGIN {print ENVIRON[\"HOME\"]}'",
+    // gawk's SYMTAB reaches ENVIRON, ARGV and ARGC by a name built from pieces
+    "ls | awk 'NR==1{for(k in SYMTAB[\"ENV\" \"IRON\"])print k\"=\"SYMTAB[\"ENV\" \"IRON\"][k]}'",
+    "ls | awk 'BEGIN{SYMTAB[\"AR\" \"GV\"][1]=\".e\" \"nv\";SYMTAB[\"AR\" \"GC\"]=2}1'",
+    "ls | awk 'BEGIN{for(f in FUNCTAB)print f}'",
     "ls | awk '@include \"x\"'",
     "ls | awk -f prog.awk",
     "ls | awk -e '{print}'",

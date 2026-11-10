@@ -440,8 +440,10 @@ function awkArgs(
   return { program, operands };
 }
 
-// running commands, writing or piping, and reading files, arguments or variables it wasn't handed
-const AWK_UNSAFE = /system|getline|ARGV|ARGC|ENVIRON|PROCINFO|[>|@]/;
+// running commands, writing or piping, and reading files, arguments or variables it wasn't handed;
+// gawk's SYMTAB and FUNCTAB name variables and functions by strings a program can assemble
+const AWK_UNSAFE =
+  /system|getline|ARGV|ARGC|ENVIRON|PROCINFO|SYMTAB|FUNCTAB|[>|@]/;
 
 const JQ_LONG = new Set([
   "--raw-output",
@@ -628,7 +630,7 @@ export type AskReason =
   | "outside-root"
   /** an argument, or the working directory, names somewhere secrets live */
   | "sensitive-path"
-  /** the realpath hook threw for a reason other than a missing path, or the root doesn't resolve */
+  /** the realpath hook threw for a reason other than a missing path, or the root or a cd target doesn't resolve */
   | "unresolvable";
 
 /** Where a command runs; a bare string is a root that is also the shell's cwd. */
@@ -640,7 +642,8 @@ export type AutoApproveScope = {
   /**
    * Resolves every symlink in an absolute path, so a link can't carry a path out of `root` or
    * onto a secret; `fs.realpathSync.native` fits. A path that doesn't exist (an error with code
-   * `ENOENT` or `ENOTDIR`) is judged on its text alone; any other throw asks.
+   * `ENOENT` or `ENOTDIR`) is judged on its text alone, except a `cd` target, which asks; any
+   * other throw asks.
    */
   realpath?: (path: string) => string;
 };
@@ -674,9 +677,22 @@ export function autoApproveVerdict(
         if (verdict !== "approved") return verdict;
       }
       // a cd that fails leaves the shell where it was
-      if (first?.words[0] === "cd")
-        next.push({ cwd: posix.resolve(cwd, first.words[1] ?? ""), ok: true });
-      else next.push({ cwd, ok: true });
+      if (first?.words[0] === "cd") {
+        const dir = posix.resolve(cwd, first.words[1] ?? "");
+        // bash moves to this lexical path when it exists, else to wherever the kernel takes the
+        // argument from the physical cwd, which the text no longer tracks
+        if (resolved.realpath) {
+          const verdict = resolvedVerdict(
+            [dir],
+            resolved.root,
+            cwd,
+            resolved.realpath,
+            true,
+          );
+          if (verdict !== "approved") return verdict;
+        }
+        next.push({ cwd: dir, ok: true });
+      } else next.push({ cwd, ok: true });
       next.push({ cwd, ok: false });
     }
     states = next;
@@ -726,12 +742,16 @@ function stepVerdict(
   return realpath ? resolvedVerdict(targets, root, cwd, realpath) : "approved";
 }
 
-/** The same root and secret checks, on where each target's symlinks really lead. */
+/**
+ * The same root and secret checks, on where each target's symlinks really lead. A target that
+ * doesn't exist is skipped, or asks with `missingAsks`.
+ */
 function resolvedVerdict(
   targets: string[],
   root: string,
   cwd: string,
   realpath: (path: string) => string,
+  missingAsks = false,
 ): "approved" | AskReason {
   const resolve = (path: string): string | undefined => {
     try {
@@ -750,7 +770,10 @@ function resolvedVerdict(
       const real = resolve(
         target.startsWith("/") ? target : `${cwd}/${target}`,
       );
-      if (real === undefined) continue;
+      if (real === undefined) {
+        if (missingAsks) return "unresolvable";
+        continue;
+      }
       const rel = posix.relative(realRoot, real);
       if (isOutside(rel)) return "outside-root";
       if (namesSecret(rel)) return "sensitive-path";
