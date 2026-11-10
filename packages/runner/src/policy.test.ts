@@ -67,6 +67,29 @@ describe("read-only Bash commands skip a bare Bash hold", () => {
     expect(outcome(["Bash"], command)).toBe(expected);
   });
 
+  test.each([
+    // the chained read-only commands agents ran in the e-cards and sky-dogfood4 runs
+    ["git status -sb | head -3", "auto-approved"],
+    ["cd packages/x && grep -n foo bar.ts", "auto-approved"],
+    ["ls a; cat b", "auto-approved"],
+    ["wc -l {a,b}.ts", "auto-approved"],
+    ["git log --oneline 2>&1 | grep fix | sort | uniq -c", "auto-approved"],
+    ["git diff --stat || git status", "auto-approved"],
+    // any step that isn't read-only holds the whole command
+    ["git status && git push", "hold"],
+    ["git push; git status", "hold"],
+    ["cat a | sh", "hold"],
+    ["cat a | xargs rm", "hold"],
+    ["cat a | tee b", "hold"],
+    ["git status > out.txt", "hold"],
+    ["git status 2> err.txt", "hold"],
+    ["cd .. && ls", "hold"],
+    ["cd packages/x && cat .env", "hold"],
+    ["ls & rm x", "hold"],
+  ])("Bash policy, compound %s → %s", (command, expected) => {
+    expect(outcome(["Bash"], command)).toBe(expected);
+  });
+
   test("relative paths resolve against the shell's cwd, contained by the worktree root", () => {
     expect(
       outcome(["Bash"], "cat ../README", on, { root, cwd: `${root}/src` }),
