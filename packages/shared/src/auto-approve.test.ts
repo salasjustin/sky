@@ -145,6 +145,17 @@ const reasons: Record<Exclude<AskReason, "unresolvable">, string[]> = {
     "echo 'unterminated",
     "ls (",
     "ls )",
+    // subshells, grouping, here-strings, process substitution and NUL
+    "(rm x)",
+    "ls; (cd ..; ls)",
+    "{ ls; }",
+    "ls | (cat)",
+    "cat <<< x",
+    "ls >(tee f)",
+    "ls\u0000rm x",
+    // a quoted or brace-built `2` is a word, not the stderr fd
+    "ls '2'>/dev/null",
+    "ls {2,3}>/dev/null",
   ],
   program: [
     "FOO=1 ls",
@@ -542,15 +553,15 @@ test("an absolute path inside the worktree is fine", () => {
 });
 
 test("quoting can't smuggle a program or secret past the checks", () => {
-  expect(approved('"ls"')).toBe(true);
-  expect(approved("l's'")).toBe(true);
-  expect(approved('"rm" x')).toBe(false);
-  expect(approved('cat ".env"')).toBe(false);
-  expect(approved("cat '.e'nv")).toBe(false);
-  expect(approved('cat "~/.ssh/id_rsa"')).toBe(false);
-  expect(approved('"FOO=1" ls')).toBe(false);
-  expect(approved("FOO='1' ls")).toBe(false);
-  expect(approved('echo ";" && rm x')).toBe(false);
+  expect(verdict('"ls"')).toBe("approved");
+  expect(verdict("l's'")).toBe("approved");
+  expect(verdict('"rm" x')).toBe("not-allowed");
+  expect(verdict('cat ".env"')).toBe("sensitive-path");
+  expect(verdict("cat '.e'nv")).toBe("sensitive-path");
+  expect(verdict('cat "~/.ssh/id_rsa"')).toBe("outside-root");
+  expect(verdict('"FOO=1" ls')).toBe("program");
+  expect(verdict("FOO='1' ls")).toBe("program");
+  expect(verdict('echo ";" && rm x')).toBe("not-allowed");
 });
 
 test("echo prints and never reads, so a path-like argument is fine", () => {
@@ -625,15 +636,39 @@ test("an empty replacement turns auto-approval off", () => {
 
 test("added commands get the same structural and path checks", () => {
   const config = { defaults: true, commands: ["make check", "find", "git"] };
-  expect(approved("make check; rm x", config)).toBe(false);
-  expect(approved("make check > f", config)).toBe(false);
-  expect(approved("make check ../x", config)).toBe(false);
-  expect(approved("make check .env", config)).toBe(false);
-  expect(approved("FOO=1 make check", config)).toBe(false);
+  expect(verdict("make check; rm x", config)).toBe("not-allowed");
+  expect(verdict("make check > f", config)).toBe("syntax");
+  expect(verdict("make check ../x", config)).toBe("outside-root");
+  expect(verdict("make check .env", config)).toBe("sensitive-path");
+  expect(verdict("FOO=1 make check", config)).toBe("program");
   // a broad entry doesn't lift the per-program guards
-  expect(approved("find . -delete", config)).toBe(false);
-  expect(approved("git diff --output=f", config)).toBe(false);
-  expect(approved("git -c core.pager=sh log", config)).toBe(false);
+  expect(verdict("find . -delete", config)).toBe("unsafe-option");
+  expect(verdict("git diff --output=f", config)).toBe("unsafe-option");
+  expect(verdict("git -c core.pager=sh log", config)).toBe("unsafe-option");
+  // `--config-env` sets config like `-c`, here before the subcommand
+  expect(verdict("git --config-env=diff.external=X diff", config)).toBe(
+    "unsafe-option",
+  );
+  expect(verdict("git --config-env diff.external=X diff", config)).toBe(
+    "unsafe-option",
+  );
+  // the broad entry itself runs plain git
+  expect(verdict("git diff --stat", config)).toBe("approved");
+});
+
+test("a pipe-only program added as an entry keeps its own guards", () => {
+  const config = {
+    defaults: true,
+    commands: ["sort", "uniq", "jq", "awk"],
+  };
+  expect(verdict("sort a.txt", config)).toBe("approved");
+  expect(verdict("uniq a.txt", config)).toBe("approved");
+  expect(verdict("awk '{print}' a.txt", config)).toBe("approved");
+  expect(verdict("sort -o out f", config)).toBe("unsafe-option");
+  expect(verdict("uniq a.txt out", config)).toBe("unsafe-option");
+  expect(verdict("jq -f prog.jq", config)).toBe("unsafe-option");
+  expect(verdict("awk '{system(\"rm x\")}'", config)).toBe("unsafe-option");
+  expect(verdict("sort .env", config)).toBe("sensitive-path");
 });
 
 describe("compound commands", () => {
@@ -677,6 +712,10 @@ describe("cd", () => {
     `cd ${CWD}/src && ls`,
     "cd src && git log | head -3",
     "ls && cd src && cat a.ts",
+    // `&&` runs only where the previous cd succeeded
+    "cd src && cd lib && cat ../../package.json",
+    "cd a || cd b && cat ../package.json",
+    "cd a || cd b; ls",
   ])("approves %s", (command) => {
     expect(verdict(command)).toBe("approved");
   });
@@ -691,6 +730,11 @@ describe("cd", () => {
     ["cd src; cat ../package.json", "outside-root"],
     ["cd src || cat ../package.json", "outside-root"],
     ["cd src && ls || cat ../package.json", "outside-root"],
+    // a failure after a successful chain leaves the shell in an earlier directory
+    ["cd src && cd lib; cat ../../package.json", "outside-root"],
+    ["cd src; cd ..", "outside-root"],
+    ["cd a || cd b; cat ../x", "outside-root"],
+    ["FOO=1 cd src", "program"],
     ["cd .ssh && ls", "sensitive-path"],
     ["cd .git && cat config", "sensitive-path"],
     ["cd src && cat ../.env", "sensitive-path"],
@@ -725,6 +769,10 @@ describe("cd", () => {
 });
 
 describe("brace expansion", () => {
+  /** One `{w0,w1,…}` group expanding to `count` words. */
+  const alternatives = (count: number) =>
+    `{${Array.from({ length: count }, (_, i) => `w${i}`).join(",")}}`;
+
   test.each([
     "ls {a,b}",
     "wc -l {a,b}.ts",
@@ -733,6 +781,9 @@ describe("brace expansion", () => {
     "cat {a,b}/{c,d}.ts",
     "cat '{a,b}'",
     "grep -n foo {src,test}/a.ts | head",
+    // the cap is 64 words from one word: six pairs, or one group of 64
+    "ls {a,b}{c,d}{e,f}{g,h}{i,j}{k,l}",
+    `ls ${alternatives(64)}`,
   ])("approves %s", (command) => {
     expect(verdict(command)).toBe("approved");
   });
@@ -760,6 +811,11 @@ describe("brace expansion", () => {
     ["ls {a, b}", "syntax"],
     ["ls {a;b}", "syntax"],
     ["ls {a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}", "syntax"],
+    [`ls ${alternatives(65)}`, "syntax"],
+    ["ls {a,b,c}{d,e}{f,g}{h,i}{j,k}{l,m}", "syntax"],
+    // an expanded word is checked against the program's own guards
+    ["git log {--output=f,x}", "unsafe-option"],
+    ["find . {-delete,-x}", "unsafe-option"],
   ])("asks on %s (%s)", (command, reason) => {
     expect(verdict(command)).toBe(reason);
   });
@@ -804,6 +860,13 @@ describe("pipes", () => {
     "cat package.json | jq -r '.scripts | keys[]'",
     "ls -l | awk '{print $1}'",
     "ls -l | awk -F: '/ts/ {n++} END {print n}'",
+    // the same programs on a file inside the root: the path checks are live, not blanket
+    "ls | awk '{print}' a.txt",
+    "ls | jq . a.json",
+    "ls | uniq a.txt",
+    "ls | cut -f1 a.txt",
+    "ls | nl a.txt",
+    "ls | column -t a.txt",
   ])("approves %s", (command) => {
     expect(verdict(command)).toBe("approved");
   });
@@ -825,6 +888,20 @@ describe("pipes", () => {
     ["ls | grep x ../y", "outside-root"],
     ["ls | sort .env", "sensitive-path"],
     ["ls | sed -i s/a/b/ f", "unsafe-option"],
+    // so does every pipe-only program that reads a named file instead of stdin
+    ["ls | awk '{print}' .env", "sensitive-path"],
+    ["ls | awk -F: '{print}' /etc/passwd", "outside-root"],
+    ["ls | awk -v x=1 '{print}' ../x", "outside-root"],
+    ["ls | jq . ../x", "outside-root"],
+    ["ls | jq . .env", "sensitive-path"],
+    ["ls | uniq .env", "sensitive-path"],
+    ["ls | uniq ../x", "outside-root"],
+    ["ls | cut -f1 /etc/passwd", "outside-root"],
+    ["ls | cut -f1 .env", "sensitive-path"],
+    ["ls | nl .env", "sensitive-path"],
+    ["ls | nl ../x", "outside-root"],
+    ["ls | column -t ../x", "outside-root"],
+    ["ls | column -t .env", "sensitive-path"],
   ])("asks on %s (%s)", (command, reason) => {
     expect(verdict(command)).toBe(reason);
   });
