@@ -945,8 +945,8 @@ describe("pipes", () => {
     "ls | awk 'BEGIN {ARGV[1] = \"/etc/passwd\"; ARGC = 2}'",
     "ls | awk 'BEGIN {print ENVIRON[\"HOME\"]}'",
     // gawk's SYMTAB reaches ENVIRON, ARGV and ARGC by a name built from pieces
-    "ls | awk 'NR==1{for(k in SYMTAB[\"ENV\" \"IRON\"])print k\"=\"SYMTAB[\"ENV\" \"IRON\"][k]}'",
-    "ls | awk 'BEGIN{SYMTAB[\"AR\" \"GV\"][1]=\".e\" \"nv\";SYMTAB[\"AR\" \"GC\"]=2}1'",
+    'ls | awk \'NR==1{for(k in SYMTAB["ENV" "IRON"])print k"="SYMTAB["ENV" "IRON"][k]}\'',
+    'ls | awk \'BEGIN{SYMTAB["AR" "GV"][1]=".e" "nv";SYMTAB["AR" "GC"]=2}1\'',
     "ls | awk 'BEGIN{for(f in FUNCTAB)print f}'",
     "ls | awk '@include \"x\"'",
     "ls | awk -f prog.awk",
