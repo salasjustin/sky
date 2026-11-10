@@ -68,7 +68,7 @@ describe("read-only Bash commands skip a bare Bash hold", () => {
   });
 
   test.each([
-    // the chained read-only commands agents ran in the e-cards and sky-dogfood4 runs
+    // chained read-only commands as agents write them
     ["git status -sb | head -3", "auto-approved"],
     ["cd packages/x && grep -n foo bar.ts", "auto-approved"],
     ["ls a; cat b", "auto-approved"],

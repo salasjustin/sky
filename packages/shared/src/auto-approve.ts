@@ -679,8 +679,8 @@ export function autoApproveVerdict(
       // a cd that fails leaves the shell where it was
       if (first?.words[0] === "cd") {
         const dir = posix.resolve(cwd, first.words[1] ?? "");
-        // bash moves to this lexical path when it exists, else to wherever the kernel takes the
-        // argument from the physical cwd, which the text no longer tracks
+        // bash moves to this lexical path when it exists and otherwise falls back to the physical
+        // one, which the text doesn't track, so the target must resolve inside the root
         if (resolved.realpath) {
           const verdict = resolvedVerdict(
             [dir],
