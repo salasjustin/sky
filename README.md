@@ -162,7 +162,7 @@ Here `DOCS_API_KEY` on the left is the variable the server sees, and on the righ
 
 `approvalPolicy` holds the listed tool calls until you approve or deny them. A Bash command on the auto-approve list skips a bare `Bash` entry and runs at once, so `git status` or `grep` doesn't cost an approval. A `Bash(git diff:*)` entry still holds what it names, and `Read`, `Glob` and `Grep` are unaffected.
 
-A command skips approval only when every simple command in it would skip approval on its own: each is plain words starting with a list entry, and none of the checks below asks. Simple commands may be joined by `;`, `&&`, `||` and `|`, so `git status -sb | head -3`, `ls a; cat b` and `cd packages/x && grep -n foo bar.ts` run at once, while `git status && git push` waits for you. Anything else waits for you, and so does a command the runner can't evaluate.
+A command skips approval only when every simple command in it would skip approval on its own: each is plain words starting with a list entry, and none of the checks below asks. Simple commands may be joined by `;`, `&&`, `||` and `|`, so `git status -sb | head -3`, `ls a; cat b` and `cd packages/x && grep -n foo bar.ts` run at once, while `git status && git push` asks. Anything else waits for you, and so does a command the runner can't evaluate.
 
 Built-in list (`defaults: true`), with what each asks on besides the checks on every command:
 
@@ -178,7 +178,7 @@ Built-in list (`defaults: true`), with what each asks on besides the checks on e
 - `git branch`: asks on the git options above, any flag but `-l`/`--list`, `-a`/`--all`, `-r`/`--remotes`, `-v`/`-vv`/`--verbose`, `--show-current`, `--color`/`--no-color`, and a name without `--list` or `-l`.
 - `pnpm test`, `pnpm typecheck`, `pnpm lint`: see below.
 - `node --version`, `node -v`: asks on anything else.
-- `cd <dir>`: one directory and no options; asks on a bare `cd`, `cd -`, zsh's `cd +1` and two-argument `cd old new`, and on a `cd` inside a pipeline. Later commands' paths resolve against `<dir>` when they run only if the `cd` succeeded (after `&&`), and against both `<dir>` and the directory before it otherwise, since a failed `cd` leaves the shell where it was: `cd src && cat ../package.json` runs, `cd src; cat ../package.json` asks.
+- `cd <dir>`: one directory and no options; asks on a bare `cd`, `cd -`, zsh's `cd +1` and two-argument `cd old new`, and on a `cd` inside a pipeline. A later command that runs only after the `cd` succeeds (after `&&`) has its paths checked against `<dir>`; any other later command is checked against both `<dir>` and the directory before it, since a failed `cd` leaves the shell where it was: `cd src && cat ../package.json` runs, `cd src; cat ../package.json` asks.
 
 Only on the right of a `|`, filtering what the command before printed:
 
@@ -187,13 +187,13 @@ Only on the right of a `|`, filtering what the command before printed:
 - `uniq`: asks on a second file operand, which `uniq` writes to, and on options other than `-c`, `-d`, `-D`, `-u`, `-i`, `-z`, `-f`/`-s`/`-w N` and their long forms.
 - `jq`: asks on `-f`/`--from-file`, `--rawfile`, `--slurpfile`, `--argfile`, `-L` and any option outside the plain output ones, and on a filter using `env`, `$ENV`, `import`, `include` or `modulemeta`. The filter isn't checked as a path; file operands are.
 - `awk`: asks on any option but `-F` and `-v`, so `-f`, `-e`, `-d` and the gawk file options ask, and on a program holding `system`, `getline`, `ARGV`, `ARGC`, `ENVIRON`, `PROCINFO`, `>`, `|` or `@`. The program isn't checked as a path; file operands are.
-- `sed`: on a pipe it may read stdin, so `| sed -n 1,5p` needs no file.
+- `sed`: already on the list above; after a `|` it reads stdin, so `| sed -n 1,5p` needs no file.
 
 These are built in with the defaults, so `defaults: false` drops them, `cd` included.
 
 Checks on every command:
 
-- Syntax: unquoted, a lone `&`, `|&`, `<`, `(`, `)`, `*`, `?`, `[`, `]` and `#` ask (background, stderr pipes, input redirects and here-docs, subshells and process substitution, globs, comments), and so do newlines, unbalanced quotes, a word starting with `~` (even quoted) and a word starting with an unquoted `=` (zsh expands `=ls` to a program's path). `$`, backticks, `\` and `!` ask outside single quotes; inside single quotes they are plain text for `grep`, `rg`, `sed`, `echo` and the pipe-only filters above (`awk '{print $1}'`, `grep 'foo$'`), and ask for every other program, since pnpm script arguments or `make 'X=$(shell …)'` would expand them. The first word of each command must be a program name, not a variable assignment, a path or an option.
+- Syntax: a lone `&`, `|&`, `<`, `(`, `)`, `*`, `?`, `[`, `]` or `#` outside quotes asks (background, stderr pipes, input redirects and here-docs, subshells and process substitution, globs, comments), and so do newlines, unbalanced quotes, a word starting with `~` (even quoted) and a word starting with an unquoted `=` (zsh expands `=ls` to a program's path). `$`, backticks, `\` and `!` ask outside single quotes; inside single quotes they are plain text for `grep`, `rg`, `sed`, `echo` and the pipe-only filters above (`awk '{print $1}'`, `grep 'foo$'`), and ask for every other program, since pnpm script arguments or `make 'X=$(shell …)'` would expand them. The first word of each command must be a program name, not a variable assignment, a path or an option.
 - Redirects: only `2>&1`, `2>/dev/null` and `>/dev/null` (with or without a space before `/dev/null`); any other `>`, `>>`, `>|`, `&>` or `>&` asks.
 - Braces: `{a,b}` in an argument is expanded as the shell would and each resulting word is checked, so `wc -l {a,b}.ts` runs and `cat {a,.env}` asks. Sequences (`{1..3}`), nested groups, quotes inside a group, a group with no comma, an expansion past 64 words, braces in the program's place and an expanded word that is empty or starts with `~` or `=` ask.
 - Paths: every argument, both sides of an `=` or `:` in it, and a value glued to a short option (`-o/etc/x`) is resolved against the shell's current directory, which an earlier `cd` may have moved. It asks when that lands outside the agent's worktree, when the shell itself is outside it, or when any path segment is `.claude`, `.config`, `.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker` or `environ`, starts with `.env`, `.dev.vars`, `.npmrc`, `.yarnrc`, `.netrc`, `.pgpass`, `.pypirc`, `.htpasswd` or `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`, ends in `.pem`, `.key`, `.p12` or `.pfx`, or contains `credentials`, `token`, `secret` or `.tfstate` (any case), or when the path reaches `.git/config`. Segments are matched anywhere, so `cat .claude/CLAUDE.md` inside the worktree asks, and so does a search for `token` (`rg token src`).
