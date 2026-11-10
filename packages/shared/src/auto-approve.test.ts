@@ -189,6 +189,7 @@ const reasons: Record<Exclude<AskReason, "unresolvable">, string[]> = {
   ],
   "unsafe-option": [
     "git log -c core.pager=sh",
+    "git log --config-env=core.pager=SHELL",
     "git diff --output=f",
     "git diff --output f",
     "git log --output=f",

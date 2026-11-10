@@ -321,8 +321,9 @@ const RG_UNSAFE =
 const GREP_LONG =
   /^--(extended-regexp|fixed-strings|basic-regexp|perl-regexp|ignore-case|no-ignore-case|word-regexp|line-regexp|invert-match|count|files-with-matches|files-without-match|only-matching|quiet|silent|no-messages|byte-offset|line-number|with-filename|no-filename|initial-tab|null|text|no-group-separator|colou?r|regexp|file|max-count|before-context|after-context|context|binary-files|group-separator|label)(=.*)?$/;
 
+// `--config-env` sets config like `-c`, so `diff.external` or `core.fsmonitor` would run a program
 const GIT_UNSAFE =
-  /^(--output.*|--ext-diff|--textconv|--no-index|--open-files-in-pager.*|--exec-path.*|-c|-O.*|--work-tree.*|--git-dir.*)$/;
+  /^(--output.*|--ext-diff|--textconv|--no-index|--open-files-in-pager.*|--exec-path.*|-c|--config-env.*|-O.*|--work-tree.*|--git-dir.*)$/;
 
 const GIT_BRANCH_FLAGS = new Set([
   "--list",

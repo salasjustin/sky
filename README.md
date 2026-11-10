@@ -174,7 +174,7 @@ Built-in list (`defaults: true`), with what each asks on besides the checks on e
 - `sed`: asks on anything but `sed -n 'N,Mp' file…` or `sed -n 'Np' file…`.
 - `tail`: asks on following, `-f`/`-F` in any bundle and any `--f…`.
 - `find`: asks on `-L`, `-follow`, `-files0-from`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`, `-fprint`, `-fprint0`, `-fprintf`, `-fls`.
-- `git status`, `git log`, `git diff`, `git show`, `git rev-parse`: asks on `-c`, `-O…`, `--output…`, `--ext-diff`, `--textconv`, `--no-index`, `--open-files-in-pager…`, `--exec-path…`, `--git-dir…`, `--work-tree…`.
+- `git status`, `git log`, `git diff`, `git show`, `git rev-parse`: asks on `-c`, `--config-env…`, `-O…`, `--output…`, `--ext-diff`, `--textconv`, `--no-index`, `--open-files-in-pager…`, `--exec-path…`, `--git-dir…`, `--work-tree…`.
 - `git branch`: asks on the git options above, any flag but `-l`/`--list`, `-a`/`--all`, `-r`/`--remotes`, `-v`/`-vv`/`--verbose`, `--show-current`, `--color`/`--no-color`, and a name without `--list` or `-l`.
 - `pnpm test`, `pnpm typecheck`, `pnpm lint`: see below.
 - `node --version`, `node -v`: asks on anything else.
