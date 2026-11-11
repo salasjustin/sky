@@ -2367,3 +2367,53 @@ test("a GitHub head that is someone else's, neither this branch's history nor th
     "an earlier publish's patch\n",
   );
 });
+
+/** Merges `shas` into the branch, as `commit` makes commits. */
+const merge = (...shas: string[]) => {
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=Claude",
+      "-c",
+      "user.email=noreply@anthropic.com",
+      "merge",
+      "-q",
+      "--no-edit",
+      ...shas,
+    ],
+    {
+      cwd: work,
+      env: {
+        ...withoutHostIdentity(),
+        GIT_AUTHOR_DATE: "2026-10-30T14:00:00+00:00",
+        GIT_COMMITTER_DATE: "2026-10-30T14:00:00+00:00",
+      },
+    },
+  );
+  return git(work, "rev-parse", "HEAD");
+};
+
+/** The base moves to a new commit, here as fetched (`origin/main`) and on GitHub. */
+const baseMoves = (files: Record<string, string>) => {
+  const next = nextBase(files);
+  git(work, "update-ref", "refs/remotes/origin/main", next);
+  baseMovesTo(next);
+  return next;
+};
+
+test("a merge of the base GitHub holds is sent with the base tip as its second parent, so the base is an ancestor of the published head", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  const gh = fakeGitHub({ ref: first });
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base);
+
+  const result = await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[first, base]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+  expect(result.sha).toBe("commit1");
+});
