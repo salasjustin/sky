@@ -14,16 +14,20 @@ export type Memory = {
 /**
  * The Mem row's total, used and available columns and the Swap row's total and used; undefined when
  * `free` printed no Mem row, or a header not ending in `available` (procps before 3.3.10 ends in `cached`).
+ * Also undefined when buff/cache exceeds total: a sprite's platform-managed memory can report more
+ * page cache than it has memory, and procps then prints used = total and available 0 for a sprite
+ * that is nearly idle, so the row says nothing of what a new process can claim.
  */
 export function parseFree(stdout: string): Memory | undefined {
   if (!/^\s+total\s.*\savailable$/m.test(stdout)) return undefined;
-  const mem = /^Mem:\s+(\d+)\s+(\d+)\s+\d+\s+\d+\s+\d+\s+(\d+)/m.exec(stdout);
+  const mem = /^Mem:\s+(\d+)\s+(\d+)\s+\d+\s+\d+\s+(\d+)\s+(\d+)/m.exec(stdout);
   if (!mem) return undefined;
+  if (Number(mem[3]) > Number(mem[1])) return undefined;
   const swap = /^Swap:\s+(\d+)\s+(\d+)/m.exec(stdout);
   return {
     totalMb: Number(mem[1]),
     usedMb: Number(mem[2]),
-    availableMb: Number(mem[3]),
+    availableMb: Number(mem[4]),
     swapTotalMb: Number(swap?.[1] ?? 0),
     swapUsedMb: Number(swap?.[2] ?? 0),
   };
