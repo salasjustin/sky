@@ -2,8 +2,9 @@ import { posix } from "node:path";
 
 /**
  * Bash commands that run without an approval request. Deliberately strict and fail-closed:
- * only a single simple command is ever approved, and anything this parser doesn't fully
- * understand is left for a person to decide.
+ * simple commands joined by `;`, `&&`, `||` and `|` are approved only when every one of them
+ * would be on its own, and anything this parser doesn't fully understand is left for a person
+ * to decide.
  */
 
 /**
@@ -43,52 +44,203 @@ export type AutoApprove = {
   commands: string[];
 };
 
-type Word = { text: string; quoted: boolean };
+type Operator = ";" | "&&" | "||" | "|";
+/**
+ * `literal` marks a word holding `$`, a backtick, `\` or `!` inside single quotes, `braced` one
+ * of the words a `{a,b}` group expanded to; `redirect` is one of the harmless ones `lex` lets
+ * through.
+ */
+type Token =
+  | { word: string; literal: boolean; braced: boolean }
+  | { op: Operator }
+  | { redirect: true };
+
+/** More words than this from one brace-expanded word asks rather than being checked one by one. */
+const MAX_BRACE_WORDS = 64;
+
+/**
+ * Programs whose arguments are patterns, programs or text and go no further, so a single-quoted
+ * `$` reaches them as a plain character. Anything else may hand an argument to a shell or an
+ * expander of its own (pnpm script arguments, `make 'X=$(shell …)'`), so it asks.
+ */
+const TAKES_LITERALS = new Set([
+  "grep",
+  "rg",
+  "sed",
+  "echo",
+  "sort",
+  "uniq",
+  "cut",
+  "tr",
+  "nl",
+  "column",
+  "jq",
+  "awk",
+]);
 
 // Outside quotes these either chain, redirect, substitute, expand or comment; inside quotes they are literal.
 const UNQUOTED_SPECIAL = /[;&|<>()*?[\]{}#]/;
-// Expand or escape even inside double quotes, so they are refused wherever they appear.
-const ALWAYS_REFUSED = /[$`\\!\n\r\0]/;
+// Expand or escape even inside double quotes, so they are refused outside single quotes.
+const EXPANDING = /[$`\\!]/;
+// End a command, or hide the rest of it, wherever they appear.
+const LINE_BREAKING = /[\n\r\0]/;
 
-/** Splits one simple command into words, or undefined when it holds anything but plain words. */
-function tokenize(command: string): Word[] | undefined {
-  if (ALWAYS_REFUSED.test(command)) return undefined;
-  const words: Word[] = [];
+/**
+ * Splits a command into words and the chaining operators between them, or undefined when it
+ * holds anything else.
+ */
+function lex(command: string): Token[] | undefined {
+  if (LINE_BREAKING.test(command)) return undefined;
+  const tokens: Token[] = [];
   let text = "";
-  let quoted = false;
   let open = false;
+  let quoted = false;
+  let literal = false;
   let quote: string | undefined;
-  for (const ch of command) {
+  // a word with brace groups: the alternatives of each finished segment, and the group still open
+  let parts: string[][] = [];
+  let group: string[] | undefined;
+  const dropWord = () => {
+    text = "";
+    open = false;
+    quoted = false;
+    literal = false;
+    parts = [];
+  };
+  /** False when the word's braces don't make a plain `{a,b}` expansion. */
+  const endWord = (): boolean => {
+    if (group) return false;
+    if (!open) return true;
+    let words = [""];
+    for (const alternatives of [...parts, [text]]) {
+      words = words.flatMap((w) => alternatives.map((a) => w + a));
+      if (words.length > MAX_BRACE_WORDS) return false;
+    }
+    const braced = parts.length > 0;
+    // tilde and zsh's `=` expansion run after brace expansion, and an empty word vanishes
+    if (braced && words.some((w) => w === "" || /^[~=]/.test(w))) return false;
+    for (const word of words) tokens.push({ word, literal, braced });
+    dropWord();
+    return true;
+  };
+  const append = (ch: string) => {
+    if (group) group[group.length - 1] += ch;
+    else text += ch;
+    open = true;
+  };
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i] ?? "";
+    const next = command[i + 1];
+    // single quotes are fully literal in bash and zsh, so awk's `$1` is plain text there
+    if (EXPANDING.test(ch)) {
+      if (quote !== "'") return undefined;
+      literal = true;
+    }
     if (quote !== undefined) {
       if (ch === quote) quote = undefined;
       else text += ch;
     } else if (ch === "'" || ch === '"') {
+      if (group) return undefined;
       quote = ch;
-      quoted = true;
       open = true;
+      quoted = true;
+    } else if (ch === ">") {
+      // only `2>&1`, `2>/dev/null` and `>/dev/null`; a quoted or glued `2` is a word, not stderr
+      const fd = open ? text : "";
+      if (open && (fd !== "2" || quoted || parts.length > 0)) return undefined;
+      dropWord();
+      let j = i + 1;
+      if (command[j] === "&") {
+        if (fd !== "2" || command[j + 1] !== "1") return undefined;
+        j += 2;
+      } else {
+        while (command[j] === " " || command[j] === "\t") j++;
+        if (!command.startsWith("/dev/null", j)) return undefined;
+        j += "/dev/null".length;
+      }
+      if (!/^[ \t;|&]?$/.test(command[j] ?? "")) return undefined;
+      tokens.push({ redirect: true });
+      i = j - 1;
     } else if (ch === " " || ch === "\t") {
-      if (open) words.push({ text, quoted });
+      if (!endWord()) return undefined;
+    } else if (ch === ";") {
+      if (!endWord()) return undefined;
+      tokens.push({ op: ";" });
+    } else if ((ch === "&" || ch === "|") && next === ch) {
+      if (!endWord()) return undefined;
+      tokens.push({ op: ch === "&" ? "&&" : "||" });
+      i++;
+    } else if (ch === "|" && next !== "&") {
+      if (!endWord()) return undefined;
+      tokens.push({ op: "|" });
+    } else if (ch === "{") {
+      // one level of `{a,b}`; sequences (`{1..3}`) and nesting ask
+      if (group) return undefined;
+      parts.push([text]);
       text = "";
-      quoted = false;
-      open = false;
+      group = [""];
+      open = true;
+    } else if (ch === "," && group) {
+      group.push("");
+    } else if (ch === "}") {
+      if (!group || group.length < 2) return undefined;
+      parts.push(group);
+      group = undefined;
     } else if (UNQUOTED_SPECIAL.test(ch)) {
       return undefined;
     } else {
       // a leading unquoted `~` is tilde expansion, and in zsh a leading `=` expands to a program's path
       if (!open && (ch === "~" || ch === "=")) return undefined;
-      text += ch;
-      open = true;
+      append(ch);
     }
   }
-  if (quote !== undefined) return undefined;
-  if (open) words.push({ text, quoted });
-  return words;
+  if (quote !== undefined || !endWord()) return undefined;
+  return tokens;
+}
+
+/**
+ * One simple command of a compound one; `piped` when its stdin is the previous step's output,
+ * `literal` when a word holds single-quoted expansion characters.
+ */
+type Step = { words: string[]; piped: boolean; literal: boolean };
+
+/** Steps joined by `|`, run when `after` (the operator before it) lets them. */
+type Pipeline = { steps: Step[]; after?: Exclude<Operator, "|"> };
+
+/** The pipelines `;`, `&&` and `||` join, or undefined when any simple command is empty. */
+function parsePipelines(command: string): Pipeline[] | undefined {
+  const tokens = lex(command);
+  if (!tokens) return undefined;
+  const newStep = (piped: boolean): Step => ({
+    words: [],
+    piped,
+    literal: false,
+  });
+  const pipelines: Pipeline[] = [{ steps: [newStep(false)] }];
+  for (const token of tokens) {
+    const pipeline = pipelines.at(-1);
+    const step = pipeline?.steps.at(-1);
+    if (!pipeline || !step) return undefined;
+    if ("redirect" in token) continue;
+    if ("word" in token) {
+      // braces in the program's place would choose the program
+      if (token.braced && step.words.length === 0) return undefined;
+      step.words.push(token.word);
+      step.literal ||= token.literal;
+    } else if (step.words.length === 0) return undefined;
+    else if (token.op === "|") pipeline.steps.push(newStep(true));
+    else pipelines.push({ steps: [newStep(false)], after: token.op });
+  }
+  const steps = pipelines.flatMap((p) => p.steps);
+  return steps.every((s) => s.words.length > 0) ? pipelines : undefined;
 }
 
 /** The words of an allowlist entry, or undefined when it isn't a plain run of words. */
 export function parseCommandEntry(entry: string): string[] | undefined {
-  const words = tokenize(entry)?.map((w) => w.text);
-  return words && words.length > 0 && !isAssignment(words[0] ?? "")
+  const tokens = lex(entry);
+  if (!tokens || tokens.length === 0) return undefined;
+  const words = tokens.flatMap((t) => ("word" in t ? [t.word] : []));
+  return words.length === tokens.length && !isAssignment(words[0] ?? "")
     ? words
     : undefined;
 }
@@ -169,8 +321,9 @@ const RG_UNSAFE =
 const GREP_LONG =
   /^--(extended-regexp|fixed-strings|basic-regexp|perl-regexp|ignore-case|no-ignore-case|word-regexp|line-regexp|invert-match|count|files-with-matches|files-without-match|only-matching|quiet|silent|no-messages|byte-offset|line-number|with-filename|no-filename|initial-tab|null|text|no-group-separator|colou?r|regexp|file|max-count|before-context|after-context|context|binary-files|group-separator|label)(=.*)?$/;
 
+// `--config-env` sets config like `-c`, so `diff.external` or `core.fsmonitor` would run a program
 const GIT_UNSAFE =
-  /^(--output.*|--ext-diff|--textconv|--no-index|--open-files-in-pager.*|--exec-path.*|-c|-O.*|--work-tree.*|--git-dir.*)$/;
+  /^(--output.*|--ext-diff|--textconv|--no-index|--open-files-in-pager.*|--exec-path.*|-c|--config-env.*|-O.*|--work-tree.*|--git-dir.*)$/;
 
 const GIT_BRANCH_FLAGS = new Set([
   "--list",
@@ -224,13 +377,165 @@ function pnpmWords(words: string[]): string[] | undefined {
 }
 
 /**
+ * Built in alongside the defaults, but only on the right of a `|`: they filter what the step
+ * before printed, so on their own they'd mostly wait on a terminal or read files the list
+ * doesn't cover.
+ */
+const PIPE_ONLY = new Set([
+  "sort",
+  "uniq",
+  "cut",
+  "tr",
+  "nl",
+  "column",
+  "jq",
+  "awk",
+]);
+
+// GNU long options take any unambiguous prefix (`--out` is `--output`), so these match whole
+// names only; none writes, runs a program or reads a file list
+const SORT_LONG =
+  /^--(ignore-leading-blanks|dictionary-order|ignore-case|general-numeric-sort|ignore-nonprinting|month-sort|human-numeric-sort|numeric-sort|random-sort|reverse|version-sort|merge|stable|unique|zero-terminated|debug|check(=(quiet|silent|diagnose-first))?|key(=.*)?|field-separator(=.*)?|sort=[a-z]+|buffer-size=\w+|parallel=\d+)$/;
+
+const UNIQ_LONG =
+  /^--(count|repeated|all-repeated(=\w+)?|unique|ignore-case|zero-terminated|group(=\w+)?|(skip-fields|skip-chars|check-chars)=\d+)$/;
+
+/** Whether `uniq`'s arguments name at most one file: a second operand is where it writes. */
+function uniqReadsOnly(args: string[]): boolean {
+  let operands = 0;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] ?? "";
+    if (a === "--") {
+      operands += args.length - i - 1;
+      break;
+    }
+    // `-f`, `-s` and `-w` take a count, glued or as the next word
+    const counted = /^-[cdDuiz]*[fsw](\d*)$/.exec(a);
+    if (counted) {
+      if (counted[1] === "") i++;
+    } else if (a === "-" || !a.startsWith("-")) operands++;
+    else if (!/^-[cdDuiz]+$/.test(a) && !UNIQ_LONG.test(a)) return false;
+  }
+  return operands <= 1;
+}
+
+/** awk's inline program and the file operands after it, or undefined on an option other than `-F` or `-v`. */
+function awkArgs(
+  args: string[],
+): { program?: string; operands: string[] } | undefined {
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] ?? "";
+    if (a === "--") {
+      i++;
+      break;
+    }
+    if (a === "-F" || a === "-v") i += 2;
+    else if (/^-[Fv]./.test(a)) i++;
+    else if (a.startsWith("-") && a !== "-") return undefined;
+    else break;
+  }
+  if (i > args.length) return undefined;
+  const [program, ...operands] = args.slice(i);
+  return { program, operands };
+}
+
+// running commands, writing or piping, and reading files, arguments or variables it wasn't handed;
+// gawk's SYMTAB and FUNCTAB name variables and functions by strings a program can assemble
+const AWK_UNSAFE =
+  /system|getline|ARGV|ARGC|ENVIRON|PROCINFO|SYMTAB|FUNCTAB|[>|@]/;
+
+const JQ_LONG = new Set([
+  "--raw-output",
+  "--raw-output0",
+  "--join-output",
+  "--ascii-output",
+  "--compact-output",
+  "--null-input",
+  "--slurp",
+  "--raw-input",
+  "--sort-keys",
+  "--color-output",
+  "--monochrome-output",
+  "--tab",
+  "--exit-status",
+  "--seq",
+  "--stream",
+  "--unbuffered",
+  "--args",
+  "--jsonargs",
+]);
+
+/** jq's filter and its file operands, or undefined on an option outside the plain output ones. */
+function jqArgs(
+  args: string[],
+): { filter?: string; operands: string[] } | undefined {
+  let filter: string | undefined;
+  const operands: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] ?? "";
+    // a named value is a string, never opened
+    if (a === "--arg" || a === "--argjson") i += 2;
+    else if (a === "--indent") i += 1;
+    else if (JQ_LONG.has(a) || /^-[nrjascCMSeR]+$/.test(a)) continue;
+    else if (a.startsWith("-")) return undefined;
+    else if (filter === undefined) filter = a;
+    else operands.push(a);
+    if (i >= args.length) return undefined;
+  }
+  return { filter, operands };
+}
+
+// the environment, and modules jq would read off its search path
+const JQ_UNSAFE = /\b(env|ENV|import|include|modulemeta)\b/;
+
+/** The arguments a program may open as files; the rest are patterns, programs or sets. */
+function fileArgs(words: string[]): string[] {
+  const [program, ...args] = words;
+  switch (program) {
+    case "tr":
+      return [];
+    case "awk":
+      return awkArgs(args)?.operands ?? args;
+    case "jq":
+      return jqArgs(args)?.operands ?? args;
+    default:
+      return args;
+  }
+}
+
+/**
  * Per-program checks that run whichever entry allowed the command; false means ask. With
  * `complete` false, `words` is only the start of a command and fails only if no command
- * starting with them could pass.
+ * starting with them could pass. `piped` is a step reading the previous one's output.
  */
-function guard(words: string[], complete = true): boolean {
+function guard(words: string[], complete = true, piped = false): boolean {
   const [program = "", ...args] = words;
   switch (program) {
+    case "cd": {
+      // no `-`/OLDPWD, options, zsh's `+N` stack entries or two-argument form, nor a bare cd home
+      const [dir, ...rest] = args;
+      if (dir === undefined) return !complete;
+      return rest.length === 0 && !/^[-+]/.test(dir);
+    }
+    case "sort":
+      return args.every((a) =>
+        a.startsWith("--")
+          ? a === "--" || SORT_LONG.test(a)
+          : !/^-\S*[oT]/.test(a),
+      );
+    case "uniq":
+      return uniqReadsOnly(args);
+    case "awk": {
+      const split = awkArgs(args);
+      if (!split) return false;
+      if (split.program === undefined) return !complete;
+      return !AWK_UNSAFE.test(split.program);
+    }
+    case "jq": {
+      const split = jqArgs(args);
+      return split !== undefined && !JQ_UNSAFE.test(split.filter ?? "");
+    }
     case "find":
       return !args.some((a) => FIND_UNSAFE.has(a));
     case "wc":
@@ -248,7 +553,8 @@ function guard(words: string[], complete = true): boolean {
     case "sed": {
       // `sed -n 'N,Mp' file` only: `-i`, `w`, `e` and other scripts write or run things
       const [flag, script, ...files] = args;
-      if (complete && files.length === 0) return false;
+      // with no file it reads stdin, which only a pipe feeds
+      if (complete && !piped && files.length === 0) return false;
       return (
         (flag === undefined || flag === "-n") &&
         (script === undefined || /^\d+(,\d+)?p$/.test(script)) &&
@@ -312,11 +618,11 @@ export function commandEntryProblem(entry: string): string | undefined {
 
 /** Why a command still asks; see `autoApproveVerdict`. */
 export type AskReason =
-  /** not one simple command of plain words: chaining, redirection, substitution, expansion, bad quoting */
+  /** not plain words joined by `;`, `&&`, `||` and `|`: background, redirection, substitution, expansion, bad quoting, cd in a pipeline */
   | "syntax"
-  /** starts with a variable assignment, a path or an option instead of a program name */
+  /** a step starts with a variable assignment, a path or an option instead of a program name */
   | "program"
-  /** no allowlist entry is a prefix of it */
+  /** no allowlist entry is a prefix of a step */
   | "not-allowed"
   /** a per-program guard refuses an option or argument that writes, runs code, recurses or follows */
   | "unsafe-option"
@@ -324,7 +630,7 @@ export type AskReason =
   | "outside-root"
   /** an argument, or the working directory, names somewhere secrets live */
   | "sensitive-path"
-  /** the realpath hook threw for a reason other than a missing path, or the root doesn't resolve */
+  /** the realpath hook threw for a reason other than a missing path, or the root or a cd target doesn't resolve */
   | "unresolvable";
 
 /** Where a command runs; a bare string is a root that is also the shell's cwd. */
@@ -336,7 +642,8 @@ export type AutoApproveScope = {
   /**
    * Resolves every symlink in an absolute path, so a link can't carry a path out of `root` or
    * onto a secret; `fs.realpathSync.native` fits. A path that doesn't exist (an error with code
-   * `ENOENT` or `ENOTDIR`) is judged on its text alone; any other throw asks.
+   * `ENOENT` or `ENOTDIR`) is judged on its text alone, except a `cd` target, which asks; any
+   * other throw asks.
    */
   realpath?: (path: string) => string;
 };
@@ -350,10 +657,58 @@ export function autoApproveVerdict(
   autoApprove: AutoApprove,
   scope: string | AutoApproveScope,
 ): "approved" | AskReason {
-  const tokens = tokenize(command);
-  if (!tokens || tokens.length === 0) return "syntax";
-  const raw = tokens.map((t) => t.text);
+  const pipelines = parsePipelines(command);
+  if (!pipelines) return "syntax";
+  const resolved = typeof scope === "string" ? { root: scope } : scope;
+  // every cwd the shell may be in after the pipelines so far, with whether the last one succeeded
+  let states = [{ cwd: resolved.cwd ?? resolved.root, ok: true }];
+  for (const { steps, after } of pipelines) {
+    const [first] = steps;
+    // in a pipeline bash runs cd in a subshell and zsh doesn't, so where it leaves the shell is unclear
+    if (steps.length > 1 && steps.some((s) => s.words[0] === "cd"))
+      return "syntax";
+    const runs = (ok: boolean) =>
+      after === "&&" ? ok : after === "||" ? !ok : true;
+    const cwds = new Set(states.filter((s) => runs(s.ok)).map((s) => s.cwd));
+    const next = states.filter((s) => !runs(s.ok));
+    for (const cwd of cwds) {
+      for (const step of steps) {
+        const verdict = stepVerdict(step, autoApprove, { ...resolved, cwd });
+        if (verdict !== "approved") return verdict;
+      }
+      // a cd that fails leaves the shell where it was
+      if (first?.words[0] === "cd") {
+        const dir = posix.resolve(cwd, first.words[1] ?? "");
+        // bash moves to this lexical path when it exists and otherwise falls back to the physical
+        // one, which the text doesn't track, so the target must resolve inside the root
+        if (resolved.realpath) {
+          const verdict = resolvedVerdict(
+            [dir],
+            resolved.root,
+            cwd,
+            resolved.realpath,
+            true,
+          );
+          if (verdict !== "approved") return verdict;
+        }
+        next.push({ cwd: dir, ok: true });
+      } else next.push({ cwd, ok: true });
+      next.push({ cwd, ok: false });
+    }
+    states = next;
+  }
+  return "approved";
+}
+
+/** The verdict on one simple command, as if it ran alone. */
+function stepVerdict(
+  step: Step,
+  autoApprove: AutoApprove,
+  { root, cwd = root, realpath }: AutoApproveScope,
+): "approved" | AskReason {
+  const raw = step.words;
   const first = raw[0] ?? "";
+  if (step.literal && !TAKES_LITERALS.has(first)) return "syntax";
   if (isAssignment(first) || first.includes("/") || first.startsWith("-"))
     return "program";
   const words = first === "pnpm" ? pnpmWords(raw) : raw;
@@ -363,21 +718,19 @@ export function autoApproveVerdict(
     ...(autoApprove.defaults ? DEFAULT_AUTO_APPROVE_COMMANDS : []),
     ...autoApprove.commands,
   ];
-  const allowed = entries.some((entry) => {
-    const prefix = parseCommandEntry(entry);
-    return prefix?.every((w, i) => words[i] === w);
-  });
+  const builtIn = first === "cd" || (step.piped && PIPE_ONLY.has(first));
+  const allowed =
+    (autoApprove.defaults && builtIn) ||
+    entries.some((entry) => {
+      const prefix = parseCommandEntry(entry);
+      return prefix?.every((w, i) => words[i] === w);
+    });
   if (!allowed) return "not-allowed";
-  if (!guard(words)) return "unsafe-option";
+  if (!guard(words, true, step.piped)) return "unsafe-option";
 
   // echo only prints its arguments, so a path-like one isn't a read
   if (first === "echo") return "approved";
-  const {
-    root,
-    cwd = root,
-    realpath,
-  } = typeof scope === "string" ? { root: scope } : scope;
-  const args = raw.slice(1).flatMap(pathCandidates);
+  const args = fileArgs(raw).flatMap(pathCandidates);
   // "." stands for the cwd itself, which `ls` or `git status` reads with no argument
   const targets = [".", ...args];
   if (targets.some((t) => leavesRoot(t, root, cwd))) return "outside-root";
@@ -389,12 +742,16 @@ export function autoApproveVerdict(
   return realpath ? resolvedVerdict(targets, root, cwd, realpath) : "approved";
 }
 
-/** The same root and secret checks, on where each target's symlinks really lead. */
+/**
+ * The same root and secret checks, on where each target's symlinks really lead. A target that
+ * doesn't exist is skipped, or asks with `missingAsks`.
+ */
 function resolvedVerdict(
   targets: string[],
   root: string,
   cwd: string,
   realpath: (path: string) => string,
+  missingAsks = false,
 ): "approved" | AskReason {
   const resolve = (path: string): string | undefined => {
     try {
@@ -413,7 +770,10 @@ function resolvedVerdict(
       const real = resolve(
         target.startsWith("/") ? target : `${cwd}/${target}`,
       );
-      if (real === undefined) continue;
+      if (real === undefined) {
+        if (missingAsks) return "unresolvable";
+        continue;
+      }
       const rel = posix.relative(realRoot, real);
       if (isOutside(rel)) return "outside-root";
       if (namesSecret(rel)) return "sensitive-path";
@@ -425,9 +785,10 @@ function resolvedVerdict(
 }
 
 /**
- * Whether `command` may run without an approval request: one simple command, none of the
- * shell's chaining, redirection, substitution or expansion, starting with an allowlisted
- * command, and touching no secret path nor anything outside the root. A string `scope` is
+ * Whether `command` may run without an approval request: simple commands joined by `;`, `&&`,
+ * `||` and `|`, none of the shell's other redirection, substitution or expansion, each starting
+ * with an allowlisted command (or `cd`, or a pipe-only filter after a `|`) and touching no
+ * secret path nor anything outside the root from any cwd it may run in. A string `scope` is
  * both root and cwd.
  */
 export function isAutoApproved(
