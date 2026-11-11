@@ -44,7 +44,7 @@ Mem:           16000        9019        1500         100        5000        6200
 });
 
 test("parseFree reads nothing from a Mem row whose buff/cache exceeds its total", () => {
-  // a nearly idle sprite whose page cache is reported above its memory: procps prints available 0
+  // a nearly idle sprite that reports more page cache than memory, and available 0
   expect(
     parseFree(`${header}
 Mem:            8192        8192           0           0        8922           0
