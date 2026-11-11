@@ -3053,6 +3053,26 @@ test("a launch on a sprite whose memory can't be read goes ahead and logs it", a
   );
 });
 
+test("a launch on a sprite reporting more page cache than memory goes ahead and logs it", async () => {
+  const envId = readyEnv();
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "free"
+      ? {
+          exitCode: 0,
+          stdout: `               total        used        free      shared  buff/cache   available
+Mem:            8192        8192           0           0        8922           0
+Swap:              0           0           0
+`,
+        }
+      : exec(argv);
+  const { run } = await launched(envId);
+  await sessionOpened();
+  expect(logs).toContain(
+    `launching ${run.id}: the memory of ${spriteNameFor(envId)} could not be read; launching anyway`,
+  );
+});
+
 test("a launch whose memory read fails at the Sprites API goes ahead and logs it", async () => {
   const envId = readyEnv();
   server.use(

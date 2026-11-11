@@ -43,6 +43,22 @@ Mem:           16000        9019        1500         100        5000        6200
   ).toMatchObject({ availableMb: 6200, swapTotalMb: 0, swapUsedMb: 0 });
 });
 
+test("parseFree reads nothing from a Mem row whose buff/cache exceeds its total", () => {
+  // a nearly idle sprite that reports more page cache than memory, and available 0
+  expect(
+    parseFree(`${header}
+Mem:            8192        8192           0           0        8922           0
+Swap:              0           0           0
+`),
+  ).toBeUndefined();
+  // at the total it is still a reading
+  expect(
+    parseFree(`${header}
+Mem:            8192         100           0           0        8192        8000
+`),
+  ).toMatchObject({ totalMb: 8192, availableMb: 8000 });
+});
+
 test("parseFree reads nothing from output it doesn't recognise", () => {
   for (const out of [
     "",
