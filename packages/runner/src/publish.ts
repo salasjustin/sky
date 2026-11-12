@@ -884,9 +884,14 @@ export async function publish(options: {
         at = ours.lastIndexOf(outside);
         baseline = remoteWorkflows;
       }
-      // a tree this branch also has, on a history that doesn't pass through the base as it is now
-      // (published before the base moved), would keep that stale history under the new commits
-      if (at !== -1 && !(await sitsOn(call, remote, mergeBase))) {
+      // a tree this branch also has, on a history that doesn't pass through the base commit the
+      // matching local commit forks from (published before the base moved, rebased here since),
+      // would keep that stale history under the new commits; a commit from before a merge of the
+      // base forks from the older base, so it is compared with that one, not the base as it is now
+      const forkedFrom =
+        at !== -1 &&
+        (await git(cwd, "merge-base", known[at] as string, mergeBase)).trim();
+      if (forkedFrom && !(await sitsOn(call, remote, forkedFrom))) {
         at = -1;
         rewritten = true;
       } else if (at === -1) {

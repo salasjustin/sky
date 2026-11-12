@@ -2554,8 +2554,8 @@ test("a merge whose only change past its first parent is under .github/workflows
   expect(gh.commits.map((c) => c.parents)).toEqual([[base], ["commit1", base]]);
   // the base's newer workflow is GitHub's already and the connector can't write it, so it isn't sent
   expect(treePaths(gh)).not.toContain(".github/workflows/ci.yml");
-  // the merged tree's ci.yml differs from the baseline's, so it is reported as held
-  expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
+  // the merge's workflows are the base's, which GitHub already has, so the branch holds nothing back
+  expect(result.held).toBeUndefined();
 });
 
 test("a branch already on GitHub that merges a base which since changed a workflow is refused before anything is sent", async () => {
@@ -2590,6 +2590,51 @@ test("a branch already on GitHub that merges a base whose workflows haven't chan
 
   expect(gh.commits.map((c) => c.parents)).toEqual([[first, base]]);
   expect(treePaths(gh)).toEqual(["b.txt"]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("a branch published before, whose head GitHub holds under another sha, merges the moved base and is sent on top of that head, not rewritten", async () => {
+  const oldBase = baseSha;
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  // what the earlier publish made of `first`, on the base as it was then
+  const gh = fakeGitHub({
+    ref: "gh_first",
+    commitTrees: { gh_first: git(work, "rev-parse", `${first}^{tree}`) },
+    commitParents: { gh_first: [oldBase] },
+  });
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base);
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([["gh_first", base]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("a continued branch whose head GitHub holds under another sha merges the moved base and is sent on top of that head, not refused", async () => {
+  const oldBase = baseSha;
+  git(work, "config", "branch.claude/agt_1.sky-remote-branch", "feature/x");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  const gh = fakeGitHub({
+    ref: "gh_first",
+    branch: "feature/x",
+    pulls: [{ ...OPEN_PR, head: "feature/x" }],
+    allowPullUpdates: true,
+    commitTrees: { gh_first: git(work, "rev-parse", `${first}^{tree}`) },
+    commitParents: { gh_first: [oldBase] },
+  });
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base);
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([["gh_first", base]]);
   expect(gh.refWrites).toEqual([
     { method: "PATCH", body: { sha: "commit1", force: false } },
   ]);
