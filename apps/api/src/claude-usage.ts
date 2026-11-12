@@ -156,7 +156,8 @@ export type UsageProbe = ReturnType<typeof createUsageProbe>;
  * Keeps each subscription's last-seen usage fresh: `refresh` probes it when the stored reading is
  * older than `USAGE_STALE_MS`, at most one probe at a time per subscription, and stores the answer.
  * A subscription the probe finds full is marked limited until its window resets. A probe that fails
- * is logged by name and leaves the stored reading as it was.
+ * is logged by name, leaves the stored reading as it was, and is not tried again for
+ * `USAGE_STALE_MS`; meanwhile `failedRecently` is true for that subscription.
  */
 export function createUsageProbe({
   db,
@@ -171,10 +172,18 @@ export function createUsageProbe({
   probe?: (token: string) => Promise<ClaudeUsage>;
 }) {
   const inFlight = new Map<string, Promise<void>>();
+  // when each subscription's last probe failed; in memory, as a failure is no reading to store
+  const failedAt = new Map<string, number>();
+
+  const failedRecently = (name: string, now: Date = new Date()) => {
+    const at = failedAt.get(name);
+    return at !== undefined && now.getTime() - at < USAGE_STALE_MS;
+  };
 
   async function run(name: string, token: string): Promise<void> {
     try {
       const usage = await probe(token);
+      failedAt.delete(name);
       saveUsage(db, name, usage);
       const full = [usage.fiveHour, usage.sevenDay].filter(
         (w): w is ClaudeUsageWindow => w !== null && w.utilization >= 1,
@@ -185,6 +194,7 @@ export function createUsageProbe({
         .sort((a, b) => b.getTime() - a.getTime())[0];
       if (until) markLimited(db, name, until);
     } catch (err) {
+      failedAt.set(name, Date.now());
       log(
         `probing the usage of Claude credential ${name} failed: ${err instanceof Error ? err.message : err}`,
       );
@@ -192,12 +202,15 @@ export function createUsageProbe({
   }
 
   return {
+    /** Whether the subscription's last probe failed within `USAGE_STALE_MS`: its stored reading, if any, is not current. */
+    failedRecently,
     /** Resolves once the subscription's usage is fresh, or the probe has failed; never throws. */
     refresh(name: string, now: Date = new Date()): Promise<void> {
       const stored = storedUsage(db, name);
       if (
-        stored &&
-        now.getTime() - Date.parse(stored.probedAt) < USAGE_STALE_MS
+        (stored &&
+          now.getTime() - Date.parse(stored.probedAt) < USAGE_STALE_MS) ||
+        failedRecently(name, now)
       ) {
         return Promise.resolve();
       }

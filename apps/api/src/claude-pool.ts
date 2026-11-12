@@ -90,9 +90,10 @@ export function poolExhausted(
 /**
  * The credential a launch in a pool environment runs on: the subscription in its pool that isn't
  * limited and has the most headroom (the lowest of its 5-hour and 7-day use), from usage no older
- * than `USAGE_STALE_MS`; ties go to the earlier in the list, and a subscription never probed
- * ranks after those that were. With every subscription limited, the API key when the environment
- * allows it and the server has one, else an error naming the earliest reset in UTC.
+ * than `USAGE_STALE_MS`; ties go to the earlier in the list, and a subscription never probed, or
+ * whose last probe failed, ranks after those that answered. With every subscription limited, the
+ * API key when the environment allows it and the server has one, else an error naming the earliest
+ * reset in UTC.
  */
 export async function resolvePoolAuth(
   deps: { db: Db; config: Config; usage: UsageProbe },
@@ -112,11 +113,12 @@ export async function resolvePoolAuth(
   );
   const now = new Date();
   const best = members
-    .map((name, order) => ({
-      name,
-      order,
-      score: usageScore(storedUsage(db, name), now) ?? 2,
-    }))
+    .map((name, order) => {
+      const reading = usage.failedRecently(name, now)
+        ? undefined
+        : storedUsage(db, name);
+      return { name, order, score: usageScore(reading, now) ?? 2 };
+    })
     .filter(({ name }) => limitedUntil(db, name, now) === undefined)
     .sort((a, b) => a.score - b.score || a.order - b.order)[0];
   if (best) return subscriptionAuth(config, best.name);

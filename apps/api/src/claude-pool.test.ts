@@ -364,6 +364,48 @@ test("a probe that fails never fails the launch: that subscription just ranks af
   expect(logs.join("\n")).not.toContain(PERSONAL_TOKEN);
 });
 
+test("a failed probe is not asked again for a few minutes, then is", async () => {
+  readings[PERSONAL_TOKEN] = "broken";
+  readings[WORK_TOKEN] = { h5: 0.5, d7: 0.5 };
+  const env = poolEnv(["personal", "work"]);
+  const probesOf = (token: string) =>
+    probes.filter((p) => p.token === token).length;
+  await launchedRun(env);
+  await launchedRun(env);
+  expect(probesOf(PERSONAL_TOKEN)).toBe(1);
+  // the failure is no reading: nothing is stored that could rank it
+  expect(storedUsage(db, "personal")).toBeUndefined();
+
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    vi.setSystemTime(Date.now() + USAGE_STALE_MS + 1_000);
+    await launchedRun(env);
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(probesOf(PERSONAL_TOKEN)).toBe(2);
+});
+
+test("a subscription whose probe failed ranks as never probed, not by its older reading", async () => {
+  db.insert(claudeUsage)
+    .values({
+      credential: "personal",
+      fiveHourUtilization: 0,
+      sevenDayUtilization: 0,
+      probedAt: new Date(Date.now() - USAGE_STALE_MS - 1_000).toISOString(),
+    })
+    .run();
+  readings[PERSONAL_TOKEN] = "broken";
+  readings[WORK_TOKEN] = { h5: 0.9, d7: 0.5 };
+  const env = poolEnv(["personal", "work"]);
+  expect((await launchedRun(env)).file.CLAUDE_CODE_OAUTH_TOKEN).toBe(
+    WORK_TOKEN,
+  );
+  expect((await launchedRun(env)).file.CLAUDE_CODE_OAUTH_TOKEN).toBe(
+    WORK_TOKEN,
+  );
+});
+
 // --- failover ---------------------------------------------------------------------------------------------
 
 test.each([
