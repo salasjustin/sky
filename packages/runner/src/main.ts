@@ -1,5 +1,6 @@
 import { appendFileSync } from "node:fs";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { removeCommandEnvNow } from "./claude-auth.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { writeClaudeCredentials } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
@@ -91,6 +92,8 @@ async function main(): Promise<void> {
   const dieBy = (signal: NodeJS.Signals) => {
     stopListening();
     release();
+    // the session's `finally` never runs on this path, and the file may hold the project's key
+    removeCommandEnvNow();
     process.kill(process.pid, signal);
   };
   let dying = false;

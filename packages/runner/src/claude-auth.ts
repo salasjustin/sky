@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -100,6 +101,21 @@ export type CommandEnv = {
   remove: () => Promise<void>;
 };
 
+// every script `prepareCommandEnv` wrote that its `remove` hasn't deleted yet
+const unremoved = new Set<string>();
+
+/**
+ * Deletes every command-env script still on disk, synchronously: for a process about to die by a
+ * signal, which never reaches the session's own `remove`. Never throws, so the death goes ahead.
+ */
+export function removeCommandEnvNow(): void {
+  for (const path of unremoved)
+    try {
+      rmSync(path, { force: true });
+    } catch {}
+  unremoved.clear();
+}
+
 /**
  * Writes `commandEnvScript` to a file only this user reads, and the SessionStart hook that appends
  * it to `$CLAUDE_ENV_FILE`. The values ride in the file, not in argv or Claude's env.
@@ -113,6 +129,8 @@ export async function prepareCommandEnv(
   if (script === undefined) return { hooks: undefined, remove: async () => {} };
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `sky-command-env-${randomUUID()}.sh`);
+  // before the write: a signal can land while it is in flight
+  unremoved.add(path);
   await writeFile(path, script, { mode: 0o600, flag: "wx" });
   return {
     hooks: {
@@ -127,6 +145,9 @@ export async function prepareCommandEnv(
         },
       ],
     },
-    remove: () => rm(path, { force: true }),
+    remove: () => {
+      unremoved.delete(path);
+      return rm(path, { force: true });
+    },
   };
 }
