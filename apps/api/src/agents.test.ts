@@ -1631,6 +1631,19 @@ test("GET of a run whose runner was killed before it made its branch is a 200 wi
   )[2];
   expect(script).toContain("refs/heads/");
   expect(script).toContain("2>/dev/null");
+  // a branch never created is a normal answer, not worth a line
+  expect(logs.filter((l) => l.startsWith(`diff of ${run.id}`))).toEqual([]);
+});
+
+test("GET of a run whose diff fails in git is still a 200 with no diff, and logs the run, agent and exit", async () => {
+  const { agent, run } = await finishedRun();
+  wire.exec = (argv) => (isDiff(argv) ? { exitCode: 128 } : { exitCode: 0 });
+  const { status, body } = await getRun(agent.id, run.id);
+  expect(status).toBe(200);
+  expect(body).toMatchObject({ id: run.id, diff: null });
+  expect(logs).toContain(
+    `diff of ${run.id} (agent ${agent.id}) exited 128; answered without one`,
+  );
 });
 
 test("GET while the sprite is unreachable gets 502", async () => {
@@ -3373,9 +3386,28 @@ function runnerAlive(runId: string, alive: () => boolean) {
       : exec(argv);
 }
 
+/** The stop-lingering exec's argv after the script: `[mode, quietS, termS, pattern]`. */
+const stopLingeringArgs = (runId: string) =>
+  wire.execUrls
+    .map((u) => new URL(u).searchParams.getAll("cmd"))
+    .filter((cmd) => cmd[0] === "bash" && cmd.at(-1) === runnerPattern(runId))
+    .map((cmd) => cmd.slice(3));
+
+/** Moves the run's terminal event `ms` before now, as though the run ended that long ago. */
+const endedAgo = (runId: string, ms: number) =>
+  db.$client
+    .prepare(
+      "update events set ts = ? where run_id = ? and type in ('run.finished', 'run.failed', 'run.stopped')",
+    )
+    .run(new Date(Date.now() - ms).toISOString(), runId);
+
+// the follow-up may SIGTERM a previous runner only once its run ended this long ago
+const SIGNAL_WINDOW_MS = 60_000;
+
 test("a follow-up right after stop waits for the stopped runner; still alive, it gets 409 runner_still_exiting and starts nothing", async () => {
   const { agent, run, envId } = await runningRun();
   expect((await action(agent.id, "stop")).status).toBe(200);
+  // the stop's run.stopped carries the real time; this test's own timeout keeps it far inside the window
   let alive = true;
   runnerAlive(run.id, () => alive);
 
@@ -3393,15 +3425,52 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
   // the wait is bounded on the sprite, to the same 30 s archive allows
   const wait = wire.calls.at(-1) ?? "";
   expect(wait.startsWith(`exec ${spriteNameFor(envId)} - bash -c `)).toBe(true);
-  // a short wait for the runner to exit on its own, then SIGTERM, then a longer wait
-  expect(wait).toContain("pkill -TERM");
-  expect(wait).toContain(` _ 5 10 ${runnerPattern(run.id)}`);
+  // the stop already signalled it: a second SIGTERM would kill it mid-commit, so both waits only wait
+  expect(stopLingeringArgs(run.id)).toEqual([
+    ["wait", "5", "9", runnerPattern(run.id)],
+  ]);
 
+  // the retry the 409 asks for is just as soon after the stop, and waits the same way
   alive = false;
   expect((await followUp(agent.id, { prompt: "go another way" })).status).toBe(
     202,
   );
+  expect(stopLingeringArgs(run.id).map(([mode]) => mode)).toEqual([
+    "wait",
+    "wait",
+  ]);
+  // the stop's own pkill is the only signal the runner got
+  expect(wire.calls.filter((c) => c.includes(" - pkill "))).toHaveLength(1);
+  expect(logs.join("\n")).not.toContain("SIGTERMed");
   await sessionOpened(2);
+});
+
+test("a follow-up a while after stop may SIGTERM a runner still alive: it is wedged, not committing", async () => {
+  const { agent, run } = await runningRun();
+  expect((await action(agent.id, "stop")).status).toBe(200);
+  endedAgo(run.id, SIGNAL_WINDOW_MS + 60_000);
+  runnerAlive(run.id, () => false);
+  expect((await followUp(agent.id, { prompt: "go another way" })).status).toBe(
+    202,
+  );
+  expect(stopLingeringArgs(run.id)).toEqual([
+    ["term", "5", "9", runnerPattern(run.id)],
+  ]);
+  await sessionOpened(2);
+});
+
+test("a follow-up within a minute of the sweep failing a run as quiet only waits for its runner", async () => {
+  const { agent, run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  // the sweep's run.failed carries the real time; the boot sweep signals the runner of each run it fails
+  expect(failStaleRuns(db, 0, Date.now() + 1000)).toEqual([run.id]);
+  runnerAlive(run.id, () => true);
+  expect((await followUp(agent.id, { prompt: "carry on" })).status).toBe(409);
+  expect(stopLingeringArgs(run.id).map(([mode]) => mode)).toEqual(["wait"]);
 });
 
 /** A deadline of `ms` on the sprite calls before a launch, with every other bound at the test default. */
@@ -3424,8 +3493,9 @@ test("a follow-up whose previous runner outlived its timed-out run SIGTERMs it, 
     type: "run.started",
     payload: { sessionId: "s" },
   });
-  // the sweep failed it as quiet; its runner is still there
+  // the sweep failed it as quiet long ago; its runner is still there
   expect(failStaleRuns(db, 0, Date.now() + 1000)).toEqual([run.id]);
+  endedAgo(run.id, SIGNAL_WINDOW_MS + 60_000);
   // exit 3: still alive after the quiet wait, gone after the SIGTERM
   const exec = wire.exec;
   wire.exec = (argv) =>
@@ -3443,10 +3513,12 @@ test("a follow-up whose previous runner outlived its timed-out run SIGTERMs it, 
 test("a follow-up whose previous runner won't exit even after the SIGTERM gets 409 runner_still_exiting, inside the deadline", async () => {
   appWithDeadline(2_000);
   const { agent, run } = await finishedRun();
+  endedAgo(run.id, SIGNAL_WINDOW_MS + 60_000);
   runnerAlive(run.id, () => true);
   const started = Date.now();
   const res = await followUp(agent.id, { prompt: "again" });
   expect(Date.now() - started).toBeLessThan(2_000);
+  expect(stopLingeringArgs(run.id).map(([mode]) => mode)).toEqual(["term"]);
   expect(res.status).toBe(409);
   expect(await res.json()).toMatchObject({
     error: { code: "runner_still_exiting" },

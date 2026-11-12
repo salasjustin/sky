@@ -1,11 +1,12 @@
 import { zValidator } from "@hono/zod-validator";
-import { agents, type Db, environments, runs } from "@sky/db";
+import { agents, type Db, environments, events, runs } from "@sky/db";
 import {
   AgentId,
   agentBranch,
   BranchName,
   type Decision,
   EnvironmentId,
+  type EventType,
   RequestId,
   RunId,
 } from "@sky/shared";
@@ -217,18 +218,31 @@ const agentWithSprite = (tx: Tx, id: AgentId, principal: Principal) =>
     .where(and(eq(agents.id, id), ownAgents(principal)))
     .get();
 
+// a runner aborting at its run's end commits and pushes within this; one still alive past it is
+// wedged, not committing, and a SIGTERM (a second one kills at once) costs it no work
+const COMMIT_WINDOW_MS = 60_000;
+const END_EVENTS: EventType[] = ["run.finished", "run.failed", "run.stopped"];
+
 /**
- * The agent's latest run, when it has ended and so may leave a runner still exiting; undefined for
- * an unknown, not-owned or archived agent, or one whose latest run is active, which the follow-up
- * refuses.
+ * The agent's latest run, when it has ended and so may leave a runner still exiting, with whether
+ * the follow-up may SIGTERM that runner: only once the run ended `COMMIT_WINDOW_MS` before `now`.
+ * Undefined for an unknown, not-owned or archived agent, or one whose latest run is active, which
+ * the follow-up refuses.
  */
-function previousRunnerOf(db: Db, id: AgentId, principal: Principal) {
+function previousRunnerOf(
+  db: Db,
+  id: AgentId,
+  principal: Principal,
+  now: number,
+) {
   const row = db
     .select({
       runId: runs.id,
       status: runs.status,
       archivedAt: agents.archivedAt,
       spriteName: environments.spriteName,
+      // a run ended without a terminal event counts from its creation
+      endedAt: sql<string>`coalesce((select max(${events.ts}) from ${events} where ${events.runId} = ${runs.id} and ${inArray(events.type, END_EVENTS)}), ${runs.createdAt})`,
     })
     .from(runs)
     .innerJoin(agents, eq(runs.agentId, agents.id))
@@ -237,7 +251,10 @@ function previousRunnerOf(db: Db, id: AgentId, principal: Principal) {
     .orderBy(desc(runs.createdAt), desc(sql`${runs}.rowid`))
     .get();
   if (!row || row.archivedAt || isActive(row.status)) return undefined;
-  return row;
+  return {
+    ...row,
+    maySignal: now - Date.parse(row.endedAt) >= COMMIT_WINDOW_MS,
+  };
 }
 
 /** Re-reads an agent this transaction already found. */
@@ -250,7 +267,7 @@ const agentRow = (tx: Tx, id: AgentId) => {
 // $1 the base, $2 the agent's branch. A branch that was never created is a normal answer, not an
 // error, and git's complaint about it stays off the wire: the SDK's HTTP exec reads each chunk as a
 // frame, so a failing command's stderr and exit status in one chunk fail the whole call
-const DIFF = `git rev-parse --verify --quiet "refs/heads/$2" >/dev/null 2>&1 || exit 3; exec git diff "$1...$2" 2>/dev/null`;
+export const DIFF = `git rev-parse --verify --quiet "refs/heads/$2" >/dev/null 2>&1 || exit 3; exec git diff "$1...$2" 2>/dev/null`;
 
 const archived = (c: Context) =>
   apiError(c, 409, "agent_archived", "the agent is archived");
@@ -484,9 +501,14 @@ export function agentRoutes(
       const reserved = reservedIn(envVars);
       if (reserved) return reservedName(c, reserved);
       // an ended run's runner may still be aborting and committing in the worktree a new one resumes in,
-      // or be alive past its run's end (a timed-out run's, wedged): it is signalled, and the wait for
+      // or be alive long past its run's end (wedged): only that one is signalled, and the wait for
       // it stays inside the deadline so the caller gets this answer, not its own client's timeout
-      const previous = previousRunnerOf(c.var.db, id, c.var.principal);
+      const previous = previousRunnerOf(
+        c.var.db,
+        id,
+        c.var.principal,
+        Date.now(),
+      );
       if (previous) {
         let runner: LingeringRunner;
         try {
@@ -495,6 +517,7 @@ export function agentRoutes(
             previous.spriteName,
             previous.runId,
             preLaunchDeadlineMs,
+            previous.maySignal,
           );
         } catch (err) {
           log(`waiting for the runner of ${previous.runId} failed: ${err}`);
@@ -755,7 +778,12 @@ export function agentRoutes(
             ["sh", "-c", DIFF, "sh", base, agent.branch],
             { op: "diff", cwd: REPO_DIR },
           );
-          // nonzero: the runner never created the branch (a launch that failed, a runner killed first)
+          // 3: the runner never created the branch (a launch that failed, a runner killed first)
+          if (out.exitCode !== 0 && out.exitCode !== 3) {
+            log(
+              `diff of ${run.id} (agent ${agent.id}) exited ${out.exitCode}; answered without one`,
+            );
+          }
           if (out.exitCode === 0) {
             // the worktree's files are Claude's to write, and it can write what it read from its env
             diff = redact(out.stdout, [

@@ -224,25 +224,30 @@ export async function awaitRunnerExit(
 }
 
 // a runner a stop or a failure already signalled normally exits within this on its own; a second
-// SIGTERM kills a runner at once, so only one still alive after it is signalled again
+// SIGTERM kills a runner at once, so only the caller knowing it wedged signals one still alive.
+// Together under the 20 s pre-launch deadline: each wait checks once more after its last sleep
 const QUIET_WAIT_S = 5;
-const TERM_WAIT_S = 10;
-// $1 and $2 the seconds each wait lasts, $3 the pattern. Exits 0 once nothing matches, 3 when
-// that took the SIGTERM, 1 while a runner still lives; pgrep's own errors exit 2
-const STOP_LINGERING = `gone() { for _ in $(seq "$1"); do pgrep -f "$2" >/dev/null; case $? in 1) return 0;; 0) sleep 1;; *) exit 2;; esac; done; return 1; }; gone "$1" "$3" && exit 0; pkill -TERM -f "$3"; gone "$2" "$3" && exit 3; exit 1`;
+const TERM_WAIT_S = 9;
+// $0 `term` or `wait`, $1 and $2 the seconds each wait lasts, $3 the pattern. Under `term` a runner
+// still alive after the first wait is SIGTERMed; under `wait` the second wait only waits. Exits 0
+// once nothing matches, 3 when that took the SIGTERM, 1 while a runner still lives; pgrep's own
+// errors exit 2
+export const STOP_LINGERING = `gone() { for _ in $(seq "$1"); do pgrep -f "$2" >/dev/null; case $? in 1) return 0;; 0) sleep 1;; *) exit 2;; esac; done; pgrep -f "$2" >/dev/null; case $? in 1) return 0;; 0) return 1;; *) exit 2;; esac; }; gone "$1" "$3" && exit 0; if [ "$0" != term ]; then gone "$2" "$3" && exit 0; exit 1; fi; pkill -TERM -f "$3"; gone "$2" "$3" && exit 3; exit 1`;
 
 export type LingeringRunner = "gone" | "terminated" | "alive";
 
 /**
  * Leaves no runner of the run, an ended one's, alive on its sprite: gives it a few seconds to exit,
- * SIGTERMs it, then gives it time to commit and exit. One exec, bounded by `deadlineMs`, which
- * must cover both waits. Throws when the sprite can't answer in time.
+ * SIGTERMs it when `maySignal`, then gives it time to commit and exit. Without `maySignal` both
+ * waits only wait, for a runner something already signalled. One exec, bounded by `deadlineMs`,
+ * which must cover both waits. Throws when the sprite can't answer in time.
  */
 export async function stopLingeringRunner(
   sprites: SpriteOps,
   spriteName: string,
   runId: RunId,
   deadlineMs: number,
+  maySignal: boolean,
 ): Promise<LingeringRunner> {
   const out = await execInSprite(
     sprites,
@@ -251,7 +256,7 @@ export async function stopLingeringRunner(
       "bash",
       "-c",
       STOP_LINGERING,
-      "_",
+      maySignal ? "term" : "wait",
       String(QUIET_WAIT_S),
       String(TERM_WAIT_S),
       runnerPattern(runId),
@@ -886,7 +891,7 @@ export function createLauncher({
             [...secrets.values(), agentToken],
           );
           log(`launching ${launch.runId} failed: ${detail}`);
-          db.transaction(
+          const ended = db.transaction(
             (tx) =>
               failRun(
                 tx,
@@ -900,8 +905,9 @@ export function createLauncher({
             { behavior: "immediate" },
           );
           nudgeDeliveries();
-          // best effort, not awaited: a sprite that can't be reached is logged by `signalRunner`
-          if (maybeStarted.delete(launch.runId)) {
+          // best effort, not awaited: a sprite that can't be reached is logged by `signalRunner`.
+          // A run something else already ended had its runner signalled there; a second SIGTERM kills it
+          if (maybeStarted.delete(launch.runId) && ended) {
             void signalRunner(sprites, launch.spriteName, launch.runId, log);
           }
         })
