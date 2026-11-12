@@ -603,11 +603,13 @@ async function forkPoint(
  * and body. Claude
  * Code's attribution is stripped from each commit message and the pull request's body, never its
  * title. The base is first refreshed to GitHub's current head, with the branch's commits rebased
- * onto it when it moved (`refreshBase`). That rebase flattens a merge: the merge commit is dropped
- * and the commits it brought in are replayed one by one. Where the base hasn't moved, first-parent
+ * onto it when it moved (`refreshBase`), unless the branch is a continued one. That rebase flattens
+ * a merge: the merge commit is dropped and the commits it brought in that the base lacks are
+ * replayed one by one. Where the base hasn't moved, first-parent
  * history is replayed and a merge commit is sent with its other parents as they are, so a merge of
  * the base leaves the base an ancestor of the published head; a merge of a commit GitHub doesn't
- * hold is refused before anything is sent. A branch on GitHub whose head this branch held before a
+ * hold, or one whose `.github/workflows/` would be sent without its merged-in changes there, is
+ * refused before anything is sent. A branch on GitHub whose head this branch held before a
  * rebase or amend here is force-updated to the rewritten history; one holding a commit neither this
  * branch nor the base has
  * is refused before anything is sent, and the GitHub branch a continued agent works on is only ever
@@ -988,6 +990,17 @@ export async function publish(options: {
       if (!(await found)) {
         throw new PublishError(
           `commit ${sha} on ${localBranch} merges ${other}, which GitHub doesn't have (as from a branch made only here), and publish sends a merge only with parents GitHub already holds, so nothing was sent; merge only branches GitHub has, or replace the merge with its commits: \`git rebase ${mergeBase}\` replays them onto this branch's own, then publish again`,
+        );
+      }
+      // the merge goes out with the baseline's workflows, so one whose own differ, merging a parent
+      // whose differ too, would make that parent an ancestor without its workflow changes, which the
+      // pull request then shows as undone; a merge whose own are the baseline's is sent as it is
+      if (
+        (await workflowsOf(other)) !== baseline &&
+        (await workflowsOf(sha)) !== baseline
+      ) {
+        throw new PublishError(
+          `commit ${sha} on ${localBranch} merges ${other}, and the merge's ${WORKFLOWS_DIR}/ differs from the one publish can send, which is the one GitHub already has since the connector can't write there: sent, it would make ${other} an ancestor without its workflow changes, so the pull request would show them as undone, and nothing was sent; have someone merge ${base} into ${remoteBranch} from outside the sandbox, then publish again${continued && remoteBranch === continued ? "" : ", or rebase instead of merging"}`,
         );
       }
     }
