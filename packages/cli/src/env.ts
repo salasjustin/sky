@@ -36,6 +36,28 @@ function filteringWebhookIds(err: unknown): string[] | undefined {
     : undefined;
 }
 
+/**
+ * `--pool`'s value: undefined when not given, null for `all` (every subscription the server holds),
+ * else the names, in order.
+ */
+function parsePool(value: string | undefined): string[] | null | undefined {
+  if (value === undefined) return undefined;
+  const names = value
+    .split(",")
+    .map((n) => n.trim())
+    .filter((n) => n !== "");
+  if (names.length === 0) {
+    throw new UsageError("--pool names no subscription", true);
+  }
+  if (names.includes("all")) {
+    if (names.length > 1) {
+      throw new UsageError("--pool=all stands alone", true);
+    }
+    return null;
+  }
+  return names;
+}
+
 /** The claude assignment `env show` and `env set-claude` print: names only. */
 const claudeLine = (env: ApiEnvironment) =>
   `claude credential: ${env.claudeCredential ?? "default"}${env.claudePool ? ` [${env.claudePool.join(", ")}]` : ""} (fallback: ${env.claudeFallback})`;
@@ -156,16 +178,8 @@ export const env: AgentCommand = {
       if (values.pool !== undefined && credential !== "pool") {
         throw new UsageError("--pool goes with the credential pool", true);
       }
-      const poolNames =
-        values.pool === undefined
-          ? undefined
-          : values.pool
-              .split(",")
-              .map((n) => n.trim())
-              .filter((n) => n !== "");
-      if (poolNames && poolNames.length === 0) {
-        throw new UsageError("--pool names no subscription", true);
-      }
+      // undefined leaves the pool's list as it is, `all` (null) resets it to every subscription
+      const poolNames = parsePool(values.pool);
       const fallback =
         values.fallback === undefined
           ? undefined
@@ -178,8 +192,8 @@ export const env: AgentCommand = {
         if (envId === undefined) return 1;
         const { raw, env } = await api.patchEnvironment(envId, {
           claudeCredential: credential === "default" ? null : credential,
-          // a pool with no list is every subscription the server holds
-          ...(credential === "pool" && { claudePool: poolNames ?? null }),
+          // only --pool changes the list: --fallback alone must not widen an ordered pool
+          ...(poolNames !== undefined && { claudePool: poolNames }),
           ...(fallback?.success && { claudeFallback: fallback.data }),
         });
         out.result(raw, `${envLine(env)}\n${claudeLine(env)}`);

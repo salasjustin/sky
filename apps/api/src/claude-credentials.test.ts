@@ -39,8 +39,34 @@ const WORK_TOKEN = "work-subscription-opaque-3";
 const API_KEY = "anthropic-api-key-opaque-4";
 const ALL_VALUES = [DEFAULT_TOKEN, PERSONAL_TOKEN, WORK_TOKEN, API_KEY];
 
+const MONTH_NAMES = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
+/**
+ * A weekly-limit message whose reset is `days` days and `hour` o'clock (UTC) ahead of the real now,
+ * with that instant: always inside the week a reset is held to, whatever day the suite runs.
+ */
+function weeklyLimit(days = 3, hour = 10) {
+  const at = new Date(Date.now() + days * 86_400_000);
+  at.setUTCHours(hour, 0, 0, 0);
+  const text = `You've hit your weekly limit · resets ${MONTH_NAMES[at.getUTCMonth()]} ${at.getUTCDate()}, ${hour}am (UTC)`;
+  return { text, at: at.toISOString() };
+}
+
 const FIVE_HOUR = "You've hit your 5-hour limit · resets 10:20am (UTC)";
-const WEEKLY = "You've hit your weekly limit · resets Dec 30, 10am (UTC)";
+const WEEKLY = weeklyLimit().text;
 
 let dir: string;
 let db: Db;
@@ -204,7 +230,11 @@ test.each([
     "5-hour",
     "2026-11-13T08:00:00.000Z",
   ],
-  [WEEKLY, "weekly", "2026-12-30T10:00:00.000Z"],
+  [
+    "You've hit your weekly limit · resets Nov 15, 10am (UTC)",
+    "weekly",
+    "2026-11-15T10:00:00.000Z",
+  ],
   [
     "You've hit your weekly limit · resets Nov 15 at 3:30pm (UTC)",
     "weekly",
@@ -523,6 +553,15 @@ test("a limit message with no readable reset holds the subscription for a short 
   const until = limitedUntil(db, "personal")?.getTime() ?? 0;
   expect(until).toBeGreaterThanOrEqual(before + 15 * 60_000 - 1_000);
   expect(until).toBeLessThanOrEqual(Date.now() + 15 * 60_000);
+});
+
+test("a weekly limit whose date is past a week out is held at a week, not at that date", () => {
+  expect(
+    parseUsageLimit(
+      "You've hit your weekly limit · resets Dec 30, 10am (UTC)",
+      NOW,
+    )?.resetsAt?.toISOString(),
+  ).toBe(new Date(NOW.getTime() + MAX_RESET_MS).toISOString());
 });
 
 test("a limit message naming a reset past a week holds the subscription a week at most", async () => {

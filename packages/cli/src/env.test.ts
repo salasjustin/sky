@@ -542,7 +542,7 @@ test("env set-claude pool sets the pool, with --pool its subscriptions in order"
     "--pool=work, personal",
   ]);
   expect(bodies).toEqual([
-    { claudeCredential: "pool", claudePool: null },
+    { claudeCredential: "pool" },
     { claudeCredential: "pool", claudePool: ["work", "personal"] },
   ]);
   expect(r.stdout).toContain("claude credential: pool [work, personal]");
@@ -552,4 +552,78 @@ test("--pool goes only with the pool credential", async () => {
   const r = await runCli(["env", "set-claude", "web", "personal", "--pool=a"]);
   expect(r.code).toBe(2);
   expect(r.stderr).toMatch(/--pool goes with the credential pool/);
+});
+
+test("env set-claude pool --fallback=none leaves an ordered pool as it is", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(
+        claudeAssignment({
+          claudeCredential: "pool",
+          claudePool: ["work", "personal"],
+          claudeFallback: "none",
+        }),
+      );
+    }),
+  );
+  const r = await runCli([
+    "env",
+    "set-claude",
+    "web",
+    "pool",
+    "--fallback=none",
+  ]);
+  expect(r.code).toBe(0);
+  // no claudePool key: the server keeps the list
+  expect(bodies).toEqual([
+    { claudeCredential: "pool", claudeFallback: "none" },
+  ]);
+  expect(r.stdout).toContain("pool [work, personal] (fallback: none)");
+});
+
+test("env set-claude pool --pool=all resets the pool to every subscription", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(
+        claudeAssignment({ claudeCredential: "pool", claudePool: null }),
+      );
+    }),
+  );
+  expect(
+    (await runCli(["env", "set-claude", "web", "pool", "--pool=all"])).code,
+  ).toBe(0);
+  expect(bodies).toEqual([{ claudeCredential: "pool", claudePool: null }]);
+});
+
+test("--pool=all stands alone", async () => {
+  const r = await runCli([
+    "env",
+    "set-claude",
+    "web",
+    "pool",
+    "--pool=all,work",
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toMatch(/--pool=all stands alone/);
+});
+
+test("--fallback alone on a non-pool credential sends no pool either", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(claudeAssignment());
+    }),
+  );
+  await runCli(["env", "set-claude", "web", "personal", "--fallback=none"]);
+  expect(bodies).toEqual([
+    { claudeCredential: "personal", claudeFallback: "none" },
+  ]);
 });

@@ -23,6 +23,17 @@ const {
   claudeFallback,
 } = Environment.shape;
 
+/**
+ * The Claude fields have no default here, unlike in the API: a file that omits them leaves the
+ * environment's as they are, so `sky apply` never undoes `sky env set-claude`. Only a field the file
+ * names changes anything.
+ */
+const optionalClaude = {
+  claudeCredential: claudeCredential.unwrap().optional(),
+  claudePool: claudePool.unwrap().optional(),
+  claudeFallback: claudeFallback.unwrap().optional(),
+};
+
 /** What `env.yaml` holds; the API's create body, so the API URL and key can't be smuggled in. */
 export const EnvSpec = z.strictObject({
   name,
@@ -32,9 +43,7 @@ export const EnvSpec = z.strictObject({
   concurrency,
   approvalPolicy,
   autoApprove,
-  claudeCredential,
-  claudePool,
-  claudeFallback,
+  ...optionalClaude,
 });
 export type EnvSpec = z.infer<typeof EnvSpec>;
 

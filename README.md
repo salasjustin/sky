@@ -98,9 +98,12 @@ approvalPolicy: [Bash] # tool names whose calls wait for your approval
 autoApprove: # optional: Bash commands that skip approvalPolicy
   defaults: true # false drops the built-in list
   commands: [make check] # added to the built-ins (or all there is, with defaults: false)
-claudeCredential: personal # optional: which Claude credential runs use (see Claude credentials); omit for the default token
-claudeFallback: api-key # api-key (default) or none: what a run does while its subscription is at its limit
+claudeCredential: personal # optional: which Claude credential runs use (see Claude credentials)
+claudePool: [work, personal] # optional, with claudeCredential: pool: the subscriptions it may use, in order
+claudeFallback: api-key # optional: api-key or none, what a run does while its subscription is at its limit
 ```
+
+The Claude fields are optional and leave an environment's as they are when omitted, so `sky apply` never undoes a `sky env set-claude`: only the fields the file names change anything. A new environment gets the defaults (the default token, every subscription if it is a pool, `api-key`).
 
 `setup` runs in the clone with bash, with pnpm and yarn on `PATH` and `SKY_CLAUDE` set to the `claude` binary agents run. After it, Sky installs the plugins the repo's `.claude/settings.json` enables in `enabledPlugins`, from the marketplaces its `extraKnownMarketplaces` declares. If a plugin comes from a marketplace that isn't declared there, add the marketplace in `setup`:
 
@@ -178,7 +181,7 @@ If the message gives no reset time Sky can read, it holds the limit for 15 minut
 
 #### Opt-in subscription pool
 
-`claudeCredential: pool` lets one environment spread its runs over several subscriptions. It is the only assignment that does, and nothing is a pool until you set it. `claudePool: [work, personal]` (`sky env set-claude <env> pool --pool=work,personal`) lists the subscriptions it may use, in failover order; without a list the pool is every subscription the server holds, the default included.
+`claudeCredential: pool` lets one environment spread its runs over several subscriptions. It is the only assignment that does, and nothing is a pool until you set it. `claudePool: [work, personal]` (`sky env set-claude <env> pool --pool=work,personal`) lists the subscriptions it may use, in failover order; without a list the pool is every subscription the server holds, the default included. `sky env set-claude` changes the list only when `--pool` is given, so `--fallback=none` alone leaves an ordered pool as it is; `--pool=all` resets it to every subscription.
 
 - **Usage.** For each subscription Sky keeps its last-seen 5-hour and 7-day usage and their reset times, read from the `anthropic-ratelimit-unified-*` headers of a one-token probe (`POST /v1/messages` on the cheapest model, with the Claude Code system prompt and the OAuth beta header). A pool launch probes the subscriptions whose reading is older than 5 minutes, one probe at a time per subscription and never more often than that, and stores the readings, so a restart keeps them. A probe that fails is logged by name and never fails the launch. A subscription the probe finds full is marked limited until that window resets. One the probe gets a `429` for with no window full is marked limited until the earliest reset the answer gives. Either is held 15 minutes when the answer gives no reset. A subscription whose token is refused (`401` or `403`) is logged by name, nothing is stored for it, and pool launches leave it out for 5 minutes. No reset is held further than 7 days ahead, from a probe or a limit message.
 - **Pick.** A pool launch runs on the subscription in the pool that isn't limited and has the most headroom: the lowest of the larger of its 5-hour and 7-day use, a window already past its reset counting as unused. Ties go to the earlier in the list, and a subscription that was never probed, or whose last probe failed, ranks after those that answered.

@@ -41,8 +41,34 @@ const PERSONAL_TOKEN = "personal-subscription-opaque-2";
 const WORK_TOKEN = "work-subscription-opaque-3";
 const API_KEY = "anthropic-api-key-opaque-4";
 
+const MONTH_NAMES = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
+/**
+ * A weekly-limit message whose reset is `days` days and `hour` o'clock (UTC) ahead of the real now,
+ * with that instant: always inside the week a reset is held to, whatever day the suite runs.
+ */
+function weeklyLimit(days = 3, hour = 10) {
+  const at = new Date(Date.now() + days * 86_400_000);
+  at.setUTCHours(hour, 0, 0, 0);
+  const text = `You've hit your weekly limit · resets ${MONTH_NAMES[at.getUTCMonth()]} ${at.getUTCDate()}, ${hour}am (UTC)`;
+  return { text, at: at.toISOString() };
+}
+
 const FIVE_HOUR = "You've hit your 5-hour limit · resets 10:20am (UTC)";
-const WEEKLY = "You've hit your weekly limit · resets Dec 30, 10am (UTC)";
+const WEEKLY = weeklyLimit().text;
 
 /** A reset left out falls a few hours or days ahead; null sends none. The status is 200 unless given. */
 type Reading = {
@@ -282,13 +308,13 @@ test("usage is read from the unified rate-limit headers, resets as epoch seconds
       "anthropic-ratelimit-unified-5h-utilization": "0.25",
       "anthropic-ratelimit-unified-5h-reset": "1794484800",
       "anthropic-ratelimit-unified-7d-utilization": "0.5",
-      "anthropic-ratelimit-unified-7d-reset": "2026-11-20T00:00:00Z",
+      "anthropic-ratelimit-unified-7d-reset": "2026-11-18T00:00:00Z",
     }),
     new Date("2026-11-12T08:00:00Z"),
   );
   expect(usage).toEqual({
     fiveHour: { utilization: 0.25, resetsAt: "2026-11-12T12:00:00.000Z" },
-    sevenDay: { utilization: 0.5, resetsAt: "2026-11-20T00:00:00.000Z" },
+    sevenDay: { utilization: 0.5, resetsAt: "2026-11-18T00:00:00.000Z" },
     probedAt: "2026-11-12T08:00:00.000Z",
   });
   expect(parseUsageHeaders(new Headers({ "content-type": "x" }))).toBeNull();
@@ -596,7 +622,8 @@ test("with no API key, the end of the pool is the failed run noting the earliest
   readings[WORK_TOKEN] = { h5: 0.2, d7: 0.2 };
   const env = poolEnv(["personal", "work"]);
   const r1 = await launchedRun(env);
-  await failWith(r1, "You've hit your 5-hour limit · resets Dec 29, 9am (UTC)");
+  const soon = weeklyLimit(2, 9);
+  await failWith(r1, soon.text);
   await sessionOpened(2);
   const second = String(wire.sessions[1]?.env.RUN_ID);
   await postEvent(envFileOf(wire, wire.sessions[1]).AGENT_TOKEN, {
@@ -607,7 +634,7 @@ test("with no API key, the end of the pool is the failed run noting the earliest
   await vi.waitFor(() => expect(warningsOf(second)).toHaveLength(1));
   const [warning] = warningsOf(second);
   expect(warning).toContain("pool is at its usage limit");
-  expect(warning).toMatch(/earliest resets \d{4}-12-29T09:00:00\.000Z \(UTC\)/);
+  expect(warning).toContain(`earliest resets ${soon.at} (UTC)`);
   expect(wire.sessions).toHaveLength(2);
 });
 
@@ -1003,4 +1030,22 @@ test("a subscription already tried in a run's chain is not tried again, even onc
   );
   await sessionOpened(3);
   expect(credentialsUsed()).toEqual(["personal", "work", "api-key"]);
+});
+
+test("a patch that doesn't name claudePool leaves an ordered pool's list as it is", async () => {
+  const id = poolEnv(["work", "personal"]);
+  for (const patch of [
+    { claudeFallback: "none" },
+    { claudeCredential: "pool", claudeFallback: "api-key" },
+  ]) {
+    const res = await call(admin, "PATCH", `/v1/environments/${id}`, patch);
+    expect(await res.json()).toMatchObject({
+      claudeCredential: "pool",
+      claudePool: ["work", "personal"],
+    });
+  }
+  const reset = await call(admin, "PATCH", `/v1/environments/${id}`, {
+    claudePool: null,
+  });
+  expect(await reset.json()).toMatchObject({ claudePool: null });
 });
