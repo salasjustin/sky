@@ -2424,16 +2424,20 @@ test("an octopus merge of commits GitHub holds keeps every parent, in order", as
   const gh = fakeGitHub();
   // another branch's head on GitHub
   const other = nextBase({ "x.txt": "from another branch\n" });
+  const lookedUp: string[] = [];
   server.use(
-    http.get(`${REPO}/git/commits/${other}`, () =>
-      HttpResponse.json(apiCommit(other)),
-    ),
+    http.get(`${REPO}/git/commits/${other}`, () => {
+      lookedUp.push(other);
+      return HttpResponse.json(apiCommit(other));
+    }),
   );
   const base = baseMoves({ "b.txt": "from main\n" });
   merge(base, other);
 
   await run();
 
+  // the parent is looked up on GitHub by its own sha, not assumed held
+  expect(lookedUp).toEqual([other]);
   expect(gh.commits.map((c) => c.parents)).toEqual([
     [base],
     ["commit1", base, other],
@@ -2462,6 +2466,49 @@ test("a merge of a branch only this clone has is refused, naming the merge, befo
   expect(String(error)).toMatch(
     /merge only branches GitHub has, or replace the merge with its commits: `git rebase [0-9a-f]{40}`/,
   );
+  expectNothingSent(gh);
+});
+
+test("a GitHub error other than not-found on a merge's parent lookup is raised as it is, not read as the parent missing", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const gh = fakeGitHub();
+  const other = nextBase({ "x.txt": "from another branch\n" });
+  server.use(
+    http.get(`${REPO}/git/commits/${other}`, () =>
+      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+    ),
+  );
+  merge(other);
+
+  const error = await run().catch((e: unknown) => e);
+
+  expect(String(error)).toContain(
+    `GET /repos/acme/widgets/git/commits/${other} returned 500: Server Error`,
+  );
+  expect(String(error)).not.toContain("doesn't have");
+  expectNothingSent(gh);
+});
+
+test("an octopus merge with one parent GitHub holds and one it doesn't is refused, naming the missing one, before anything is sent", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const gh = fakeGitHub();
+  const held = nextBase({ "x.txt": "on GitHub\n" });
+  const missing = nextBase({ "y.txt": "only here\n" });
+  server.use(
+    http.get(`${REPO}/git/commits/${held}`, () =>
+      HttpResponse.json(apiCommit(held)),
+    ),
+  );
+  const merged = merge(held, missing);
+
+  const error = await run().catch((e: unknown) => e);
+
+  expect(String(error)).toContain(
+    `commit ${merged} on claude/agt_1 merges ${missing}, which GitHub doesn't have`,
+  );
+  expect(String(error)).not.toContain(`merges ${held}`);
   expectNothingSent(gh);
 });
 
@@ -2502,9 +2549,13 @@ test("a merge whose only change past its first parent is under .github/workflows
   const base = baseMoves({ ".github/workflows/ci.yml": "name: ci v2\n" });
   merge(base);
 
-  await run();
+  const result = await run();
 
   expect(gh.commits.map((c) => c.parents)).toEqual([[base], ["commit1", base]]);
+  // the base's newer workflow is GitHub's already and the connector can't write it, so it isn't sent
+  expect(treePaths(gh)).not.toContain(".github/workflows/ci.yml");
+  // the merged tree's ci.yml differs from the baseline's, so it is reported as held
+  expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
 });
 
 test("a branch already on GitHub that merges a base which since changed a workflow is refused before anything is sent", async () => {
