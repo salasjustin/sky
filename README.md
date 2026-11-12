@@ -44,7 +44,7 @@ A `runs` key, within the environments on its list:
 - is refused with `403 forbidden` on environment create, update, delete and retry, every secret route, and the key routes;
 - gets `404 not_found` for an environment not on its list and for any agent that isn't its own, so it can't probe ids.
 
-**Ownership.** Every agent records the key that started it; one started with the admin key is admin-owned. A `runs` key only ever sees and acts on its own agents, including in `GET /v1/events`, `GET /v1/stream` and through `/mcp`. The admin key sees and acts on all of them.
+**Ownership.** Every agent records the key that started it; one started with the admin key is admin-owned, as is every agent created before keys existed. A `runs` key only ever sees and acts on its own agents, including in `GET /v1/events`, `GET /v1/stream` and through `/mcp`. The admin key sees and acts on all of them.
 
 **The environment is the boundary inside the sprite.** These limits hold at the API. Every agent of an environment runs on its one sprite as the same user, so an agent a `runs` key starts can read what that sprite holds: the environment's secrets, the Claude login, and the files, variables and agent tokens of other agents running there. A prompt asking for them is enough. Put an environment on a key's list only when you'd hand that system the environment's secrets; for a system you trust less, give it an environment of its own.
 
