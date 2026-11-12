@@ -52,7 +52,7 @@ test("key create resolves env names to ids and prints the id and secret once on 
   ]);
   expect(r.stdout).toBe(`key_1 ${secret}\n`);
   expect(r.stderr).not.toContain(secret);
-  expect(r.stderr).toMatch(/only now/);
+  expect(r.stderr).toMatch(/can.t be shown again/);
 });
 
 test("a repeated --env adds to the comma list instead of replacing it", async () => {
