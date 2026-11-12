@@ -20,7 +20,6 @@ import {
   MAX_RESET_MS,
   markLimited,
   parseUsageLimit,
-  UNKNOWN_RESET_MS,
 } from "./claude-credentials.js";
 import type { Config } from "./config.js";
 import { KnownSecrets } from "./redact.js";
@@ -171,6 +170,13 @@ async function failWith(
   expect(res.status).toBe(201);
 }
 
+/**
+ * How many times a failed run's retry has asked its sprite whether the runner exited. A failure's
+ * request makes that call before it answers, so a retry that should not happen shows here at once.
+ */
+const exitWaits = () =>
+  logs.filter((line) => line.includes("await-exit: start")).length;
+
 /** The error the API stored on a failed run. */
 const failureOf = (runId: string) => {
   const row = db
@@ -304,6 +310,8 @@ test("a limit error marks that subscription limited until its reset and retries 
   await failWith(r, FIVE_HOUR);
 
   await sessionOpened(2);
+  // the signal the no-retry tests read is live: a real retry raises it
+  expect(exitWaits()).toBe(1);
   const retry = wire.sessions[1];
   const file = envFileOf(wire, retry);
   expect(file).toMatchObject({
@@ -340,12 +348,13 @@ test("the retry is one: a limit on the API-key run is not retried, and no other 
 
   // the key's own run reports a limit-shaped failure: it is not a subscription's, so nothing is marked or retried
   const retryToken = envFileOf(wire, retry).AGENT_TOKEN;
+  expect(exitWaits()).toBe(1);
   await postEvent(retryToken, {
     runId: retry?.env.RUN_ID,
     type: "run.failed",
     payload: { error: FIVE_HOUR },
   });
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(exitWaits()).toBe(1);
   expect(wire.sessions).toHaveLength(2);
   expect(limitedUntil(db, "api-key")).toBeUndefined();
   expect(limitedUntil(db, "default")).toBeUndefined();
@@ -433,7 +442,7 @@ test("claudeFallback none: a run that hits its limit is not retried on the key",
   });
   const r = await launchedRun(personal);
   await failWith(r, FIVE_HOUR);
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(exitWaits()).toBe(0);
   expect(wire.sessions).toHaveLength(1);
   // the limit is still recorded, so the next launch names the reset time
   expect(limitedUntil(db, "personal")).toBeDefined();
@@ -443,9 +452,67 @@ test("with no API key set, a run that hits its limit is marked, not retried", as
   buildApp({ anthropicApiKey: undefined });
   const r = await launchedRun(readyEnv({ claudeCredential: "personal" }));
   await failWith(r, FIVE_HOUR);
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(exitWaits()).toBe(0);
   expect(wire.sessions).toHaveLength(1);
   expect(limitedUntil(db, "personal")).toBeDefined();
+});
+
+test("an unassigned environment that hits its limit marks the default token and retries once on the API key, never on another subscription", async () => {
+  const r = await launchedRun(readyEnv());
+  expect(r.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(DEFAULT_TOKEN);
+  await failWith(r, FIVE_HOUR);
+  await sessionOpened(2);
+
+  expect(exitWaits()).toBe(1);
+  expect(limitedUntil(db, "default")).toBeDefined();
+  expect(limitedUntil(db, "personal")).toBeUndefined();
+  expect(limitedUntil(db, "work")).toBeUndefined();
+  const retry = wire.sessions[1];
+  const file = envFileOf(wire, retry);
+  expect(file).toMatchObject({
+    SKY_CLAUDE_AUTH: "api-key",
+    SKY_CLAUDE_API_KEY: API_KEY,
+  });
+  expect(runRow(String(retry?.env.RUN_ID))).toMatchObject({
+    claudeCredential: "api-key",
+    retryOf: r.run.id,
+  });
+  // an unassigned environment is no pool: no probe is made either, as the test server refuses an unanswered request
+  for (const session of wire.sessions) {
+    const text = JSON.stringify(envFileOf(wire, session));
+    expect(text).not.toContain(PERSONAL_TOKEN);
+    expect(text).not.toContain(WORK_TOKEN);
+  }
+});
+
+test("while the default token is limited, a launch in an unassigned environment goes to the API key", async () => {
+  markLimited(db, "default", new Date(Date.now() + 3_600_000));
+  const r = await launchedRun(readyEnv());
+  expect(r.file).toMatchObject({
+    SKY_CLAUDE_AUTH: "api-key",
+    SKY_CLAUDE_API_KEY: API_KEY,
+  });
+  expect(JSON.stringify(r.file)).not.toContain(DEFAULT_TOKEN);
+  expect(JSON.stringify(r.file)).not.toContain(PERSONAL_TOKEN);
+  expect(JSON.stringify(r.file)).not.toContain(WORK_TOKEN);
+  expect(runRow(r.run.id)?.claudeCredential).toBe("api-key");
+
+  // the limit is the default token's alone: an environment assigned another subscription is untouched
+  const personal = await launchedRun(
+    readyEnv({ claudeCredential: "personal" }),
+  );
+  expect(personal.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(PERSONAL_TOKEN);
+});
+
+test("with no API key set, a limited default token fails an unassigned environment's launch at once", async () => {
+  buildApp({ anthropicApiKey: undefined });
+  const until = new Date(Date.now() + 3_600_000);
+  markLimited(db, "default", until);
+  const { run } = await launch(readyEnv());
+  await vi.waitFor(() => expect(runRow(run.id)?.status).toBe("failed"));
+  expect(failureOf(run.id)).toContain("claude_limited");
+  expect(failureOf(run.id)).toContain(until.toISOString());
+  expect(wire.sessions).toHaveLength(0);
 });
 
 test("a limit message with no readable reset holds the subscription for a short while", async () => {
@@ -454,8 +521,8 @@ test("a limit message with no readable reset holds the subscription for a short 
   await failWith(r, "You've hit your limit");
   await sessionOpened(2);
   const until = limitedUntil(db, "personal")?.getTime() ?? 0;
-  expect(until).toBeGreaterThanOrEqual(before + UNKNOWN_RESET_MS - 1_000);
-  expect(until).toBeLessThanOrEqual(Date.now() + UNKNOWN_RESET_MS);
+  expect(until).toBeGreaterThanOrEqual(before + 15 * 60_000 - 1_000);
+  expect(until).toBeLessThanOrEqual(Date.now() + 15 * 60_000);
 });
 
 test("a limit message naming a reset past a week holds the subscription a week at most", async () => {
@@ -511,6 +578,10 @@ test("no token or key appears in logs, events, run output or the credential list
     await (await call(admin, "GET", "/v1/claude-credentials")).text(),
     await (await call(admin, "GET", "/v1/environments")).text(),
   ].join("\n");
+  // the log was written: a line about this very failure is there to be searched
+  expect(logs.join("\n")).toContain(
+    "Claude credential personal is at its 5-hour usage limit",
+  );
   for (const value of ALL_VALUES) {
     expect(stored).not.toContain(value);
     expect(api).not.toContain(value);
@@ -643,6 +714,7 @@ test("a runs key can't change an environment's credential or fallback", async ()
     { claudeCredential: "work" },
     { claudeCredential: null },
     { claudeFallback: "none" },
+    { claudePool: ["work"] },
   ]) {
     const res = await call(key, "PATCH", `/v1/environments/${envId}`, body);
     expect(res.status).toBe(403);

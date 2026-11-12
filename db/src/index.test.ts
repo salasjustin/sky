@@ -244,11 +244,54 @@ test("migrating a populated 0000 file keeps every row, cascade children included
       t !== "claude_usage",
   );
   for (const table of atInit) expect([table, count(table)]).toEqual([table, 1]);
+  // the columns added since hold what an existing row should: the key as the fallback, nothing assigned
+  expect(
+    db.$client
+      .prepare(
+        "select claude_credential, claude_pool, claude_fallback from environments",
+      )
+      .get(),
+  ).toEqual({
+    claude_credential: null,
+    claude_pool: null,
+    claude_fallback: "api-key",
+  });
+  expect(
+    db.$client.prepare("select claude_credential, retry_of from runs").get(),
+  ).toEqual({ claude_credential: null, retry_of: null });
   const createdAt = db.$client
     .prepare("select created_at from environments")
     .pluck()
     .get();
   expect(createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+});
+
+test("the claude_limits and claude_usage timestamps reject any form but UTC ISO-8601", () => {
+  migrate(db);
+  const iso = "2026-11-12T10:20:00.000Z";
+  expect(() =>
+    run(
+      "insert into claude_limits (credential, limited_until) values ('personal', ?)",
+      iso,
+    ),
+  ).not.toThrow();
+  expect(() =>
+    run(
+      "insert into claude_usage (credential, probed_at) values ('personal', ?)",
+      iso,
+    ),
+  ).not.toThrow();
+  for (const bad of ["2026-11-12 10:20:00", "tomorrow"]) {
+    expect(() =>
+      run("update claude_limits set limited_until = ?", bad),
+    ).toThrow(/CHECK constraint failed/);
+    expect(() => run("update claude_limits set created_at = ?", bad)).toThrow(
+      /CHECK constraint failed/,
+    );
+    expect(() => run("update claude_usage set probed_at = ?", bad)).toThrow(
+      /CHECK constraint failed/,
+    );
+  }
 });
 
 test("environment failure columns accept the provisioning steps and stderr up to 4000 chars", () => {

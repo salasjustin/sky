@@ -17,17 +17,12 @@ import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
-import {
-  limitedUntil,
-  markLimited,
-  UNKNOWN_RESET_MS,
-} from "./claude-credentials.js";
+import { limitedUntil, markLimited } from "./claude-credentials.js";
 import { credentialsTried } from "./claude-pool.js";
 import {
   PROBE_MODEL,
   parseUsageHeaders,
   storedUsage,
-  USAGE_STALE_MS,
   usageScore,
 } from "./claude-usage.js";
 import { type Config, loadConfig } from "./config.js";
@@ -246,6 +241,13 @@ async function failWith(
   expect(res.status).toBe(201);
 }
 
+/**
+ * How many times a failed run's retry has asked its sprite whether the runner exited. A failure's
+ * request makes that call before it answers, so a retry that should not happen shows here at once.
+ */
+const exitWaits = () =>
+  logs.filter((line) => line.includes("await-exit: start")).length;
+
 /** The credential name each launched session was recorded on, oldest first. */
 const credentialsUsed = () =>
   wire.sessions.map((s) => runRow(String(s.env.RUN_ID))?.claudeCredential);
@@ -380,8 +382,24 @@ test("a subscription the probe finds full with no reset given is held for the un
   const r = await launchedRun(poolEnv());
   expect(r.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(PERSONAL_TOKEN);
   const until = limitedUntil(db, "default")?.getTime();
-  expect(until).toBeGreaterThanOrEqual(before + UNKNOWN_RESET_MS);
-  expect(until).toBeLessThanOrEqual(Date.now() + UNKNOWN_RESET_MS);
+  expect(until).toBeGreaterThanOrEqual(before + 15 * 60_000);
+  expect(until).toBeLessThanOrEqual(Date.now() + 15 * 60_000);
+});
+
+test("a subscription found full with no reset is not picked while the other members are limited: the pool goes to the API key", async () => {
+  readings[DEFAULT_TOKEN] = { h5: 1, h5Reset: null, d7: 0.2 };
+  markLimited(db, "personal", new Date(Date.now() + 3_600_000));
+  markLimited(db, "work", new Date(Date.now() + 3_600_000));
+  const r = await launchedRun(poolEnv(["personal", "work", "default"]));
+  // the one probe made found default full, which is what held it
+  expect(probes.map((p) => p.token)).toEqual([DEFAULT_TOKEN]);
+  expect(limitedUntil(db, "default")).toBeDefined();
+  expect(r.file).toMatchObject({
+    SKY_CLAUDE_AUTH: "api-key",
+    SKY_CLAUDE_API_KEY: API_KEY,
+  });
+  expect(JSON.stringify(r.file)).not.toContain(DEFAULT_TOKEN);
+  expect(runRow(r.run.id)?.claudeCredential).toBe("api-key");
 });
 
 test("a subscription whose probe is refused with a 429 and no window full is marked limited until its earliest reset", async () => {
@@ -433,7 +451,7 @@ test("usage newer than a few minutes is reused, and older is asked for again", a
   expect(probes).toHaveLength(2);
   db.update(claudeUsage)
     .set({
-      probedAt: new Date(Date.now() - USAGE_STALE_MS - 1_000).toISOString(),
+      probedAt: new Date(Date.now() - 5 * 60_000 - 1_000).toISOString(),
     })
     .run();
   await launchedRun(env);
@@ -465,7 +483,7 @@ test("a failed probe is not asked again for a few minutes, then is", async () =>
 
   vi.useFakeTimers({ toFake: ["Date"] });
   try {
-    vi.setSystemTime(Date.now() + USAGE_STALE_MS + 1_000);
+    vi.setSystemTime(Date.now() + 5 * 60_000 + 1_000);
     await launchedRun(env);
   } finally {
     vi.useRealTimers();
@@ -479,7 +497,7 @@ test("a subscription whose probe failed ranks as never probed, not by its older 
       credential: "personal",
       fiveHourUtilization: 0,
       sevenDayUtilization: 0,
-      probedAt: new Date(Date.now() - USAGE_STALE_MS - 1_000).toISOString(),
+      probedAt: new Date(Date.now() - 5 * 60_000 - 1_000).toISOString(),
     })
     .run();
   readings[PERSONAL_TOKEN] = "broken";
@@ -558,12 +576,14 @@ test("each subscription is tried once and the chain ends on the API key", async 
   expect(last).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
 
   // a limit-shaped failure of the key's own run goes nowhere
+  const waits = exitWaits();
+  expect(waits).toBe(2);
   await postEvent(last.AGENT_TOKEN, {
     runId: wire.sessions[2]?.env.RUN_ID,
     type: "run.failed",
     payload: { error: FIVE_HOUR },
   });
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(exitWaits()).toBe(waits);
   expect(wire.sessions).toHaveLength(3);
   expect(runRow(String(wire.sessions[2]?.env.RUN_ID))?.retryOf).toBe(
     wire.sessions[1]?.env.RUN_ID,
@@ -809,6 +829,14 @@ test("no token or key appears in the logs, events or API output of a pool run", 
   const api = await (
     await call(admin, "GET", `/v1/agents/${r.agent.id}/runs/${r.run.id}`)
   ).text();
+  // the log was written: lines about this very run are there to be searched
+  const logged = logs.join("\n");
+  expect(logged).toContain(
+    "probing the usage of Claude credential work failed",
+  );
+  expect(logged).toContain(
+    "Claude credential personal is at its 5-hour usage limit",
+  );
   for (const value of [PERSONAL_TOKEN, WORK_TOKEN, API_KEY, DEFAULT_TOKEN]) {
     expect(stored).not.toContain(value);
     expect(api).not.toContain(value);
@@ -846,6 +874,23 @@ test("a pool environment switched to its own subscription while a retry waits re
       .set({ claudeCredential: "default", claudePool: null })
       .where(eq(environments.id, env))
       .run(),
+  );
+  await failWith(r, FIVE_HOUR);
+  await sessionOpened(2);
+  expect(credentialsUsed()).toEqual(["personal", "default"]);
+  expect(JSON.stringify(envFileOf(wire, wire.sessions[1]))).not.toContain(
+    WORK_TOKEN,
+  );
+});
+
+test("a pool member marked limited while a retry waits is not retried on: the retry goes to the next one that isn't", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  readings[WORK_TOKEN] = { h5: 0.2, d7: 0.2 };
+  readings[DEFAULT_TOKEN] = { h5: 0.3, d7: 0.3 };
+  const env = poolEnv(["personal", "work", "default"]);
+  const r = await launchedRun(env);
+  duringRetryWait(r.run.id, () =>
+    markLimited(db, "work", new Date(Date.now() + 3_600_000)),
   );
   await failWith(r, FIVE_HOUR);
   await sessionOpened(2);

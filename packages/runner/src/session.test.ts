@@ -1204,12 +1204,14 @@ describe("the Claude credential of a run", () => {
 
   test("an API-key run: the Claude process holds Sky's key alone, with no subscription token", async () => {
     vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", undefined);
+    // a real token in the runner's env: the run chose the key, so the token must be left out
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
     vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
     const seen = await sessionSeen({ ...config, claudeAuth: "api-key" });
     const env = seen.options.env ?? {};
     expect(env.ANTHROPIC_API_KEY).toBe(SKY_KEY);
     expect(env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(JSON.stringify(env)).not.toContain(TOKEN);
     expect(env).not.toHaveProperty("SKY_CLAUDE_API_KEY");
     expect(JSON.stringify(env)).not.toContain(PROJECT_KEY);
   });

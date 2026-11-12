@@ -190,7 +190,15 @@ test("an API-key run needs SKY_CLAUDE_API_KEY, not the subscription token", () =
 });
 
 test("an unknown SKY_CLAUDE_AUTH is refused, naming the variable only", () => {
-  expect(() => loadConfig({ ...env, SKY_CLAUDE_AUTH: "other-secret" })).toThrow(
-    /SKY_CLAUDE_AUTH(?!.*other-secret)/,
-  );
+  const message = (() => {
+    try {
+      loadConfig({ ...env, SKY_CLAUDE_AUTH: "other-secret" });
+    } catch (e) {
+      return (e as Error).message;
+    }
+    return "";
+  })();
+  expect(message).toContain("SKY_CLAUDE_AUTH");
+  // anywhere in the message, before or after the name
+  expect(message).not.toContain("other-secret");
 });
