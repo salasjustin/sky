@@ -676,6 +676,81 @@ test("no token or key appears in the logs, events or API output of a pool run", 
   }
 });
 
+/** Runs `change` while the retry of `failedId` waits for that run's runner to exit. */
+function duringRetryWait(failedId: string, change: () => void) {
+  const exec = wire.exec;
+  wire.exec = (argv) => {
+    // awaitRunnerExit's `bash -c <script> _ <pattern naming the run>`
+    if (argv[0] === "bash" && argv[3] === "_" && argv[4]?.includes(failedId)) {
+      change();
+    }
+    return exec(argv);
+  };
+}
+
+const retryOf = (failedId: string) =>
+  db
+    .select()
+    .from(runs)
+    .where(eq(runs.retryOf, failedId as RunId))
+    .get();
+
+test("a pool environment switched to its own subscription while a retry waits retries on that one, not the next in the old pool", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  readings[WORK_TOKEN] = { h5: 0.2, d7: 0.2 };
+  const env = poolEnv(["personal", "work"]);
+  const r = await launchedRun(env);
+  duringRetryWait(r.run.id, () =>
+    db
+      .update(environments)
+      .set({ claudeCredential: "default", claudePool: null })
+      .where(eq(environments.id, env))
+      .run(),
+  );
+  await failWith(r, FIVE_HOUR);
+  await sessionOpened(2);
+  expect(credentialsUsed()).toEqual(["personal", "default"]);
+  expect(JSON.stringify(envFileOf(wire, wire.sessions[1]))).not.toContain(
+    WORK_TOKEN,
+  );
+});
+
+test("a pool environment whose pool drops the next subscription while a retry waits does not retry on it", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  readings[WORK_TOKEN] = { h5: 0.2, d7: 0.2 };
+  readings[DEFAULT_TOKEN] = { h5: 0.3, d7: 0.3 };
+  const env = poolEnv(["personal", "work"]);
+  const r = await launchedRun(env);
+  duringRetryWait(r.run.id, () =>
+    db
+      .update(environments)
+      .set({ claudePool: ["personal", "default"] })
+      .where(eq(environments.id, env))
+      .run(),
+  );
+  await failWith(r, FIVE_HOUR);
+  await sessionOpened(2);
+  expect(credentialsUsed()).toEqual(["personal", "default"]);
+});
+
+test("an environment whose API key fallback is turned off while a retry waits does not retry on the key", async () => {
+  const env = readyEnv({ claudeCredential: "personal" });
+  const r = await launchedRun(env);
+  duringRetryWait(r.run.id, () =>
+    db
+      .update(environments)
+      .set({ claudeFallback: "none" })
+      .where(eq(environments.id, env))
+      .run(),
+  );
+  await failWith(r, FIVE_HOUR);
+  // the retry is refused as a fresh launch would be: personal is limited and the key is off
+  await vi.waitFor(() => expect(retryOf(r.run.id)?.status).toBe("failed"));
+  const retry = retryOf(r.run.id);
+  expect(failureOf(String(retry?.id))).toContain("claude_limited");
+  expect(wire.sessions).toHaveLength(1);
+});
+
 test("a subscription already tried in a run's chain is not tried again, even once its limit has lifted", async () => {
   readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
   readings[WORK_TOKEN] = { h5: 0.2, d7: 0.2 };

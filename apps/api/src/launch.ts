@@ -16,6 +16,7 @@ import {
   apiKeyAuth,
   type ClaudeAuth,
   ClaudeCredentialError,
+  limitedUntil,
   markLimited,
   parseUsageLimit,
   resolveClaudeAuth,
@@ -287,7 +288,8 @@ export type Launch = {
   remoteBranch: string | null;
   /**
    * Set on a retry of a run that hit its subscription's usage limit: the credential it runs on, the
-   * API key or, in a pool environment, the next subscription, whatever the environment's assignment.
+   * API key or, in a pool environment, the next subscription. One the environment no longer allows
+   * when the retry launches is dropped, and the retry resolves as a fresh launch would.
    */
   forceCredential?: string;
 };
@@ -454,16 +456,33 @@ export function createLauncher({
     }, wakeAfterMs).unref();
   }
 
+  /**
+   * Whether a retry's credential, chosen before the wait for the failed runner, is still one the
+   * environment allows: the key while its fallback is on, a subscription while the environment is
+   * still a pool holding it and it isn't limited.
+   */
+  function retryCredentialAllowed(
+    credential: string,
+    env: NonNullable<ReturnType<typeof assignmentOf>>,
+  ): boolean {
+    if (credential === API_KEY_CREDENTIAL) return env.claudeFallback !== "none";
+    return (
+      env.claudeCredential === POOL_CREDENTIAL &&
+      poolMembers(config, env.claudePool).includes(credential) &&
+      limitedUntil(db, credential) === undefined
+    );
+  }
+
   /** The credential the launch runs on, by its environment's assignment; throws a `ClaudeCredentialError` when none is usable. */
   async function claudeAuthFor(launch: Launch): Promise<ClaudeAuth> {
-    if (launch.forceCredential === API_KEY_CREDENTIAL) {
-      return apiKeyAuth(config, "the retry");
-    }
-    if (launch.forceCredential) {
-      return subscriptionAuth(config, launch.forceCredential);
-    }
     const assignment = assignmentOf(launch.envId);
     if (!assignment) throw new Error(`environment ${launch.envId} is gone`);
+    const forced = launch.forceCredential;
+    if (forced && retryCredentialAllowed(forced, assignment)) {
+      return forced === API_KEY_CREDENTIAL
+        ? apiKeyAuth(config, "the retry")
+        : subscriptionAuth(config, forced);
+    }
     // only a pool environment's launch may land on a subscription it isn't assigned
     return assignment.claudeCredential === POOL_CREDENTIAL
       ? resolvePoolAuth({ db, config, usage }, assignment)
