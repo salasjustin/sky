@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { BaseProfiles } from "@sky/shared";
+import { BaseProfiles, DEFAULT_CLAUDE_CREDENTIAL } from "@sky/shared";
 import { z } from "zod";
 
 // the build copies the runner bundle next to the API bundle, which is where this module lands
@@ -78,7 +78,12 @@ export type Config = {
   spritesToken: string;
   dataDir: string;
   port: number;
+  /** The default credential, `CLAUDE_CODE_OAUTH_TOKEN`. */
   claudeOauthToken: string;
+  /** Named subscription tokens, `CLAUDE_OAUTH_TOKEN_<NAME>` by lowercased name; the default is not among them. */
+  claudeOauthTokens: Record<string, string>;
+  /** The pay-per-use fallback, `SKY_ANTHROPIC_API_KEY`; undefined when unset. */
+  anthropicApiKey: string | undefined;
   publicBaseUrl: string;
   runnerBundlePath: string;
   cliBundlePath: string;
@@ -94,6 +99,28 @@ export type Config = {
 };
 
 type Env = Record<string, string | undefined>;
+
+const NAMED_TOKEN = /^CLAUDE_OAUTH_TOKEN_(.+)$/;
+
+/**
+ * The named subscription tokens in `env`, by lowercased name, and the variables whose names can't be
+ * a credential's. Empty values are skipped: a secret set to nothing holds no credential.
+ */
+function namedClaudeTokens(env: Env) {
+  const tokens: Record<string, string> = {};
+  const invalid: string[] = [];
+  for (const [variable, value] of Object.entries(env)) {
+    const suffix = NAMED_TOKEN.exec(variable)?.[1];
+    if (suffix === undefined || !value) continue;
+    const name = suffix.toLowerCase();
+    if (!/^[a-z0-9_]{1,64}$/.test(name) || name === DEFAULT_CLAUDE_CREDENTIAL) {
+      invalid.push(variable);
+    } else {
+      tokens[name] = value;
+    }
+  }
+  return { tokens, invalid };
+}
 
 /**
  * A union no branch matched reports one issue at the union, "Invalid input"; its branches' own
@@ -115,7 +142,8 @@ export function loadConfig(
   env: Env,
 ): { ok: true; config: Config } | { ok: false; message: string } {
   const parsed = configSchema.safeParse(env);
-  if (parsed.success) {
+  const named = namedClaudeTokens(env);
+  if (parsed.success && named.invalid.length === 0) {
     const e = parsed.data;
     return {
       ok: true,
@@ -125,6 +153,8 @@ export function loadConfig(
         dataDir: e.DATA_DIR,
         port: e.PORT,
         claudeOauthToken: e.CLAUDE_CODE_OAUTH_TOKEN,
+        claudeOauthTokens: named.tokens,
+        anthropicApiKey: env.SKY_ANTHROPIC_API_KEY || undefined,
         publicBaseUrl: e.PUBLIC_BASE_URL,
         runnerBundlePath: e.RUNNER_BUNDLE_PATH,
         cliBundlePath: e.CLI_BUNDLE_PATH,
@@ -143,7 +173,7 @@ export function loadConfig(
     };
   }
   // zod's default issue messages describe the rule, never the input
-  const problems = parsed.error.issues
+  const problems = (parsed.success ? [] : parsed.error.issues)
     .flatMap(unionBranchIssues)
     .map((issue) => {
       const name = String(issue.path[0]);
@@ -153,5 +183,12 @@ export function loadConfig(
         ? `${name} is missing`
         : `${name}${field ? `.${field}` : ""} is invalid: ${issue.message}`;
     });
+  // a name is all that is said of a token variable; its value never is
+  problems.push(
+    ...named.invalid.map(
+      (variable) =>
+        `${variable} is invalid: a name is lowercase letters, digits and _ (up to 64), and not "default", which is CLAUDE_CODE_OAUTH_TOKEN`,
+    ),
+  );
   return { ok: false, message: `invalid config: ${problems.join("; ")}` };
 }

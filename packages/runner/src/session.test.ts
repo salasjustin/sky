@@ -57,6 +57,7 @@ beforeEach(() => {
     sessionId: undefined,
     apiBaseUrl: "https://api.test",
     agentToken: "agent-secret",
+    claudeAuth: "oauth",
     repoDir: join(root, "repo"),
     worktreesDir: join(root, "worktrees"),
     approvalPolicy: [],
@@ -1058,8 +1059,7 @@ test("without checks, the session is told nothing about them", async () => {
   }
 });
 
-test("a project's ANTHROPIC_API_KEY reaches the session's commands; AGENT_TOKEN never does", async () => {
-  vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-api-secret");
+test("AGENT_TOKEN never reaches the session", async () => {
   vi.stubEnv("AGENT_TOKEN", "agent-secret");
   try {
     const query = scripted([init, success]);
@@ -1069,12 +1069,194 @@ test("a project's ANTHROPIC_API_KEY reaches the session's commands; AGENT_TOKEN 
       signal: new AbortController().signal,
       awaitDecision: noDecision,
     });
-    const env = query.calls[0]?.options.env;
-    expect(env).toHaveProperty("ANTHROPIC_API_KEY", "sk-ant-api-secret");
-    expect(env).not.toHaveProperty("AGENT_TOKEN");
+    expect(query.calls[0]?.options.env).not.toHaveProperty("AGENT_TOKEN");
   } finally {
     vi.unstubAllEnvs();
   }
+});
+
+describe("the Claude credential of a run", () => {
+  const SKY_KEY = "sky-anthropic-key-opaque";
+  const PROJECT_KEY = "project-anthropic-key-opaque";
+  const TOKEN = "subscription-token-opaque";
+
+  type Seen = {
+    options: Options;
+    /** What a Bash command sees of ANTHROPIC_API_KEY, from sourcing the file Claude Code sources before each command. */
+    commandKey: string;
+    scriptPath: string | undefined;
+  };
+
+  /** Runs a session, and at its start runs the SessionStart hook the way Claude Code does. */
+  async function sessionSeen(
+    runConfig: Config,
+    result: unknown = success,
+  ): Promise<Seen> {
+    const seen: Partial<Seen> = {};
+    const query = scripted([
+      init,
+      (async (options: Options) => {
+        seen.options = options;
+        const command = (
+          options.settings as {
+            hooks?: {
+              SessionStart?: { hooks: { command: string }[] }[];
+            };
+          }
+        ).hooks?.SessionStart?.[0]?.hooks[0]?.command;
+        seen.scriptPath = command && /cat '([^']+)'/.exec(command)?.[1];
+        const envFile = join(root, "claude-env-file");
+        writeFileSync(envFile, "");
+        if (command) {
+          execFileSync("sh", ["-c", command], {
+            env: { ...process.env, CLAUDE_ENV_FILE: envFile },
+          });
+        }
+        // a command's shell: Claude's own env, with that file sourced first
+        seen.commandKey = execFileSync(
+          "sh",
+          ["-c", `. '${envFile}'; printf %s "$ANTHROPIC_API_KEY"`],
+          { env: options.env as Record<string, string>, encoding: "utf8" },
+        );
+      }) as unknown as SDKMessage,
+      result,
+    ]);
+    await runSession(runConfig, {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    });
+    return seen as Seen;
+  }
+
+  afterEach(() => vi.unstubAllEnvs());
+
+  test("a subscription run: the Claude process holds the token and no API key, even when the project has one", async () => {
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
+    vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
+    vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "project-auth-token-opaque");
+    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+    const seen = await sessionSeen(config);
+    const env = seen.options.env ?? {};
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(TOKEN);
+    expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
+    expect(env).not.toHaveProperty("ANTHROPIC_AUTH_TOKEN");
+    expect(env).not.toHaveProperty("SKY_CLAUDE_API_KEY");
+    expect(JSON.stringify(env)).not.toContain(SKY_KEY);
+    expect(JSON.stringify(env)).not.toContain(PROJECT_KEY);
+  });
+
+  test("a subscription run: the project's own ANTHROPIC_API_KEY still works for its commands", async () => {
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
+    vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
+    const seen = await sessionSeen(config);
+    expect(seen.commandKey).toBe(PROJECT_KEY);
+    // the key rides in a file only this user reads, not in the settings Claude Code is started with
+    expect(JSON.stringify(seen.options.settings)).not.toContain(PROJECT_KEY);
+  });
+
+  test("a subscription run whose project has no key sets nothing up for commands", async () => {
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
+    vi.stubEnv("ANTHROPIC_API_KEY", undefined);
+    const seen = await sessionSeen(config);
+    expect(seen.options.settings).not.toHaveProperty("hooks");
+    expect(seen.commandKey).toBe("");
+  });
+
+  test("an API-key run: the Claude process holds Sky's key alone, with no subscription token", async () => {
+    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", undefined);
+    vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
+    const seen = await sessionSeen({ ...config, claudeAuth: "api-key" });
+    const env = seen.options.env ?? {};
+    expect(env.ANTHROPIC_API_KEY).toBe(SKY_KEY);
+    expect(env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(env).not.toHaveProperty("SKY_CLAUDE_API_KEY");
+    expect(JSON.stringify(env)).not.toContain(PROJECT_KEY);
+  });
+
+  test("an API-key run: Sky's key never reaches the project's commands, which keep the project's own key", async () => {
+    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+    vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
+    const seen = await sessionSeen({ ...config, claudeAuth: "api-key" });
+    expect(seen.commandKey).toBe(PROJECT_KEY);
+    expect(JSON.stringify(seen.options.settings)).not.toContain(SKY_KEY);
+  });
+
+  test("an API-key run whose project has no key: its commands see no ANTHROPIC_API_KEY, not Sky's", async () => {
+    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+    vi.stubEnv("ANTHROPIC_API_KEY", undefined);
+    const seen = await sessionSeen({ ...config, claudeAuth: "api-key" });
+    expect(seen.options.env?.ANTHROPIC_API_KEY).toBe(SKY_KEY);
+    expect(seen.commandKey).toBe("");
+  });
+
+  test("the file holding the project's key is removed when the session ends", async () => {
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
+    vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
+    const seen = await sessionSeen(config);
+    expect(seen.scriptPath).toBeDefined();
+    expect(existsSync(String(seen.scriptPath))).toBe(false);
+  });
+
+  test("a run that can't write that file fails rather than start with Sky's key visible to commands", async () => {
+    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+    vi.stubEnv("TMPDIR", join(root, "not-a-directory"));
+    writeFileSync(join(root, "not-a-directory"), "");
+    const { posted, post } = recorder();
+    const query = scripted([init, success]);
+    const code = await runSession(
+      { ...config, claudeAuth: "api-key" },
+      {
+        query,
+        post,
+        signal: new AbortController().signal,
+        awaitDecision: noDecision,
+      },
+    );
+    expect(code).toBe(1);
+    expect(query.calls).toHaveLength(0);
+    expect(posted.at(-1)?.type).toBe("run.failed");
+  });
+
+  test("a usage limit, which Claude reports as an error result of subtype success, reaches run.failed as its own text", async () => {
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
+    const { posted, post } = recorder();
+    const limit = "You've hit your 5-hour limit · resets 10:20am (UTC)";
+    const query = scripted([
+      init,
+      { ...success, is_error: true, result: limit },
+    ]);
+    const code = await runSession(config, {
+      query,
+      post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    });
+    expect(code).toBe(1);
+    expect(posted.at(-1)).toMatchObject({
+      type: "run.failed",
+      payload: { error: limit },
+    });
+  });
+
+  test("an API-key run tells the agent its nested claude isn't logged in", async () => {
+    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+    const query = scripted([init, success]);
+    await runSession(
+      { ...config, claudeAuth: "api-key", checks: ["claude -p /review"] },
+      {
+        query,
+        post: recorder().post,
+        signal: new AbortController().signal,
+        awaitDecision: noDecision,
+      },
+    );
+    const append = JSON.stringify(query.calls[0]?.options.systemPrompt);
+    expect(append).toContain("is not logged in on this run");
+    expect(append).not.toContain("already logged in");
+  });
 });
 
 test("the PreToolUse hook outlasts the longest wait, so a late approval still reaches the tool call", async () => {

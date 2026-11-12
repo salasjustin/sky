@@ -413,3 +413,107 @@ test("env list --json with no environments prints the empty list object", async 
   expect(r.code).toBe(0);
   expect(JSON.parse(r.stdout)).toEqual({ data: [] });
 });
+
+const claudeAssignment = (over: Record<string, unknown> = {}) =>
+  envJson({ claudeCredential: "personal", claudeFallback: "api-key", ...over });
+
+test("env set-claude patches the credential and prints the assignment by name", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(claudeAssignment());
+    }),
+  );
+  const r = await runCli(["env", "set-claude", "web", "personal"]);
+  expect(r.code).toBe(0);
+  expect(bodies).toEqual([{ claudeCredential: "personal" }]);
+  expect(r.stdout).toBe(
+    "env_1 ready acme/web web\nclaude credential: personal (fallback: api-key)\n",
+  );
+});
+
+test("env set-claude default clears the assignment, and --fallback sets the fallback", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(
+        claudeAssignment({ claudeCredential: null, claudeFallback: "none" }),
+      );
+    }),
+  );
+  const r = await runCli([
+    "env",
+    "set-claude",
+    "web",
+    "default",
+    "--fallback=none",
+  ]);
+  expect(r.code).toBe(0);
+  expect(bodies).toEqual([{ claudeCredential: null, claudeFallback: "none" }]);
+  expect(r.stdout).toContain("claude credential: default (fallback: none)");
+});
+
+test("env set-claude api-key is accepted as a name", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(
+        claudeAssignment({ claudeCredential: "api-key" }),
+      );
+    }),
+  );
+  expect((await runCli(["env", "set-claude", "web", "api-key"])).code).toBe(0);
+  expect(bodies).toEqual([{ claudeCredential: "api-key" }]);
+});
+
+test("the API refusing a credential its server doesn't hold is the CLI's failure, message intact", async () => {
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, () =>
+      HttpResponse.json(
+        {
+          error: {
+            code: "unknown_credential",
+            message: 'unknown Claude credential "x"; this server has: default',
+          },
+        },
+        { status: 400 },
+      ),
+    ),
+  );
+  const r = await runCli(["env", "set-claude", "web", "x"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("this server has: default");
+});
+
+test.each([
+  [["env", "set-claude", "web"], /takes <env> <name\|api-key\|default>/],
+  [["env", "set-claude", "web", "Not A Name"], /not a credential name/],
+  [["env", "set-claude", "web", "x", "--fallback=maybe"], /api-key or none/],
+  [["env", "list", "--fallback=none"], /only goes with env set-claude/],
+])("%j is a usage error", async (argv, message) => {
+  const r = await runCli(argv);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toMatch(message);
+});
+
+test("env show says which credential an environment uses once it isn't the default", async () => {
+  server.use(
+    list,
+    http.get(`${apiUrl}/v1/environments/env_1`, () =>
+      HttpResponse.json(
+        claudeAssignment({ claudeCredential: "work", claudeFallback: "none" }),
+      ),
+    ),
+  );
+  const r = await runCli(["env", "show", "env_1"]);
+  expect(r.stdout).toBe(
+    "env_1 ready acme/web web\nclaude credential: work (fallback: none)\n",
+  );
+});

@@ -16,6 +16,8 @@ test("parses a spec and fills the schema defaults", () => {
       concurrency: 3,
       approvalPolicy: [],
       autoApprove: { defaults: true, commands: [] },
+      claudeCredential: null,
+      claudeFallback: "api-key",
     },
   });
 });
@@ -122,6 +124,8 @@ test("a spec's hash changes with its base", () => {
     concurrency: 3,
     approvalPolicy: [],
     autoApprove: { defaults: true, commands: [] },
+    claudeCredential: null,
+    claudeFallback: "api-key" as const,
   };
   expect(specHash({ ...base, base: null })).not.toBe(
     specHash({ ...base, base: "acme" }),

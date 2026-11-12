@@ -18,6 +18,8 @@ test("accepts an environment and defaults its cap and approval policy", () => {
     concurrency: 3,
     approvalPolicy: [],
     autoApprove: { defaults: true, commands: [] },
+    claudeCredential: null,
+    claudeFallback: "api-key",
   });
 });
 

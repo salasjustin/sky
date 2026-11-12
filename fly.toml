@@ -3,7 +3,10 @@
 #   WEBHOOK_SIGNING_KEY      HMAC key for outbound webhooks, >=32 chars: openssl rand -hex 32
 #   SECRET_ENCRYPTION_KEY    AES-256 key, base64 of 32 bytes: openssl rand -base64 32
 #   SPRITES_TOKEN            Sprites API token, from the user's Sprites org
-#   CLAUDE_CODE_OAUTH_TOKEN  runner auth for Claude Code, from the user's `claude setup-token`
+#   CLAUDE_CODE_OAUTH_TOKEN  runner auth for Claude Code, from the user's `claude setup-token`; the default credential
+# Optional secrets (the README's "Claude credentials" explains them):
+#   CLAUDE_OAUTH_TOKEN_<NAME>  another subscription's token, named by <NAME> (CLAUDE_OAUTH_TOKEN_PERSONAL is "personal")
+#   SKY_ANTHROPIC_API_KEY      a pay-per-use Anthropic API key, the fallback while an environment's subscription is at its limit
 
 app = "sky-justin"            # placeholder: app name chosen at deploy
 primary_region = "sin" # placeholder: region code chosen at deploy, e.g. "iad"

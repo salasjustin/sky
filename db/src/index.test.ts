@@ -82,6 +82,7 @@ test("openDb sets WAL, foreign keys and a busy timeout on the connection", () =>
 const TABLES = [
   "agents",
   "api_keys",
+  "claude_limits",
   "environments",
   "events",
   "run_env_vars",
@@ -237,7 +238,8 @@ test("migrating a populated 0000 file keeps every row, cascade children included
       t !== "webhook_deliveries" &&
       t !== "run_requests" &&
       t !== "run_env_vars" &&
-      t !== "api_keys",
+      t !== "api_keys" &&
+      t !== "claude_limits",
   );
   for (const table of atInit) expect([table, count(table)]).toEqual([table, 1]);
   const createdAt = db.$client

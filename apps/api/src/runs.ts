@@ -66,6 +66,10 @@ export const presentRun = (row: RunRow, error: string | null) => ({
           durationMs: row.durationMs,
         },
   error,
+  // the Claude credential's name, never a value; null before the launch picks one
+  claudeCredential: row.claudeCredential,
+  // the run this one retries on the API key after a usage limit; null for any other
+  retryOf: row.retryOf,
   createdAt: row.createdAt,
 });
 

@@ -1,3 +1,4 @@
+import { ClaudeCredentialName, ClaudeFallback } from "@sky/shared";
 import type { AgentCommand } from "./agent.js";
 import { type ApiEnvironment, ApiError } from "./api.js";
 import { UsageError } from "./output.js";
@@ -35,12 +36,19 @@ function filteringWebhookIds(err: unknown): string[] | undefined {
     : undefined;
 }
 
+/** The claude assignment `env show` and `env set-claude` print: names only. */
+const claudeLine = (env: ApiEnvironment) =>
+  `claude credential: ${env.claudeCredential ?? "default"} (fallback: ${env.claudeFallback})`;
+
 export const env: AgentCommand = {
-  options: { yes: { type: "boolean" } },
+  options: { yes: { type: "boolean" }, fallback: { type: "string" } },
   prepare(positionals, values) {
     const [sub, ...rest] = positionals;
     if (values.yes && sub !== "delete") {
       throw new UsageError("--yes only goes with env delete", true);
+    }
+    if (values.fallback !== undefined && sub !== "set-claude") {
+      throw new UsageError("--fallback only goes with env set-claude", true);
     }
     if (sub === "list") {
       if (rest.length > 0) {
@@ -63,6 +71,9 @@ export const env: AgentCommand = {
         if (envId === undefined) return 1;
         const { raw, env } = await api.getEnvironment(envId);
         const lines = [envLine(env)];
+        if (env.claudeCredential !== null || env.claudeFallback !== "api-key") {
+          lines.push(claudeLine(env));
+        }
         if (env.failure) {
           lines.push(`failed at step ${env.failure.step}`);
           const tail = env.failure.stderr.trimEnd();
@@ -118,9 +129,44 @@ export const env: AgentCommand = {
         return 0;
       };
     }
+    if (sub === "set-claude") {
+      const [ref, credential, ...extra] = rest;
+      if (ref === undefined || credential === undefined || extra.length > 0) {
+        throw new UsageError(
+          "env set-claude takes <env> <name|api-key|default> [--fallback=api-key|none]",
+          true,
+        );
+      }
+      if (
+        credential !== "default" &&
+        !ClaudeCredentialName.safeParse(credential).success
+      ) {
+        throw new UsageError(
+          `${JSON.stringify(credential)} is not a credential name: use a subscription's name, api-key or default`,
+          true,
+        );
+      }
+      const fallback =
+        values.fallback === undefined
+          ? undefined
+          : ClaudeFallback.safeParse(values.fallback);
+      if (fallback && !fallback.success) {
+        throw new UsageError("--fallback is api-key or none", true);
+      }
+      return async (api, _io, out) => {
+        const envId = await resolveEnvId(api, ref, out);
+        if (envId === undefined) return 1;
+        const { raw, env } = await api.patchEnvironment(envId, {
+          claudeCredential: credential === "default" ? null : credential,
+          ...(fallback?.success && { claudeFallback: fallback.data }),
+        });
+        out.result(raw, `${envLine(env)}\n${claudeLine(env)}`);
+        return 0;
+      };
+    }
     throw new UsageError(
       sub === undefined
-        ? "env needs a subcommand: list, show, delete or retry"
+        ? "env needs a subcommand: list, show, delete, retry or set-claude"
         : `unknown env subcommand '${sub}'`,
       true,
     );

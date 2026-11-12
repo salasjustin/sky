@@ -57,6 +57,8 @@ const RUNNER_ENV_NAMES: ReadonlySet<string> = new Set([
   "AGENT_TOKEN",
   "CLAUDE_CODE_OAUTH_TOKEN",
   "ANTHROPIC_API_KEY",
+  "SKY_CLAUDE_AUTH",
+  "SKY_CLAUDE_API_KEY",
   "PROMPT",
   "PROMPT_FILE",
   "ENV_FILE",

@@ -1,6 +1,7 @@
 export * from "./agent.js";
 export * from "./auto-approve.js";
 export * from "./base-profile.js";
+export * from "./claude-credential.js";
 export * from "./environment.js";
 export * from "./event.js";
 export * from "./ids.js";

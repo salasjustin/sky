@@ -1,5 +1,6 @@
 import {
   ApiKey,
+  ClaudeCredentialSummary,
   CreatedApiKey,
   Environment,
   type KeyInput,
@@ -37,6 +38,8 @@ export const ApiRun = z
       ])
       .nullable(),
     compareUrl: z.string().nullable(),
+    /** The Claude credential the run used, by name; absent from an older API. */
+    claudeCredential: z.string().nullable().optional(),
   })
   .loose();
 export type ApiRun = z.infer<typeof ApiRun>;
@@ -339,6 +342,16 @@ export function createApi(config: Config) {
         `/v1/keys/${encodeURIComponent(id)}`,
       );
       return parseKey(ApiKey, status, json, "a revoked key");
+    },
+    /** Admin only. Names, kinds, assignments, limits and counts; the API has no value to send. */
+    async listClaudeCredentials(): Promise<ClaudeCredentialSummary[]> {
+      const { status, json } = await request("GET", "/v1/claude-credentials");
+      return parseKey(
+        z.object({ data: z.array(ClaudeCredentialSummary) }),
+        status,
+        json,
+        "a Claude credential list",
+      ).data;
     },
     async listSecrets(envId: string): Promise<SecretSummary[]> {
       const { status, json } = await request(

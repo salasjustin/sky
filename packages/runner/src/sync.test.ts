@@ -853,6 +853,7 @@ async function runOnce(
       sessionId: undefined,
       apiBaseUrl: "https://api.test",
       agentToken: "agent-secret",
+      claudeAuth: "oauth",
       approvalPolicy: [],
       autoApprove: { defaults: true, commands: [] },
       sessionEnv,

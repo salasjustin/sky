@@ -24,6 +24,8 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       dataDir: "/data",
       port: 8080,
       claudeOauthToken,
+      claudeOauthTokens: {},
+      anthropicApiKey: undefined,
       publicBaseUrl: "https://sky.example.com",
       runnerBundlePath: expect.stringMatching(/\/runner\.mjs$/),
       cliBundlePath: expect.stringMatching(/\/sky\.mjs$/),
@@ -309,4 +311,52 @@ test("docs/examples/base-profile.kru.json is a valid SKY_BASE_PROFILES", () => {
   const result = loadConfig({ ...required, SKY_BASE_PROFILES: example });
   expect(result.ok).toBe(true);
   expect(result.ok && Object.keys(result.config.baseProfiles)).toEqual(["kru"]);
+});
+
+test("named subscription tokens and the API key come from their own variables, by lowercased name", () => {
+  const result = loadConfig({
+    ...required,
+    CLAUDE_OAUTH_TOKEN_PERSONAL: "personal-token-opaque",
+    CLAUDE_OAUTH_TOKEN_WORK_2: "work-token-opaque",
+    SKY_ANTHROPIC_API_KEY: "api-key-opaque",
+  });
+  expect(result.ok).toBe(true);
+  if (result.ok) {
+    expect(result.config.claudeOauthTokens).toEqual({
+      personal: "personal-token-opaque",
+      work_2: "work-token-opaque",
+    });
+    expect(result.config.anthropicApiKey).toBe("api-key-opaque");
+    // the default stays CLAUDE_CODE_OAUTH_TOKEN, and is not one of the named
+    expect(result.config.claudeOauthToken).toBe(claudeOauthToken);
+  }
+});
+
+test("an unset or empty API key and token variable hold no credential", () => {
+  const result = loadConfig({
+    ...required,
+    CLAUDE_OAUTH_TOKEN_EMPTY: "",
+    SKY_ANTHROPIC_API_KEY: "",
+  });
+  expect(result.ok).toBe(true);
+  if (result.ok) {
+    expect(result.config.claudeOauthTokens).toEqual({});
+    expect(result.config.anthropicApiKey).toBeUndefined();
+  }
+});
+
+test("a token variable that names no usable credential is refused by its variable name, never its value", () => {
+  const value = "never-echoed-token-value";
+  for (const variable of [
+    "CLAUDE_OAUTH_TOKEN_DEFAULT",
+    `CLAUDE_OAUTH_TOKEN_${"A".repeat(65)}`,
+    "CLAUDE_OAUTH_TOKEN_NOT-A-NAME",
+  ]) {
+    const result = loadConfig({ ...required, [variable]: value });
+    expect(result).toEqual({
+      ok: false,
+      message: expect.stringContaining(`${variable} is invalid`),
+    });
+    if (!result.ok) expect(result.message).not.toContain(value);
+  }
 });
