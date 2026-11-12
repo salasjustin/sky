@@ -80,6 +80,11 @@ export const PROJECT_VARIABLES = [
   ),
 ];
 
+// Sky is the host choosing where the Claude process sends its requests and with what credential: in
+// this mode Claude Code ignores the endpoint, provider and credential variables a settings file sets,
+// mid-session edits included (code.claude.com/docs/en/env-vars)
+export const HOST_MANAGED = "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST";
+
 /**
  * The env of the Claude process itself, carrying exactly the chosen credential and sending it to the
  * Anthropic API. Claude Code prefers `ANTHROPIC_API_KEY` over the subscription token, so a project's
@@ -88,7 +93,7 @@ export const PROJECT_VARIABLES = [
  * chosen credential to the project's gateway or cloud, so those go too. Sky's key arrives as
  * `SKY_CLAUDE_API_KEY` so it never shares a name with the project's. The credential is read from
  * `runnerEnv`, the env the API launched the runner with, so a profile's session env merged into
- * `env` can't swap it.
+ * `env` can't swap it. Host-managed mode is always on, whatever the project or profile set it to.
  */
 export function claudeProcessEnv(
   env: NodeJS.ProcessEnv,
@@ -109,6 +114,7 @@ export function claudeProcessEnv(
   } else if (runnerEnv.CLAUDE_CODE_OAUTH_TOKEN) {
     out.CLAUDE_CODE_OAUTH_TOKEN = runnerEnv.CLAUDE_CODE_OAUTH_TOKEN;
   }
+  out[HOST_MANAGED] = "1";
   return out;
 }
 

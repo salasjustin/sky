@@ -119,6 +119,20 @@ describe("a settings file that redirects Claude or swaps its credential", () => 
     expect(REDIRECT_SETTINGS).toContain("apiKeyHelper");
   });
 
+  test.each([
+    [
+      { env: { CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "0" } },
+      "settings_redirect: .claude/settings.json sets env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST; Sky runs Claude only with its own credential. Remove it to run on Sky.",
+    ],
+    [
+      { policyHelper: VALUE },
+      "settings_redirect: .claude/settings.json sets policyHelper; Sky runs Claude only with its own credential. Remove it to run on Sky.",
+    ],
+  ])("%j fails the check", (settings, line) => {
+    write(projectSettings(), settings);
+    expect(check()).toEqual([line]);
+  });
+
   // each key is tried in the project file; each location below is tried with one of each kind of key
   test.each(KEYS)(
     "$key fails the check, naming the file and the key and never the value",

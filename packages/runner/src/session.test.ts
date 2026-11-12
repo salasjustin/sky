@@ -839,8 +839,9 @@ test("the profile's session variables reach the session, over the caller's env",
   });
 });
 
-test("with no profile, the session env holds the caller's env plus only the runner's git identity and config", async () => {
+test("with no profile, the session env holds the caller's env plus only host mode and the runner's git identity and config", async () => {
   for (const name of [
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
@@ -863,6 +864,7 @@ test("with no profile, the session env holds the caller's env plus only the runn
       .filter((k) => !(k in process.env))
       .sort(),
   ).toEqual([
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
     "GIT_AUTHOR_EMAIL",
     "GIT_AUTHOR_NAME",
     "GIT_COMMITTER_EMAIL",
@@ -970,7 +972,7 @@ test("a check written as plain `claude -p` is still run with every project crede
     const append = await appendOf(['claude -p "/acme:review"']);
     expect(append).toContain('- claude -p "/acme:review"');
     expect(append).not.toContain("as written");
-    const instruction = /`(env (?:-u \S+ )+)claude -p …`, even where/;
+    const instruction = /`(env (?:-u \S+ )+(?:\S+=\S+ )*)claude -p …`, even where/;
     const prefix = instruction.exec(append)?.[1] ?? "";
     for (const name of [
       "ANTHROPIC_API_KEY",
@@ -988,11 +990,13 @@ test("a check written as plain `claude -p` is still run with every project crede
       env: {
         PATH: process.env.PATH,
         CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+        CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "0",
         ...projectEnv,
       },
       encoding: "utf8",
     });
     expect(seen).toContain("CLAUDE_CODE_OAUTH_TOKEN=subscription-token");
+    expect(seen).toMatch(/^CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1$/m);
     for (const name of PROJECT_VARIABLES)
       expect(seen).not.toContain(`${name}=`);
   } finally {
@@ -3583,13 +3587,19 @@ describe("a repo's or sandbox's Claude settings", () => {
     };
     for (const [name, value] of Object.entries(redirects))
       vi.stubEnv(name, value);
+    vi.stubEnv("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "");
     const { code, query } = await run({
       ...config,
-      sessionEnv: { ANTHROPIC_API_KEY: VALUE, https_proxy: VALUE },
+      sessionEnv: {
+        ANTHROPIC_API_KEY: VALUE,
+        https_proxy: VALUE,
+        CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "0",
+      },
     });
     expect(code).toBe(0);
     const env = query.calls[0]?.options.env ?? {};
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(TOKEN);
+    expect(env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBe("1");
     for (const name of [
       ...Object.keys(redirects),
       "ANTHROPIC_API_KEY",

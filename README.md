@@ -195,12 +195,14 @@ Sky holds subscription tokens and a paid API key, and Claude Code lets a setting
 
 Before Claude starts, the runner reads every settings file the session would load: the repo's `.claude/settings.json` and `.claude/settings.local.json` (in the worktree and in the main checkout), the user-level `settings.json` in the sandbox (under `~/.claude` or `CLAUDE_CONFIG_DIR`, where an environment's `setup` may have written one), and the managed `managed-settings.json` and `managed-settings.d/*.json` under `/etc/claude-code`. If any sets one of these keys, the run fails with `settings_redirect`:
 
-- **`env` entries** that move the endpoint or swap the credential: `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, the provider switches (`CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_ANTHROPIC_AWS`, `_MANTLE`) and their base URLs and keys, `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` (and their lowercase names), and `CLAUDE_CONFIG_DIR`;
-- **settings keys** that run a command for a credential or change the login: `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`, `forceLoginMethod`, `forceLoginGatewayUrl`.
+- **`env` entries** that move the endpoint or swap the credential: `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, `CLAUDE_CODE_OAUTH_SCOPES`, `ANTHROPIC_CUSTOM_HEADERS`, the provider switches (`CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_ANTHROPIC_AWS`, `_MANTLE`) and their base URLs and keys (`ANTHROPIC_AWS_BASE_URL`, `ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_BEDROCK_MANTLE_BASE_URL`, `ANTHROPIC_FOUNDRY_BASE_URL`, `ANTHROPIC_FOUNDRY_RESOURCE`, `ANTHROPIC_VERTEX_BASE_URL`, `ANTHROPIC_AWS_API_KEY`, `ANTHROPIC_FOUNDRY_API_KEY`, `ANTHROPIC_FOUNDRY_AUTH_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`), workload identity (`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_WORKSPACE_ID`, `ANTHROPIC_PROFILE`), `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` (and their lowercase names), `CLAUDE_CONFIG_DIR`, and `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`, to any value;
+- **settings keys** that run a command for a credential, compute the managed settings or change the login: `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`, `policyHelper`, `forceLoginMethod`, `forceLoginGatewayUrl`.
 
 The error names the file and the key and never the value: `settings_redirect: .claude/settings.json sets env.ANTHROPIC_BASE_URL; Sky runs Claude only with its own credential. Remove it to run on Sky.` It is a final failure: Sky doesn't retry it or try another credential. Remove the key and launch again. Everything else in these files still works: `CLAUDE.md`, hooks, skills, permissions and other `env` entries.
 
-The same names are kept out of the Claude process's own env when they come from the environment's secrets or a base profile's session env. The commands the session runs keep them, as they always did.
+Sky starts Claude with `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`, so the endpoint and credential `env` entries a settings file gains mid-run are ignored by Claude. The check above covers what is on disk when the run starts.
+
+The same names (less `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`) are kept out of the Claude process's own env when they come from the environment's secrets or a base profile's session env. The commands the session runs keep them, as they always did.
 
 ### Base profiles
 

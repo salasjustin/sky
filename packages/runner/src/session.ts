@@ -27,6 +27,7 @@ import {
 import {
   type CommandEnv,
   claudeProcessEnv,
+  HOST_MANAGED,
   PROJECT_VARIABLES,
   prepareCommandEnv,
 } from "./claude-auth.js";
@@ -238,9 +239,9 @@ const NOTES_HEADING =
 
 // a check's nested `claude` runs without the project's key, auth token, gateway and provider switches,
 // which commands get back from the command-env file: they would outrank the subscription login, or
-// send its token to the project's gateway
+// send its token to the project's gateway. It is host-managed like the session, whatever a command set
 const UNSET_PROJECT = PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ");
-const NESTED_CLAUDE = `env ${UNSET_PROJECT} claude -p …`;
+const NESTED_CLAUDE = `env ${UNSET_PROJECT} ${HOST_MANAGED}=1 claude -p …`;
 
 /**
  * The env's base profile lists what to run before finishing. A command that calls `claude` runs as
@@ -481,7 +482,8 @@ export async function runSession(
   } catch (error) {
     return fail(`worktree setup failed: ${messageOf(error)}`);
   }
-  // before Claude starts, so no setting of the repo's, the sandbox's or a policy's ever sees the run's credential
+  // fails early, naming file and key, on what is on disk now; endpoint and credential `env` entries a
+  // settings file gains mid-run are ignored by Claude in the host-managed mode `claudeProcessEnv` sets
   const redirects = settingsRedirects({
     cwd,
     repoDir: config.repoDir,
