@@ -1,7 +1,11 @@
 import { claudeUsage, type Db } from "@sky/db";
 import type { ClaudeUsage, ClaudeUsageWindow } from "@sky/shared";
 import { eq } from "drizzle-orm";
-import { markLimited, tokenOf } from "./claude-credentials.js";
+import {
+  markLimited,
+  tokenOf,
+  UNKNOWN_RESET_MS,
+} from "./claude-credentials.js";
 import type { Config } from "./config.js";
 
 const MESSAGES_URL = "https://api.anthropic.com/v1/messages";
@@ -155,9 +159,10 @@ export type UsageProbe = ReturnType<typeof createUsageProbe>;
 /**
  * Keeps each subscription's last-seen usage fresh: `refresh` probes it when the stored reading is
  * older than `USAGE_STALE_MS`, at most one probe at a time per subscription, and stores the answer.
- * A subscription the probe finds full is marked limited until its window resets. A probe that fails
- * is logged by name, leaves the stored reading as it was, and is not tried again for
- * `USAGE_STALE_MS`; meanwhile `failedRecently` is true for that subscription.
+ * A subscription the probe finds full is marked limited until its window resets, or for
+ * `UNKNOWN_RESET_MS` when the answer gives no reset. A probe that fails is logged by name, leaves
+ * the stored reading as it was, and is not tried again for `USAGE_STALE_MS`; meanwhile
+ * `failedRecently` is true for that subscription.
  */
 export function createUsageProbe({
   db,
@@ -185,13 +190,18 @@ export function createUsageProbe({
       const usage = await probe(token);
       failedAt.delete(name);
       saveUsage(db, name, usage);
-      const full = [usage.fiveHour, usage.sevenDay].filter(
-        (w): w is ClaudeUsageWindow => w !== null && w.utilization >= 1,
-      );
-      const until = full
-        .map((w) => (w.resetsAt ? new Date(w.resetsAt) : undefined))
-        .filter((d): d is Date => d !== undefined && d > new Date())
-        .sort((a, b) => b.getTime() - a.getTime())[0];
+      const now = new Date();
+      const [until] = [usage.fiveHour, usage.sevenDay]
+        .filter(
+          (w): w is ClaudeUsageWindow => w !== null && w.utilization >= 1,
+        )
+        .map((w) =>
+          w.resetsAt
+            ? new Date(w.resetsAt)
+            : new Date(now.getTime() + UNKNOWN_RESET_MS),
+        )
+        .filter((at) => at > now)
+        .sort((a, b) => b.getTime() - a.getTime());
       if (until) markLimited(db, name, until);
     } catch (err) {
       failedAt.set(name, Date.now());

@@ -17,7 +17,11 @@ import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
-import { limitedUntil, markLimited } from "./claude-credentials.js";
+import {
+  limitedUntil,
+  markLimited,
+  UNKNOWN_RESET_MS,
+} from "./claude-credentials.js";
 import {
   PROBE_MODEL,
   parseUsageHeaders,
@@ -44,7 +48,13 @@ const API_KEY = "anthropic-api-key-opaque-4";
 const FIVE_HOUR = "You've hit your 5-hour limit · resets 10:20am (UTC)";
 const WEEKLY = "You've hit your weekly limit · resets Dec 30, 10am (UTC)";
 
-type Reading = { h5: number; h5Reset?: number; d7: number; d7Reset?: number };
+/** A reset left out falls a few hours or days ahead; null sends none. */
+type Reading = {
+  h5: number;
+  h5Reset?: number | null;
+  d7: number;
+  d7Reset?: number | null;
+};
 const inHours = (h: number) => Math.floor(Date.now() / 1000) + h * 3600;
 
 let dir: string;
@@ -108,13 +118,21 @@ beforeEach(() => {
         {
           headers: {
             "anthropic-ratelimit-unified-5h-utilization": String(reading.h5),
-            "anthropic-ratelimit-unified-5h-reset": String(
-              reading.h5Reset ?? inHours(3),
-            ),
+            ...(reading.h5Reset === null
+              ? {}
+              : {
+                  "anthropic-ratelimit-unified-5h-reset": String(
+                    reading.h5Reset ?? inHours(3),
+                  ),
+                }),
             "anthropic-ratelimit-unified-7d-utilization": String(reading.d7),
-            "anthropic-ratelimit-unified-7d-reset": String(
-              reading.d7Reset ?? inHours(100),
-            ),
+            ...(reading.d7Reset === null
+              ? {}
+              : {
+                  "anthropic-ratelimit-unified-7d-reset": String(
+                    reading.d7Reset ?? inHours(100),
+                  ),
+                }),
           },
         },
       );
@@ -325,6 +343,18 @@ test("a subscription the probe finds full is marked limited until its window res
   const r = await launchedRun(poolEnv());
   expect(r.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(PERSONAL_TOKEN);
   expect(limitedUntil(db, "default")).toBeDefined();
+});
+
+test("a subscription the probe finds full with no reset given is held for the unknown-reset window", async () => {
+  readings[DEFAULT_TOKEN] = { h5: 1, h5Reset: null, d7: 0.2 };
+  readings[PERSONAL_TOKEN] = { h5: 0.6, d7: 0.6 };
+  readings[WORK_TOKEN] = { h5: 0.7, d7: 0.7 };
+  const before = Date.now();
+  const r = await launchedRun(poolEnv());
+  expect(r.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(PERSONAL_TOKEN);
+  const until = limitedUntil(db, "default")?.getTime();
+  expect(until).toBeGreaterThanOrEqual(before + UNKNOWN_RESET_MS);
+  expect(until).toBeLessThanOrEqual(Date.now() + UNKNOWN_RESET_MS);
 });
 
 test("an explicit pool list is the only subscriptions used, and the order breaks a tie", async () => {
