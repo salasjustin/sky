@@ -2,6 +2,7 @@ import { setMaxListeners } from "node:events";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import { type Db, migrate, openDb } from "@sky/db";
+import type { RunId } from "@sky/shared";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { createDispatcher } from "./deliveries.js";
@@ -14,6 +15,7 @@ import {
   failStaleRuns,
   failUnlaunchedRuns,
   pruneClaudeEvents,
+  spritesOfRuns,
 } from "./runs.js";
 import { purgeExpiredEnvVars } from "./secrets.js";
 import { SPRITES_TIMEOUT_MS, type SpriteOps } from "./sprites.js";
@@ -24,7 +26,8 @@ const SWEEP_EVERY_MS = 60_000;
  * Opens and migrates the one DB handle the app reuses for its lifetime, fails provisioning a previous
  * process left unfinished, and fails silent runs and abandoned waits now and every minute after. Runs
  * outlive a restart: their runners keep posting, so only silence fails one. A run failed for missing its
- * launch deadline has its runner signalled too, without waiting on the sprite. A `running` run silent
+ * launch deadline, for going quiet (`runner_timeout`) or for an abandoned wait has its runner signalled
+ * too, without waiting on the sprite. A `running` run silent
  * past the probe window has its runner looked for on its sprite, also unawaited (see
  * `createRunProber`). The same sweep deletes run envVars past their TTL and `claude.*` and
  * `runner.heartbeat` events past 7 days. Webhook deliveries left pending resume at once.
@@ -58,22 +61,29 @@ export function boot(config: Config, log: (line: string) => void) {
     log,
     nudgeDeliveries: dispatcher.nudge,
   });
+  // not awaited, so one slow sprite never holds up the sweep (signalRunner is bounded, logs, never throws)
+  const signalAll = (found: { runId: RunId; spriteName: string }[]) => {
+    for (const { runId, spriteName } of found) {
+      void signalRunner(spriteOps, spriteName, runId, log);
+    }
+  };
   const sweep = () => {
     purgeExpiredEnvVars(db, secrets, new Date());
     const late = failUnlaunchedRuns(db, config.launchDeadlineMs);
-    for (const { runId, spriteName } of late) {
-      log(`run ${runId} failed: launch_timeout`);
-      // a runner that started after all would hold the agent's sprite against its follow-up;
-      // not awaited, so one slow sprite never holds up the sweep (signalRunner logs, never throws)
-      void signalRunner(spriteOps, spriteName, runId, log);
-    }
+    for (const { runId } of late) log(`run ${runId} failed: launch_timeout`);
+    // a runner that started after all would hold the agent's sprite against its follow-up
+    signalAll(late);
     const stale = failStaleRuns(db, config.runTimeoutMs);
     for (const id of stale) log(`run ${id} failed: runner_timeout`);
+    // a runner that went quiet may be wedged yet alive, and would hold its agent's next follow-up
+    // up; the sweep after a restart finds the runs a dead process left, so they are signalled too
+    signalAll(spritesOfRuns(db, stale));
     // after the timeout sweep, so a run it just failed isn't probed; not awaited, so a sprite
     // that is slow to wake never holds up the sweep (the prober logs, never throws)
     void prober.sweep();
     const abandoned = failAbandonedWaits(db, config.waitTimeoutMs);
     for (const id of abandoned) log(`run ${id} failed: waiting_timeout`);
+    signalAll(spritesOfRuns(db, abandoned));
     if (late.length + stale.length + abandoned.length > 0) dispatcher.nudge();
     const pruned = pruneClaudeEvents(db);
     if (pruned > 0) {

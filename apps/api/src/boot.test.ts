@@ -158,6 +158,8 @@ test("an env a previous process left provisioning boots as failed; others keep t
 });
 
 test("boot fails runs a previous process left silent past the timeout; fresh ones stay", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-env_a");
   const first = booted().db;
   first.$client.exec(`
     insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a');
@@ -179,6 +181,39 @@ test("boot fails runs a previous process left silent past the timeout; fresh one
   expect(
     db.$client.prepare("select status from agents where id = 'agt_old'").get(),
   ).toEqual({ status: "idle" });
+  // the failed run's runner may be alive and wedged, and would hold its agent's follow-up; the fresh run's is left
+  await expect
+    .poll(() => wire.calls)
+    .toEqual([
+      `exec sky-env_a - pkill -TERM -f ${runnerPattern("run_old" as RunId)}`,
+    ]);
+});
+
+test("a sprite that can't be reached for the runner_timeout signal doesn't stop the run failing; the failure is logged", async () => {
+  // no sprite on the wire: every exec answers 404
+  stubSprites();
+  const first = booted().db;
+  first.$client.exec(`
+    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a');
+    insert into agents (id, env_id, branch, status) values ('agt_old', 'env_a', 'claude/agt_old', 'running');
+    insert into runs (id, agent_id, status, created_at) values ('run_old', 'agt_old', 'running', '2026-01-01T00:00:00.000Z');
+  `);
+  first.$client.close();
+
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
+  expect(db.$client.prepare("select status from runs").all()).toEqual([
+    { status: "failed" },
+  ]);
+  expect(
+    db.$client.prepare("select status from agents where id = 'agt_old'").get(),
+  ).toEqual({ status: "idle" });
+  // settled before teardown closes the DB and resets the handlers
+  await expect
+    .poll(() =>
+      lines.some((l) => l.includes("signalling the runner of run_old failed")),
+    )
+    .toBe(true);
 });
 
 test("boot fails a run that never reported in past the launch deadline and signals its runner", async () => {

@@ -19,10 +19,11 @@ import { apiError } from "./errors.js";
 import { type AppEnv, factory } from "./factory.js";
 import { mintId } from "./ids.js";
 import {
-  awaitRunnerExit,
   type Launcher,
+  type LingeringRunner,
   removeWorktree,
   signalRunner,
+  stopLingeringRunner,
 } from "./launch.js";
 import { REPO_DIR } from "./provision.js";
 import { redact } from "./redact.js";
@@ -246,8 +247,22 @@ const agentRow = (tx: Tx, id: AgentId) => {
   return row;
 };
 
+// $1 the base, $2 the agent's branch. A branch that was never created is a normal answer, not an
+// error, and git's complaint about it stays off the wire: the SDK's HTTP exec reads each chunk as a
+// frame, so a failing command's stderr and exit status in one chunk fail the whole call
+const DIFF = `git rev-parse --verify --quiet "refs/heads/$2" >/dev/null 2>&1 || exit 3; exec git diff "$1...$2" 2>/dev/null`;
+
 const archived = (c: Context) =>
   apiError(c, 409, "agent_archived", "the agent is archived");
+
+/** `work`'s result, or `late` once `ms` have passed; `work` is left to finish on its own. */
+function within<T>(ms: number, work: Promise<T>, late: T): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(late), ms);
+  });
+  return Promise.race([work, expired]).finally(() => clearTimeout(timer));
+}
 
 // a wake still running past this is abandoned: the runner asks again once its sprite is up
 const WAKE_TIMEOUT_MS = 15_000;
@@ -367,6 +382,7 @@ export function agentRoutes(
   sprites: SpriteOps,
   log: (line: string) => void,
   heartbeatMs: number,
+  preLaunchDeadlineMs: number,
 ) {
   return factory
     .createApp()
@@ -382,7 +398,14 @@ export function agentRoutes(
         const gate = launchableEnv(c.var.db, envId);
         if (gate.kind === "at_cap") return atCap(c, gate.limit);
         if (gate.kind !== "ready") return refuseEnv(c, gate.kind);
-        const check = await checkBranch(gate.env, branch);
+        const check = await within(
+          preLaunchDeadlineMs,
+          checkBranch(gate.env, branch),
+          {
+            kind: "failed",
+            detail: `no answer within ${preLaunchDeadlineMs / 1000}s`,
+          },
+        );
         if (check.kind !== "exists") {
           if (check.kind === "failed") {
             log(
@@ -460,15 +483,18 @@ export function agentRoutes(
       const { prompt, envVars, ttlSeconds } = c.req.valid("json");
       const reserved = reservedIn(envVars);
       if (reserved) return reservedName(c, reserved);
-      // an ended run's runner may still be aborting and committing in the worktree a new one resumes in
+      // an ended run's runner may still be aborting and committing in the worktree a new one resumes in,
+      // or be alive past its run's end (a timed-out run's, wedged): it is signalled, and the wait for
+      // it stays inside the deadline so the caller gets this answer, not its own client's timeout
       const previous = previousRunnerOf(c.var.db, id, c.var.principal);
       if (previous) {
-        let exited: boolean;
+        let runner: LingeringRunner;
         try {
-          exited = await awaitRunnerExit(
+          runner = await stopLingeringRunner(
             sprites,
             previous.spriteName,
             previous.runId,
+            preLaunchDeadlineMs,
           );
         } catch (err) {
           log(`waiting for the runner of ${previous.runId} failed: ${err}`);
@@ -479,7 +505,10 @@ export function agentRoutes(
             "could not check the agent's previous runner on its sprite; retry",
           );
         }
-        if (!exited) {
+        if (runner === "terminated") {
+          log(`the runner of ${previous.runId} outlived its run; SIGTERMed`);
+        }
+        if (runner === "alive") {
           return apiError(
             c,
             409,
@@ -723,10 +752,10 @@ export function agentRoutes(
           const out = await execInSprite(
             sprites,
             spriteName,
-            ["git", "diff", `${base}...${agent.branch}`],
+            ["sh", "-c", DIFF, "sh", base, agent.branch],
             { op: "diff", cwd: REPO_DIR },
           );
-          // nonzero: the runner never created the branch (a launch that failed)
+          // nonzero: the runner never created the branch (a launch that failed, a runner killed first)
           if (out.exitCode === 0) {
             // the worktree's files are Claude's to write, and it can write what it read from its env
             diff = redact(out.stdout, [

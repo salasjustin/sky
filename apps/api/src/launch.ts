@@ -144,9 +144,13 @@ class LowMemoryError extends Error {}
 export const runnerPattern = (runId: RunId) =>
   `${RUNNER.replaceAll(".", "\\.")} ${runId}$`;
 
+// a sprite that can't answer this fast is logged and left: the signal is best effort, and a caller
+// that awaits it (stop, archive) answers its own client within the CLI's request timeout
+const SIGNAL_TIMEOUT_MS = 10_000;
+
 /**
  * SIGTERMs the run's runner, which aborts its Claude session and commits before exiting. A failure
- * is logged, not thrown; a runner already gone counts as signalled.
+ * is logged, not thrown; a runner already gone counts as signalled. Bounded by `SIGNAL_TIMEOUT_MS`.
  */
 export async function signalRunner(
   sprites: SpriteOps,
@@ -159,7 +163,10 @@ export async function signalRunner(
       sprites,
       spriteName,
       ["pkill", "-TERM", "-f", runnerPattern(runId)],
-      { op: "pkill" },
+      {
+        op: "pkill",
+        timeoutMs: Math.min(sprites.timeoutMs, SIGNAL_TIMEOUT_MS),
+      },
     );
     // pkill exits 1 when nothing matched
     if (out.exitCode > 1) {
@@ -213,6 +220,47 @@ export async function awaitRunnerExit(
   );
   if (out.exitCode === 0) return true;
   if (out.exitCode === 1) return false;
+  throw new Error(`exit ${out.exitCode}: ${out.stderr.trim()}`);
+}
+
+// a runner a stop or a failure already signalled normally exits within this on its own; a second
+// SIGTERM kills a runner at once, so only one still alive after it is signalled again
+const QUIET_WAIT_S = 5;
+const TERM_WAIT_S = 10;
+// $1 and $2 the seconds each wait lasts, $3 the pattern. Exits 0 once nothing matches, 3 when
+// that took the SIGTERM, 1 while a runner still lives; pgrep's own errors exit 2
+const STOP_LINGERING = `gone() { for _ in $(seq "$1"); do pgrep -f "$2" >/dev/null; case $? in 1) return 0;; 0) sleep 1;; *) exit 2;; esac; done; return 1; }; gone "$1" "$3" && exit 0; pkill -TERM -f "$3"; gone "$2" "$3" && exit 3; exit 1`;
+
+export type LingeringRunner = "gone" | "terminated" | "alive";
+
+/**
+ * Leaves no runner of the run, an ended one's, alive on its sprite: gives it a few seconds to exit,
+ * SIGTERMs it, then gives it time to commit and exit. One exec, bounded by `deadlineMs`, which
+ * must cover both waits. Throws when the sprite can't answer in time.
+ */
+export async function stopLingeringRunner(
+  sprites: SpriteOps,
+  spriteName: string,
+  runId: RunId,
+  deadlineMs: number,
+): Promise<LingeringRunner> {
+  const out = await execInSprite(
+    sprites,
+    spriteName,
+    [
+      "bash",
+      "-c",
+      STOP_LINGERING,
+      "_",
+      String(QUIET_WAIT_S),
+      String(TERM_WAIT_S),
+      runnerPattern(runId),
+    ],
+    { op: "stop-lingering", timeoutMs: deadlineMs },
+  );
+  if (out.exitCode === 0) return "gone";
+  if (out.exitCode === 3) return "terminated";
+  if (out.exitCode === 1) return "alive";
   throw new Error(`exit ${out.exitCode}: ${out.stderr.trim()}`);
 }
 
@@ -599,6 +647,8 @@ export function createLauncher({
       ),
     );
     await holdSprite(launch, "starting the runner anyway");
+    // from here a failure may leave a runner that did start; see `start`
+    maybeStarted.add(launch.runId);
     await step(launch, "start runner", () =>
       startDetached(
         sprites,
@@ -639,6 +689,7 @@ export function createLauncher({
         throw err;
       }),
     );
+    maybeStarted.delete(launch.runId);
     wakeIfSilent(launch);
   }
 
@@ -675,6 +726,9 @@ export function createLauncher({
   // launches by run, so a run that fails on its subscription's usage limit can be retried once. In
   // memory: a restart between the launch and the failure loses the retry, never the limit
   const launches = new Map<RunId, { launch: Launch; at: number }>();
+  // runs whose launch is at or past the runner's start: one that fails there (a start that timed out
+  // may still have spawned it) has its runner signalled, as a run failed `runner_timeout` does
+  const maybeStarted = new Set<RunId>();
 
   /**
    * A run failed with `error`. When that is its subscription reaching its usage limit, the
@@ -846,6 +900,10 @@ export function createLauncher({
             { behavior: "immediate" },
           );
           nudgeDeliveries();
+          // best effort, not awaited: a sprite that can't be reached is logged by `signalRunner`
+          if (maybeStarted.delete(launch.runId)) {
+            void signalRunner(sprites, launch.spriteName, launch.runId, log);
+          }
         })
         .catch((err: unknown) => {
           log(`launching ${launch.runId} could not record its outcome: ${err}`);

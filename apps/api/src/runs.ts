@@ -300,6 +300,21 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
   );
 }
 
+/** The sprite each of `runIds` ran on, for the runners of runs just failed that may live on there. */
+export function spritesOfRuns(
+  db: Db,
+  runIds: RunId[],
+): { runId: RunId; spriteName: string }[] {
+  if (runIds.length === 0) return [];
+  return db
+    .select({ runId: runs.id, spriteName: environments.spriteName })
+    .from(runs)
+    .innerJoin(agents, eq(runs.agentId, agents.id))
+    .innerJoin(environments, eq(agents.envId, environments.id))
+    .where(inArray(runs.id, runIds))
+    .all();
+}
+
 /**
  * Fails, with `launch_timeout`, every run still `starting` that was created over `deadlineMs` ago
  * and has no event but a `runner.warning` or `runner.heartbeat`, neither of which proves the launch
