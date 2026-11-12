@@ -610,7 +610,7 @@ test("--pool=all stands alone", async () => {
     "--pool=all,work",
   ]);
   expect(r.code).toBe(2);
-  expect(r.stderr).toMatch(/--pool=all stands alone/);
+  expect(r.stderr).toMatch(/--pool=all takes no other subscription names/);
 });
 
 test("--fallback alone on a non-pool credential sends no pool either", async () => {

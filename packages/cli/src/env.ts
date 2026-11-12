@@ -51,7 +51,7 @@ function parsePool(value: string | undefined): string[] | null | undefined {
   }
   if (names.includes("all")) {
     if (names.length > 1) {
-      throw new UsageError("--pool=all stands alone", true);
+      throw new UsageError("--pool=all takes no other subscription names", true);
     }
     return null;
   }
@@ -178,7 +178,6 @@ export const env: AgentCommand = {
       if (values.pool !== undefined && credential !== "pool") {
         throw new UsageError("--pool goes with the credential pool", true);
       }
-      // undefined leaves the pool's list as it is, `all` (null) resets it to every subscription
       const poolNames = parsePool(values.pool);
       const fallback =
         values.fallback === undefined

@@ -103,7 +103,7 @@ claudePool: [work, personal] # optional, with claudeCredential: pool: the subscr
 claudeFallback: api-key # optional: api-key or none, what a run does while its subscription is at its limit
 ```
 
-The Claude fields are optional and leave an environment's as they are when omitted, so `sky apply` never undoes a `sky env set-claude`: only the fields the file names change anything. A new environment gets the defaults (the default token, every subscription if it is a pool, `api-key`).
+The Claude fields are optional. A field the file omits keeps the environment's current value, so `sky apply` never undoes a `sky env set-claude`, and deleting `claudeCredential` from the file doesn't move an environment back to the default token: write `claudeCredential: default` for that. A new environment gets the defaults (the default token, every subscription if it is a pool, `api-key`).
 
 `setup` runs in the clone with bash, with pnpm and yarn on `PATH` and `SKY_CLAUDE` set to the `claude` binary agents run. After it, Sky installs the plugins the repo's `.claude/settings.json` enables in `enabledPlugins`, from the marketplaces its `extraKnownMarketplaces` declares. If a plugin comes from a marketplace that isn't declared there, add the marketplace in `setup`:
 
@@ -165,7 +165,7 @@ Runs authenticate to Claude with a credential the server holds as a secret. Each
 
 A `<NAME>` is up to 64 letters, digits and `_`, and not `DEFAULT` or `POOL`. A token secret with any other name stops the API from booting.
 
-**Each environment has one credential.** Assign it with `sky env set-claude <env> <name|api-key|pool|default>`, the `claudeCredential` field of `env.yaml`, or `PATCH /v1/environments/:id`; only the admin key can. Unset (or `default`) is the default token. A run records the name of the credential it used: `sky status` prints it and a run's `claudeCredential` carries it. `GET /v1/claude-credentials` (admin only) and `sky claude-credentials` list each credential with its kind (`subscription` or `api-key`), the environments assigned it, when its limit lifts if it is limited, how many runs started on it since midnight UTC, its last-seen 5-hour and 7-day usage, and the pool environments that may use it.
+**Each environment has one credential.** Assign it with `sky env set-claude <env> <name|api-key|pool|default>`, the `claudeCredential` field of `env.yaml`, or `PATCH /v1/environments/:id`; only the admin key can. `default`, or leaving it unset on a new environment, is the default token. A run records the name of the credential it used: `sky status` prints it and a run's `claudeCredential` carries it. `GET /v1/claude-credentials` (admin only) and `sky claude-credentials` list each credential with its kind (`subscription` or `api-key`), the environments assigned it, when its limit lifts if it is limited, how many runs started on it since midnight UTC, its last-seen 5-hour and 7-day usage, and the pool environments that may use it.
 
 **Only a `pool` environment moves work between subscriptions, and pools are off by default.** An environment assigned a subscription, `api-key` or the default token uses that credential alone: Sky does not balance its runs across tokens, and a run that fails on its subscription is never retried on another. Its only fallback is the API key. Moving between subscriptions is something you opt an environment into, with `claudeCredential: pool` ([below](#opt-in-subscription-pool)).
 

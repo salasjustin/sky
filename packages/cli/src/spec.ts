@@ -25,8 +25,7 @@ const {
 
 /**
  * The Claude fields have no default here, unlike in the API: a file that omits them leaves the
- * environment's as they are, so `sky apply` never undoes `sky env set-claude`. Only a field the file
- * names changes anything.
+ * environment's as they are, so `sky apply` never undoes `sky env set-claude`.
  */
 const optionalClaude = {
   claudeCredential: claudeCredential.unwrap().optional(),

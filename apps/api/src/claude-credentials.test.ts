@@ -66,8 +66,8 @@ function weeklyLimit(days = 3, hour = 10) {
 }
 
 /**
- * A 5-hour-limit message whose reset is the next :20 past an hour three hours ahead of the real now
- * (UTC), so the hold outlives the test whatever time of day the suite runs.
+ * A 5-hour-limit message whose reset is 20 past the hour three hours ahead of the real now (UTC), so
+ * the hold outlives the test whatever time of day the suite runs.
  */
 function fiveHourLimit() {
   const hour = (new Date().getUTCHours() + 3) % 24;
