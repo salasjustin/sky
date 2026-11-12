@@ -51,7 +51,10 @@ function parsePool(value: string | undefined): string[] | null | undefined {
   }
   if (names.includes("all")) {
     if (names.length > 1) {
-      throw new UsageError("--pool=all takes no other subscription names", true);
+      throw new UsageError(
+        "--pool=all takes no other subscription names",
+        true,
+      );
     }
     return null;
   }
