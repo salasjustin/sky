@@ -17,8 +17,9 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { gateway, publish as publishRun } from "./publish.js";
 import { pullRepo } from "./repo.js";
-import { type QueryFn, runSession as runSessionRaw } from "./session.js";
+import type { QueryFn } from "./session.js";
 import * as sync from "./sync.js";
+import { hermeticRunSession as runSessionRaw } from "./testing/hermetic-run.js";
 
 // these tests run real git against real repositories, which is slow when the whole suite shares a CI runner
 vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });

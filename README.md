@@ -189,6 +189,21 @@ If the message gives no reset time Sky can read, it holds the limit for 15 minut
 
 `sky claude-credentials` shows each subscription's usage and which pool environments use it. The API key rules above are unchanged for pools: the key reaches only the Claude session of a run that is on it.
 
+### What Sky refuses in Claude settings
+
+Sky holds subscription tokens and a paid API key, and Claude Code lets a settings file choose where it sends requests and with what it signs them. So a run that would let a settings file redirect the credential doesn't start.
+
+Before Claude starts, the runner reads every settings file the session would load: the repo's `.claude/settings.json` and `.claude/settings.local.json` (in the worktree and in the main checkout), the user-level `settings.json` in the sandbox (under `~/.claude` or `CLAUDE_CONFIG_DIR`, where an environment's `setup` may have written one), and the managed `managed-settings.json` and `managed-settings.d/*.json` under `/etc/claude-code`. If any sets one of these keys, the run fails with `settings_redirect`:
+
+- **`env` entries** that move the endpoint or swap the credential: `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, `CLAUDE_CODE_OAUTH_SCOPES`, `ANTHROPIC_CUSTOM_HEADERS`, the provider switches (`CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_ANTHROPIC_AWS`, `_MANTLE`) and their base URLs and keys (`ANTHROPIC_AWS_BASE_URL`, `ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_BEDROCK_MANTLE_BASE_URL`, `ANTHROPIC_FOUNDRY_BASE_URL`, `ANTHROPIC_FOUNDRY_RESOURCE`, `ANTHROPIC_VERTEX_BASE_URL`, `ANTHROPIC_AWS_API_KEY`, `ANTHROPIC_FOUNDRY_API_KEY`, `ANTHROPIC_FOUNDRY_AUTH_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`), workload identity (`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_WORKSPACE_ID`, `ANTHROPIC_PROFILE`), `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` (and their lowercase names), `CLAUDE_CONFIG_DIR`, and `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`, to any value;
+- **settings keys** that run a command for a credential, compute the managed settings or change the login: `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`, `policyHelper`, `forceLoginMethod`, `forceLoginGatewayUrl`.
+
+The error names the file and the key and never the value: `settings_redirect: .claude/settings.json sets env.ANTHROPIC_BASE_URL; Sky runs Claude only with its own credential. Remove it to run on Sky.` It is a final failure: Sky doesn't retry it or try another credential. Remove the key and launch again. Everything else in these files still works: `CLAUDE.md`, hooks, skills, permissions and other `env` entries.
+
+Sky starts Claude, and a check's nested `claude`, with `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`, so Claude ignores the endpoint and credential `env` entries a settings file gains mid-run. The check above covers what is on disk when the run starts.
+
+The same names (less `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`) are kept out of the Claude process's own env when they come from the environment's secrets or a base profile's session env. The commands the session runs get the project's values back, except `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` and `CLAUDE_CODE_OAUTH_SCOPES`, which reach neither Claude nor its commands.
+
 ### Base profiles
 
 A base profile is what every sprite gets before its own `setup`, defined once on the server so no client's tooling lives in Sky's code. The API reads them from `SKY_BASE_PROFILES`, a JSON object of profiles by name, empty by default; an environment picks one with `base: <name>`. A `base` the server doesn't have is rejected, and changing `base` rebuilds the sprite like changing `setup` (so it is refused with `agents_exist` while unarchived agents exist). With no `base`, an environment gets no plugins or MCP servers beyond its repo's, no store sync and no check instructions.
@@ -358,6 +373,7 @@ A run the API fails ends with `run.failed`, and its `error` is one of:
 | `launch_timeout`            | the runner never reported in within `LAUNCH_DEADLINE_MINUTES` (default 15); a `runner.warning` or heartbeat doesn't count as reporting in                                                                                                  |
 | `claude_limited`            | the launch was refused: the environment's subscription is at its usage limit and the API key can't stand in (none is set, or the environment's `claudeFallback` is `none`); the error names the reset time in UTC                          |
 | `claude_credential_missing` | the environment is assigned a credential this server no longer holds, or the API key it is assigned isn't set                                                                                                                              |
+| `settings_redirect`         | the runner refused to start Claude: a settings file sets a key that would redirect its credential, see [What Sky refuses in Claude settings](#what-sky-refuses-in-claude-settings); the error names the file and key. Not retried          |
 | `sprite_low_memory`         | the launch was refused: the sprite had less memory available than `SPRITE_MIN_FREE_MB` (default 1024); the error says how much was free. Wait for a run on the sprite to end, or lower `concurrency`                                       |
 | `runner_lost`               | the run went quiet, the API woke its sprite, and the runner was no longer running there; the error names the sprite                                                                                                                        |
 | `runner_killed`             | as `runner_lost`, and the sprite killed the runner, likely out of memory: the kernel logged a kill after the run was created, or the sprite had less than `SPRITE_MIN_FREE_MB` available; the error names the sprite and the memory it had |

@@ -44,6 +44,7 @@ test("a subscription run's process env keeps the token and no API key of any nam
   expect(claudeProcessEnv(runnerEnv, "oauth")).toEqual({
     PATH: "/bin",
     CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+    CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1",
   });
 });
 
@@ -51,6 +52,7 @@ test("an API-key run's process env holds Sky's key as ANTHROPIC_API_KEY, and no 
   expect(claudeProcessEnv(runnerEnv, "api-key")).toEqual({
     PATH: "/bin",
     ANTHROPIC_API_KEY: "sky-key",
+    CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1",
   });
 });
 
@@ -63,12 +65,32 @@ test("the credential comes from the runner's own env, never from a session env m
   expect(claudeProcessEnv(merged, "oauth", runnerEnv)).toEqual({
     PATH: "/bin",
     CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+    CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1",
   });
   expect(claudeProcessEnv(merged, "api-key", runnerEnv)).toEqual({
     PATH: "/bin",
     ANTHROPIC_API_KEY: "sky-key",
+    CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1",
   });
 });
+
+test.each(["oauth", "api-key"] as const)(
+  "a %s run's Claude is host-managed, whatever the secrets or the profile set the switch to",
+  (auth) => {
+    const secrets = {
+      ...runnerEnv,
+      CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "0",
+    };
+    for (const profileValue of ["0", ""])
+      expect(
+        claudeProcessEnv(
+          { ...secrets, CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: profileValue },
+          auth,
+          secrets,
+        ).CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST,
+      ).toBe("1");
+  },
+);
 
 test("the command script gives commands the project's key, or unsets Sky's on an API-key run", () => {
   expect(commandEnvScript("oauth", { ANTHROPIC_API_KEY: "pk'1" })).toBe(
@@ -101,6 +123,26 @@ test("the command script gives commands back every project value the Claude proc
   expect(script).not.toContain("subscription-token");
   expect(script).not.toContain("sky-key");
   expect(commandEnvScript("api-key", runnerEnv)).toBe(script);
+});
+
+test("the command script exports the project's proxies and custom headers, and no OAuth refresh token or scopes", () => {
+  expect(
+    commandEnvScript("oauth", {
+      PATH: "/bin",
+      HTTPS_PROXY: "http://proxy.example:3128",
+      https_proxy: "http://proxy.example:3129",
+      ANTHROPIC_CUSTOM_HEADERS: "x-team: acme",
+      CLAUDE_CODE_OAUTH_REFRESH_TOKEN: "refresh-token-opaque",
+      CLAUDE_CODE_OAUTH_SCOPES: "user:inference",
+    }),
+  ).toBe(
+    [
+      "export ANTHROPIC_CUSTOM_HEADERS='x-team: acme'",
+      "export HTTPS_PROXY='http://proxy.example:3128'",
+      "export https_proxy='http://proxy.example:3129'",
+      "",
+    ].join("\n"),
+  );
 });
 
 test("an API-key run whose project has a gateway but no key still unsets Sky's key for commands", () => {
