@@ -1,5 +1,6 @@
 import { appendFileSync } from "node:fs";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { removeCommandEnvNow } from "./claude-auth.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { writeClaudeCredentials } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
@@ -91,6 +92,8 @@ async function main(): Promise<void> {
   const dieBy = (signal: NodeJS.Signals) => {
     stopListening();
     release();
+    // the session's `finally` never runs on this path, and the file may hold the project's key
+    removeCommandEnvNow();
     process.kill(process.pid, signal);
   };
   let dying = false;
@@ -121,7 +124,8 @@ async function main(): Promise<void> {
   });
   await step("sprite hold", () => hold.ready);
   // a stop while the hold was landing skips setup; the session reports it as run.failed
-  if (!controller.signal.aborted) await setUpSession(controller.signal);
+  if (!controller.signal.aborted)
+    await setUpSession(controller.signal, config.claudeAuth);
   warn("runner: session starting");
   try {
     process.exitCode = await runSession(config, {
@@ -143,15 +147,21 @@ async function main(): Promise<void> {
   else stopListening();
 }
 
-async function setUpSession(signal: AbortSignal): Promise<void> {
-  // so a nested `claude -p` in the sandbox is logged in; a failure costs the Kru checks, not the run
-  await step("claude credentials", () =>
-    writeClaudeCredentials(process.env).catch((error: unknown) =>
-      warn(
-        `runner: nested claude login not set up: ${error instanceof Error ? error.message : String(error)}`,
+async function setUpSession(
+  signal: AbortSignal,
+  claudeAuth: Config["claudeAuth"],
+): Promise<void> {
+  // so a nested `claude -p` in the sandbox is logged in; a failure costs the Kru checks, not the run.
+  // An API-key run writes nothing: the file is shared by every agent on the sprite and holds a subscription
+  if (claudeAuth === "oauth") {
+    await step("claude credentials", () =>
+      writeClaudeCredentials(process.env).catch((error: unknown) =>
+        warn(
+          `runner: nested claude login not set up: ${error instanceof Error ? error.message : String(error)}`,
+        ),
       ),
-    ),
-  );
+    );
+  }
   // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
   await step("store sync", () => syncStoreQuietly("pull", process.env, warn));
   // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails the run

@@ -27,12 +27,21 @@ export class KnownSecrets {
       | "claudeOauthToken"
       | "webhookSigningKey"
       | "secretEncryptionKey"
-    >,
+    > &
+      Partial<Pick<Config, "claudeOauthTokens" | "anthropicApiKey">>,
   ): KnownSecrets {
     const secrets = new KnownSecrets();
     secrets.add("SKY_API_KEY", config.apiKey);
     secrets.add("SPRITES_TOKEN", config.spritesToken);
     secrets.add("CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken);
+    for (const [name, token] of Object.entries(
+      config.claudeOauthTokens ?? {},
+    )) {
+      secrets.add(`CLAUDE_OAUTH_TOKEN_${name}`, token);
+    }
+    if (config.anthropicApiKey) {
+      secrets.add("SKY_ANTHROPIC_API_KEY", config.anthropicApiKey);
+    }
     secrets.add("WEBHOOK_SIGNING_KEY", config.webhookSigningKey);
     secrets.add(
       "SECRET_ENCRYPTION_KEY",

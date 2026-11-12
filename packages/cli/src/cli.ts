@@ -2,6 +2,7 @@ import { parseArgs } from "node:util";
 import { type AgentCommand, agentCommands } from "./agent.js";
 import { type Api, ApiError, createApi } from "./api.js";
 import { apply } from "./apply.js";
+import { claudeCredentials } from "./claude-credentials.js";
 import { type Config, configPath, type Env, resolveConfig } from "./config.js";
 import { env } from "./env.js";
 import { key } from "./key.js";
@@ -57,6 +58,27 @@ const help = (io: Io) => `Usage:
   sky env retry <env> [options]
       Provision a failed environment again. Prints its line, now
       provisioning; sky env show reports when it's ready.
+  sky env set-claude <env> <name|api-key|pool|default>
+      [--pool=<name,...>] [--fallback=api-key|none] [options]
+      Choose the Claude credential the environment's runs use: the name of
+      a subscription token the server holds (CLAUDE_OAUTH_TOKEN_<NAME>),
+      api-key for the pay-per-use Anthropic API key, or default for the
+      server's default token. --fallback=none stops a run from using the
+      API key while its subscription is at its usage limit; the launch
+      fails with the reset time instead. Only pool moves runs between
+      subscriptions: the environment's runs go to the subscription with
+      the most headroom and, on a usage limit, on to the next one.
+      --pool=a,b limits and orders the choice; --pool=all (any case)
+      resets it to every subscription the server holds, so no
+      subscription named "all" can be listed there. Without --pool the
+      list stays as it is, so --fallback alone never widens an ordered
+      pool. Needs the admin key.
+  sky claude-credentials [options]
+      Print "<name> <subscription|api-key> <limited-until=<time>|-> <runs
+      today> <env ids|-> <5h=N%|-> <7d=N%|-> <pool env ids|->" per
+      credential: its limit, its environments, its last-seen usage and the
+      pool environments that may use it. Values are never printed. Needs
+      the admin key.
   sky webhook add <url> --events=<types,...> [options]
       [--format=standard --secret=@file|-] [--env=<id|name>,...]
       Subscribe an https URL to event types. --format=standard signs
@@ -107,7 +129,8 @@ const help = (io: Io) => `Usage:
       30s apart); a 4xx ends the wait. With no --timeout it waits as long as
       the run and any outage take; --timeout bounds both.
   sky status <agent> [options]
-      Print "<runId> <status>", then its summary, error and compare link.
+      Print "<runId> <status>", then its summary, error, the Claude
+      credential it used and its compare link.
   sky approve <agent> <requestId> [--reason=<text>] [options]
   sky deny <agent> <requestId> --reason=<text> [options]
   sky answer <agent> <requestId> -- <text>
@@ -296,6 +319,7 @@ async function runSecret(args: string[], io: Io): Promise<number> {
 
 const commands: Record<string, AgentCommand> = {
   ...agentCommands,
+  "claude-credentials": claudeCredentials,
   env,
   key,
   webhook,
@@ -335,6 +359,8 @@ async function runCommand(
     secret: text(values.secret),
     env: list(values.env),
     role: text(values.role),
+    fallback: text(values.fallback),
+    pool: text(values.pool),
   });
   return await withApi(values, io, (api, out) => action(api, io, out));
 }

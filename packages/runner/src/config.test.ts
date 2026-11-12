@@ -19,6 +19,7 @@ test("reads a run from env, defaulting the sprite paths", () => {
     sessionId: undefined,
     apiBaseUrl: "https://api.test",
     agentToken: "agent-secret",
+    claudeAuth: "oauth",
     repoDir: "/workspace/repo",
     worktreesDir: "/workspace/worktrees",
     approvalPolicy: [],
@@ -171,4 +172,33 @@ test("names every bad key without echoing any value", () => {
   expect(message).toMatch(/AGENT_TOKEN/);
   expect(message).toMatch(/CLAUDE_CODE_OAUTH_TOKEN/);
   expect(message).not.toMatch(/nope|secret/);
+});
+
+test("an API-key run needs SKY_CLAUDE_API_KEY, not the subscription token", () => {
+  const { CLAUDE_CODE_OAUTH_TOKEN: _, ...withoutToken } = env;
+  expect(
+    loadConfig({
+      ...withoutToken,
+      SKY_CLAUDE_AUTH: "api-key",
+      SKY_CLAUDE_API_KEY: "api-secret",
+    }).claudeAuth,
+  ).toBe("api-key");
+  expect(() =>
+    loadConfig({ ...withoutToken, SKY_CLAUDE_AUTH: "api-key" }),
+  ).toThrow(/SKY_CLAUDE_API_KEY/);
+  expect(() => loadConfig(withoutToken)).toThrow(/CLAUDE_CODE_OAUTH_TOKEN/);
+});
+
+test("an unknown SKY_CLAUDE_AUTH is refused, naming the variable only", () => {
+  const message = (() => {
+    try {
+      loadConfig({ ...env, SKY_CLAUDE_AUTH: "other-secret" });
+    } catch (e) {
+      return (e as Error).message;
+    }
+    return "";
+  })();
+  expect(message).toContain("SKY_CLAUDE_AUTH");
+  // anywhere in the message, before or after the name
+  expect(message).not.toContain("other-secret");
 });

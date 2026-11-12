@@ -1,9 +1,16 @@
-# Required secrets (fly secrets set; names only, never values here):
+# Setting a secret restarts the only machine, which drops every active run's in-memory usage-limit
+# retry: stage it (fly secrets set --stage), then run `fly secrets deploy` while no run is active.
+# Required secrets (names only, never values here):
 #   SKY_API_KEY              bearer key for /v1 and /mcp, >=32 token68 chars: openssl rand -hex 32
 #   WEBHOOK_SIGNING_KEY      HMAC key for outbound webhooks, >=32 chars: openssl rand -hex 32
 #   SECRET_ENCRYPTION_KEY    AES-256 key, base64 of 32 bytes: openssl rand -base64 32
 #   SPRITES_TOKEN            Sprites API token, from the user's Sprites org
-#   CLAUDE_CODE_OAUTH_TOKEN  runner auth for Claude Code, from the user's `claude setup-token`
+#   CLAUDE_CODE_OAUTH_TOKEN  runner auth for Claude Code, from the user's `claude setup-token`; the default credential
+# Optional secrets (the README's "Claude credentials" explains them):
+#   CLAUDE_OAUTH_TOKEN_<NAME>  another subscription's token, named by <NAME> lowercased (CLAUDE_OAUTH_TOKEN_PERSONAL is "personal");
+#                              <NAME> is up to 64 letters, digits and _, and not DEFAULT or POOL; a bad name stops the API from booting
+#   SKY_ANTHROPIC_API_KEY      a pay-per-use Anthropic API key: `api-key`, assignable to an environment, and the fallback while
+#                              an environment's subscription is at its limit
 
 app = "sky-justin"            # placeholder: app name chosen at deploy
 primary_region = "sin" # placeholder: region code chosen at deploy, e.g. "iad"
@@ -18,7 +25,7 @@ kill_timeout = 30
   # how a sprite reaches this API; host must match `app` above
   PUBLIC_BASE_URL = "https://sky-justin.fly.dev"
 
-# single machine + single volume: the SQLite file is one unreplicated copy, so the volume needs snapshots
+# single machine + single volume: the SQLite file is one unreplicated copy, and the volume's snapshots are its only backup
 [mounts]
   source = "sky_data"
   destination = "/data"

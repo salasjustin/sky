@@ -20,6 +20,9 @@ const spec = {
 const env = (over: Record<string, unknown> = {}) => ({
   id: "env_1",
   ...spec,
+  claudeCredential: null,
+  claudePool: null,
+  claudeFallback: "api-key",
   status: "ready",
   spriteName: "sky-env-1",
   checkpointId: "ckpt_1",
@@ -130,6 +133,113 @@ test("patches only the changed fields", async () => {
   expect(writes).toEqual([{ method: "PATCH", body: { concurrency: 5 } }]);
   expect(r.sleeps).toEqual([]);
   expect(lock().specHash).toBe(specHash({ ...spec, concurrency: 5 }));
+});
+
+const poolSetByHand = {
+  claudeCredential: "pool",
+  claudePool: ["work", "personal"],
+  claudeFallback: "none",
+};
+
+test("an env.yaml that omits the Claude fields leaves what sky env set-claude set: nothing is written", async () => {
+  // no POST/PATCH handler: any write is an unhandled request and fails the test
+  server.use(list(env(poolSetByHand)));
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([]);
+  expect(r.stdout).toBe("up to date web env_1\n");
+});
+
+test("an env.yaml that changes another field leaves the omitted Claude fields out of the patch", async () => {
+  writeFileSync(file, `${yaml}concurrency: 5\n`);
+  server.use(
+    list(env(poolSetByHand)),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, env({ ...poolSetByHand, concurrency: 5 })),
+    ),
+  );
+  expect((await runCli(["apply", file])).code).toBe(0);
+  expect(writes).toEqual([{ method: "PATCH", body: { concurrency: 5 } }]);
+});
+
+test("only the Claude fields a file names change the environment", async () => {
+  writeFileSync(file, `${yaml}claudeCredential: personal\n`);
+  server.use(
+    list(env(poolSetByHand)),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, env({ ...poolSetByHand, claudeCredential: "personal" })),
+    ),
+  );
+  expect((await runCli(["apply", file])).code).toBe(0);
+  // the pool list and the fallback aren't named, so they aren't sent
+  expect(writes).toEqual([
+    { method: "PATCH", body: { claudeCredential: "personal" } },
+  ]);
+});
+
+test("a file naming every Claude field sets all of them", async () => {
+  writeFileSync(
+    file,
+    `${yaml}claudeCredential: pool\nclaudePool: [work, personal]\nclaudeFallback: none\n`,
+  );
+  server.use(
+    list(env()),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, env(poolSetByHand)),
+    ),
+  );
+  expect((await runCli(["apply", file])).code).toBe(0);
+  expect(writes).toEqual([
+    {
+      method: "PATCH",
+      body: {
+        claudeCredential: "pool",
+        claudePool: ["work", "personal"],
+        claudeFallback: "none",
+      },
+    },
+  ]);
+});
+
+test("a file naming every Claude field writes nothing once they match", async () => {
+  writeFileSync(
+    file,
+    `${yaml}claudeCredential: pool\nclaudePool: [work, personal]\nclaudeFallback: none\n`,
+  );
+  server.use(list(env(poolSetByHand)));
+  const r = await runCli(["apply", file]);
+  expect(r.stdout).toBe("up to date web env_1\n");
+  expect(writes).toEqual([]);
+});
+
+test("claudeCredential: default matches an env on the default token, which the API reports as null", async () => {
+  writeFileSync(file, `${yaml}claudeCredential: default\n`);
+  // no POST/PATCH handler: any write is an unhandled request and fails the test
+  server.use(list(env({ claudeCredential: null })));
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([]);
+  expect(r.stdout).toBe("up to date web env_1\n");
+});
+
+test("claudeCredential: default moves an env off a named credential back to the default token", async () => {
+  writeFileSync(file, `${yaml}claudeCredential: default\n`);
+  server.use(
+    list(env({ claudeCredential: "personal" })),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, env({ claudeCredential: null })),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([
+    { method: "PATCH", body: { claudeCredential: "default" } },
+  ]);
+  expect(r.stdout).toBe("ready web env_1\n");
 });
 
 test("the lock's id finds a renamed env, which is patched rather than created", async () => {

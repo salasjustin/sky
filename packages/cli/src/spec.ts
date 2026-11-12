@@ -10,8 +10,28 @@ import {
 } from "yaml";
 import { z } from "zod";
 
-const { name, repo, setup, base, concurrency, approvalPolicy, autoApprove } =
-  Environment.shape;
+const {
+  name,
+  repo,
+  setup,
+  base,
+  concurrency,
+  approvalPolicy,
+  autoApprove,
+  claudeCredential,
+  claudePool,
+  claudeFallback,
+} = Environment.shape;
+
+/**
+ * The Claude fields have no default here, unlike in the API: a file that omits them leaves the
+ * environment's as they are, so `sky apply` never undoes `sky env set-claude`.
+ */
+const optionalClaude = {
+  claudeCredential: claudeCredential.unwrap().optional(),
+  claudePool: claudePool.unwrap().optional(),
+  claudeFallback: claudeFallback.unwrap().optional(),
+};
 
 /** What `env.yaml` holds; the API's create body, so the API URL and key can't be smuggled in. */
 export const EnvSpec = z.strictObject({
@@ -22,6 +42,7 @@ export const EnvSpec = z.strictObject({
   concurrency,
   approvalPolicy,
   autoApprove,
+  ...optionalClaude,
 });
 export type EnvSpec = z.infer<typeof EnvSpec>;
 

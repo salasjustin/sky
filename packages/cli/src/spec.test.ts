@@ -127,3 +127,25 @@ test("a spec's hash changes with its base", () => {
     specHash({ ...base, base: "acme" }),
   );
 });
+
+test("the Claude fields stay absent when the file omits them, and are read when it names them", () => {
+  const omitted = parseSpec(
+    "name: web\nrepo: acme/web\nsetup: x\n",
+    "env.yaml",
+  );
+  expect(omitted.ok && Object.keys(omitted.spec)).not.toContain(
+    "claudeCredential",
+  );
+  const named = parseSpec(
+    "name: web\nrepo: acme/web\nsetup: x\nclaudeCredential: pool\nclaudePool: [work]\nclaudeFallback: none\n",
+    "env.yaml",
+  );
+  expect(named).toMatchObject({
+    ok: true,
+    spec: {
+      claudeCredential: "pool",
+      claudePool: ["work"],
+      claudeFallback: "none",
+    },
+  });
+});

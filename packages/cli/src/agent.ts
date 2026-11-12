@@ -16,6 +16,8 @@ type Values = {
   secret?: string;
   env?: string;
   role?: string;
+  fallback?: string;
+  pool?: string;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;
@@ -199,6 +201,9 @@ const status: AgentCommand = {
       const lines = [`${run.id} ${run.status}`];
       if (run.summary) lines.push(`summary: ${run.summary}`);
       if (run.error) lines.push(`error: ${run.error}`);
+      if (run.claudeCredential) {
+        lines.push(`claude credential: ${run.claudeCredential}`);
+      }
       if (run.compareUrl) lines.push(`compare: ${run.compareUrl}`);
       out.result(newest.raw, lines.join("\n"));
       return runExitCodes[run.status];

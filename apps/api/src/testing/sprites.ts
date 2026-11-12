@@ -13,6 +13,8 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   dataDir: "/unused",
   port: 8080,
   claudeOauthToken: "sk-ant-oat01-test-oauth-token",
+  claudeOauthTokens: {},
+  anthropicApiKey: undefined,
   publicBaseUrl: "https://sky.test",
   runnerBundlePath: "/unused/runner.mjs",
   cliBundlePath: "/unused/sky.mjs",

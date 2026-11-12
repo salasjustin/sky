@@ -27,8 +27,11 @@ const Env = z.object({
     .transform((s) => s || undefined),
   API_BASE_URL: z.url(),
   AGENT_TOKEN: z.string().min(1),
-  // presence only: the Claude subprocess reads it from the inherited env, so it never enters Config
-  CLAUDE_CODE_OAUTH_TOKEN: z.string().min(1),
+  // which credential the Claude session uses, and its value, which only the Claude subprocess reads,
+  // so it never enters Config: the subscription token for `oauth`, `SKY_CLAUDE_API_KEY` for `api-key`
+  SKY_CLAUDE_AUTH: z.enum(["oauth", "api-key"]).default("oauth"),
+  CLAUDE_CODE_OAUTH_TOKEN: z.string().min(1).optional(),
+  SKY_CLAUDE_API_KEY: z.string().min(1).optional(),
   REPO_DIR: z.string().min(1).default("/workspace/repo"),
   WORKTREES_DIR: z.string().min(1).default("/workspace/worktrees"),
   APPROVAL_POLICY: json.pipe(z.array(PolicyPattern)).default([]),
@@ -49,6 +52,12 @@ const Env = z.object({
     .transform((s) => s || undefined),
 });
 
+/** The variable holding the credential the run's `SKY_CLAUDE_AUTH` names; a run without it can't start a session. */
+const credentialVariable = (env: NodeJS.ProcessEnv) =>
+  env.SKY_CLAUDE_AUTH === "api-key"
+    ? "SKY_CLAUDE_API_KEY"
+    : "CLAUDE_CODE_OAUTH_TOKEN";
+
 export type Config = {
   agentId: AgentId;
   runId: RunId;
@@ -56,6 +65,8 @@ export type Config = {
   sessionId: string | undefined;
   apiBaseUrl: string;
   agentToken: string;
+  /** The credential the session authenticates with; its value is read from the env by `claudeProcessEnv`. */
+  claudeAuth: "oauth" | "api-key";
   repoDir: string;
   worktreesDir: string;
   /** Tool-call patterns that wait for a person's approval; see `matchesPolicy`. */
@@ -78,10 +89,16 @@ export class ConfigError extends Error {}
 
 export function loadConfig(env: NodeJS.ProcessEnv): Config {
   const parsed = Env.safeParse(env);
-  if (!parsed.success) {
+  const credential = credentialVariable(env);
+  if (!parsed.success || !env[credential]) {
     // keys only: issue messages can quote the received value, and two of these are secrets
     const keys = [
-      ...new Set(parsed.error.issues.map((i) => String(i.path[0]))),
+      ...new Set([
+        ...(parsed.success
+          ? []
+          : parsed.error.issues.map((i) => String(i.path[0]))),
+        ...(env[credential] ? [] : [credential]),
+      ]),
     ];
     throw new ConfigError(`missing or invalid env: ${keys.join(", ")}`);
   }
@@ -93,6 +110,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     sessionId: e.SESSION_ID,
     apiBaseUrl: e.API_BASE_URL,
     agentToken: e.AGENT_TOKEN,
+    claudeAuth: e.SKY_CLAUDE_AUTH,
     repoDir: e.REPO_DIR,
     worktreesDir: e.WORKTREES_DIR,
     approvalPolicy: e.APPROVAL_POLICY,

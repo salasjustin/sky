@@ -128,6 +128,8 @@ const eventPost = (log: (line: string) => void) =>
 export function internalRoutes(
   longPollMs: number,
   log: (line: string) => void,
+  /** Told of every run that failed, with its stored (redacted) error, once the failure is committed. */
+  onRunFailed: (runId: RunId, error: string) => void = () => {},
 ) {
   const requireToken = factory.createMiddleware(async (c, next) => {
     if (!bearer(c.req.header("authorization"))) {
@@ -206,7 +208,15 @@ export function internalRoutes(
             })
             .where(eq(agents.id, run.agentId))
             .run();
-          return { kind: "stored", id, enqueued } as const;
+          return {
+            kind: "stored",
+            id,
+            enqueued,
+            failure:
+              redacted.type === "run.failed"
+                ? { runId: run.id, error: redacted.payload.error }
+                : undefined,
+          } as const;
         },
         { behavior: "immediate" },
       );
@@ -234,6 +244,15 @@ export function internalRoutes(
       }
       // after the commit, so the dispatcher sees the rows; never awaited, so delivery can't slow the runner
       if (outcome.enqueued > 0) c.var.nudgeDeliveries();
+      if (outcome.failure) {
+        try {
+          onRunFailed(outcome.failure.runId, outcome.failure.error);
+        } catch (err) {
+          log(
+            `handling the failure of ${outcome.failure.runId} failed: ${err}`,
+          );
+        }
+      }
       return c.json({ id: outcome.id }, 201);
     })
     .get("/runs/:runId/requests/:requestId", requestParam, async (c) => {

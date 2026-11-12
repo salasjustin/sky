@@ -41,6 +41,9 @@ export const environmentFailureSteps = [
   "checkpoint",
 ] as const;
 
+// what an environment does while its subscription is at its limit; no CHECK on the column, which would make drizzle-kit rebuild the table, so the API validates it
+export const claudeFallbacks = ["api-key", "none"] as const;
+
 // what an API key may do; the CHECK on `role` spells the same list
 export const apiKeyRoles = ["admin", "runs"] as const;
 
@@ -84,6 +87,13 @@ export const environments = sqliteTable(
       .$type<{ defaults: boolean; commands: string[] }>()
       .notNull()
       .default({ defaults: true, commands: [] }),
+    // a subscription name, "api-key", "pool", or null for the default token; names only, never a value
+    claudeCredential: text("claude_credential"),
+    // with claude_credential "pool": the subscription names it may use, in order; null means every one. No CHECK, for the same reason
+    claudePool: text("claude_pool", { mode: "json" }).$type<string[] | null>(),
+    claudeFallback: text("claude_fallback", { enum: claudeFallbacks })
+      .notNull()
+      .default("api-key"),
     failureStep: text("failure_step", { enum: environmentFailureSteps }),
     // redacted and truncated by the API before it lands here
     failureStderr: text("failure_stderr"),
@@ -199,6 +209,10 @@ export const runs = sqliteTable(
     rollup: text({ mode: "json" }).$type<RunRollup>(),
     // names of the env secrets and envVars injected into the run; no CHECK, for the same reason as rollup
     secretNames: text("secret_names", { mode: "json" }).$type<string[]>(),
+    // the Claude credential the launch used, by name ("default", a subscription's name or "api-key"); null before it picks one. No CHECK, for the same reason as rollup
+    claudeCredential: text("claude_credential"),
+    // the failed run this one retries after a usage limit, on the API key or a pool's next subscription; null for any other run
+    retryOf: text("retry_of").$type<RunId>(),
     createdAt: createdAt(),
   },
   (t) => [
@@ -408,6 +422,35 @@ export const secrets = sqliteTable(
     ),
     check("secrets_key_version", sql`${c(t.keyVersion)} > 0`),
   ],
+);
+
+// a subscription's usage limit and when it resets; a row past its time is spent, and kept so a restart loses nothing
+export const claudeLimits = sqliteTable(
+  "claude_limits",
+  {
+    credential: text().primaryKey(),
+    limitedUntil: text("limited_until").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    check("claude_limits_limited_until", isoUtc(t.limitedUntil)),
+    check("claude_limits_created_at", isoUtc(t.createdAt)),
+  ],
+);
+
+// a subscription's last-seen usage from the latest probe, for pool environments to pick by
+export const claudeUsage = sqliteTable(
+  "claude_usage",
+  {
+    credential: text().primaryKey(),
+    // fractions of the window used, with when it resets; null when the probe didn't report that window
+    fiveHourUtilization: real("five_hour_utilization"),
+    fiveHourResetsAt: text("five_hour_resets_at"),
+    sevenDayUtilization: real("seven_day_utilization"),
+    sevenDayResetsAt: text("seven_day_resets_at"),
+    probedAt: text("probed_at").notNull(),
+  },
+  (t) => [check("claude_usage_probed_at", isoUtc(t.probedAt))],
 );
 
 // a run's own env values, encrypted by the API like secrets and purged once expired

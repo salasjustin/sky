@@ -32,6 +32,8 @@ A missing, unknown or revoked key returns `401`.
 sky key create better-giving --role=runs --env=bg-platform   # --env takes ids or names, comma-separated
 sky key list                    # id, role, active|revoked, name and environments; secrets are never printed
 sky key revoke key_…
+sky env set-claude web personal   # admin only: the Claude credential web's runs use: a name, api-key, pool or default
+sky claude-credentials            # admin only: each credential, its environments, limit and runs today
 ```
 
 `create` prints `key_… sky_…` once. Sky stores only a hash of the secret, so it can't be shown again; lose it and revoke the key. Revoking takes effect on the next request and also deletes the webhooks that key created. Over REST: `POST /v1/keys` (`name`, `role: "runs"`, `environmentIds`), `GET /v1/keys`, `DELETE /v1/keys/:id`.
@@ -96,7 +98,12 @@ approvalPolicy: [Bash] # tool names whose calls wait for your approval
 autoApprove: # optional: Bash commands that skip approvalPolicy
   defaults: true # false drops the built-in list
   commands: [make check] # added to the built-ins (or all there is, with defaults: false)
+claudeCredential: personal # optional: which Claude credential runs use (see Claude credentials)
+claudePool: [work, personal] # optional, with claudeCredential: pool: the subscriptions it may use, in order
+claudeFallback: api-key # optional: api-key or none, what a run does while its subscription is at its limit
 ```
+
+The Claude fields are optional. A field the file omits keeps the environment's current value, so `sky apply` never undoes a `sky env set-claude`, and deleting `claudeCredential` from the file doesn't move an environment back to the default token: write `claudeCredential: default` for that. A new environment gets the defaults (the default token, every subscription if it is a pool, `api-key`).
 
 `setup` runs in the clone with bash, with pnpm and yarn on `PATH` and `SKY_CLAUDE` set to the `claude` binary agents run. After it, Sky installs the plugins the repo's `.claude/settings.json` enables in `enabledPlugins`, from the marketplaces its `extraKnownMarketplaces` declares. If a plugin comes from a marketplace that isn't declared there, add the marketplace in `setup`:
 
@@ -145,6 +152,42 @@ sky status <agent>    # status, summary, error and compare link
 ```
 
 [Driving agents](docs/driving-agents.md) walks a bot through an agent end to end: start, wait, answer or approve, follow up, read the result, archive.
+
+### Claude credentials
+
+Runs authenticate to Claude with a credential the server holds as a secret. Each credential has a name, and no value is ever returned, printed or logged: everything below refers to them by name.
+
+| secret                      | credential                                                                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `CLAUDE_CODE_OAUTH_TOKEN`   | `default`, a subscription token from `claude setup-token`; required, and what an environment uses until it is assigned another |
+| `CLAUDE_OAUTH_TOKEN_<NAME>` | another subscription, named by `<NAME>` in lowercase: `CLAUDE_OAUTH_TOKEN_PERSONAL` is `personal`                              |
+| `SKY_ANTHROPIC_API_KEY`     | `api-key`, a pay-per-use Anthropic API key                                                                                     |
+
+A `<NAME>` is up to 64 letters, digits and `_`, and not `DEFAULT` or `POOL`. A token secret with any other name stops the API from booting.
+
+**Each environment has one credential.** Assign it with `sky env set-claude <env> <name|api-key|pool|default>`, the `claudeCredential` field of `env.yaml`, or `PATCH /v1/environments/:id`; only the admin key can. `default`, or leaving it unset on a new environment, is the default token. A run records the name of the credential it used: `sky status` prints it and a run's `claudeCredential` carries it. `GET /v1/claude-credentials` (admin only) and `sky claude-credentials` list each credential with its kind (`subscription` or `api-key`), the environments assigned it, when its limit lifts if it is limited, how many runs started on it since midnight UTC, its last-seen 5-hour and 7-day usage, and the pool environments that may use it.
+
+**Only a `pool` environment moves work between subscriptions, and pools are off by default.** An environment assigned a subscription, `api-key` or the default token uses that credential alone: Sky does not balance its runs across tokens, and a run that fails on its subscription is never retried on another. Its only fallback is the API key. Moving between subscriptions is something you opt an environment into, with `claudeCredential: pool` ([below](#opt-in-subscription-pool)).
+
+**When a subscription reaches its usage limit** (the 5-hour or the weekly one), Sky marks it limited until the reset time Claude reports, kept across restarts, and:
+
+- a run that fails with the limit is retried once, as a new run on the same agent (its `retryOf` names the failed one), resuming the same session so its worktree isn't lost, on `SKY_ANTHROPIC_API_KEY` (a pool run tries its pool's next subscription first);
+- a launch while the subscription is limited goes straight to the API key, until the reset time passes;
+- with no API key set, the launch fails at once with `claude_limited`, naming the reset time in UTC, instead of starting a run that would die.
+
+If the message gives no reset time Sky can read, it holds the limit for 15 minutes. Set `claudeFallback: none` on an environment to turn the fallback off: its limited launches fail with the same error and the reset time, and no API money is spent. A run is retried from the server's memory of its launch, so a restart between a run's launch and its limit failure loses that one retry, not the limited state. Setting a Fly secret restarts the API, so stage it with `fly secrets set --stage` and run `fly secrets deploy` while no run is active.
+
+**The API key stays out of the project's way.** Claude Code prefers `ANTHROPIC_API_KEY` over a subscription token, and an environment may hold its own `ANTHROPIC_API_KEY` secret for its commands. The runner gives the Claude session exactly the run's credential. On a subscription run no API key of any kind reaches it; the project's key still works for the commands the session runs. On an API-key run Sky's key goes to the Claude process alone: it isn't in the commands' own env, and they keep the project's own key, or have none. A nested `claude -p` (such as a Kru check) is logged in with the sandbox's subscription, so on an API-key run it isn't logged in and the agent is told to report such a check as not run.
+
+#### Opt-in subscription pool
+
+`claudeCredential: pool` lets one environment spread its runs over several subscriptions. It is the only assignment that does, and nothing is a pool until you set it. `claudePool: [work, personal]` (`sky env set-claude <env> pool --pool=work,personal`) lists the subscriptions it may use, in failover order; without a list the pool is every subscription the server holds, the default included. `sky env set-claude` changes the list only when `--pool` is given, so `--fallback=none` alone leaves an ordered pool as it is; `--pool=all` (any case) resets it to every subscription, as `claudePool: null` does in `env.yaml`, where `all` is not a keyword.
+
+- **Usage.** For each subscription Sky keeps its last-seen 5-hour and 7-day usage and their reset times, read from the `anthropic-ratelimit-unified-*` headers of a one-token probe (`POST /v1/messages` on the cheapest model, with the Claude Code system prompt and the OAuth beta header). A pool launch probes the subscriptions whose reading is older than 5 minutes, one probe at a time per subscription and never more often than that, and stores the readings, so a restart keeps them. A probe that fails is logged by name and never fails the launch. A subscription the probe finds full is marked limited until that window resets. One the probe gets a `429` for with no window full is marked limited until the earliest reset the answer gives. Either is held 15 minutes when the answer gives no reset. A subscription whose token is refused (`401` or `403`) is logged by name, nothing is stored for it, and pool launches leave it out for 5 minutes. No reset is held further than 7 days ahead, from a probe or a limit message.
+- **Pick.** A pool launch runs on the subscription in the pool that isn't limited and has the most headroom: the lowest of the larger of its 5-hour and 7-day use, a window already past its reset counting as unused. Ties go to the earlier in the list, and a subscription that was never probed, or whose last probe failed, ranks after those that answered.
+- **Failover.** A pool run that fails with a usage limit, 5-hour or weekly, marks that subscription limited until its reset and is retried once on the next subscription in the pool's order that isn't limited, resuming the same session. A chain tries each subscription at most once. After the list it goes to the API key on the terms above, or, when the server has no key or `claudeFallback` is `none`, stays failed with a `runner.warning` naming the earliest reset in UTC. A pool launch with every subscription limited, or refused by the probe, goes straight to the key, or fails with `claude_limited` naming the earliest reset.
+
+`sky claude-credentials` shows each subscription's usage and which pool environments use it. The API key rules above are unchanged for pools: the key reaches only the Claude session of a run that is on it.
 
 ### Base profiles
 
@@ -291,6 +334,7 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | `POST /v1/agents/:id/stop` · `…/archive`                                | stop the current run; archive the agent                |
 | `POST`, `GET /v1/webhooks` · `GET`, `DELETE /v1/webhooks/:id`           | subscribe an https URL to events; list, read, remove   |
 | `POST`, `GET /v1/keys` · `DELETE /v1/keys/:id`                          | admin only: mint, list and revoke `runs` keys          |
+| `GET /v1/claude-credentials`                                            | admin only: the Claude credentials, by name            |
 
 Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you'll meet:
 
@@ -308,15 +352,17 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 
 A run the API fails ends with `run.failed`, and its `error` is one of:
 
-| error               | means                                                                                                                                                                                                                                      |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `launch_failed`     | the runner couldn't be started on the sprite; the detail follows the colon                                                                                                                                                                 |
-| `launch_timeout`    | the runner never reported in within `LAUNCH_DEADLINE_MINUTES` (default 15); a `runner.warning` or heartbeat doesn't count as reporting in                                                                                                  |
-| `sprite_low_memory` | the launch was refused: the sprite had less memory available than `SPRITE_MIN_FREE_MB` (default 1024); the error says how much was free. Wait for a run on the sprite to end, or lower `concurrency`                                       |
-| `runner_lost`       | the run went quiet, the API woke its sprite, and the runner was no longer running there; the error names the sprite                                                                                                                        |
-| `runner_killed`     | as `runner_lost`, and the sprite killed the runner, likely out of memory: the kernel logged a kill after the run was created, or the sprite had less than `SPRITE_MIN_FREE_MB` available; the error names the sprite and the memory it had |
-| `runner_timeout`    | no event for `RUN_TIMEOUT_MINUTES` (default 30), though the runner was still running (or its sprite couldn't be reached to tell); names the tool call when one was running                                                                 |
-| `waiting_timeout`   | the run waited on an answer or approval past its limit and its runner is gone                                                                                                                                                              |
+| error                       | means                                                                                                                                                                                                                                      |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `launch_failed`             | the runner couldn't be started on the sprite; the detail follows the colon                                                                                                                                                                 |
+| `launch_timeout`            | the runner never reported in within `LAUNCH_DEADLINE_MINUTES` (default 15); a `runner.warning` or heartbeat doesn't count as reporting in                                                                                                  |
+| `claude_limited`            | the launch was refused: the environment's subscription is at its usage limit and the API key can't stand in (none is set, or the environment's `claudeFallback` is `none`); the error names the reset time in UTC                          |
+| `claude_credential_missing` | the environment is assigned a credential this server no longer holds, or the API key it is assigned isn't set                                                                                                                              |
+| `sprite_low_memory`         | the launch was refused: the sprite had less memory available than `SPRITE_MIN_FREE_MB` (default 1024); the error says how much was free. Wait for a run on the sprite to end, or lower `concurrency`                                       |
+| `runner_lost`               | the run went quiet, the API woke its sprite, and the runner was no longer running there; the error names the sprite                                                                                                                        |
+| `runner_killed`             | as `runner_lost`, and the sprite killed the runner, likely out of memory: the kernel logged a kill after the run was created, or the sprite had less than `SPRITE_MIN_FREE_MB` available; the error names the sprite and the memory it had |
+| `runner_timeout`            | no event for `RUN_TIMEOUT_MINUTES` (default 30), though the runner was still running (or its sprite couldn't be reached to tell); names the tool call when one was running                                                                 |
+| `waiting_timeout`           | the run waited on an answer or approval past its limit and its runner is gone                                                                                                                                                              |
 
 **The probe.** A sprite can go to sleep under a run and lose its runner. Once a `running` run has had no event for `RUN_PROBE_MINUTES` (default 5, and always below `RUN_TIMEOUT_MINUTES`; when the timeout is under 10 minutes the default is half of it), the API wakes its sprite and looks for the run's runner:
 

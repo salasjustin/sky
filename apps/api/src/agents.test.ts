@@ -148,6 +148,8 @@ test("POST returns 202 with the agent on claude/<agentId> and a starting run", a
       summary: null,
       usage: null,
       error: null,
+      claudeCredential: null,
+      retryOf: null,
       createdAt: iso,
     },
   });
@@ -202,6 +204,7 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   });
   // the secrets ride in a file only the sprite user can read, which the command sources and deletes
   expect(envFileOf(wire, session)).toEqual({
+    SKY_CLAUDE_AUTH: "oauth",
     CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
     AGENT_TOKEN: expect.any(String),
   });
@@ -354,6 +357,7 @@ test("the env's secrets reach the runner through the env file, quotes intact; a 
     TRICKY: tricky,
     DB_URL: "postgres://u:p@db/x",
     GITHUB_CONNECTOR: "VPpb7x",
+    SKY_CLAUDE_AUTH: "oauth",
     CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
     AGENT_TOKEN: expect.any(String),
   });
@@ -1409,6 +1413,8 @@ test("GET of an ended run returns its branch and its diff against the env's base
     summary: "done",
     usage,
     error: null,
+    claudeCredential: "default",
+    retryOf: null,
     createdAt: expect.any(String),
     branch: `claude/${agent.id}`,
     diff: patch,
@@ -3652,6 +3658,7 @@ test("launch envVars reach that run's env file, are stored encrypted until their
   expect(envFileOf(wire, wire.sessions[0])).toEqual({
     A_VAR: envVarValue,
     B_SECRET: "overrides-the-env-one",
+    SKY_CLAUDE_AUTH: "oauth",
     CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
     AGENT_TOKEN: expect.any(String),
   });
