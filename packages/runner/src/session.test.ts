@@ -972,7 +972,8 @@ test("a check written as plain `claude -p` is still run with every project crede
     const append = await appendOf(['claude -p "/acme:review"']);
     expect(append).toContain('- claude -p "/acme:review"');
     expect(append).not.toContain("as written");
-    const instruction = /`(env (?:-u \S+ )+(?:\S+=\S+ )*)claude -p …`, even where/;
+    const instruction =
+      /`(env (?:-u \S+ )+(?:\S+=\S+ )*)claude -p …`, even where/;
     const prefix = instruction.exec(append)?.[1] ?? "";
     for (const name of [
       "ANTHROPIC_API_KEY",
