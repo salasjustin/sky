@@ -20,6 +20,7 @@ import { RUNNER_TEXT_MAX, type RunnerEventPost } from "@sky/shared";
 import { delay, HttpResponse, http } from "msw";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
+import { PROJECT_VARIABLES } from "./claude-auth.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
 import { createDecisionWaiter } from "./requests.js";
@@ -960,15 +961,37 @@ test("with a connector and checks, the publish instructions come first, then the
   }
 });
 
-test("a check written as plain `claude -p` is still run with the API key unset", async () => {
+test("a check written as plain `claude -p` is still run with every project credential, gateway and provider switch unset", async () => {
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
   try {
     const append = await appendOf(['claude -p "/acme:review"']);
     expect(append).toContain('- claude -p "/acme:review"');
-    expect(append).toContain(
-      "`env -u ANTHROPIC_API_KEY claude -p …`, even where the check leaves that prefix out",
-    );
     expect(append).not.toContain("as written");
+    const instruction = /`(env (?:-u \S+ )+)claude -p …`, even where/;
+    const prefix = instruction.exec(append)?.[1] ?? "";
+    for (const name of [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_BASE_URL",
+      ...PROJECT_VARIABLES,
+    ])
+      expect(prefix).toContain(`-u ${name} `);
+    // what the nested `claude` would see, run in a command's env: the subscription login and nothing
+    // of the project's that outranks it or redirects it
+    const projectEnv = Object.fromEntries(
+      PROJECT_VARIABLES.map((name) => [name, `project-${name}`]),
+    );
+    const seen = execFileSync("sh", ["-c", `${prefix}env`], {
+      env: {
+        PATH: process.env.PATH,
+        CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+        ...projectEnv,
+      },
+      encoding: "utf8",
+    });
+    expect(seen).toContain("CLAUDE_CODE_OAUTH_TOKEN=subscription-token");
+    for (const name of PROJECT_VARIABLES)
+      expect(seen).not.toContain(`${name}=`);
   } finally {
     vi.unstubAllEnvs();
   }
@@ -1084,6 +1107,8 @@ describe("the Claude credential of a run", () => {
     options: Options;
     /** What a Bash command sees of ANTHROPIC_API_KEY, from sourcing the file Claude Code sources before each command. */
     commandKey: string;
+    /** What a Bash command's env holds, from sourcing that file over Claude's own env. */
+    commandEnv: Record<string, string>;
     /** What the SessionStart hook appended to the file Claude Code sources before each command. */
     commandScript: string;
     scriptPath: string | undefined;
@@ -1106,7 +1131,6 @@ describe("the Claude credential of a run", () => {
             };
           }
         ).hooks?.SessionStart?.[0]?.hooks[0]?.command;
-        seen.scriptPath = command && /cat '([^']+)'/.exec(command)?.[1];
         const envFile = join(root, "claude-env-file");
         writeFileSync(envFile, "");
         if (command) {
@@ -1115,11 +1139,22 @@ describe("the Claude credential of a run", () => {
           });
         }
         seen.commandScript = readFileSync(envFile, "utf8");
+        seen.scriptPath = /-r '([^']+)'/.exec(seen.commandScript)?.[1];
         // a command's shell: Claude's own env, with that file sourced first
         seen.commandKey = execFileSync(
           "sh",
           ["-c", `. '${envFile}'; printf %s "$ANTHROPIC_API_KEY"`],
           { env: options.env as Record<string, string>, encoding: "utf8" },
+        );
+        const sourced = execFileSync("sh", ["-c", `. '${envFile}'; env`], {
+          env: options.env as Record<string, string>,
+          encoding: "utf8",
+        });
+        seen.commandEnv = Object.fromEntries(
+          sourced.split("\n").flatMap((line) => {
+            const at = line.indexOf("=");
+            return at > 0 ? [[line.slice(0, at), line.slice(at + 1)]] : [];
+          }),
         );
       }) as unknown as SDKMessage,
       result,
@@ -1256,9 +1291,13 @@ describe("the Claude credential of a run", () => {
     const seen = await sessionSeen(config);
     expect(seen.options.env).not.toHaveProperty("ANTHROPIC_BASE_URL");
     expect(seen.options.env).not.toHaveProperty("ANTHROPIC_AUTH_TOKEN");
-    expect(seen.commandScript).toBe(
-      "export ANTHROPIC_AUTH_TOKEN='project-auth-token-opaque'\nexport ANTHROPIC_BASE_URL='https://project-gateway.example'\n",
-    );
+    expect(seen.commandEnv).toMatchObject({
+      ANTHROPIC_AUTH_TOKEN: "project-auth-token-opaque",
+      ANTHROPIC_BASE_URL: "https://project-gateway.example",
+    });
+    // Claude Code's own env file only points at the runner's, which the runner deletes
+    expect(seen.commandScript).not.toContain("project-auth-token-opaque");
+    expect(seen.commandScript).not.toContain("project-gateway.example");
   });
 
   test("the file holding the project's key is removed when the session ends", async () => {

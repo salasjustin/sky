@@ -29,8 +29,9 @@ const ROUTING_VARIABLES = [
 ];
 
 // the names `claudeProcessEnv` drops whose values are the project's, handed back to its commands by
-// `commandEnvScript`. CLAUDE_CODE_OAUTH_TOKEN is only ever the run's chosen token: the API reserves it
-const PROJECT_VARIABLES = [
+// `commandEnvScript`, and unset for a check's nested `claude`. CLAUDE_CODE_OAUTH_TOKEN is only ever the
+// run's chosen token: the API reserves it
+export const PROJECT_VARIABLES = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   ...ROUTING_VARIABLES,
@@ -75,9 +76,9 @@ const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
  * Gives the session's Bash commands back the project's own values of what `claudeProcessEnv` drops
  * (its API key, auth token, base URL and provider switches, read from `env`, the session's env before
  * the credential is chosen), so its commands work as they always did; and on an API-key run with no
- * project key, unsets Sky's. A SessionStart hook appends this to the file Claude Code sources before
- * each command, which reaches the commands and not Claude itself. Sky's key and the subscription token
- * are never written here. Undefined when there is nothing to say.
+ * project key, unsets Sky's. A SessionStart hook has the file Claude Code sources before each command
+ * source this in turn, which reaches the commands and not Claude itself. Sky's key and the
+ * subscription token are never written here. Undefined when there is nothing to say.
  */
 export function commandEnvScript(
   auth: ClaudeAuth,
@@ -118,7 +119,9 @@ export function removeCommandEnvNow(): void {
 
 /**
  * Writes `commandEnvScript` to a file only this user reads, and the SessionStart hook that appends
- * it to `$CLAUDE_ENV_FILE`. The values ride in the file, not in argv or Claude's env.
+ * to `$CLAUDE_ENV_FILE` a line sourcing that file while it exists. The values live in that file
+ * alone, never in argv, Claude's env or Claude Code's env file; once `remove` or
+ * `removeCommandEnvNow` deletes it, the line sources nothing and still succeeds.
  */
 export async function prepareCommandEnv(
   auth: ClaudeAuth,
@@ -132,6 +135,9 @@ export async function prepareCommandEnv(
   // before the write: a signal can land while it is in flight
   unremoved.add(path);
   await writeFile(path, script, { mode: 0o600, flag: "wx" });
+  const quoted = shellQuote(path);
+  const sourceWhileExists = `if [ -r ${quoted} ]; then . ${quoted}; fi`;
+  const appendSourceLine = `printf '%s\\n' ${shellQuote(sourceWhileExists)} >> "$CLAUDE_ENV_FILE"`;
   return {
     hooks: {
       SessionStart: [
@@ -139,7 +145,7 @@ export async function prepareCommandEnv(
           hooks: [
             {
               type: "command",
-              command: `cat ${shellQuote(path)} >> "$CLAUDE_ENV_FILE"`,
+              command: appendSourceLine,
             },
           ],
         },

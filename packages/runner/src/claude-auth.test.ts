@@ -1,11 +1,22 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import {
+  type CommandEnv,
   claudeProcessEnv,
   commandEnvScript,
   prepareCommandEnv,
+  removeCommandEnvNow,
 } from "./claude-auth.js";
 
 let dir: string;
@@ -108,19 +119,83 @@ test("an API-key run whose project has a gateway but no key still unsets Sky's k
   );
 });
 
+type Hooks = { SessionStart?: { hooks: { command: string }[] }[] };
+
+function hookCommand(env: CommandEnv): string {
+  const hooks = env.hooks as unknown as Hooks | undefined;
+  return hooks?.SessionStart?.[0]?.hooks[0]?.command ?? "";
+}
+
+const scriptIn = (where: string) =>
+  readdirSync(where)
+    .filter((name) => name.startsWith("sky-command-env-"))
+    .map((name) => join(where, name));
+
+/** Runs the hook as Claude Code does; `command` then sources `CLAUDE_ENV_FILE` as a command's shell does. */
+function runHookThenCommand(env: CommandEnv) {
+  const envFile = join(dir, "claude-env-file");
+  writeFileSync(envFile, "");
+  const shellEnv = { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile };
+  execFileSync("sh", ["-c", hookCommand(env)], { env: shellEnv });
+  const command = () =>
+    execFileSync(
+      "sh",
+      [
+        "-c",
+        `. "$CLAUDE_ENV_FILE" && printf %s "\${ANTHROPIC_API_KEY-unset} \${ANTHROPIC_BASE_URL-unset}"`,
+      ],
+      { env: shellEnv, encoding: "utf8" },
+    );
+  return { envFile, command };
+}
+
+const PROJECT = {
+  ANTHROPIC_API_KEY: "project-key",
+  ANTHROPIC_BASE_URL: "https://gateway.example",
+};
+
 test("the script file is readable by its owner alone, and gone once removed", async () => {
-  const env = await prepareCommandEnv(
-    "oauth",
-    { ANTHROPIC_API_KEY: "project-key" },
-    dir,
-  );
-  const command = JSON.stringify(env.hooks);
-  const path = /cat '([^']+)'/.exec(command)?.[1] ?? "";
+  const env = await prepareCommandEnv("oauth", PROJECT, dir);
+  const [path = ""] = scriptIn(dir);
   expect(readFileSync(path, "utf8")).toContain("project-key");
   expect(statSync(path).mode & 0o777).toBe(0o600);
-  expect(command).not.toContain("project-key");
   await env.remove();
-  expect(() => statSync(path)).toThrow();
+  expect(existsSync(path)).toBe(false);
+});
+
+test("the hook command names the script file and carries none of its values", async () => {
+  const env = await prepareCommandEnv("oauth", PROJECT, dir);
+  const command = hookCommand(env);
+  expect(command).toContain(scriptIn(dir)[0]);
+  expect(command).not.toContain("project-key");
+  expect(command).not.toContain("gateway.example");
+  await env.remove();
+});
+
+test("once the hook has run, a command sourcing Claude Code's env file gets the project's values, which that file never holds", async () => {
+  const env = await prepareCommandEnv("oauth", PROJECT, dir);
+  const { envFile, command } = runHookThenCommand(env);
+  expect(command()).toBe("project-key https://gateway.example");
+  const appended = readFileSync(envFile, "utf8");
+  expect(appended).not.toContain("project-key");
+  expect(appended).not.toContain("gateway.example");
+  await env.remove();
+});
+
+test("once the script is removed, sourcing Claude Code's env file still succeeds and exports nothing", async () => {
+  const env = await prepareCommandEnv("oauth", PROJECT, dir);
+  const { command } = runHookThenCommand(env);
+  await env.remove();
+  expect(command()).toBe("unset unset");
+});
+
+test("removeCommandEnvNow deletes a script still on disk before it returns, and a later remove still resolves", async () => {
+  const env = await prepareCommandEnv("oauth", PROJECT, dir);
+  const [path = ""] = scriptIn(dir);
+  expect(existsSync(path)).toBe(true);
+  removeCommandEnvNow();
+  expect(existsSync(path)).toBe(false);
+  await expect(env.remove()).resolves.toBeUndefined();
 });
 
 test("with nothing to say there is no hook and nothing to remove", async () => {
