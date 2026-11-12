@@ -125,6 +125,26 @@ test("the command script gives commands back every project value the Claude proc
   expect(commandEnvScript("api-key", runnerEnv)).toBe(script);
 });
 
+test("the command script exports the project's proxies and custom headers, and no OAuth refresh token or scopes", () => {
+  expect(
+    commandEnvScript("oauth", {
+      PATH: "/bin",
+      HTTPS_PROXY: "http://proxy.example:3128",
+      https_proxy: "http://proxy.example:3129",
+      ANTHROPIC_CUSTOM_HEADERS: "x-team: acme",
+      CLAUDE_CODE_OAUTH_REFRESH_TOKEN: "refresh-token-opaque",
+      CLAUDE_CODE_OAUTH_SCOPES: "user:inference",
+    }),
+  ).toBe(
+    [
+      "export ANTHROPIC_CUSTOM_HEADERS='x-team: acme'",
+      "export HTTPS_PROXY='http://proxy.example:3128'",
+      "export https_proxy='http://proxy.example:3129'",
+      "",
+    ].join("\n"),
+  );
+});
+
 test("an API-key run whose project has a gateway but no key still unsets Sky's key for commands", () => {
   const script = commandEnvScript("api-key", {
     ANTHROPIC_AUTH_TOKEN: "gw'token",

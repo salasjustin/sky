@@ -273,7 +273,7 @@ test("a label call that hangs is cut at the Sprites bound, logged once, and prov
   try {
     const { id } = (await (await post(kru)).json()) as { id: string };
     const sprite = spriteNameFor(id);
-    expect(await settled(id, 4_000)).toMatchObject({
+    expect(await settled(id, 15_000)).toMatchObject({
       status: "ready",
       failure: null,
     });

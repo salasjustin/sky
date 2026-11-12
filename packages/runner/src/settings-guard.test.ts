@@ -100,23 +100,52 @@ const KEYS: { key: string; settings: unknown }[] = [
 ];
 
 describe("a settings file that redirects Claude or swaps its credential", () => {
-  test("the keys include every one the task named", () => {
-    for (const name of [
-      "ANTHROPIC_BASE_URL",
+  test("the refused settings keys and env names are exactly these", () => {
+    expect([...REDIRECT_SETTINGS].sort()).toEqual([
+      "apiKeyHelper",
+      "awsAuthRefresh",
+      "awsCredentialExport",
+      "forceLoginGatewayUrl",
+      "forceLoginMethod",
+      "gcpAuthRefresh",
+      "policyHelper",
+    ]);
+    expect([...REDIRECT_SETTINGS_ENV].sort()).toEqual([
+      "ALL_PROXY",
       "ANTHROPIC_API_KEY",
       "ANTHROPIC_AUTH_TOKEN",
-      "CLAUDE_CODE_OAUTH_TOKEN",
-      "ANTHROPIC_CUSTOM_HEADERS",
-      "CLAUDE_CODE_USE_BEDROCK",
-      "CLAUDE_CODE_USE_VERTEX",
-      "CLAUDE_CODE_USE_FOUNDRY",
+      "ANTHROPIC_AWS_API_KEY",
+      "ANTHROPIC_AWS_BASE_URL",
+      "ANTHROPIC_BASE_URL",
       "ANTHROPIC_BEDROCK_BASE_URL",
+      "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+      "ANTHROPIC_CUSTOM_HEADERS",
+      "ANTHROPIC_FEDERATION_RULE_ID",
+      "ANTHROPIC_FOUNDRY_API_KEY",
+      "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+      "ANTHROPIC_FOUNDRY_BASE_URL",
+      "ANTHROPIC_FOUNDRY_RESOURCE",
+      "ANTHROPIC_ORGANIZATION_ID",
+      "ANTHROPIC_PROFILE",
       "ANTHROPIC_VERTEX_BASE_URL",
+      "ANTHROPIC_WORKSPACE_ID",
+      "AWS_BEARER_TOKEN_BEDROCK",
+      "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+      "CLAUDE_CODE_OAUTH_SCOPES",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+      "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+      "CLAUDE_CODE_USE_BEDROCK",
+      "CLAUDE_CODE_USE_FOUNDRY",
+      "CLAUDE_CODE_USE_MANTLE",
+      "CLAUDE_CODE_USE_VERTEX",
+      "CLAUDE_CONFIG_DIR",
       "HTTPS_PROXY",
       "HTTP_PROXY",
-    ])
-      expect(REDIRECT_SETTINGS_ENV).toContain(name);
-    expect(REDIRECT_SETTINGS).toContain("apiKeyHelper");
+      "all_proxy",
+      "http_proxy",
+      "https_proxy",
+    ]);
   });
 
   test.each([
@@ -203,8 +232,27 @@ describe("a settings file that redirects Claude or swaps its credential", () => 
       env: { ANTHROPIC_API_KEY: VALUE },
     });
     const lines = check();
-    expect(lines).toHaveLength(4);
+    expect(lines).toEqual([
+      "settings_redirect: .claude/settings.json sets apiKeyHelper; Sky runs Claude only with its own credential. Remove it to run on Sky.",
+      "settings_redirect: .claude/settings.json sets env.ANTHROPIC_BASE_URL; Sky runs Claude only with its own credential. Remove it to run on Sky.",
+      "settings_redirect: .claude/settings.json sets env.HTTPS_PROXY; Sky runs Claude only with its own credential. Remove it to run on Sky.",
+      `settings_redirect: ${join(dirs().home, ".claude/settings.json")} sets env.ANTHROPIC_API_KEY; Sky runs Claude only with its own credential. Remove it to run on Sky.`,
+    ]);
     expect(lines.join("\n")).not.toContain(VALUE);
+  });
+
+  test("a refused key set to an empty string is still refused", () => {
+    write(projectSettings(), { apiKeyHelper: "" });
+    expect(check()).toEqual([
+      "settings_redirect: .claude/settings.json sets apiKeyHelper; Sky runs Claude only with its own credential. Remove it to run on Sky.",
+    ]);
+  });
+
+  test("a file in managed-settings.d that isn't .json is ignored", () => {
+    write(join(dirs().managed, "managed-settings.d/10-gateway.txt"), {
+      apiKeyHelper: VALUE,
+    });
+    expect(check()).toEqual([]);
   });
 });
 

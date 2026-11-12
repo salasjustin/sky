@@ -3477,6 +3477,27 @@ describe("a repo's or sandbox's Claude settings", () => {
     expect(JSON.stringify(posted)).not.toContain(VALUE);
   });
 
+  test("an untracked project-local settings file in the main checkout fails the run, named as the main checkout's", async () => {
+    const repo = join(root, "repo");
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    writeFileSync(
+      join(repo, ".claude", "settings.local.json"),
+      JSON.stringify({ apiKeyHelper: VALUE }),
+    );
+    const { code, query, posted } = await run();
+    expect(code).toBe(1);
+    expect(query.calls).toHaveLength(0);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toMatchObject({
+      type: "run.failed",
+      payload: {
+        error:
+          "settings_redirect: .claude/settings.local.json in the main checkout sets apiKeyHelper; Sky runs Claude only with its own credential. Remove it to run on Sky.",
+      },
+    });
+    expect(JSON.stringify(posted)).not.toContain(VALUE);
+  });
+
   test("a user settings file a setup script wrote in the sandbox is caught", async () => {
     mkdirSync(join(home, ".claude"), { recursive: true });
     writeFileSync(
