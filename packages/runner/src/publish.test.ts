@@ -2367,3 +2367,301 @@ test("a GitHub head that is someone else's, neither this branch's history nor th
     "an earlier publish's patch\n",
   );
 });
+
+/** Merges `shas` into the branch, as `commit` makes commits. */
+const merge = (...shas: string[]) => {
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=Claude",
+      "-c",
+      "user.email=noreply@anthropic.com",
+      "merge",
+      "-q",
+      "--no-edit",
+      ...shas,
+    ],
+    {
+      cwd: work,
+      env: {
+        ...withoutHostIdentity(),
+        GIT_AUTHOR_DATE: "2026-10-30T14:00:00+00:00",
+        GIT_COMMITTER_DATE: "2026-10-30T14:00:00+00:00",
+      },
+    },
+  );
+  return git(work, "rev-parse", "HEAD");
+};
+
+/** The base moves to a new commit, here as fetched (`origin/main`) and on GitHub. */
+const baseMoves = (files: Record<string, string>) => {
+  const next = nextBase(files);
+  git(work, "update-ref", "refs/remotes/origin/main", next);
+  baseMovesTo(next);
+  return next;
+};
+
+test("a merge of the base GitHub holds is sent with the base tip as its second parent, so the base is an ancestor of the published head", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  const gh = fakeGitHub({ ref: first });
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base);
+
+  const result = await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[first, base]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+  expect(result.sha).toBe("commit1");
+});
+
+test("an octopus merge of commits GitHub holds keeps every parent, in order", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const gh = fakeGitHub();
+  // another branch's head on GitHub
+  const other = nextBase({ "x.txt": "from another branch\n" });
+  const lookedUp: string[] = [];
+  server.use(
+    http.get(`${REPO}/git/commits/${other}`, () => {
+      lookedUp.push(other);
+      return HttpResponse.json(apiCommit(other));
+    }),
+  );
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base, other);
+
+  await run();
+
+  // the parent is looked up on GitHub by its own sha, not assumed held
+  expect(lookedUp).toEqual([other]);
+  expect(gh.commits.map((c) => c.parents)).toEqual([
+    [base],
+    ["commit1", base, other],
+  ]);
+  expect(gh.refWrites).toEqual([
+    {
+      method: "POST",
+      body: { ref: "refs/heads/claude/agt_1", sha: "commit2" },
+    },
+  ]);
+});
+
+test("a merge of a branch only this clone has is refused, naming the merge, before anything is sent", async () => {
+  // a branch made here and never pushed
+  const side = nextBase({ "s.txt": "local only\n" });
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const gh = fakeGitHub();
+  const merged = merge(side);
+
+  const error = await run().catch((e: unknown) => e);
+
+  expect(String(error)).toContain(
+    `commit ${merged} on claude/agt_1 merges ${side}, which GitHub doesn't have`,
+  );
+  expect(String(error)).toMatch(
+    /merge only branches GitHub has, or replace the merge with its commits: `git rebase [0-9a-f]{40}`/,
+  );
+  expectNothingSent(gh);
+});
+
+test("a GitHub error other than not-found on a merge's parent lookup is raised as it is, not read as the parent missing", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const gh = fakeGitHub();
+  const other = nextBase({ "x.txt": "from another branch\n" });
+  server.use(
+    http.get(`${REPO}/git/commits/${other}`, () =>
+      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+    ),
+  );
+  merge(other);
+
+  const error = await run().catch((e: unknown) => e);
+
+  expect(String(error)).toContain(
+    `GET /repos/acme/widgets/git/commits/${other} returned 500: Server Error`,
+  );
+  expect(String(error)).not.toContain("doesn't have");
+  expectNothingSent(gh);
+});
+
+test("an octopus merge with one parent GitHub holds and one it doesn't is refused, naming the missing one, before anything is sent", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const gh = fakeGitHub();
+  const held = nextBase({ "x.txt": "on GitHub\n" });
+  const missing = nextBase({ "y.txt": "only here\n" });
+  server.use(
+    http.get(`${REPO}/git/commits/${held}`, () =>
+      HttpResponse.json(apiCommit(held)),
+    ),
+  );
+  const merged = merge(held, missing);
+
+  const error = await run().catch((e: unknown) => e);
+
+  expect(String(error)).toContain(
+    `commit ${merged} on claude/agt_1 merges ${missing}, which GitHub doesn't have`,
+  );
+  expect(String(error)).not.toContain(`merges ${held}`);
+  expectNothingSent(gh);
+});
+
+test("history without a merge sends one parent per commit and looks up no commit on GitHub", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Add b");
+  const gh = fakeGitHub();
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[baseSha], ["commit1"]]);
+  expect(gh.gets.filter((path) => path.includes("/git/commits/"))).toEqual([]);
+});
+
+test("a merge of the base after a held workflow change keeps both parents and still holds the change", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base);
+
+  const result = await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[base], ["commit1", base]]);
+  expect(treePaths(gh)).not.toContain(".github/workflows/ci.yml");
+  expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
+});
+
+test("a merge whose only change past its first parent is under .github/workflows is still sent, not skipped as held", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const base = baseMoves({ ".github/workflows/ci.yml": "name: ci v2\n" });
+  merge(base);
+
+  const result = await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[base], ["commit1", base]]);
+  // the base's newer workflow is GitHub's already and the connector can't write it, so it isn't sent
+  expect(treePaths(gh)).not.toContain(".github/workflows/ci.yml");
+  // the merge's workflows are the base's, which GitHub already has, so the branch holds nothing back
+  expect(result.held).toBeUndefined();
+});
+
+test("a branch already on GitHub that merges a base which since changed a workflow is refused before anything is sent", async () => {
+  baseWithWorkflows();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  // GitHub's head is the branch as it is here, with the base's workflows before they changed
+  const gh = fakeGitHub({ ref: first });
+  const base = baseMoves({ ".github/workflows/ci.yml": "name: ci v2\n" });
+  const merged = merge(base);
+
+  const error = await run().catch((e: unknown) => e);
+
+  expect(String(error)).toContain(
+    `commit ${merged} on claude/agt_1 merges ${base}, and the merge's .github/workflows/ differs from the one publish can send`,
+  );
+  expect(String(error)).toContain(
+    "have someone merge main into claude/agt_1 from outside the sandbox, then publish again, or rebase instead of merging",
+  );
+  expectNothingSent(gh);
+});
+
+test("a branch already on GitHub that merges a base whose workflows haven't changed is sent with both parents", async () => {
+  baseWithWorkflows();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  const gh = fakeGitHub({ ref: first });
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base);
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[first, base]]);
+  expect(treePaths(gh)).toEqual(["b.txt"]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("a branch published before, whose head GitHub holds under another sha, merges the moved base and is sent on top of that head, not rewritten", async () => {
+  const oldBase = baseSha;
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  // what the earlier publish made of `first`, on the base as it was then
+  const gh = fakeGitHub({
+    ref: "gh_first",
+    commitTrees: { gh_first: git(work, "rev-parse", `${first}^{tree}`) },
+    commitParents: { gh_first: [oldBase] },
+  });
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base);
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([["gh_first", base]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("a continued branch whose head GitHub holds under another sha merges the moved base and is sent on top of that head, not refused", async () => {
+  const oldBase = baseSha;
+  git(work, "config", "branch.claude/agt_1.sky-remote-branch", "feature/x");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  const gh = fakeGitHub({
+    ref: "gh_first",
+    branch: "feature/x",
+    pulls: [{ ...OPEN_PR, head: "feature/x" }],
+    allowPullUpdates: true,
+    commitTrees: { gh_first: git(work, "rev-parse", `${first}^{tree}`) },
+    commitParents: { gh_first: [oldBase] },
+  });
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base);
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([["gh_first", base]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("a continued branch with its own workflow changes merges an unchanged base and is sent with both parents", async () => {
+  baseWithWorkflows();
+  git(work, "config", "branch.claude/agt_1.sky-remote-branch", "feature/x");
+  writeFileSync(join(work, "theirs.txt"), "theirs\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: theirs\n");
+  const theirs = commit("Their change, with CI");
+  const gh = fakeGitHub({
+    ref: theirs,
+    branch: "feature/x",
+    pulls: [{ ...OPEN_PR, head: "feature/x" }],
+    allowPullUpdates: true,
+  });
+  // the base's workflows are still the ones their branch changed
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base);
+
+  const result = await run();
+
+  expect(result.held).toBeUndefined();
+  expect(gh.commits.map((c) => c.parents)).toEqual([[theirs, base]]);
+  expect(treePaths(gh)).toEqual(["b.txt"]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
