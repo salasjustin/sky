@@ -16,10 +16,18 @@ const split = (list: string) =>
 export const key: AgentCommand = {
   options: {
     role: { type: "string" },
-    env: { type: "string" },
+    env: { type: "string", multiple: true },
   },
   prepare(positionals, values) {
     const [sub, ...rest] = positionals;
+    if (sub !== "create" && sub !== "list" && sub !== "revoke") {
+      throw new UsageError(
+        sub === undefined
+          ? "key needs a subcommand: create, list or revoke"
+          : `unknown key subcommand '${sub}'`,
+        true,
+      );
+    }
     if (
       sub !== "create" &&
       (values.env !== undefined || values.role !== undefined)
@@ -53,48 +61,38 @@ export const key: AgentCommand = {
         return 0;
       };
     }
-    if (sub === "create") {
-      const [name, ...extra] = rest;
-      if (name === undefined || extra.length > 0) {
-        throw new UsageError(
-          "key create takes <name> --env=<id|name>,... [--role=runs]",
-          true,
-        );
-      }
-      if ((values.role ?? "runs") !== "runs") {
-        throw new UsageError("--role is runs, the only role a key gets", true);
-      }
-      if (values.env === undefined) {
-        throw new UsageError("key create needs --env=<id|name>,...", true);
-      }
-      const envRefs = split(values.env);
-      if (envRefs.length === 0) {
-        throw new UsageError("--env names no environment", true);
-      }
-      return async (api, _io, out) => {
-        const environmentIds: EnvironmentId[] = [];
-        for (const ref of envRefs) {
-          const id = await resolveEnvId(api, ref, out);
-          if (id === undefined) return 1;
-          environmentIds.push(id);
-        }
-        const created = await api.createKey({
-          name,
-          role: "runs",
-          environmentIds,
-        });
-        out.progress(
-          "the secret is shown only now; it can't be retrieved again",
-        );
-        out.result(created, `${created.id} ${created.secret}`);
-        return 0;
-      };
+    const [name, ...extra] = rest;
+    if (name === undefined || extra.length > 0) {
+      throw new UsageError(
+        "key create takes <name> --env=<id|name>,... [--role=runs]",
+        true,
+      );
     }
-    throw new UsageError(
-      sub === undefined
-        ? "key needs a subcommand: create, list or revoke"
-        : `unknown key subcommand '${sub}'`,
-      true,
-    );
+    if ((values.role ?? "runs") !== "runs") {
+      throw new UsageError("--role is runs, the only role a key gets", true);
+    }
+    if (values.env === undefined) {
+      throw new UsageError("key create needs --env=<id|name>,...", true);
+    }
+    const envRefs = split(values.env);
+    if (envRefs.length === 0) {
+      throw new UsageError("--env names no environment", true);
+    }
+    return async (api, _io, out) => {
+      const environmentIds: EnvironmentId[] = [];
+      for (const ref of envRefs) {
+        const id = await resolveEnvId(api, ref, out);
+        if (id === undefined) return 1;
+        environmentIds.push(id);
+      }
+      const created = await api.createKey({
+        name,
+        role: "runs",
+        environmentIds,
+      });
+      out.progress("the secret is shown only now; it can't be retrieved again");
+      out.result(created, `${created.id} ${created.secret}`);
+      return 0;
+    };
   },
 };

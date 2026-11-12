@@ -24,6 +24,8 @@ export interface AgentCommand {
   options: {
     [K in keyof Values]?: {
       type: NonNullable<Values[K]> extends boolean ? "boolean" : "string";
+      /** Repeats arrive comma-joined, so `--env=a --env=b` reads as `--env=a,b`. */
+      multiple?: true;
     };
   };
   prepare(positionals: string[], values: Values): Action;

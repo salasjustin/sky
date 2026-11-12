@@ -55,6 +55,24 @@ test("key create resolves env names to ids and prints the id and secret once on 
   expect(r.stderr).toMatch(/only now/);
 });
 
+test("a repeated --env adds to the comma list instead of replacing it", async () => {
+  server.use(...createHandlers);
+  const r = await runCli(["key", "create", "ci", "--env=web", "--env=api"]);
+  expect(r.code).toBe(0);
+  expect(posts).toEqual([
+    { name: "ci", role: "runs", environmentIds: ["env_1", "env_2"] },
+  ]);
+});
+
+test("a mistyped subcommand with --env exits 2 naming the subcommand, not the flag", async () => {
+  server.use(...createHandlers);
+  const r = await runCli(["key", "creat", "ci", "--env=web"]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("unknown key subcommand 'creat'");
+  expect(r.stderr).not.toContain("--env");
+  expect(posts).toEqual([]);
+});
+
 test("key create --json prints the created key, secret included, as one document", async () => {
   server.use(...createHandlers);
   const r = await runCli(["key", "create", "ci", "--env=web", "--json"]);

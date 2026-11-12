@@ -71,8 +71,10 @@ const help = (io: Io) => `Usage:
       Remove a webhook.
   sky key create <name> --env=<id|name>,... [--role=runs] [options]
       Issue an API key that can run agents only in those environments.
-      Prints "<id> <secret>"; the secret is shown only this once. Needs
-      the admin key, as do key list and key revoke.
+      --env repeats or takes a comma list. Names are resolved to ids when
+      the key is created, so an environment deleted and recreated must be
+      added to a new key. Prints "<id> <secret>"; the secret is shown only
+      this once. Needs the admin key, as do key list and key revoke.
   sky key list [options]
       Print "<id> <role> <active|revoked> <name> <env ids>" per key, oldest
       first; secrets are never printed.
@@ -185,7 +187,10 @@ export async function run(io: Io): Promise<number> {
 }
 
 function parse<
-  O extends Record<string, { type: "string" | "boolean"; short?: string }>,
+  O extends Record<
+    string,
+    { type: "string" | "boolean"; short?: string; multiple?: boolean }
+  >,
 >(args: string[], options: O, unknownOptionHint?: string) {
   try {
     return parseArgs({ args, options, allowPositionals: true, strict: true });
@@ -312,9 +317,12 @@ async function runCommand(
     io.stdout(help(io));
     return 0;
   }
-  // parseArgs types a spread option set as string | boolean
-  const text = (v: string | boolean | undefined) =>
-    typeof v === "string" ? v : undefined;
+  // parseArgs types a spread option set as string | boolean, arrays included
+  const text = (v: unknown) => (typeof v === "string" ? v : undefined);
+  const list = (v: unknown) =>
+    Array.isArray(v)
+      ? v.filter((s) => typeof s === "string").join(",")
+      : text(v);
   const action = spec.prepare(positionals, {
     prompt: text(values.prompt),
     timeout: text(values.timeout),
@@ -324,7 +332,7 @@ async function runCommand(
     events: text(values.events),
     format: text(values.format),
     secret: text(values.secret),
-    env: text(values.env),
+    env: list(values.env),
     role: text(values.role),
   });
   return await withApi(values, io, (api, out) => action(api, io, out));
