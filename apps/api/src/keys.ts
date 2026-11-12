@@ -67,7 +67,6 @@ export function keyRoutes() {
         })
         .returning()
         .get();
-      c.header("Location", `/v1/keys/${id}`);
       return c.json({ ...present(row), secret }, 201);
     })
     .get("/", adminOnly, (c) => {

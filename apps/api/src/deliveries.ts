@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 import {
   agents,
+  apiKeys,
   type Db,
   events,
   runs,
@@ -8,7 +9,7 @@ import {
   webhooks,
 } from "@sky/db";
 import type { AgentId, EnvironmentId, Event, EventType } from "@sky/shared";
-import { and, asc, eq, lt, lte, ne } from "drizzle-orm";
+import { and, asc, eq, isNull, lt, lte, ne } from "drizzle-orm";
 import { open, type Sealed, webhookSecretAad } from "./crypto.js";
 import { presentEvent } from "./run-events.js";
 import type { Tx } from "./runs.js";
@@ -89,6 +90,9 @@ export function enqueueDeliveries(
       ownerKeyId: webhooks.ownerKeyId,
     })
     .from(webhooks)
+    // a create racing its key's revoke can land after the revoke deleted the key's webhooks
+    .leftJoin(apiKeys, eq(apiKeys.id, webhooks.ownerKeyId))
+    .where(isNull(apiKeys.revokedAt))
     .all()
     .filter((w) => w.eventTypes.includes(type));
   if (subscribers.length === 0) return 0;

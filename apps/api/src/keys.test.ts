@@ -120,7 +120,7 @@ const unauthorized = {
   error: { code: "unauthorized", message: "invalid bearer token" },
 };
 
-test("admin mints a runs key: 201, the secret once, Location, and only its sha-256 stored", async () => {
+test("admin mints a runs key: 201, the secret once, no Location, and only its sha-256 stored", async () => {
   const envId = readyEnv();
   const res = await call(admin, "POST", "/v1/keys", {
     name: "ci",
@@ -137,7 +137,8 @@ test("admin mints a runs key: 201, the secret once, Location, and only its sha-2
     lastUsedAt: null,
   });
   expect(created.id).toMatch(/^key_/);
-  expect(res.headers.get("location")).toBe(`/v1/keys/${created.id}`);
+  // no GET /v1/keys/:id to point at
+  expect(res.headers.get("location")).toBeNull();
   const row = db.select().from(apiKeys).get();
   expect(row?.keyHash).toBe(
     createHash("sha256").update(created.secret).digest("hex"),
@@ -402,6 +403,45 @@ test("a key's webhook gets only its own agents' events; an admin webhook gets ev
     foreign.runId,
     adminAgent.runId,
   ]);
+});
+
+test("a webhook left owned by a revoked key gets no deliveries; an active key's still does", async () => {
+  const envId = readyEnv();
+  const active = await mintKey([envId]);
+  const revoked = await mintKey([envId], "revoked");
+  const activeHook = (await (
+    await call(active.secret, "POST", "/v1/webhooks", hook())
+  ).json()) as { id: WebhookId };
+  expect((await call(admin, "DELETE", `/v1/keys/${revoked.id}`)).status).toBe(
+    200,
+  );
+  // a create authenticated before the revoke committed, inserting after it
+  const orphan = mintId("whk");
+  db.insert(webhooks)
+    .values({
+      id: orphan,
+      url: "https://hooks.example.com/a",
+      eventTypes: ["claude.Message"],
+      ownerKeyId: revoked.id,
+    })
+    .run();
+  const activeAgent = seedAgent(envId, active.id);
+  const revokedAgent = seedAgent(envId, revoked.id);
+  for (const { runId } of [activeAgent, revokedAgent]) {
+    db.transaction((tx) =>
+      recordEvent(tx, runId, "claude.Message", { text: "hi" }),
+    );
+  }
+  const deliveriesTo = (id: WebhookId) =>
+    db
+      .select({ runId: events.runId })
+      .from(webhookDeliveries)
+      .innerJoin(events, eq(events.id, webhookDeliveries.eventId))
+      .where(eq(webhookDeliveries.webhookId, id))
+      .all()
+      .map((r) => r.runId);
+  expect(deliveriesTo(orphan)).toEqual([]);
+  expect(deliveriesTo(activeHook.id)).toEqual([activeAgent.runId]);
 });
 
 /** Parks the agent's run on an approval request, as the runner's run.waiting would. */
