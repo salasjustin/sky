@@ -140,6 +140,19 @@ function withGitConfig(
   return { ...env, ...added };
 }
 
+/**
+ * The session's env before `claudeProcessEnv` picks the credential: the runner's, which carries the
+ * project's own secrets, less the event token, which stays with the runner; plus the profile's
+ * session env and the git settings.
+ */
+function sessionEnvOf(config: Config): NodeJS.ProcessEnv {
+  const { AGENT_TOKEN: _, ...env } = process.env;
+  return withGitConfig(
+    { ...env, ...sessionGitIdentity(env), ...config.sessionEnv },
+    SESSION_GIT_CONFIG,
+  );
+}
+
 type RunnerEvent = Omit<RunnerEventPost, "runId">;
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
@@ -155,26 +168,18 @@ function sessionOptions(
   /** What the worktree's refresh from GitHub did, for the agent; see `prepareWorktree`. */
   notes: string[],
   mcpServers: Record<string, SessionMcpServer>,
-  /** The SessionStart hook that sets `ANTHROPIC_API_KEY` for the session's commands; see `prepareCommandEnv`. */
+  /** The SessionStart hook that gives the session's commands back what `claudeProcessEnv` drops; see `prepareCommandEnv`. */
   commandEnvHooks: CommandEnv["hooks"],
 ): Options {
-  // `env` replaces the subprocess env rather than adding to it, so it carries the project's own
-  // secrets to the session's commands; the event token stays with the runner. The Claude process
-  // itself gets exactly the run's credential: `claudeProcessEnv` drops the project's
-  // ANTHROPIC_API_KEY, which Claude Code would prefer over the subscription, and the commands get
-  // their ANTHROPIC_API_KEY from `commandEnvHooks` instead
-  const { AGENT_TOKEN: _, ...env } = process.env;
   return {
     cwd,
     resume: config.sessionId,
     abortController,
-    env: claudeProcessEnv(
-      withGitConfig(
-        { ...env, ...sessionGitIdentity(env), ...config.sessionEnv },
-        SESSION_GIT_CONFIG,
-      ),
-      config.claudeAuth,
-    ),
+    // `env` replaces the subprocess env rather than adding to it, so it carries the project's own
+    // secrets to the session's commands. The Claude process itself gets exactly the run's credential,
+    // sent to the Anthropic API: `claudeProcessEnv` drops the project's API key, auth token, base URL
+    // and provider switches, and the commands get those from `commandEnvHooks` instead
+    env: claudeProcessEnv(sessionEnvOf(config), config.claudeAuth, process.env),
     // Claude Code's own commit trailer and pull request footer are off, for hosting that rejects them
     settings: {
       attribution: { commit: "", pr: "" },
@@ -184,7 +189,7 @@ function sessionOptions(
       type: "preset",
       preset: "claude_code",
       append: [
-        ...(env[CONNECTOR_ENV] ? [publishInstructions()] : []),
+        ...(process.env[CONNECTOR_ENV] ? [publishInstructions()] : []),
         ...(config.checks.length > 0
           ? [checkInstructions(config.checks, config.claudeAuth)]
           : []),
@@ -695,7 +700,7 @@ export async function runSession(
     // inside the try: an API-key run that can't hide Sky's key from its commands must not start
     commandEnv = await prepareCommandEnv(
       config.claudeAuth,
-      process.env.ANTHROPIC_API_KEY || undefined,
+      sessionEnvOf(config),
     );
     const stream = deps.query({
       prompt: input.messages,

@@ -15,28 +15,55 @@ const AUTH_VARIABLES = [
   "CLAUDE_CODE_OAUTH_TOKEN",
 ];
 
+// what sends Claude Code's requests, credential included, somewhere other than the Anthropic API: the
+// endpoint override, and the provider switches that outrank every credential
+// (code.claude.com/docs/en/env-vars, code.claude.com/docs/en/authentication#authentication-precedence)
+const ROUTING_VARIABLES = [
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+  "CLAUDE_CODE_USE_MANTLE",
+];
+
+// the names `claudeProcessEnv` drops whose values are the project's, handed back to its commands by
+// `commandEnvScript`. CLAUDE_CODE_OAUTH_TOKEN is only ever the run's chosen token: the API reserves it
+const PROJECT_VARIABLES = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  ...ROUTING_VARIABLES,
+];
+
 /**
- * The env of the Claude process itself, carrying exactly the chosen credential. Claude Code prefers
- * `ANTHROPIC_API_KEY` over the subscription token, so a project's own key (an env secret, in the
- * runner's env) must never reach a subscription run, and Sky's key stands alone in an API-key run.
- * Sky's key arrives as `SKY_CLAUDE_API_KEY` so it never shares a name with the project's.
+ * The env of the Claude process itself, carrying exactly the chosen credential and sending it to the
+ * Anthropic API. Claude Code prefers `ANTHROPIC_API_KEY` over the subscription token, so a project's
+ * own key (an env secret, in the runner's env) must never reach a subscription run, and Sky's key
+ * stands alone in an API-key run. A project's `ANTHROPIC_BASE_URL` or provider switch would send the
+ * chosen credential to the project's gateway or cloud, so those go too. Sky's key arrives as
+ * `SKY_CLAUDE_API_KEY` so it never shares a name with the project's. The credential is read from
+ * `runnerEnv`, the env the API launched the runner with, so a profile's session env merged into
+ * `env` can't swap it.
  */
 export function claudeProcessEnv(
   env: NodeJS.ProcessEnv,
   auth: ClaudeAuth,
+  runnerEnv: NodeJS.ProcessEnv = env,
 ): NodeJS.ProcessEnv {
   const out = { ...env };
   for (const name of [
     ...AUTH_VARIABLES,
+    ...ROUTING_VARIABLES,
     "SKY_CLAUDE_API_KEY",
     "SKY_CLAUDE_AUTH",
   ]) {
     delete out[name];
   }
   if (auth === "api-key") {
-    if (env.SKY_CLAUDE_API_KEY) out.ANTHROPIC_API_KEY = env.SKY_CLAUDE_API_KEY;
-  } else if (env.CLAUDE_CODE_OAUTH_TOKEN) {
-    out.CLAUDE_CODE_OAUTH_TOKEN = env.CLAUDE_CODE_OAUTH_TOKEN;
+    if (runnerEnv.SKY_CLAUDE_API_KEY)
+      out.ANTHROPIC_API_KEY = runnerEnv.SKY_CLAUDE_API_KEY;
+  } else if (runnerEnv.CLAUDE_CODE_OAUTH_TOKEN) {
+    out.CLAUDE_CODE_OAUTH_TOKEN = runnerEnv.CLAUDE_CODE_OAUTH_TOKEN;
   }
   return out;
 }
@@ -44,17 +71,24 @@ export function claudeProcessEnv(
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
 /**
- * What the session's Bash commands see of `ANTHROPIC_API_KEY`: the project's own key when it has
- * one, so its commands work as they always did, and never Sky's. A SessionStart hook appends this to
- * the file Claude Code sources before each command, which reaches the commands and not Claude itself.
- * Undefined when there is nothing to say: a subscription run whose project has no key.
+ * Gives the session's Bash commands back the project's own values of what `claudeProcessEnv` drops
+ * (its API key, auth token, base URL and provider switches, read from `env`, the session's env before
+ * the credential is chosen), so its commands work as they always did; and on an API-key run with no
+ * project key, unsets Sky's. A SessionStart hook appends this to the file Claude Code sources before
+ * each command, which reaches the commands and not Claude itself. Sky's key and the subscription token
+ * are never written here. Undefined when there is nothing to say.
  */
 export function commandEnvScript(
   auth: ClaudeAuth,
-  projectKey: string | undefined,
+  env: NodeJS.ProcessEnv,
 ): string | undefined {
-  if (projectKey) return `export ANTHROPIC_API_KEY=${shellQuote(projectKey)}\n`;
-  return auth === "api-key" ? "unset ANTHROPIC_API_KEY\n" : undefined;
+  const lines = PROJECT_VARIABLES.flatMap((name) => {
+    const value = env[name];
+    return value ? [`export ${name}=${shellQuote(value)}`] : [];
+  });
+  if (auth === "api-key" && !env.ANTHROPIC_API_KEY)
+    lines.unshift("unset ANTHROPIC_API_KEY");
+  return lines.length > 0 ? `${lines.join("\n")}\n` : undefined;
 }
 
 type Settings = Exclude<Options["settings"], string | undefined>;
@@ -62,20 +96,20 @@ type Settings = Exclude<Options["settings"], string | undefined>;
 export type CommandEnv = {
   /** The `settings.hooks` that apply the script; undefined when there is no script. */
   hooks: Settings["hooks"];
-  /** Deletes the script, which may hold the project's key. */
+  /** Deletes the script, which may hold the project's key and token. */
   remove: () => Promise<void>;
 };
 
 /**
  * Writes `commandEnvScript` to a file only this user reads, and the SessionStart hook that appends
- * it to `$CLAUDE_ENV_FILE`. The key rides in the file, not in argv or Claude's env.
+ * it to `$CLAUDE_ENV_FILE`. The values ride in the file, not in argv or Claude's env.
  */
 export async function prepareCommandEnv(
   auth: ClaudeAuth,
-  projectKey: string | undefined,
+  env: NodeJS.ProcessEnv,
   dir: string = tmpdir(),
 ): Promise<CommandEnv> {
-  const script = commandEnvScript(auth, projectKey);
+  const script = commandEnvScript(auth, env);
   if (script === undefined) return { hooks: undefined, remove: async () => {} };
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `sky-command-env-${randomUUID()}.sh`);

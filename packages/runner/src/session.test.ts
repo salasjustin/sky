@@ -1084,6 +1084,8 @@ describe("the Claude credential of a run", () => {
     options: Options;
     /** What a Bash command sees of ANTHROPIC_API_KEY, from sourcing the file Claude Code sources before each command. */
     commandKey: string;
+    /** What the SessionStart hook appended to the file Claude Code sources before each command. */
+    commandScript: string;
     scriptPath: string | undefined;
   };
 
@@ -1112,6 +1114,7 @@ describe("the Claude credential of a run", () => {
             env: { ...process.env, CLAUDE_ENV_FILE: envFile },
           });
         }
+        seen.commandScript = readFileSync(envFile, "utf8");
         // a command's shell: Claude's own env, with that file sourced first
         seen.commandKey = execFileSync(
           "sh",
@@ -1190,6 +1193,72 @@ describe("the Claude credential of a run", () => {
     const seen = await sessionSeen({ ...config, claudeAuth: "api-key" });
     expect(seen.options.env?.ANTHROPIC_API_KEY).toBe(SKY_KEY);
     expect(seen.commandKey).toBe("");
+  });
+
+  describe("when the runner env and the profile's session env both carry a key, a token and a gateway", () => {
+    const GATEWAY = "https://project-gateway.example";
+    const PROFILE = {
+      ANTHROPIC_API_KEY: "profile-anthropic-key-opaque",
+      CLAUDE_CODE_OAUTH_TOKEN: "profile-token-opaque",
+      ANTHROPIC_BASE_URL: "https://profile-gateway.example",
+    };
+    const CREDENTIAL_NAMES = [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "ANTHROPIC_BASE_URL",
+      "SKY_CLAUDE_API_KEY",
+    ];
+    const credentialsIn = (env: Options["env"]) =>
+      Object.fromEntries(
+        Object.entries(env ?? {}).filter(([name]) =>
+          CREDENTIAL_NAMES.includes(name),
+        ),
+      );
+
+    beforeEach(() => {
+      vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
+      vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
+      vi.stubEnv("ANTHROPIC_BASE_URL", GATEWAY);
+      vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+    });
+
+    test.each([
+      ["a subscription run", "oauth", { CLAUDE_CODE_OAUTH_TOKEN: TOKEN }],
+      ["an API-key run", "api-key", { ANTHROPIC_API_KEY: SKY_KEY }],
+    ] as const)(
+      "%s: the Claude process holds exactly the chosen credential, sent to no gateway",
+      async (_, claudeAuth, chosen) => {
+        const seen = await sessionSeen({
+          ...config,
+          claudeAuth,
+          sessionEnv: PROFILE,
+        });
+        const env = seen.options.env;
+        expect(credentialsIn(env)).toEqual(chosen);
+        const all = JSON.stringify(env);
+        for (const other of [
+          PROJECT_KEY,
+          GATEWAY,
+          ...Object.values(PROFILE),
+          ...(claudeAuth === "oauth" ? [SKY_KEY] : [TOKEN]),
+        ])
+          expect(all).not.toContain(other);
+      },
+    );
+  });
+
+  test("a project's gateway and auth token still reach its commands, through the file and not Claude's env", async () => {
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
+    vi.stubEnv("ANTHROPIC_API_KEY", undefined);
+    vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "project-auth-token-opaque");
+    vi.stubEnv("ANTHROPIC_BASE_URL", "https://project-gateway.example");
+    const seen = await sessionSeen(config);
+    expect(seen.options.env).not.toHaveProperty("ANTHROPIC_BASE_URL");
+    expect(seen.options.env).not.toHaveProperty("ANTHROPIC_AUTH_TOKEN");
+    expect(seen.commandScript).toBe(
+      "export ANTHROPIC_AUTH_TOKEN='project-auth-token-opaque'\nexport ANTHROPIC_BASE_URL='https://project-gateway.example'\n",
+    );
   });
 
   test("the file holding the project's key is removed when the session ends", async () => {
