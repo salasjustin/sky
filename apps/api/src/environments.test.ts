@@ -65,8 +65,14 @@ const get = async (id: string) => {
   };
 };
 
+// provisioning runs real shells and node processes in the tests that pin the setup, profile and plugin
+// scripts, and each costs hundreds of ms on a runner whose cores other test files are using. The poll
+// returns the moment provisioning ends, so a generous bound costs a passing test nothing and only a
+// hung provision waits it out; the test's own timeout has to outlast it
+vi.setConfig({ testTimeout: 30_000 });
+
 /** Polls the env until its background provisioning ends. */
-const settled = (id: string, timeout = 1_000) =>
+const settled = (id: string, timeout = 20_000) =>
   vi.waitFor(
     async () => {
       const { body } = await get(id);

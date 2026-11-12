@@ -43,7 +43,11 @@ import {
 import { policyOutcome } from "./policy.js";
 import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
-import { settingsRedirects } from "./settings-guard.js";
+import {
+  defaultSettingsDirs,
+  type SettingsDirs,
+  settingsRedirects,
+} from "./settings-guard.js";
 import { prepareWorktree } from "./sync.js";
 import { commitAll, diffRollup, headSha } from "./worktree.js";
 
@@ -433,8 +437,8 @@ export async function runSession(
     warn?: (line: string) => void;
     /** Where the base profile's MCP secrets and the user config are read from; `process.env` when absent. */
     env?: NodeJS.ProcessEnv;
-    /** Where Claude Code's managed settings are read from; `MANAGED_SETTINGS_DIR` when absent. */
-    managedSettingsDir?: string;
+    /** Where the user-level and managed settings are read from; the env's `CLAUDE_CONFIG_DIR` and home, and `/etc/claude-code`, when absent. */
+    settingsDirs?: SettingsDirs;
     /** How often a tool call in flight is reported; `HEARTBEAT_INTERVAL_MS` when absent. */
     heartbeatMs?: number;
     /** `BACKGROUND_HOLD_MS` when absent. */
@@ -481,8 +485,7 @@ export async function runSession(
   const redirects = settingsRedirects({
     cwd,
     repoDir: config.repoDir,
-    env: deps.env ?? process.env,
-    managedDir: deps.managedSettingsDir,
+    ...(deps.settingsDirs ?? defaultSettingsDirs(deps.env ?? process.env)),
   });
   if (redirects.length > 0) return fail(redirects.join(" "));
   // what HEAD holds before Claude touches the worktree; the run's commits are the ones after it

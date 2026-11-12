@@ -25,7 +25,9 @@ import { PROJECT_VARIABLES } from "./claude-auth.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
 import { createDecisionWaiter } from "./requests.js";
-import { type QueryFn, runSession, sessionGitIdentity } from "./session.js";
+import { type QueryFn, sessionGitIdentity } from "./session.js";
+import { defaultSettingsDirs, settingsRedirects } from "./settings-guard.js";
+import { hermeticRunSession as runSession } from "./testing/hermetic-run.js";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -3426,7 +3428,7 @@ describe("a repo's or sandbox's Claude settings", () => {
       signal: new AbortController().signal,
       awaitDecision: noDecision,
       env: { HOME: home },
-      managedSettingsDir: managed,
+      settingsDirs: { userDirs: [join(home, ".claude")], managedDir: managed },
     });
     return { code, query, posted: rec.posted, warn };
   };
@@ -3490,6 +3492,42 @@ describe("a repo's or sandbox's Claude settings", () => {
       },
     });
     expect(JSON.stringify([posted, warn.mock.calls])).not.toContain(VALUE);
+  });
+
+  test("the machine's own Claude settings, hostile ones included, never reach a test run", async () => {
+    // what a developer's real ~/.claude and CLAUDE_CONFIG_DIR could hold
+    const realHome = mkdtempSync(join(tmpdir(), "sky-real-home-"));
+    const realConfig = mkdtempSync(join(tmpdir(), "sky-real-config-"));
+    try {
+      mkdirSync(join(realHome, ".claude"));
+      const hostile = JSON.stringify({
+        env: { HTTPS_PROXY: VALUE, ANTHROPIC_BASE_URL: VALUE },
+        apiKeyHelper: VALUE,
+      });
+      writeFileSync(join(realHome, ".claude", "settings.json"), hostile);
+      writeFileSync(join(realConfig, "settings.json"), hostile);
+      vi.stubEnv("HOME", realHome);
+      vi.stubEnv("CLAUDE_CONFIG_DIR", realConfig);
+      // the settings they'd have loaded without the injection: a run's default
+      const unguarded = settingsRedirects({
+        cwd: join(root, "repo"),
+        repoDir: join(root, "repo"),
+        ...defaultSettingsDirs(process.env),
+      });
+      expect(unguarded.length).toBeGreaterThan(0);
+      const query = scripted([init, success]);
+      const code = await runSession(config, {
+        query,
+        post: recorder().post,
+        signal: new AbortController().signal,
+        awaitDecision: noDecision,
+      });
+      expect(code).toBe(0);
+      expect(query.calls).toHaveLength(1);
+    } finally {
+      rmSync(realHome, { recursive: true, force: true });
+      rmSync(realConfig, { recursive: true, force: true });
+    }
   });
 
   test("a managed settings file is caught too", async () => {

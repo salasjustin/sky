@@ -24,14 +24,34 @@ export const REDIRECT_SETTINGS_ENV = [
 /** Where Claude Code's managed settings live on Linux, a file and a drop-in directory. */
 export const MANAGED_SETTINGS_DIR = "/etc/claude-code";
 
-export type SettingsLocations = {
+/** The directories holding Claude Code's user-level `settings.json`, as the env says: `CLAUDE_CONFIG_DIR`, and `~/.claude`. */
+export const userSettingsDirs = (env: NodeJS.ProcessEnv): string[] => [
+  ...new Set(
+    [env.CLAUDE_CONFIG_DIR, join(env.HOME || homedir(), ".claude")].filter(
+      (dir): dir is string => Boolean(dir),
+    ),
+  ),
+];
+
+/** Every place outside the project that Claude Code reads settings from. */
+export type SettingsDirs = {
+  /** Directories each holding a user-level `settings.json`. */
+  userDirs: string[];
+  /** The directory holding `managed-settings.json` and `managed-settings.d/`. */
+  managedDir: string;
+};
+
+/** Where a run reads them from when nothing says otherwise: the session's env and `/etc/claude-code`. */
+export const defaultSettingsDirs = (env: NodeJS.ProcessEnv): SettingsDirs => ({
+  userDirs: userSettingsDirs(env),
+  managedDir: MANAGED_SETTINGS_DIR,
+});
+
+export type SettingsLocations = SettingsDirs & {
   /** The run's worktree, which Claude Code starts in. */
   cwd: string;
   /** The main checkout the worktree belongs to, where Claude Code keeps the project-local file. */
   repoDir: string;
-  /** The session's env, for where the user-level settings are. */
-  env: NodeJS.ProcessEnv;
-  managedDir?: string;
 };
 
 type SettingsFile = { label: string; path: string };
@@ -51,14 +71,11 @@ function settingsFiles(where: SettingsLocations): SettingsFile[] {
       path: join(where.repoDir, ".claude/settings.local.json"),
     },
   ];
-  const home = where.env.HOME || homedir();
-  for (const dir of new Set(
-    [where.env.CLAUDE_CONFIG_DIR, join(home, ".claude")].filter(Boolean),
-  )) {
-    const path = join(String(dir), "settings.json");
+  for (const dir of where.userDirs) {
+    const path = join(dir, "settings.json");
     files.push({ label: path, path });
   }
-  const managed = where.managedDir ?? MANAGED_SETTINGS_DIR;
+  const managed = where.managedDir;
   files.push({
     label: join(managed, "managed-settings.json"),
     path: join(managed, "managed-settings.json"),
