@@ -4,7 +4,15 @@ import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { agents, type Db, environments, migrate, openDb, runs } from "@sky/db";
+import {
+  agents,
+  type Db,
+  environments,
+  migrate,
+  openDb,
+  runRequests,
+  runs,
+} from "@sky/db";
 import type { AgentId, ApiKeyId, EnvironmentId, RunId } from "@sky/shared";
 import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -215,11 +223,25 @@ test("an MCP client on a runs key has the key's limits", async () => {
       id: agentId,
       envId: mine,
       branch: `claude/${agentId}`,
-      status: "running",
+      status: "waiting",
     })
     .run();
   db.insert(runs)
-    .values({ id: "run_admins" as RunId, agentId, status: "running" })
+    .values({ id: "run_admins" as RunId, agentId, status: "waiting" })
+    .run();
+  const requestId = "req_admins";
+  db.insert(runRequests)
+    .values({
+      id: requestId,
+      runId: "run_admins" as RunId,
+      kind: "approval",
+      request: {
+        kind: "approval",
+        requestId,
+        toolName: "Bash",
+        toolSummary: "rm -rf build",
+      },
+    })
     .run();
   const client = await connect(key.secret);
 
@@ -233,13 +255,14 @@ test("an MCP client on a runs key has the key's limits", async () => {
     error: { code: "not_found" },
   });
   for (const [name, args] of [
-    ["approve", { agentId, requestId: "req_x", decision: "approve" }],
+    ["approve", { agentId, requestId, decision: "approve" }],
     ["stop", { agentId }],
   ] as const) {
     const result = await client.callTool({ name, arguments: args });
     expect(result.isError).toBe(true);
     expect(textOf(result)).toMatchObject({ status: 404 });
   }
+  expect(db.select().from(runRequests).get()?.decision).toBeNull();
   const created = await client.callTool({
     name: "create_env",
     arguments: { name: "new", repo: "acme/kru", setup: "" },
@@ -250,7 +273,7 @@ test("an MCP client on a runs key has the key's limits", async () => {
     error: { code: "forbidden" },
   });
   expect(db.select().from(environments).all()).toHaveLength(2);
-  expect(db.select().from(runs).get()?.status).toBe("running");
+  expect(db.select().from(runs).get()?.status).toBe("waiting");
 
   const launched = await client.callTool({
     name: "launch",

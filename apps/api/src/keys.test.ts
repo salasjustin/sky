@@ -128,7 +128,8 @@ test("admin mints a runs key: 201, the secret once, no Location, and only its sh
     environmentIds: [envId],
   });
   expect(res.status).toBe(201);
-  const created = CreatedApiKey.parse(await res.json());
+  // strict: a stray field in the body, a keyHash above all, fails the parse
+  const created = CreatedApiKey.strict().parse(await res.json());
   expect(created).toMatchObject({
     name: "ci",
     role: "runs",
@@ -369,6 +370,17 @@ test("a runs key's webhook may filter only on its own environments", async () =>
   expect(ok.status).toBe(201);
 });
 
+/** The run of each event delivered to the webhook, in event order. */
+const deliveredTo = (id: WebhookId) =>
+  db
+    .select({ runId: events.runId })
+    .from(webhookDeliveries)
+    .innerJoin(events, eq(events.id, webhookDeliveries.eventId))
+    .where(eq(webhookDeliveries.webhookId, id))
+    .orderBy(events.id)
+    .all()
+    .map((r) => r.runId);
+
 test("a key's webhook gets only its own agents' events; an admin webhook gets every one", async () => {
   const envId = readyEnv();
   const key = await mintKey([envId]);
@@ -389,20 +401,36 @@ test("a key's webhook gets only its own agents' events; an admin webhook gets ev
       recordEvent(tx, runId, "claude.Message", { text: "hi" }),
     );
   }
-  const deliveredTo = (id: WebhookId) =>
-    db
-      .select({ runId: events.runId })
-      .from(webhookDeliveries)
-      .innerJoin(events, eq(events.id, webhookDeliveries.eventId))
-      .where(eq(webhookDeliveries.webhookId, id))
-      .all()
-      .map((r) => r.runId);
   expect(deliveredTo(mine.id)).toEqual([own.runId]);
   expect(deliveredTo(admins.id)).toEqual([
     own.runId,
     foreign.runId,
     adminAgent.runId,
   ]);
+});
+
+test("a key's webhook listing one of its two environments gets only its own agents in that one", async () => {
+  const a = readyEnv();
+  const b = readyEnv();
+  const key = await mintKey([a, b]);
+  const other = await mintKey([a, b], "other");
+  const mine = (await (
+    await call(
+      key.secret,
+      "POST",
+      "/v1/webhooks",
+      hook({ environmentIds: [a] }),
+    )
+  ).json()) as { id: WebhookId };
+  const ownInA = seedAgent(a, key.id);
+  const ownInB = seedAgent(b, key.id);
+  const foreignInA = seedAgent(a, other.id);
+  for (const { runId } of [foreignInA, ownInB, ownInA]) {
+    db.transaction((tx) =>
+      recordEvent(tx, runId, "claude.Message", { text: "hi" }),
+    );
+  }
+  expect(deliveredTo(mine.id)).toEqual([ownInA.runId]);
 });
 
 test("a webhook left owned by a revoked key gets no deliveries; an active key's still does", async () => {
@@ -432,34 +460,33 @@ test("a webhook left owned by a revoked key gets no deliveries; an active key's 
       recordEvent(tx, runId, "claude.Message", { text: "hi" }),
     );
   }
-  const deliveriesTo = (id: WebhookId) =>
-    db
-      .select({ runId: events.runId })
-      .from(webhookDeliveries)
-      .innerJoin(events, eq(events.id, webhookDeliveries.eventId))
-      .where(eq(webhookDeliveries.webhookId, id))
-      .all()
-      .map((r) => r.runId);
-  expect(deliveriesTo(orphan)).toEqual([]);
-  expect(deliveriesTo(activeHook.id)).toEqual([activeAgent.runId]);
+  expect(deliveredTo(orphan)).toEqual([]);
+  expect(deliveredTo(activeHook.id)).toEqual([activeAgent.runId]);
 });
 
 /** Parks the agent's run on an approval request, as the runner's run.waiting would. */
-function waitingOn(runId: RunId, agentId: AgentId) {
+function waitingOn(
+  runId: RunId,
+  agentId: AgentId,
+  kind: "approval" | "question" = "approval",
+) {
   const requestId = mintId("req");
-  const request = {
-    kind: "approval" as const,
-    requestId,
-    toolName: "Bash",
-    toolSummary: "rm -rf build",
-  };
+  const request =
+    kind === "approval"
+      ? {
+          kind,
+          requestId,
+          toolName: "Bash",
+          toolSummary: "rm -rf build",
+        }
+      : { kind, requestId, prompt: "which branch?" };
   db.update(runs).set({ status: "waiting" }).where(eq(runs.id, runId)).run();
   db.update(agents)
     .set({ status: "waiting" })
     .where(eq(agents.id, agentId))
     .run();
   db.insert(runRequests)
-    .values({ id: requestId, runId, kind: "approval", request })
+    .values({ id: requestId, runId, kind, request })
     .run();
   return requestId;
 }
@@ -550,6 +577,56 @@ test("a runs key approves, stops, follows up and streams its own agent", async (
   expect(followUp.status).toBe(202);
 });
 
+test("a runs key denies, answers and archives its own agent", async () => {
+  const envId = readyEnv();
+  const key = await mintKey([envId]);
+  const denying = seedAgent(envId, key.id);
+  const denyId = waitingOn(denying.runId, denying.agentId);
+  const denied = await call(
+    key.secret,
+    "POST",
+    `/v1/agents/${denying.agentId}/approvals`,
+    { requestId: denyId, decision: "deny" },
+  );
+  expect(denied.status).toBe(200);
+  const decisionOf = (requestId: string) =>
+    db
+      .select({ decision: runRequests.decision })
+      .from(runRequests)
+      .where(eq(runRequests.id, requestId))
+      .get()?.decision;
+  expect(decisionOf(denyId)).toMatchObject({ decision: "deny" });
+
+  const asking = seedAgent(envId, key.id);
+  const questionId = waitingOn(asking.runId, asking.agentId, "question");
+  const answered = await call(
+    key.secret,
+    "POST",
+    `/v1/agents/${asking.agentId}/answers`,
+    { requestId: questionId, answer: "main" },
+  );
+  expect(answered.status).toBe(200);
+  expect(decisionOf(questionId)).toMatchObject({
+    decision: "answer",
+    answer: "main",
+  });
+
+  const idle = seedAgent(envId, key.id, "finished");
+  const archive = await call(
+    key.secret,
+    "POST",
+    `/v1/agents/${idle.agentId}/archive`,
+  );
+  expect(archive.status).toBe(200);
+  expect(
+    db
+      .select({ at: agents.archivedAt })
+      .from(agents)
+      .where(eq(agents.id, idle.agentId))
+      .get()?.at,
+  ).toEqual(expect.any(String));
+});
+
 test.each([
   ["another key's", "other"],
   ["an admin's", "admin"],
@@ -598,6 +675,37 @@ test.each([
     ]);
     expect(db.select().from(agents).get()?.archivedAt).toBeNull();
     expect(db.select().from(runRequests).get()?.decision).toBeNull();
+  },
+);
+
+test.each([
+  ["another key's", "other"],
+  ["an admin's", "admin"],
+] as const)(
+  "a follow-up on %s agent with an ended run is a 404 with no exec into its sprite",
+  async (_, ownedBy) => {
+    const envId = readyEnv();
+    const key = await mintKey([envId]);
+    const other = await mintKey([envId], "other");
+    const { agentId } = seedAgent(
+      envId,
+      ownedBy === "admin" ? null : other.id,
+      "finished",
+    );
+    const ghost = await call(
+      key.secret,
+      "POST",
+      `/v1/agents/${mintId("agt")}/runs`,
+      { prompt: "more" },
+    );
+    const before = wire.calls.length;
+    const res = await call(key.secret, "POST", `/v1/agents/${agentId}/runs`, {
+      prompt: "more",
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual(await ghost.json());
+    expect(wire.calls.length).toBe(before);
+    expect(db.select().from(runs).all()).toHaveLength(1);
   },
 );
 
@@ -681,6 +789,35 @@ test("account-wide events and the stream show a runs key only its own agents' ev
   say(foreign.runId, "theirs once more");
   expect((await s.event())?.id).toBe(String(next));
   await s.cancel();
+});
+
+test("a runs key naming its own agent reads that agent's events; another key's agent is the unknown agent's 404", async () => {
+  const envId = readyEnv();
+  const key = await mintKey([envId]);
+  const other = await mintKey([envId], "other");
+  const own = seedAgent(envId, key.id);
+  const sibling = seedAgent(envId, key.id);
+  const theirs = seedAgent(envId, other.id);
+  say(sibling.runId, "sibling");
+  const mine = say(own.runId, "mine");
+  say(theirs.runId, "theirs");
+  const res = await call(
+    key.secret,
+    "GET",
+    `/v1/events?after=evt_0&wait=0&agentId=${own.agentId}`,
+  );
+  expect(res.status).toBe(200);
+  const page = (await res.json()) as { data: { id: string }[] };
+  expect(page.data.map((e) => e.id)).toEqual([`evt_${mine}`]);
+  const miss = await call(
+    key.secret,
+    "GET",
+    `/v1/events?wait=0&agentId=${theirs.agentId}`,
+  );
+  expect(miss.status).toBe(404);
+  expect(await miss.json()).toEqual({
+    error: { code: "not_found", message: "no such agent" },
+  });
 });
 
 test("naming an agent a runs key doesn't own is the unknown agent's 404 on events and stream", async () => {
