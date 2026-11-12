@@ -46,6 +46,8 @@ A `runs` key, within the environments on its list:
 
 **Ownership.** Every agent records the key that started it; one started with the admin key is admin-owned, as are all agents that existed before keys. A `runs` key only ever sees and acts on its own agents, including in `GET /v1/events`, `GET /v1/stream` and through `/mcp`. The admin key sees and acts on all of them.
 
+**The environment is the boundary inside the sprite.** These limits hold at the API. Every agent of an environment runs on its one sprite as the same user, so an agent a `runs` key starts can read what that sprite holds: the environment's secrets, the Claude login, and the files, variables and agent tokens of other agents running there. A prompt asking for them is enough. Put an environment on a key's list only when you'd hand that system the environment's secrets; for a system you trust less, give it an environment of its own.
+
 ## Install and configure
 
 Your Sky API serves the CLI as one file. It needs Node 24 or later.
