@@ -75,9 +75,24 @@ export function limitedUntil(
   return until > now ? until : undefined;
 }
 
-/** Marks the subscription limited until `until`, persisted so a restart keeps it. */
+/** The furthest a reset can be: no Claude window resets later than its weekly one. */
+export const MAX_RESET_MS = 7 * 24 * 3_600_000;
+
+/** `at`, held to at most `MAX_RESET_MS` after `now`: a reset read from runner output or headers is not trusted further. */
+export const boundedReset = (at: Date, now: Date = new Date()): Date =>
+  at.getTime() - now.getTime() > MAX_RESET_MS
+    ? new Date(now.getTime() + MAX_RESET_MS)
+    : at;
+
+/** An all-digit time: up to 10 whole digits is epoch seconds, more is milliseconds. */
+export function epochDate(digits: string): Date {
+  const n = Number(digits);
+  return new Date((digits.split(".")[0] ?? "").length <= 10 ? n * 1000 : n);
+}
+
+/** Marks the subscription limited until `until`, at most `MAX_RESET_MS` ahead, persisted so a restart keeps it. */
 export function markLimited(db: Db, credential: string, until: Date): void {
-  const limitedUntil = until.toISOString();
+  const limitedUntil = boundedReset(until).toISOString();
   db.insert(claudeLimits)
     .values({ credential, limitedUntil })
     .onConflictDoUpdate({
@@ -226,10 +241,7 @@ function zonedInstant(
 /** When the limit lifts, from the text after "resets"; null when it names no time this can read. */
 function resetTime(text: string, now: Date): Date | null {
   const epoch = /\|(\d{9,13})\b/.exec(text)?.[1];
-  if (epoch) {
-    const n = Number(epoch);
-    return new Date(epoch.length <= 10 ? n * 1000 : n);
-  }
+  if (epoch) return epochDate(epoch);
   const m =
     /\bresets?\s+(?:at\s+)?(?:([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,|\s+at)?\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b(?:\s*\(([^)]+)\))?/i.exec(
       text,
@@ -272,7 +284,7 @@ export function parseUsageLimit(
   const resetsAt = resetTime(error, now);
   return {
     window,
-    resetsAt: resetsAt && resetsAt > now ? resetsAt : null,
+    resetsAt: resetsAt && resetsAt > now ? boundedReset(resetsAt, now) : null,
   };
 }
 

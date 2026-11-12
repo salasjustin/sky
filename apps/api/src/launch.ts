@@ -457,11 +457,12 @@ export function createLauncher({
   }
 
   /**
-   * Whether a retry's credential, chosen before the wait for the failed runner, is still one the
-   * environment allows: the key while its fallback is on, a subscription while the environment is
-   * still a pool holding it and it isn't limited.
+   * Whether a credential chosen before a wait (a retry's, before the failed runner exits; a pool's
+   * pick, before its usage probes answer) is still one the environment allows: the key while its
+   * fallback is on, a subscription while the environment is still a pool holding it and it isn't
+   * limited.
    */
-  function retryCredentialAllowed(
+  function stillAllowed(
     credential: string,
     env: NonNullable<ReturnType<typeof assignmentOf>>,
   ): boolean {
@@ -475,18 +476,35 @@ export function createLauncher({
 
   /** The credential the launch runs on, by its environment's assignment; throws a `ClaudeCredentialError` when none is usable. */
   async function claudeAuthFor(launch: Launch): Promise<ClaudeAuth> {
-    const assignment = assignmentOf(launch.envId);
-    if (!assignment) throw new Error(`environment ${launch.envId} is gone`);
     const forced = launch.forceCredential;
-    if (forced && retryCredentialAllowed(forced, assignment)) {
+    if (forced && stillAllowed(forced, currentAssignment(launch.envId))) {
       return forced === API_KEY_CREDENTIAL
         ? apiKeyAuth(config, "the retry")
         : subscriptionAuth(config, forced);
     }
-    // only a pool environment's launch may land on a subscription it isn't assigned
-    return assignment.claudeCredential === POOL_CREDENTIAL
-      ? resolvePoolAuth({ db, config, usage }, assignment)
-      : resolveClaudeAuth(db, config, assignment);
+    // a pool's pick waits on usage probes: an admin change meanwhile sends it round again. Each round
+    // that waits probes a subscription that is then fresh or held for USAGE_STALE_MS, so the rounds end
+    for (;;) {
+      const assignment = currentAssignment(launch.envId);
+      // only a pool environment's launch may land on a subscription it isn't assigned
+      if (assignment.claudeCredential !== POOL_CREDENTIAL) {
+        return resolveClaudeAuth(db, config, assignment);
+      }
+      const auth = await resolvePoolAuth({ db, config, usage }, assignment);
+      const after = currentAssignment(launch.envId);
+      if (
+        after.claudeCredential === POOL_CREDENTIAL &&
+        stillAllowed(auth.credential, after)
+      ) {
+        return auth;
+      }
+    }
+  }
+
+  function currentAssignment(envId: EnvironmentId) {
+    const assignment = assignmentOf(envId);
+    if (!assignment) throw new Error(`environment ${envId} is gone`);
+    return assignment;
   }
 
   const assignmentOf = (envId: EnvironmentId) =>
@@ -754,7 +772,8 @@ export function createLauncher({
             id: retryId,
             agentId: found.id,
             status: "starting",
-            claudeCredential: target,
+            // set by the launch once it settles on one: `target` may be refused there
+            claudeCredential: null,
             retryOf: failedId,
           })
           .run();

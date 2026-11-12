@@ -17,6 +17,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
 import {
   limitedUntil,
+  MAX_RESET_MS,
   markLimited,
   parseUsageLimit,
   UNKNOWN_RESET_MS,
@@ -455,6 +456,19 @@ test("a limit message with no readable reset holds the subscription for a short 
   const until = limitedUntil(db, "personal")?.getTime() ?? 0;
   expect(until).toBeGreaterThanOrEqual(before + UNKNOWN_RESET_MS - 1_000);
   expect(until).toBeLessThanOrEqual(Date.now() + UNKNOWN_RESET_MS);
+});
+
+test("a limit message naming a reset past a week holds the subscription a week at most", async () => {
+  const far = "Claude AI usage limit reached|9999999999";
+  expect(parseUsageLimit(far, NOW)?.resetsAt?.getTime()).toBe(
+    NOW.getTime() + MAX_RESET_MS,
+  );
+  const r = await launchedRun(readyEnv({ claudeCredential: "personal" }));
+  await failWith(r, far);
+  await sessionOpened(2);
+  const until = limitedUntil(db, "personal")?.getTime();
+  expect(until).toBeDefined();
+  expect(until).toBeLessThanOrEqual(Date.now() + MAX_RESET_MS);
 });
 
 test("the limited state survives a restart", async () => {

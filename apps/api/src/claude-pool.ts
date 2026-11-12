@@ -72,18 +72,24 @@ export function earliestReset(
 }
 
 /**
- * Why a pool has nothing to run on: every subscription in it is at its usage limit, and the
- * earliest of them lifts at the time named. The API key, when set and allowed, is the caller's.
+ * Why a pool has nothing to run on: every subscription in it is at its usage limit, or `refused`
+ * by Anthropic, and the earliest limit lifts at the time named. The API key, when set and allowed,
+ * is the caller's.
  */
 export function poolExhausted(
   db: Db,
   members: string[],
   now: Date,
   detail: string,
+  refused: string[] = [],
 ): ClaudeCredentialError {
   const first = earliestReset(db, members, now);
+  const refusedNote =
+    refused.length === 0
+      ? ""
+      : ` or had its token refused (${refused.map((n) => JSON.stringify(n)).join(", ")})`;
   return new ClaudeCredentialError(
-    `claude_limited: every subscription in this environment's pool is at its usage limit${first ? `; the earliest resets ${first.toISOString()} (UTC)` : ""}; ${detail}`,
+    `claude_limited: every subscription in this environment's pool is at its usage limit${refusedNote}${first ? `; the earliest resets ${first.toISOString()} (UTC)` : ""}; ${detail}`,
   );
 }
 
@@ -91,9 +97,9 @@ export function poolExhausted(
  * The credential a launch in a pool environment runs on: the subscription in its pool that isn't
  * limited and has the most headroom (the lowest of its 5-hour and 7-day use), from usage no older
  * than `USAGE_STALE_MS`; ties go to the earlier in the list, and a subscription never probed, or
- * whose last probe failed, ranks after those that answered. With every subscription limited, the
- * API key when the environment allows it and the server has one, else an error naming the earliest
- * reset in UTC.
+ * whose last probe failed, ranks after those that answered. One whose token the probe found refused
+ * is left out, like a limited one. With every subscription out, the API key when the environment
+ * allows it and the server has one, else an error naming the earliest reset in UTC.
  */
 export async function resolvePoolAuth(
   deps: { db: Db; config: Config; usage: UsageProbe },
@@ -119,15 +125,21 @@ export async function resolvePoolAuth(
         : storedUsage(db, name);
       return { name, order, score: usageScore(reading, now) ?? 2 };
     })
-    .filter(({ name }) => limitedUntil(db, name, now) === undefined)
+    .filter(
+      ({ name }) =>
+        limitedUntil(db, name, now) === undefined &&
+        !usage.refusedRecently(name, now),
+    )
     .sort((a, b) => a.score - b.score || a.order - b.order)[0];
   if (best) return subscriptionAuth(config, best.name);
+  const refused = members.filter((name) => usage.refusedRecently(name, now));
   if (env.claudeFallback === "none") {
     throw poolExhausted(
       db,
       members,
       now,
       "this environment's API key fallback is off, so launch again after the reset",
+      refused,
     );
   }
   if (!config.anthropicApiKey) {
@@ -136,6 +148,7 @@ export async function resolvePoolAuth(
       members,
       now,
       "this server has no SKY_ANTHROPIC_API_KEY to fall back on, so launch again after the reset",
+      refused,
     );
   }
   return apiKeyAuth(config, "the fallback");

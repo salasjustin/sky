@@ -22,6 +22,7 @@ import {
   markLimited,
   UNKNOWN_RESET_MS,
 } from "./claude-credentials.js";
+import { credentialsTried } from "./claude-pool.js";
 import {
   PROBE_MODEL,
   parseUsageHeaders,
@@ -48,12 +49,13 @@ const API_KEY = "anthropic-api-key-opaque-4";
 const FIVE_HOUR = "You've hit your 5-hour limit · resets 10:20am (UTC)";
 const WEEKLY = "You've hit your weekly limit · resets Dec 30, 10am (UTC)";
 
-/** A reset left out falls a few hours or days ahead; null sends none. */
+/** A reset left out falls a few hours or days ahead; null sends none. The status is 200 unless given. */
 type Reading = {
   h5: number;
   h5Reset?: number | null;
   d7: number;
   d7Reset?: number | null;
+  status?: number;
 };
 const inHours = (h: number) => Math.floor(Date.now() / 1000) + h * 3600;
 
@@ -63,8 +65,10 @@ let config: Config;
 let logs: string[];
 let app: ReturnType<typeof createApp>;
 let wire: SpritesWire;
-/** What the stand-in for Anthropic answers each token's probe with. */
-let readings: Record<string, Reading | "broken">;
+/** What the stand-in for Anthropic answers each token's probe with; revoked is a 401. */
+let readings: Record<string, Reading | "broken" | "revoked">;
+/** Runs while a probe is answered: what a launch waiting on its probes may see change. */
+let duringProbe: (() => void) | undefined;
 let probes: {
   token: string;
   body: Record<string, unknown>;
@@ -98,6 +102,7 @@ beforeEach(() => {
   logs = [];
   probes = [];
   readings = {};
+  duringProbe = undefined;
   server.use(
     http.post("https://api.anthropic.com/v1/messages", async ({ request }) => {
       const token = (request.headers.get("authorization") ?? "").replace(
@@ -109,13 +114,21 @@ beforeEach(() => {
         body: (await request.json()) as Record<string, unknown>,
         beta: request.headers.get("anthropic-beta"),
       });
+      duringProbe?.();
       const reading = readings[token];
+      if (reading === "revoked") {
+        return HttpResponse.json(
+          { error: "authentication_error" },
+          { status: 401 },
+        );
+      }
       if (!reading || reading === "broken") {
         return HttpResponse.json({ error: "overloaded" }, { status: 529 });
       }
       return HttpResponse.json(
         { id: "msg_1", content: [{ type: "text", text: "." }] },
         {
+          status: reading.status ?? 200,
           headers: {
             "anthropic-ratelimit-unified-5h-utilization": String(reading.h5),
             ...(reading.h5Reset === null
@@ -279,6 +292,20 @@ test("usage is read from the unified rate-limit headers, resets as epoch seconds
   expect(parseUsageHeaders(new Headers({ "content-type": "x" }))).toBeNull();
 });
 
+test("a reset header of 13 digits is epoch milliseconds, and none is read as later than a week ahead", () => {
+  const usage = parseUsageHeaders(
+    new Headers({
+      "anthropic-ratelimit-unified-5h-utilization": "0.25",
+      "anthropic-ratelimit-unified-5h-reset": "1794484800000",
+      "anthropic-ratelimit-unified-7d-utilization": "0.5",
+      "anthropic-ratelimit-unified-7d-reset": "2027-06-01T00:00:00Z",
+    }),
+    new Date("2026-11-12T08:00:00Z"),
+  );
+  expect(usage?.fiveHour?.resetsAt).toBe("2026-11-12T12:00:00.000Z");
+  expect(usage?.sevenDay?.resetsAt).toBe("2026-11-19T08:00:00.000Z");
+});
+
 test("a window whose reset has passed counts as unused, and an unprobed subscription has no score", () => {
   const now = new Date("2026-11-12T08:00:00Z");
   const usage = {
@@ -355,6 +382,36 @@ test("a subscription the probe finds full with no reset given is held for the un
   const until = limitedUntil(db, "default")?.getTime();
   expect(until).toBeGreaterThanOrEqual(before + UNKNOWN_RESET_MS);
   expect(until).toBeLessThanOrEqual(Date.now() + UNKNOWN_RESET_MS);
+});
+
+test("a subscription whose probe is refused with a 429 is marked limited until its latest reset, whatever its usage says", async () => {
+  const weekly = inHours(50);
+  readings[DEFAULT_TOKEN] = {
+    h5: 0.99,
+    h5Reset: inHours(2),
+    d7: 0.2,
+    d7Reset: weekly,
+    status: 429,
+  };
+  readings[PERSONAL_TOKEN] = { h5: 0.995, d7: 0.5 };
+  readings[WORK_TOKEN] = { h5: 0.999, d7: 0.5 };
+  const r = await launchedRun(poolEnv());
+  expect(r.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(PERSONAL_TOKEN);
+  expect(limitedUntil(db, "default")?.getTime()).toBe(weekly * 1000);
+});
+
+test("a subscription whose token is refused is left out of the pick, not ranked last, and is not marked limited", async () => {
+  readings[PERSONAL_TOKEN] = "revoked";
+  // a failed probe ranks last as well: ranked, personal would win the tie as first in the list
+  readings[WORK_TOKEN] = "broken";
+  const r = await launchedRun(poolEnv(["personal", "work"]));
+  expect(r.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(WORK_TOKEN);
+  expect(limitedUntil(db, "personal")).toBeUndefined();
+  expect(storedUsage(db, "personal")).toBeUndefined();
+  expect(logs.join("\n")).toContain(
+    "the token of Claude credential personal was refused (401)",
+  );
+  expect(logs.join("\n")).not.toContain(PERSONAL_TOKEN);
 });
 
 test("an explicit pool list is the only subscriptions used, and the order breaks a tie", async () => {
@@ -557,6 +614,17 @@ test("with every subscription limited, a pool launch goes to the API key", async
   });
   expect(runRow(r.run.id)?.claudeCredential).toBe("api-key");
   expect(probes).toHaveLength(0);
+});
+
+test("with every subscription's token refused, a pool launch goes to the API key", async () => {
+  readings[PERSONAL_TOKEN] = "revoked";
+  readings[WORK_TOKEN] = "revoked";
+  const r = await launchedRun(poolEnv(["personal", "work"]));
+  expect(r.file).toMatchObject({
+    SKY_CLAUDE_AUTH: "api-key",
+    SKY_CLAUDE_API_KEY: API_KEY,
+  });
+  expect(runRow(r.run.id)?.claudeCredential).toBe("api-key");
 });
 
 test("with every subscription limited and no key, the launch fails at once naming the earliest reset", async () => {
@@ -821,6 +889,56 @@ test("an environment whose API key fallback is turned off while a retry waits do
   const retry = retryOf(r.run.id);
   expect(failureOf(String(retry?.id))).toContain("claude_limited");
   expect(wire.sessions).toHaveLength(1);
+});
+
+test("a retry refused at launch records no credential, so its chain counts only what ran", async () => {
+  const env = readyEnv({ claudeCredential: "personal" });
+  const r = await launchedRun(env);
+  duringRetryWait(r.run.id, () =>
+    db
+      .update(environments)
+      .set({ claudeFallback: "none" })
+      .where(eq(environments.id, env))
+      .run(),
+  );
+  await failWith(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(retryOf(r.run.id)?.status).toBe("failed"));
+  const retry = retryOf(r.run.id);
+  expect(retry?.claudeCredential).toBeNull();
+  expect(credentialsTried(db, String(retry?.id))).toEqual(
+    new Set(["personal"]),
+  );
+});
+
+test("a pool environment switched to a named subscription while its launch waits on the probes launches on that one", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  readings[WORK_TOKEN] = { h5: 0.2, d7: 0.2 };
+  const env = poolEnv(["personal", "work"]);
+  duringProbe = () =>
+    db
+      .update(environments)
+      .set({ claudeCredential: "default", claudePool: null })
+      .where(eq(environments.id, env))
+      .run();
+  const r = await launchedRun(env);
+  expect(r.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(DEFAULT_TOKEN);
+  expect(credentialsUsed()).toEqual(["default"]);
+  expect(JSON.stringify(r.file)).not.toContain(PERSONAL_TOKEN);
+});
+
+test("a pool that drops its pick while the launch waits on the probes launches on another member", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  readings[WORK_TOKEN] = { h5: 0.2, d7: 0.2 };
+  const env = poolEnv(["personal", "work"]);
+  duringProbe = () =>
+    db
+      .update(environments)
+      .set({ claudePool: ["work"] })
+      .where(eq(environments.id, env))
+      .run();
+  const r = await launchedRun(env);
+  expect(r.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(WORK_TOKEN);
+  expect(credentialsUsed()).toEqual(["work"]);
 });
 
 test("a subscription already tried in a run's chain is not tried again, even once its limit has lifted", async () => {
