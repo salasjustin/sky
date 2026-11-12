@@ -68,10 +68,11 @@ const help = (io: Io) => `Usage:
       fails with the reset time instead. Only pool moves runs between
       subscriptions: the environment's runs go to the subscription with
       the most headroom and, on a usage limit, on to the next one.
-      --pool=a,b limits and orders the choice; --pool=all resets it to
-      every subscription the server holds (so no subscription can be
-      named "all", in any case, there). Without --pool the list stays as it is, so
-      --fallback alone never widens an ordered pool. Needs the admin key.
+      --pool=a,b limits and orders the choice; --pool=all (any case)
+      resets it to every subscription the server holds, so no
+      subscription named "all" can be listed there. Without --pool the
+      list stays as it is, so --fallback alone never widens an ordered
+      pool. Needs the admin key.
   sky claude-credentials [options]
       Print "<name> <subscription|api-key> <limited-until=<time>|-> <runs
       today> <env ids|-> <5h=N%|-> <7d=N%|-> <pool env ids|->" per

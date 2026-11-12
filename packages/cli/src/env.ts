@@ -1,4 +1,8 @@
-import { ClaudeCredentialName, ClaudeFallback } from "@sky/shared";
+import {
+  ClaudeCredentialName,
+  ClaudeFallback,
+  ClaudeSubscriptionName,
+} from "@sky/shared";
 import type { AgentCommand } from "./agent.js";
 import { type ApiEnvironment, ApiError } from "./api.js";
 import { UsageError } from "./output.js";
@@ -58,6 +62,14 @@ function parsePool(value: string | undefined): string[] | null | undefined {
       );
     }
     return null;
+  }
+  // checked here, not by the API's 400: a misspelt name is the invocation's fault (exit 2), not a failure
+  const bad = names.find((n) => !ClaudeSubscriptionName.safeParse(n).success);
+  if (bad !== undefined) {
+    throw new UsageError(
+      `${JSON.stringify(bad)} in --pool is not a subscription name: use one the server holds, in lowercase letters, digits and _`,
+      true,
+    );
   }
   return names;
 }

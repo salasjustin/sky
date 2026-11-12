@@ -635,7 +635,7 @@ test("--fallback alone on a non-pool credential sends no pool either", async () 
   ]);
 });
 
-test.each(["all", "ALL", "All"])(
+test.each(["ALL", "All"])(
   "--pool=%s resets the pool to every subscription",
   async (value) => {
     const bodies: unknown[] = [];
@@ -669,4 +669,30 @@ test("--pool=ALL stands alone too", async () => {
     "--pool=work,ALL",
   ]);
   expect(r.code).toBe(2);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toMatch(/--pool=all takes no other subscription names/);
+});
+
+test("a --pool name that isn't a subscription name is a usage error, with no request", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(claudeAssignment());
+    }),
+  );
+  const r = await runCli([
+    "env",
+    "set-claude",
+    "web",
+    "pool",
+    "--pool=work,PERSONAL",
+  ]);
+  expect(r.code).toBe(2);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toMatch(
+    /"PERSONAL" in --pool is not a subscription name: use one the server holds, in lowercase letters, digits and _/,
+  );
+  expect(bodies).toEqual([]);
 });
