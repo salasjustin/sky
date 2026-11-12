@@ -1,5 +1,6 @@
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { DEFAULT_CLAUDE_CREDENTIAL } from "@sky/shared";
 import { z } from "zod";
 import { type Api, type ApiEnvironment, ApiError } from "./api.js";
 import type { Io } from "./cli.js";
@@ -155,12 +156,21 @@ const reprovisioningFields = (patch: Partial<EnvSpec>) =>
 function changedFields(spec: EnvSpec, env: ApiEnvironment): Partial<EnvSpec> {
   const patch: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(spec)) {
-    if (JSON.stringify(value) !== JSON.stringify(env[key as keyof EnvSpec])) {
+    const stored = env[key as keyof EnvSpec];
+    if (comparable(key, value) !== comparable(key, stored)) {
       patch[key] = value;
     }
   }
   return patch;
 }
+
+/** The API stores the default credential as null, so `claudeCredential: default` in a file names the same thing. */
+const comparable = (key: string, value: unknown) =>
+  JSON.stringify(
+    key === "claudeCredential" && value === DEFAULT_CLAUDE_CREDENTIAL
+      ? null
+      : value,
+  );
 
 type Waited =
   | { done: true; current: Fetched }

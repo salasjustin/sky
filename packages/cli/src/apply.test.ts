@@ -215,6 +215,33 @@ test("a file naming every Claude field writes nothing once they match", async ()
   expect(writes).toEqual([]);
 });
 
+test("claudeCredential: default matches an env on the default token, which the API reports as null", async () => {
+  writeFileSync(file, `${yaml}claudeCredential: default\n`);
+  // no POST/PATCH handler: any write is an unhandled request and fails the test
+  server.use(list(env({ claudeCredential: null })));
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([]);
+  expect(r.stdout).toBe("up to date web env_1\n");
+});
+
+test("claudeCredential: default moves an env off a named credential back to the default token", async () => {
+  writeFileSync(file, `${yaml}claudeCredential: default\n`);
+  server.use(
+    list(env({ claudeCredential: "personal" })),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, env({ claudeCredential: null })),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([
+    { method: "PATCH", body: { claudeCredential: "default" } },
+  ]);
+  expect(r.stdout).toBe("ready web env_1\n");
+});
+
 test("the lock's id finds a renamed env, which is patched rather than created", async () => {
   writeFileSync(file, yaml.replace("name: web", "name: site"));
   writeFileSync(lockFile, JSON.stringify({ envId: "env_1" }));

@@ -622,7 +622,14 @@ test("--fallback alone on a non-pool credential sends no pool either", async () 
       return HttpResponse.json(claudeAssignment());
     }),
   );
-  await runCli(["env", "set-claude", "web", "personal", "--fallback=none"]);
+  const r = await runCli([
+    "env",
+    "set-claude",
+    "web",
+    "personal",
+    "--fallback=none",
+  ]);
+  expect(r.code).toBe(0);
   expect(bodies).toEqual([
     { claudeCredential: "personal", claudeFallback: "none" },
   ]);
