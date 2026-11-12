@@ -6,24 +6,106 @@ import { server } from "../../../test/msw.js";
 import { createMcpHandler, type Fetch } from "./index.js";
 
 const API = "https://api.test";
-const KEY = "hk_test";
+const KEY = "sky_caller0000000000000000000000000000000000";
 
 const clients: Client[] = [];
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((c) => c.close()));
 });
 
-async function connect(fetch?: Fetch) {
-  const handler = createMcpHandler({ baseUrl: API, apiKey: KEY, fetch });
+/** A client whose every MCP request carries `Bearer <key>`. */
+async function connect(
+  fetch?: Fetch,
+  key = KEY,
+  handler = createMcpHandler({ baseUrl: API, fetch }),
+) {
   const client = new Client({ name: "test", version: "0.0.0" });
   await client.connect(
     new StreamableHTTPClientTransport(new URL("http://mcp.test/mcp"), {
       fetch: (url, init) => handler(new Request(url, init)),
+      requestInit: { headers: { authorization: `Bearer ${key}` } },
     }),
   );
   clients.push(client);
   return client;
 }
+
+test("two callers on one handler each forward their own key", async () => {
+  const seen = route("post", "/v1/agents/agt_1/stop", 200, {});
+  const handler = createMcpHandler({ baseUrl: API });
+  const first = await connect(undefined, "sky_first", handler);
+  const second = await connect(undefined, "sky_second", handler);
+
+  await first.callTool({ name: "stop", arguments: { agentId: "agt_1" } });
+  await second.callTool({ name: "stop", arguments: { agentId: "agt_1" } });
+  await first.callTool({ name: "stop", arguments: { agentId: "agt_1" } });
+
+  expect(seen.map((s) => s.auth)).toEqual([
+    "Bearer sky_first",
+    "Bearer sky_second",
+    "Bearer sky_first",
+  ]);
+});
+
+test.each([
+  ["no authorization header", {}],
+  ["a non-bearer scheme", { authorization: `Basic ${KEY}` }],
+  ["an empty bearer token", { authorization: "Bearer " }],
+])("a request with %s is 401 and reaches no tool", async (_, headers) => {
+  const seen = route("post", "/v1/agents/agt_1/stop", 200, {});
+  const handler = createMcpHandler({ baseUrl: API });
+
+  const res = await handler(
+    new Request("http://mcp.test/mcp", {
+      method: "POST",
+      headers: {
+        ...headers,
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "stop", arguments: { agentId: "agt_1" } },
+      }),
+    }),
+  );
+
+  expect(res.status).toBe(401);
+  expect(await res.json()).toEqual({
+    error: { code: "unauthorized", message: "missing bearer token" },
+  });
+  expect(seen).toEqual([]);
+});
+
+test("an upstream error echoing the caller's key comes back without it", async () => {
+  server.use(
+    http.post(
+      `${API}/v1/agents`,
+      ({ request }) =>
+        new HttpResponse(`denied: ${request.headers.get("authorization")}`, {
+          status: 403,
+        }),
+    ),
+  );
+  const launch = {
+    name: "launch",
+    arguments: { envId: "env_1", prompt: "go" },
+  };
+  const unreachable = await connect(() => {
+    throw new Error(`refused ${KEY}`);
+  });
+  const echoing = await connect();
+
+  const thrown = await unreachable.callTool(launch);
+  const echoed = await echoing.callTool(launch);
+
+  expect(rawText(thrown)).not.toContain(KEY);
+  expect(rawText(echoed)).not.toContain(KEY);
+  expect(textOf(thrown).error.message).toBe("Error: refused [redacted]");
+  expect(textOf(echoed).error.message).toBe("denied: Bearer [redacted]");
+});
 
 /** Answers one route, recording the bearer and JSON body it received. */
 function route(
@@ -523,22 +605,22 @@ test.each([
   expect(rawText(result)).toMatch(message);
 });
 
-test.each([
-  [{ baseUrl: "not a url", apiKey: KEY }, /baseUrl/],
-  [{ baseUrl: API, apiKey: "" }, /apiKey/],
-])("createMcpHandler rejects bad options %j", (options, message) => {
-  expect(() => createMcpHandler(options)).toThrow(message);
+test("createMcpHandler rejects a baseUrl that isn't an http(s) url", () => {
+  expect(() => createMcpHandler({ baseUrl: "not a url" })).toThrow(/baseUrl/);
 });
 
 test.each(["GET", "DELETE"])(
   "%s on the endpoint is 405 with Allow: POST, opening no stream",
   async (method) => {
-    const handler = createMcpHandler({ baseUrl: API, apiKey: KEY });
+    const handler = createMcpHandler({ baseUrl: API });
 
     const res = await handler(
       new Request("http://mcp.test/mcp", {
         method,
-        headers: { accept: "text/event-stream" },
+        headers: {
+          accept: "text/event-stream",
+          authorization: `Bearer ${KEY}`,
+        },
       }),
     );
 

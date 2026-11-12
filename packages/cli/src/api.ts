@@ -1,4 +1,10 @@
-import { Environment, RunStatus } from "@sky/shared";
+import {
+  ApiKey,
+  CreatedApiKey,
+  Environment,
+  type KeyInput,
+  RunStatus,
+} from "@sky/shared";
 import { z } from "zod";
 import type { Config } from "./config.js";
 
@@ -54,6 +60,26 @@ const ApiWebhook = z
   })
   .loose();
 export type ApiWebhook = z.infer<typeof ApiWebhook>;
+
+/** Keys are parsed, not loose: output is built from the parse, so a field the API adds (a hash) never reaches stdout. */
+const KeyList = z.object({ data: z.array(ApiKey) });
+
+function parseKey<T>(
+  schema: z.ZodType<T>,
+  status: number,
+  json: unknown,
+  what: string,
+): T {
+  const parsed = schema.safeParse(json);
+  if (!parsed.success) {
+    throw new ApiError(
+      status,
+      "bad_response",
+      `the API returned ${what} this CLI can't read`,
+    );
+  }
+  return parsed.data;
+}
 
 const Launched = z.object({
   agent: z.object({ id: z.string() }),
@@ -295,6 +321,24 @@ export function createApi(config: Config) {
     },
     async deleteWebhook(id: string): Promise<void> {
       await request("DELETE", `/v1/webhooks/${encodeURIComponent(id)}`);
+    },
+    /** The only response that carries the key's secret. */
+    async createKey(body: KeyInput): Promise<CreatedApiKey> {
+      const { status, json } = await request("POST", "/v1/keys", body);
+      return parseKey(CreatedApiKey, status, json, "a created key");
+    },
+    /** Oldest first. */
+    async listKeys(): Promise<ApiKey[]> {
+      const { status, json } = await request("GET", "/v1/keys");
+      return parseKey(KeyList, status, json, "a key list").data;
+    },
+    /** Revoking a revoked key succeeds again; an unknown id is 404. */
+    async revokeKey(id: string): Promise<ApiKey> {
+      const { status, json } = await request(
+        "DELETE",
+        `/v1/keys/${encodeURIComponent(id)}`,
+      );
+      return parseKey(ApiKey, status, json, "a revoked key");
     },
     async listSecrets(envId: string): Promise<SecretSummary[]> {
       const { status, json } = await request(

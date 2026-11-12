@@ -12,6 +12,7 @@ import {
 import { Environment, EnvironmentId } from "@sky/shared";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
+import { adminOnly, canUseEnv } from "./auth.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
@@ -148,6 +149,7 @@ const envParam = zValidator(
   },
 );
 
+/** `/v1/environments`; an issued key reads the ones on its list and changes none. */
 export function environmentRoutes(
   provisioner: Provisioner,
   sprites: SpriteOps,
@@ -155,10 +157,18 @@ export function environmentRoutes(
 ) {
   return factory
     .createApp()
+    .on("POST", ["/", "/:id/retry"], adminOnly)
+    .on(["PATCH", "DELETE"], "/:id", adminOnly)
     .get("/", (c) => {
+      const { principal } = c.var;
       const rows = c.var.db
         .select()
         .from(environments)
+        .where(
+          principal.role === "admin"
+            ? undefined
+            : inArray(environments.id, principal.environmentIds),
+        )
         // ties within a millisecond go by insert order (rowid); ids are random
         .orderBy(asc(environments.createdAt), asc(sql`rowid`))
         .all();
@@ -203,7 +213,10 @@ export function environmentRoutes(
       return c.json(present(row), 202);
     })
     .get("/:id", envParam, (c) => {
-      const row = findEnv(c.var.db, c.req.valid("param").id);
+      const { id } = c.req.valid("param");
+      const row = canUseEnv(c.var.principal, id)
+        ? findEnv(c.var.db, id)
+        : undefined;
       if (!row) return apiError(c, 404, "not_found", notFound);
       return c.json(present(row), 200);
     })

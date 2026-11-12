@@ -22,3 +22,5 @@ export const WebhookId = prefixedId("whk");
 export type WebhookId = z.infer<typeof WebhookId>;
 export const RequestId = prefixedId("req");
 export type RequestId = z.infer<typeof RequestId>;
+export const ApiKeyId = prefixedId("key");
+export type ApiKeyId = z.infer<typeof ApiKeyId>;

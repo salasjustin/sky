@@ -8,8 +8,9 @@ import {
   WebhookFormat,
   WebhookId,
 } from "@sky/shared";
-import { asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
+import { canUseEnv, ownerKeyOf, type Principal } from "./auth.js";
 import { seal, webhookSecretAad } from "./crypto.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
@@ -42,6 +43,12 @@ const present = (row: typeof webhooks.$inferSelect) => ({
 
 const notFound = "no such webhook";
 
+/** Limits a `webhooks` query to the ones `principal` created; an admin sees every one. */
+const ownWebhooks = (principal: Principal) =>
+  principal.role === "admin"
+    ? undefined
+    : eq(webhooks.ownerKeyId, principal.keyId);
+
 const webhookParam = zValidator(
   "param",
   z.object({ id: WebhookId }),
@@ -57,6 +64,7 @@ export function webhookRoutes() {
       const rows = c.var.db
         .select()
         .from(webhooks)
+        .where(ownWebhooks(c.var.principal))
         // ties within a millisecond go by insert order (rowid); ids are random
         .orderBy(asc(webhooks.createdAt), asc(sql`rowid`))
         .all();
@@ -108,7 +116,8 @@ export function webhookRoutes() {
           .where(inArray(environments.id, environmentIds))
           .all();
         const unknown = environmentIds.filter(
-          (id) => !known.some((e) => e.id === id),
+          (id) =>
+            !known.some((e) => e.id === id) || !canUseEnv(c.var.principal, id),
         );
         if (unknown.length > 0) {
           return apiError(
@@ -129,6 +138,7 @@ export function webhookRoutes() {
           ...fields,
           id,
           environmentIds: environmentIds as typeof fields.environmentIds,
+          ownerKeyId: ownerKeyOf(c.var.principal),
           ...(sealed && {
             secretCiphertext: sealed.ciphertext,
             secretNonce: sealed.nonce,
@@ -144,7 +154,12 @@ export function webhookRoutes() {
       const row = c.var.db
         .select()
         .from(webhooks)
-        .where(eq(webhooks.id, c.req.valid("param").id))
+        .where(
+          and(
+            eq(webhooks.id, c.req.valid("param").id),
+            ownWebhooks(c.var.principal),
+          ),
+        )
         .get();
       if (!row) return apiError(c, 404, "not_found", notFound);
       return c.json(present(row), 200);
@@ -152,7 +167,12 @@ export function webhookRoutes() {
     .delete("/:id", webhookParam, (c) => {
       const deleted = c.var.db
         .delete(webhooks)
-        .where(eq(webhooks.id, c.req.valid("param").id))
+        .where(
+          and(
+            eq(webhooks.id, c.req.valid("param").id),
+            ownWebhooks(c.var.principal),
+          ),
+        )
         .returning({ id: webhooks.id })
         .get();
       if (!deleted) return apiError(c, 404, "not_found", notFound);

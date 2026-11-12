@@ -15,6 +15,7 @@ type Values = {
   format?: string;
   secret?: string;
   env?: string;
+  role?: string;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;

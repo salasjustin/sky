@@ -11,6 +11,7 @@ const tokenPatterns = [
   /\bsk-[0-9A-Za-z_-]{16,}/g,
   /\bgh[pousr]_[0-9A-Za-z]{20,}/g,
   /\bgithub_pat_[0-9A-Za-z_]{20,}/g,
+  /\bsky_[0-9A-Za-z_-]{20,}/g,
   /\beyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+/g,
 ];
 

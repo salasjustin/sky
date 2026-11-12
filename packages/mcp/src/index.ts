@@ -20,13 +20,10 @@ export interface McpHandlerOptions {
   baseUrl: string;
   /** Sends each `/v1` request; defaults to the global `fetch`. */
   fetch?: Fetch;
-  /** Bearer key every `/v1` call carries. */
-  apiKey: string;
 }
 
 const HandlerOptions = z.object({
   baseUrl: z.url({ protocol: /^https?$/ }),
-  apiKey: z.string().min(1),
 });
 
 type Outcome =
@@ -64,11 +61,20 @@ const parseJson = (raw: string) => {
   }
 };
 
-function apiClient({
-  baseUrl,
-  apiKey,
-  fetch: send = fetch,
-}: McpHandlerOptions): Call {
+/** Swaps every occurrence of `token` in `value`'s strings for `[redacted]`. */
+const redact = <T>(value: T, token: string): T =>
+  JSON.parse(
+    JSON.stringify(value).replaceAll(
+      JSON.stringify(token).slice(1, -1),
+      "[redacted]",
+    ),
+  );
+
+/** Calls `/v1` as the caller whose bearer `token` this is; error text never carries it. */
+function apiClient(
+  { baseUrl, fetch: send = fetch }: McpHandlerOptions,
+  token: string,
+): Call {
   const base = baseUrl.replace(/\/+$/, "");
   return async (method, path, body) => {
     let res: Response;
@@ -77,14 +83,17 @@ function apiClient({
         new Request(`${base}${path}`, {
           method,
           headers: {
-            authorization: `Bearer ${apiKey}`,
+            authorization: `Bearer ${token}`,
             ...(body !== undefined && { "content-type": "application/json" }),
           },
           body: body === undefined ? undefined : JSON.stringify(body),
         }),
       );
     } catch (err) {
-      return { ok: false, result: failure(0, "api_unreachable", String(err)) };
+      return {
+        ok: false,
+        result: failure(0, "api_unreachable", redact(String(err), token)),
+      };
     }
     const raw = await res.text();
     const parsed = parseJson(raw);
@@ -96,10 +105,10 @@ function apiClient({
         result: failure(
           res.status,
           `http_${res.status}`,
-          raw || res.statusText,
+          redact(raw || res.statusText, token),
         ),
       };
-    const { error } = envelope.data;
+    const error = redact(envelope.data.error, token);
     return {
       ok: false,
       result: text({ status: res.status, error }, true),
@@ -349,15 +358,23 @@ function buildServer(call: Call) {
   return server;
 }
 
-/** A stateless streamable-HTTP MCP endpoint whose tools call `/v1`. */
+const bearerToken = (request: Request) =>
+  /^bearer\s+(\S+)$/i.exec(request.headers.get("authorization") ?? "")?.[1];
+
+/** A stateless streamable-HTTP MCP endpoint whose tools call `/v1` with the bearer token of the request they serve. */
 export function createMcpHandler(
   options: McpHandlerOptions,
 ): (request: Request) => Promise<Response> {
   const checked = HandlerOptions.safeParse(options);
   if (!checked.success)
     throw new TypeError(`createMcpHandler: ${z.prettifyError(checked.error)}`);
-  const api = apiClient(options);
   return async (request) => {
+    const token = bearerToken(request);
+    if (!token)
+      return Response.json(
+        { error: { code: "unauthorized", message: "missing bearer token" } },
+        { status: 401 },
+      );
     // stateless: a GET stream would sit on a server that never emits, and there is no session to DELETE
     if (request.method !== "POST")
       return Response.json(
@@ -372,7 +389,7 @@ export function createMcpHandler(
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
-    await buildServer(api).connect(transport);
+    await buildServer(apiClient(options, token)).connect(transport);
     return transport.handleRequest(request);
   };
 }

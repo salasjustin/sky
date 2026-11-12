@@ -4,6 +4,7 @@ import { EnvironmentId, type RunId } from "@sky/shared";
 import { and, asc, eq, isNotNull, lte } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
+import { adminOnly } from "./auth.js";
 import { BASE_ENV_NAMES } from "./base-profile.js";
 import {
   envSecretAad,
@@ -231,10 +232,11 @@ const envExists = (db: Db, id: EnvironmentId) =>
     .where(eq(environments.id, id))
     .get() !== undefined;
 
-/** `/:id/secrets`, mounted beside the environment routes. */
+/** `/:id/secrets`, mounted beside the environment routes; an issued key can't list, set or delete one. */
 export function secretRoutes() {
   return factory
     .createApp()
+    .use("/:id/secrets/*", adminOnly)
     .get("/:id/secrets", envParam, (c) => {
       const { id } = c.req.valid("param");
       const db = c.var.db;

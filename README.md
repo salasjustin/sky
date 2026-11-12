@@ -22,7 +22,29 @@ Every call carries the API key you set at deploy time:
 Authorization: Bearer <SKY_API_KEY>
 ```
 
-A missing or wrong key returns `401`.
+A missing, unknown or revoked key returns `401`.
+
+### Keys and roles
+
+`SKY_API_KEY` is the **admin** key: it can do everything, and only it can mint, list and revoke other keys. Issue a narrower **`runs`** key to give another system its own agents on chosen environments and nothing else:
+
+```bash
+sky key create better-giving --role=runs --env=bg-platform   # --env takes ids or names, comma-separated
+sky key list                    # id, role, active|revoked, name and environments; secrets are never printed
+sky key revoke key_…
+```
+
+`create` prints `key_… sky_…` once. Sky stores only a hash of the secret, so it can't be shown again; lose it and revoke the key. Revoking takes effect on the next request and also deletes the webhooks that key created. Over REST: `POST /v1/keys` (`name`, `role: "runs"`, `environmentIds`), `GET /v1/keys`, `DELETE /v1/keys/:id`.
+
+A `runs` key, within the environments on its list:
+
+- can start agents (`POST /v1/agents`), follow up, read agents, runs, events and streams, approve, deny and answer, and stop and archive **its own** agents;
+- can read the environments on its list (`GET` only, no secrets);
+- can add, list and delete **its own** webhooks, which deliver only its own agents' events;
+- is refused with `403 forbidden` on environment create, update, delete and retry, every secret route, and the key routes;
+- gets `404 not_found` for an environment not on its list and for any agent that isn't its own, so it can't probe ids.
+
+**Ownership.** Every agent records the key that started it; one started with the admin key is admin-owned, as are all agents that existed before keys. A `runs` key only ever sees and acts on its own agents, including in `GET /v1/events`, `GET /v1/stream` and through `/mcp`. The admin key sees and acts on all of them.
 
 ## Install and configure
 
@@ -105,6 +127,9 @@ sky webhook add https://example.com/hook --events=run.waiting,run.finished   # a
 sky webhook add https://example.com/hook --events=run.waiting --format=standard --secret=@secret.txt --env=web
 sky webhook list                # id, format, url, event types and environments; secrets are never printed
 sky webhook delete whk_…
+sky key create <name> --role=runs --env=web,api   # admin only: a key limited to those environments; prints the secret once
+sky key list
+sky key revoke key_…
 ```
 
 `<env>` is an environment's name or id.
@@ -263,6 +288,7 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | `POST /v1/agents/:id/answers` · `…/approvals`                           | answer a waiting question; approve or deny a tool call |
 | `POST /v1/agents/:id/stop` · `…/archive`                                | stop the current run; archive the agent                |
 | `POST`, `GET /v1/webhooks` · `GET`, `DELETE /v1/webhooks/:id`           | subscribe an https URL to events; list, read, remove   |
+| `POST`, `GET /v1/keys` · `DELETE /v1/keys/:id`                          | admin only: mint, list and revoke `runs` keys          |
 
 Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you'll meet:
 
@@ -306,7 +332,7 @@ A run is probed at most once per window, and a slow sprite never holds up the AP
 
 ## MCP
 
-`POST /mcp` (streamable HTTP, same bearer key) exposes `create_env`, `launch`, `followup`, `status`, `answer`, `approve`, `stop`, `archive` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents.
+`POST /mcp` (streamable HTTP, same bearer keys: every tool call runs with the caller's own key, so a `runs` key gets the same limits as over REST) exposes `create_env`, `launch`, `followup`, `status`, `answer`, `approve`, `stop`, `archive` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents.
 
 `wait_for_events` waits up to 30 seconds and returns as soon as something happens, with a `cursor` to pass back as `after` on the next call. Call it in a loop to follow every agent live without a public URL. On your first call, use `status` to find agents already waiting.
 

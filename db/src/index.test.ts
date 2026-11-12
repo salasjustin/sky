@@ -81,6 +81,7 @@ test("openDb sets WAL, foreign keys and a busy timeout on the connection", () =>
 
 const TABLES = [
   "agents",
+  "api_keys",
   "environments",
   "events",
   "run_env_vars",
@@ -235,7 +236,8 @@ test("migrating a populated 0000 file keeps every row, cascade children included
     (t) =>
       t !== "webhook_deliveries" &&
       t !== "run_requests" &&
-      t !== "run_env_vars",
+      t !== "run_env_vars" &&
+      t !== "api_keys",
   );
   for (const table of atInit) expect([table, count(table)]).toEqual([table, 1]);
   const createdAt = db.$client
@@ -919,4 +921,110 @@ test("migrating a populated 0008 file adds remote_branch as NULL and keeps every
     db.$client.prepare("select id, remote_branch from agents").all(),
   ).toEqual([{ id: "agt_1", remote_branch: null }]);
   expect(count("runs")).toBe(1);
+});
+
+const seedKey = (id = "key_1", hash = "a".repeat(64)) =>
+  run(
+    "insert into api_keys (id, name, key_hash, role, environment_ids) values (?, 'ci', ?, 'runs', '[\"env_1\"]')",
+    id,
+    hash,
+  );
+
+test("api keys hold a unique hash, a known role, an environment id array and UTC revoked/last-used stamps", () => {
+  migrate(db);
+  seedKey();
+  expect(() => seedKey("key_2")).toThrow(/UNIQUE constraint failed/);
+  run(
+    "insert into api_keys (id, name, key_hash, role, environment_ids) values ('key_3', 'root', 'b', 'admin', '[]')",
+  );
+  const rejects = (stmt: string, error: RegExp) =>
+    expect(() => run(stmt)).toThrow(error);
+  rejects("update api_keys set role = 'owner'", /CHECK constraint failed/);
+  rejects(
+    "update api_keys set environment_ids = '{}'",
+    /CHECK constraint failed/,
+  );
+  rejects("update api_keys set environment_ids = null", /NOT NULL/);
+  rejects("update api_keys set name = null", /NOT NULL/);
+  rejects(
+    "update api_keys set revoked_at = '2026-11-12 10:00:00'",
+    /CHECK constraint failed/,
+  );
+  rejects(
+    "update api_keys set last_used_at = 'yesterday'",
+    /CHECK constraint failed/,
+  );
+  expect(() =>
+    run(
+      "update api_keys set revoked_at = '2026-11-12T10:00:00.000Z', last_used_at = '2026-11-12T09:00:00.000Z' where id = 'key_1'",
+    ),
+  ).not.toThrow();
+});
+
+test("an agent or webhook's owner key must exist, and null means an admin created it", () => {
+  migrate(db);
+  seedRun();
+  seedKey();
+  run("update agents set owner_key_id = 'key_1'");
+  expect(() => run("update agents set owner_key_id = 'key_nope'")).toThrow(
+    /FOREIGN KEY constraint failed/,
+  );
+  run(
+    "insert into webhooks (id, url, event_types, owner_key_id) values ('whk_1', 'https://x.test', '[\"run.started\"]', 'key_1')",
+  );
+  expect(() =>
+    run(
+      "insert into webhooks (id, url, event_types, owner_key_id) values ('whk_2', 'https://x.test', '[\"run.started\"]', 'key_nope')",
+    ),
+  ).toThrow(/FOREIGN KEY constraint failed/);
+  run(
+    "insert into webhooks (id, url, event_types) values ('whk_3', 'https://x.test', '[\"run.started\"]')",
+  );
+  expect(
+    db
+      .select({ id: webhooks.id, ownerKeyId: webhooks.ownerKeyId })
+      .from(webhooks)
+      .orderBy(webhooks.id)
+      .all(),
+  ).toEqual([
+    { id: "whk_1", ownerKeyId: "key_1" },
+    { id: "whk_3", ownerKeyId: null },
+  ]);
+});
+
+test("a key's agents are found through the owner_key_id index", () => {
+  migrate(db);
+  const plan = db.$client
+    .prepare(
+      "explain query plan select id from agents where owner_key_id = 'key_1'",
+    )
+    .all() as { detail: string }[];
+  expect(plan.map((p) => p.detail).join("\n")).toMatch(
+    /USING (COVERING )?INDEX agents_owner_key_id/,
+  );
+});
+
+test("migrating a populated 0012 file adds owner_key_id as NULL and keeps every agent, run, webhook and delivery", () => {
+  migrateThrough("0012_funny_lady_mastermind");
+  seedRun();
+  const eventId = insertEvent();
+  run(
+    "insert into webhooks (id, url, event_types) values ('whk_1', 'https://x.test', '[\"run.started\"]')",
+  );
+  run(
+    "insert into webhook_deliveries (webhook_id, event_id, status, next_attempt_at) values ('whk_1', ?, 'pending', '2026-11-12T00:00:00Z')",
+    eventId,
+  );
+
+  migrate(db);
+
+  expect(
+    db.$client.prepare("select id, owner_key_id from agents").all(),
+  ).toEqual([{ id: "agt_1", owner_key_id: null }]);
+  expect(
+    db.$client.prepare("select id, owner_key_id from webhooks").all(),
+  ).toEqual([{ id: "whk_1", owner_key_id: null }]);
+  expect(count("runs")).toBe(1);
+  expect(count("webhook_deliveries")).toBe(1);
+  expect(count("api_keys")).toBe(0);
 });

@@ -1,6 +1,7 @@
 import type {
   AgentId,
   AgentStatus,
+  ApiKeyId,
   Decision,
   EnvironmentId,
   EnvironmentStatus,
@@ -39,6 +40,9 @@ export const environmentFailureSteps = [
   "setup",
   "checkpoint",
 ] as const;
+
+// what an API key may do; the CHECK on `role` spells the same list
+export const apiKeyRoles = ["admin", "runs"] as const;
 
 // a webhook delivery's lifecycle; the CHECK on `status` spells the same list
 export const deliveryStatuses = ["pending", "delivered", "failed"] as const;
@@ -112,6 +116,35 @@ export const environments = sqliteTable(
   ],
 );
 
+// keys are revoked, never deleted, so the agents and webhooks that reference one need no ON DELETE
+export const apiKeys = sqliteTable(
+  "api_keys",
+  {
+    id: text().$type<ApiKeyId>().primaryKey(),
+    name: text().notNull(),
+    // lowercase-hex sha-256 of the secret; the secret itself is never stored
+    keyHash: text("key_hash").notNull(),
+    role: text({ enum: apiKeyRoles }).notNull(),
+    environmentIds: text("environment_ids", { mode: "json" })
+      .$type<EnvironmentId[]>()
+      .notNull(),
+    createdAt: createdAt(),
+    revokedAt: text("revoked_at"),
+    lastUsedAt: text("last_used_at"),
+  },
+  (t) => [
+    uniqueIndex("api_keys_key_hash").on(t.keyHash),
+    check("api_keys_role", sql`${c(t.role)} in ('admin', 'runs')`),
+    check(
+      "api_keys_environment_ids",
+      sql`json_type(${c(t.environmentIds)}) = 'array'`,
+    ),
+    check("api_keys_created_at", isoUtc(t.createdAt)),
+    check("api_keys_revoked_at", isoUtc(t.revokedAt)),
+    check("api_keys_last_used_at", isoUtc(t.lastUsedAt)),
+  ],
+);
+
 export const agents = sqliteTable(
   "agents",
   {
@@ -129,9 +162,14 @@ export const agents = sqliteTable(
     // the existing GitHub branch the agent started from and publishes to; null means it uses `branch`.
     // no CHECK, for the same reason as archivedAt; the API validates the name
     remoteBranch: text("remote_branch"),
+    // the key that started the agent; null means an admin did
+    ownerKeyId: text("owner_key_id")
+      .$type<ApiKeyId>()
+      .references(() => apiKeys.id),
   },
   (t) => [
     index("agents_env_id").on(t.envId),
+    index("agents_owner_key_id").on(t.ownerKeyId),
     check(
       "agents_status",
       sql`${c(t.status)} in ('idle', 'running', 'waiting')`,
@@ -234,6 +272,10 @@ export const webhooks = sqliteTable(
       [EnvironmentId, ...EnvironmentId[]]
     >(),
     createdAt: createdAt(),
+    // the key that created the webhook; null means an admin did
+    ownerKeyId: text("owner_key_id")
+      .$type<ApiKeyId>()
+      .references(() => apiKeys.id),
   },
   (t) => [
     check(

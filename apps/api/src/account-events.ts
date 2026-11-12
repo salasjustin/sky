@@ -3,6 +3,7 @@ import { agents, type Db, events, runs } from "@sky/db";
 import { type AgentId, type Event, EventCursor, EventType } from "@sky/shared";
 import { and, asc, eq, gt, inArray, max } from "drizzle-orm";
 import { z } from "zod";
+import { ownAgents, type Principal } from "./auth.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { anyRun, presentEvent, runEvents } from "./run-events.js";
@@ -10,7 +11,12 @@ import { tailSSE } from "./run-stream.js";
 
 const PAGE = 100;
 
-type EventFilter = { types?: EventType[]; agentId?: AgentId };
+/** `principal` limits the read to the agents it may see. */
+type EventFilter = {
+  types?: EventType[];
+  agentId?: AgentId;
+  principal: Principal;
+};
 
 const latestEventId = (db: Db) =>
   db
@@ -43,6 +49,7 @@ function readEvents(
         gt(events.id, after),
         filter.types && inArray(events.type, filter.types),
         filter.agentId && eq(runs.agentId, filter.agentId),
+        ownAgents(filter.principal),
       ),
     )
     .orderBy(asc(events.id))
@@ -97,14 +104,21 @@ const lastEventId = zValidator(
   },
 );
 
-/** The filter's agent: `{ agentId: undefined }` when none is named, undefined when the named one doesn't exist. */
-const knownAgent = (db: Db, agentId: string | undefined) =>
+/**
+ * The filter's agent: `{ agentId: undefined }` when none is named, undefined when the named one
+ * doesn't exist or isn't `principal`'s to see.
+ */
+const knownAgent = (
+  db: Db,
+  agentId: string | undefined,
+  principal: Principal,
+) =>
   agentId === undefined
     ? { agentId: undefined }
     : db
         .select({ agentId: agents.id })
         .from(agents)
-        .where(eq(agents.id, agentId as AgentId))
+        .where(and(eq(agents.id, agentId as AgentId), ownAgents(principal)))
         .get();
 
 /** Account-wide event reads: a long-poll page and a live SSE tail, both off the API's own database. */
@@ -123,9 +137,10 @@ export function accountEventRoutes(
       async (c) => {
         const db = c.var.db;
         const { types, after, wait, ...q } = c.req.valid("query");
-        const agent = knownAgent(db, q.agentId);
+        const { principal } = c.var;
+        const agent = knownAgent(db, q.agentId, principal);
         if (!agent) return apiError(c, 404, "not_found", "no such agent");
-        const filter = { types, agentId: agent.agentId };
+        const filter = { types, agentId: agent.agentId, principal };
 
         // subscribed before the first read, so an event landing in between still wakes it
         let dirty = false;
@@ -171,9 +186,10 @@ export function accountEventRoutes(
     .get("/stream", query(filterQuery), lastEventId, (c) => {
       const db = c.var.db;
       const { types, after, ...q } = c.req.valid("query");
-      const agent = knownAgent(db, q.agentId);
+      const { principal } = c.var;
+      const agent = knownAgent(db, q.agentId, principal);
       if (!agent) return apiError(c, 404, "not_found", "no such agent");
-      const filter = { types, agentId: agent.agentId };
+      const filter = { types, agentId: agent.agentId, principal };
       // a reconnecting EventSource keeps its original URL, so the header is the fresher cursor
       let cursor =
         c.req.valid("header")["last-event-id"] ?? after ?? latestEventId(db);
