@@ -384,20 +384,20 @@ test("a subscription the probe finds full with no reset given is held for the un
   expect(until).toBeLessThanOrEqual(Date.now() + UNKNOWN_RESET_MS);
 });
 
-test("a subscription whose probe is refused with a 429 is marked limited until its latest reset, whatever its usage says", async () => {
-  const weekly = inHours(50);
+test("a subscription whose probe is refused with a 429 and no window full is marked limited until its earliest reset", async () => {
+  const fiveHour = inHours(2);
   readings[DEFAULT_TOKEN] = {
     h5: 0.99,
-    h5Reset: inHours(2),
+    h5Reset: fiveHour,
     d7: 0.2,
-    d7Reset: weekly,
+    d7Reset: inHours(50),
     status: 429,
   };
   readings[PERSONAL_TOKEN] = { h5: 0.995, d7: 0.5 };
   readings[WORK_TOKEN] = { h5: 0.999, d7: 0.5 };
   const r = await launchedRun(poolEnv());
   expect(r.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(PERSONAL_TOKEN);
-  expect(limitedUntil(db, "default")?.getTime()).toBe(weekly * 1000);
+  expect(limitedUntil(db, "default")?.getTime()).toBe(fiveHour * 1000);
 });
 
 test("a subscription whose token is refused is left out of the pick, not ranked last, and is not marked limited", async () => {

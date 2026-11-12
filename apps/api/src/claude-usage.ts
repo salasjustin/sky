@@ -177,11 +177,12 @@ export type UsageProbe = ReturnType<typeof createUsageProbe>;
 /**
  * Keeps each subscription's last-seen usage fresh: `refresh` probes it when the stored reading is
  * older than `USAGE_STALE_MS`, at most one probe at a time per subscription, and stores the answer.
- * A subscription the probe finds full, or that is refused with a 429 whatever its usage, is marked
- * limited until the latest reset the answer gives, or for `UNKNOWN_RESET_MS` when it gives none. A
- * probe that fails, or whose token is refused (401, 403), is logged by name, leaves the stored
- * reading as it was, and is not tried again for `USAGE_STALE_MS`; meanwhile `failedRecently` is true
- * for that subscription, and `refusedRecently` too when its token was refused.
+ * A subscription the probe finds full is marked limited until its full window resets, or for
+ * `UNKNOWN_RESET_MS` when the answer gives no reset. One refused with a 429 and no window full is
+ * held until the earliest reset the answer gives, else for `UNKNOWN_RESET_MS`. A probe that fails,
+ * or whose token is refused (401, 403), is logged by name, leaves the stored reading as it was, and
+ * is not tried again for `USAGE_STALE_MS`; meanwhile `failedRecently` is true for that
+ * subscription, and `refusedRecently` too when its token was refused.
  */
 export function createUsageProbe({
   db,
@@ -222,6 +223,16 @@ export function createUsageProbe({
       .filter((at) => at > now)
       .sort((a, b) => b.getTime() - a.getTime())[0];
 
+  /** The earliest future reset `windows` give; undefined when they give none. */
+  const soonestReset = (
+    windows: (ClaudeUsageWindow | null)[],
+    now: Date,
+  ): Date | undefined =>
+    windows
+      .flatMap((w) => (w?.resetsAt ? [new Date(w.resetsAt)] : []))
+      .filter((at) => at > now)
+      .sort((a, b) => a.getTime() - b.getTime())[0];
+
   async function run(name: string, token: string): Promise<void> {
     try {
       const answer = await probe(token);
@@ -237,16 +248,19 @@ export function createUsageProbe({
       const { usage } = answer;
       if (usage) saveUsage(db, name, usage);
       const windows = usage ? [usage.fiveHour, usage.sevenDay] : [];
-      // a 429 is a limit whatever the usage says; any other answer, when a window is full
-      const limiting =
-        answer.kind === "limited"
-          ? windows
-          : windows.filter((w) => w !== null && w.utilization >= 1);
-      const until = latestReset(limiting, now);
+      const full = windows.filter((w) => w !== null && w.utilization >= 1);
+      const until = latestReset(full, now);
       if (until) {
         markLimited(db, name, until);
       } else if (answer.kind === "limited") {
-        markLimited(db, name, new Date(now.getTime() + UNKNOWN_RESET_MS));
+        // not the latest: that could hold a 5-hour limit for a week, and an early guess costs one
+        // failed launch, whose limit message then gives the exact reset
+        markLimited(
+          db,
+          name,
+          soonestReset(windows, now) ??
+            new Date(now.getTime() + UNKNOWN_RESET_MS),
+        );
       }
     } catch (err) {
       failures.set(name, { at: Date.now(), refused: false });
