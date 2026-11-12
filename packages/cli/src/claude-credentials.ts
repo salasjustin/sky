@@ -2,15 +2,17 @@ import type { ClaudeCredentialSummary } from "@sky/shared";
 import type { AgentCommand } from "./agent.js";
 import { UsageError } from "./output.js";
 
-/**
- * Name and kind, when it resets (a dash when not limited), runs since midnight UTC, then the
- * assigned env ids, comma-joined (a dash for none). No field can hold a value: the API has none to send.
- */
 const percent = (
   label: string,
   window: { utilization: number } | null | undefined,
 ) => (window ? `${label}=${Math.round(window.utilization * 100)}%` : "-");
 
+/**
+ * Name and kind, when it resets (a dash when not limited), runs since midnight UTC, the assigned env
+ * ids, its last-seen 5-hour and 7-day usage as percentages, then the pool env ids that may use it;
+ * ids comma-joined, and a dash for an empty list or a window never read. No field can hold a value:
+ * the API has none to send.
+ */
 const credentialLine = (c: ClaudeCredentialSummary) =>
   [
     c.name,

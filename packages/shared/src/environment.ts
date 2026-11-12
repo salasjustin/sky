@@ -57,7 +57,7 @@ export const Environment = z.object({
     defaults: true,
     commands: [],
   })),
-  /** Which Claude credential this environment's runs use: a subscription name or `api-key`; null is the default token. */
+  /** Which Claude credential this environment's runs use: a subscription name, `api-key` or `pool`; null is the default token, and `default` is stored as null. */
   claudeCredential: ClaudeCredentialName.nullable().default(null),
   /** With `claudeCredential: pool`, the subscriptions it may use, in failover order; null is every one the server holds. */
   claudePool: z

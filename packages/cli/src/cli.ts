@@ -65,11 +65,10 @@ const help = (io: Io) => `Usage:
       api-key for the pay-per-use Anthropic API key, or default for the
       server's default token. --fallback=none stops a run from using the
       API key while its subscription is at its usage limit; the launch
-      fails with the reset time instead. Sky never moves a run to another
-      subscription. pool is the one exception, and opt-in: the
-      environment's runs go to the subscription with the most headroom
-      (--pool=a,b limits and orders the choice) and, on a usage limit,
-      on to the next one. Needs the admin key.
+      fails with the reset time instead. Only pool moves runs between
+      subscriptions: the environment's runs go to the subscription with
+      the most headroom (--pool=a,b limits and orders the choice) and, on
+      a usage limit, on to the next one. Needs the admin key.
   sky claude-credentials [options]
       Print "<name> <subscription|api-key> <limited-until=<time>|-> <runs
       today> <env ids|-> <5h=N%|-> <7d=N%|-> <pool env ids|->" per

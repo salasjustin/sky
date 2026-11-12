@@ -672,8 +672,8 @@ export function createLauncher({
     }
   }
 
-  // launches by run, so a run that fails on its subscription's usage limit can be retried once on the
-  // API key. In memory: a restart between the launch and the failure loses the retry, never the limit
+  // launches by run, so a run that fails on its subscription's usage limit can be retried once. In
+  // memory: a restart between the launch and the failure loses the retry, never the limit
   const launches = new Map<RunId, { launch: Launch; at: number }>();
 
   /**

@@ -14,8 +14,9 @@ export const API_KEY_CREDENTIAL = "api-key";
 export const POOL_CREDENTIAL = "pool";
 
 /**
- * A subscription's name: lowercase letters, digits and `_`; the server's `CLAUDE_OAUTH_TOKEN_<NAME>`.
- * Never `pool`, which is the assignment {@link POOL_CREDENTIAL}.
+ * A subscription's name: up to 64 lowercase letters, digits and `_`. `default` is the server's
+ * `CLAUDE_CODE_OAUTH_TOKEN`; any other is its `CLAUDE_OAUTH_TOKEN_<NAME>`. Never `pool`, which is the
+ * assignment {@link POOL_CREDENTIAL}.
  */
 export const ClaudeSubscriptionName = z
   .string()
@@ -43,7 +44,7 @@ export const ClaudeCredentialName = z
 export const ClaudeFallback = z.enum([API_KEY_CREDENTIAL, "none"]);
 export type ClaudeFallback = z.infer<typeof ClaudeFallback>;
 
-/** Last-seen usage of one window: how much of it is used (0 to 1) and when it resets. */
+/** Last-seen usage of one window: the fraction of it used, where 1 or more is full, and when it resets. */
 export const ClaudeUsageWindow = z.object({
   utilization: z.number().min(0),
   resetsAt: z.iso.datetime().nullable(),

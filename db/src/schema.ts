@@ -41,10 +41,10 @@ export const environmentFailureSteps = [
   "checkpoint",
 ] as const;
 
-// what an API key may do; the CHECK on `role` spells the same list
 // what an environment does while its subscription is at its limit; no CHECK on the column, which would make drizzle-kit rebuild the table, so the API validates it
 export const claudeFallbacks = ["api-key", "none"] as const;
 
+// what an API key may do; the CHECK on `role` spells the same list
 export const apiKeyRoles = ["admin", "runs"] as const;
 
 // a webhook delivery's lifecycle; the CHECK on `status` spells the same list
@@ -87,7 +87,7 @@ export const environments = sqliteTable(
       .$type<{ defaults: boolean; commands: string[] }>()
       .notNull()
       .default({ defaults: true, commands: [] }),
-    // a subscription name, "api-key", or null for the default token; names only, never a value
+    // a subscription name, "api-key", "pool", or null for the default token; names only, never a value
     claudeCredential: text("claude_credential"),
     // with claude_credential "pool": the subscription names it may use, in order; null means every one. No CHECK, for the same reason
     claudePool: text("claude_pool", { mode: "json" }).$type<string[] | null>(),
@@ -211,7 +211,7 @@ export const runs = sqliteTable(
     secretNames: text("secret_names", { mode: "json" }).$type<string[]>(),
     // the Claude credential the launch used, by name ("default", a subscription's name or "api-key"); null before it picks one. No CHECK, for the same reason as rollup
     claudeCredential: text("claude_credential"),
-    // the failed run this one retries on the API key after a usage limit; null for any other run
+    // the failed run this one retries after a usage limit, on the API key or a pool's next subscription; null for any other run
     retryOf: text("retry_of").$type<RunId>(),
     createdAt: createdAt(),
   },
