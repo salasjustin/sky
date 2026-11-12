@@ -27,6 +27,7 @@ import {
 } from "./claude-usage.js";
 import { type Config, loadConfig } from "./config.js";
 import { spriteNameFor } from "./sprites.js";
+import { fiveHourLimit, weeklyLimit } from "./testing/limits.js";
 import {
   envFileOf,
   type SpritesWire,
@@ -41,43 +42,7 @@ const PERSONAL_TOKEN = "personal-subscription-opaque-2";
 const WORK_TOKEN = "work-subscription-opaque-3";
 const API_KEY = "anthropic-api-key-opaque-4";
 
-const MONTH_NAMES = [
-  "Jan",
-  "Feb",
-  "Mar",
-  "Apr",
-  "May",
-  "Jun",
-  "Jul",
-  "Aug",
-  "Sep",
-  "Oct",
-  "Nov",
-  "Dec",
-];
-
-/**
- * A weekly-limit message whose reset is `days` days and `hour` o'clock (UTC) ahead of the real now,
- * with that instant: always inside the week a reset is held to, whatever day the suite runs.
- */
-function weeklyLimit(days = 3, hour = 10) {
-  const at = new Date(Date.now() + days * 86_400_000);
-  at.setUTCHours(hour, 0, 0, 0);
-  const text = `You've hit your weekly limit · resets ${MONTH_NAMES[at.getUTCMonth()]} ${at.getUTCDate()}, ${hour}am (UTC)`;
-  return { text, at: at.toISOString() };
-}
-
-/**
- * A 5-hour-limit message whose reset is 20 past the hour three hours ahead of the real now (UTC), so
- * the hold outlives the test whatever time of day the suite runs.
- */
-function fiveHourLimit() {
-  const hour = (new Date().getUTCHours() + 3) % 24;
-  const clock = `${hour % 12 === 0 ? 12 : hour % 12}:20${hour < 12 ? "am" : "pm"}`;
-  return `You've hit your 5-hour limit · resets ${clock} (UTC)`;
-}
-
-const FIVE_HOUR = fiveHourLimit();
+const FIVE_HOUR = fiveHourLimit().text;
 const WEEKLY = weeklyLimit().text;
 
 /** A reset left out falls a few hours or days ahead; null sends none. The status is 200 unless given. */

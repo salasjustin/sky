@@ -49,7 +49,8 @@ function parsePool(value: string | undefined): string[] | null | undefined {
   if (names.length === 0) {
     throw new UsageError("--pool names no subscription", true);
   }
-  if (names.includes("all")) {
+  // any case: `ALL` is what someone shouting at a terminal means
+  if (names.some((n) => n.toLowerCase() === "all")) {
     if (names.length > 1) {
       throw new UsageError(
         "--pool=all takes no other subscription names",

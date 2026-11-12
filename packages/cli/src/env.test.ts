@@ -634,3 +634,39 @@ test("--fallback alone on a non-pool credential sends no pool either", async () 
     { claudeCredential: "personal", claudeFallback: "none" },
   ]);
 });
+
+test.each(["all", "ALL", "All"])(
+  "--pool=%s resets the pool to every subscription",
+  async (value) => {
+    const bodies: unknown[] = [];
+    server.use(
+      list,
+      http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+        bodies.push(await request.json());
+        return HttpResponse.json(
+          claudeAssignment({ claudeCredential: "pool", claudePool: null }),
+        );
+      }),
+    );
+    const r = await runCli([
+      "env",
+      "set-claude",
+      "web",
+      "pool",
+      `--pool=${value}`,
+    ]);
+    expect(r.code).toBe(0);
+    expect(bodies).toEqual([{ claudeCredential: "pool", claudePool: null }]);
+  },
+);
+
+test("--pool=ALL stands alone too", async () => {
+  const r = await runCli([
+    "env",
+    "set-claude",
+    "web",
+    "pool",
+    "--pool=work,ALL",
+  ]);
+  expect(r.code).toBe(2);
+});

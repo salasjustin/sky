@@ -70,7 +70,7 @@ const help = (io: Io) => `Usage:
       the most headroom and, on a usage limit, on to the next one.
       --pool=a,b limits and orders the choice; --pool=all resets it to
       every subscription the server holds (so no subscription can be
-      named "all" there). Without --pool the list stays as it is, so
+      named "all", in any case, there). Without --pool the list stays as it is, so
       --fallback alone never widens an ordered pool. Needs the admin key.
   sky claude-credentials [options]
       Print "<name> <subscription|api-key> <limited-until=<time>|-> <runs

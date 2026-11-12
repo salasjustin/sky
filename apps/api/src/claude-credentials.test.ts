@@ -24,6 +24,7 @@ import {
 import type { Config } from "./config.js";
 import { KnownSecrets } from "./redact.js";
 import { spriteNameFor } from "./sprites.js";
+import { fiveHourLimit, weeklyLimit } from "./testing/limits.js";
 import {
   envFileOf,
   type SpritesWire,
@@ -39,43 +40,7 @@ const WORK_TOKEN = "work-subscription-opaque-3";
 const API_KEY = "anthropic-api-key-opaque-4";
 const ALL_VALUES = [DEFAULT_TOKEN, PERSONAL_TOKEN, WORK_TOKEN, API_KEY];
 
-const MONTH_NAMES = [
-  "Jan",
-  "Feb",
-  "Mar",
-  "Apr",
-  "May",
-  "Jun",
-  "Jul",
-  "Aug",
-  "Sep",
-  "Oct",
-  "Nov",
-  "Dec",
-];
-
-/**
- * A weekly-limit message whose reset is `days` days and `hour` o'clock (UTC) ahead of the real now,
- * with that instant: always inside the week a reset is held to, whatever day the suite runs.
- */
-function weeklyLimit(days = 3, hour = 10) {
-  const at = new Date(Date.now() + days * 86_400_000);
-  at.setUTCHours(hour, 0, 0, 0);
-  const text = `You've hit your weekly limit · resets ${MONTH_NAMES[at.getUTCMonth()]} ${at.getUTCDate()}, ${hour}am (UTC)`;
-  return { text, at: at.toISOString() };
-}
-
-/**
- * A 5-hour-limit message whose reset is 20 past the hour three hours ahead of the real now (UTC), so
- * the hold outlives the test whatever time of day the suite runs.
- */
-function fiveHourLimit() {
-  const hour = (new Date().getUTCHours() + 3) % 24;
-  const clock = `${hour % 12 === 0 ? 12 : hour % 12}:20${hour < 12 ? "am" : "pm"}`;
-  return `You've hit your 5-hour limit · resets ${clock} (UTC)`;
-}
-
-const FIVE_HOUR = fiveHourLimit();
+const FIVE_HOUR = fiveHourLimit().text;
 const WEEKLY = weeklyLimit().text;
 
 let dir: string;
@@ -348,40 +313,51 @@ test("an environment assigned a credential the server no longer holds fails its 
 
 // --- the usage limit and the API key fallback -------------------------------------------------------
 
-test("a limit error marks that subscription limited until its reset and retries the run once on the API key, in the same session", async () => {
-  const personal = readyEnv({ claudeCredential: "personal" });
-  const r = await launchedRun(personal);
-  await failWith(r, FIVE_HOUR);
+// the clock is faked (Date only) so the fixture's reset lands at every kind of hour: around midnight, noon and after
+test.each([0, 11, 12, 13, 23])(
+  "a limit error marks that subscription limited until its reset and retries the run once on the API key, in the same session, at %i:05 UTC",
+  async (hour) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(Date.UTC(2026, 10, 12, hour, 5)));
+    try {
+      const limit = fiveHourLimit();
+      const personal = readyEnv({ claudeCredential: "personal" });
+      const r = await launchedRun(personal);
+      await failWith(r, limit.text);
 
-  await sessionOpened(2);
-  // the signal the no-retry tests read is live: a real retry raises it
-  expect(exitWaits()).toBe(1);
-  const retry = wire.sessions[1];
-  const file = envFileOf(wire, retry);
-  expect(file).toMatchObject({
-    SKY_CLAUDE_AUTH: "api-key",
-    SKY_CLAUDE_API_KEY: API_KEY,
-  });
-  expect(file).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
-  expect(retry?.env.SESSION_ID).toBe("sess-1");
-  expect(retry?.env.RUN_ID).not.toBe(r.run.id);
+      await sessionOpened(2);
+      // the signal the no-retry tests read is live: a real retry raises it
+      expect(exitWaits()).toBe(1);
+      const retry = wire.sessions[1];
+      const file = envFileOf(wire, retry);
+      expect(file).toMatchObject({
+        SKY_CLAUDE_AUTH: "api-key",
+        SKY_CLAUDE_API_KEY: API_KEY,
+      });
+      expect(file).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+      expect(retry?.env.SESSION_ID).toBe("sess-1");
+      expect(retry?.env.RUN_ID).not.toBe(r.run.id);
 
-  const until = limitedUntil(db, "personal");
-  expect(until?.getUTCHours()).toBe(10);
-  expect(until?.getUTCMinutes()).toBe(20);
-  expect(until && until.getTime() > Date.now()).toBe(true);
+      // held until the reset the message gave, which is still ahead
+      const until = limitedUntil(db, "personal");
+      expect(until?.toISOString()).toBe(limit.at);
+      expect(until && until.getTime() > Date.now()).toBe(true);
 
-  const retried = runRow(String(retry?.env.RUN_ID));
-  expect(retried).toMatchObject({
-    claudeCredential: "api-key",
-    retryOf: r.run.id,
-    agentId: r.agent.id,
-  });
-  expect(runRow(r.run.id)?.status).toBe("failed");
-  // the same agent: its worktree and session carry on
-  const prompt = wire.files.get(`/workspace/runs/${retried?.id}.prompt`);
-  expect(new TextDecoder().decode(prompt)).toContain("fix the flaky test");
-});
+      const retried = runRow(String(retry?.env.RUN_ID));
+      expect(retried).toMatchObject({
+        claudeCredential: "api-key",
+        retryOf: r.run.id,
+        agentId: r.agent.id,
+      });
+      expect(runRow(r.run.id)?.status).toBe("failed");
+      // the same agent: its worktree and session carry on
+      const prompt = wire.files.get(`/workspace/runs/${retried?.id}.prompt`);
+      expect(new TextDecoder().decode(prompt)).toContain("fix the flaky test");
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
 
 test("the retry is one: a limit on the API-key run is not retried, and no other subscription is ever tried", async () => {
   const personal = readyEnv({ claudeCredential: "personal" });
