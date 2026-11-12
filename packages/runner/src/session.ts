@@ -43,6 +43,7 @@ import {
 import { policyOutcome } from "./policy.js";
 import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
+import { settingsRedirects } from "./settings-guard.js";
 import { prepareWorktree } from "./sync.js";
 import { commitAll, diffRollup, headSha } from "./worktree.js";
 
@@ -432,6 +433,8 @@ export async function runSession(
     warn?: (line: string) => void;
     /** Where the base profile's MCP secrets and the user config are read from; `process.env` when absent. */
     env?: NodeJS.ProcessEnv;
+    /** Where Claude Code's managed settings are read from; `MANAGED_SETTINGS_DIR` when absent. */
+    managedSettingsDir?: string;
     /** How often a tool call in flight is reported; `HEARTBEAT_INTERVAL_MS` when absent. */
     heartbeatMs?: number;
     /** `BACKGROUND_HOLD_MS` when absent. */
@@ -474,6 +477,14 @@ export async function runSession(
   } catch (error) {
     return fail(`worktree setup failed: ${messageOf(error)}`);
   }
+  // before Claude starts, so no setting of the repo's, the sandbox's or a policy's ever sees the run's credential
+  const redirects = settingsRedirects({
+    cwd,
+    repoDir: config.repoDir,
+    env: deps.env ?? process.env,
+    managedDir: deps.managedSettingsDir,
+  });
+  if (redirects.length > 0) return fail(redirects.join(" "));
   // what HEAD holds before Claude touches the worktree; the run's commits are the ones after it
   const runStart = await headSha(cwd).catch((error: unknown) =>
     error instanceof Error ? error : new Error(String(error)),

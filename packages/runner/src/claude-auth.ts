@@ -28,6 +28,46 @@ const ROUTING_VARIABLES = [
   "CLAUDE_CODE_USE_MANTLE",
 ];
 
+// the rest of what changes where Claude Code sends its requests or with what it signs them: other
+// providers' endpoints and credentials, extra request headers, workload identity, and the proxies
+// the requests go through (code.claude.com/docs/en/env-vars)
+export const REDIRECT_ENV_VARIABLES = [
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "ANTHROPIC_AWS_BASE_URL",
+  "ANTHROPIC_BEDROCK_BASE_URL",
+  "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+  "ANTHROPIC_FOUNDRY_BASE_URL",
+  "ANTHROPIC_FOUNDRY_RESOURCE",
+  "ANTHROPIC_VERTEX_BASE_URL",
+  "ANTHROPIC_AWS_API_KEY",
+  "ANTHROPIC_FOUNDRY_API_KEY",
+  "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "ANTHROPIC_FEDERATION_RULE_ID",
+  "ANTHROPIC_ORGANIZATION_ID",
+  "ANTHROPIC_WORKSPACE_ID",
+  "ANTHROPIC_PROFILE",
+  "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+  "CLAUDE_CODE_OAUTH_SCOPES",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "ALL_PROXY",
+  "https_proxy",
+  "http_proxy",
+  "all_proxy",
+];
+
+/**
+ * Every environment variable that would redirect the Claude session or swap its credential, as a
+ * name a settings file's `env` block could set; the session's own env and those blocks are held to
+ * this one list.
+ */
+export const REDIRECT_VARIABLES = [
+  ...AUTH_VARIABLES,
+  ...ROUTING_VARIABLES,
+  ...REDIRECT_ENV_VARIABLES,
+];
+
 // the names `claudeProcessEnv` drops whose values are the project's, handed back to its commands by
 // `commandEnvScript`, and unset for a check's nested `claude`. CLAUDE_CODE_OAUTH_TOKEN is only ever the
 // run's chosen token: the API reserves it
@@ -35,6 +75,9 @@ export const PROJECT_VARIABLES = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   ...ROUTING_VARIABLES,
+  ...REDIRECT_ENV_VARIABLES.filter(
+    (name) => !name.startsWith("CLAUDE_CODE_OAUTH_"),
+  ),
 ];
 
 /**
@@ -54,8 +97,7 @@ export function claudeProcessEnv(
 ): NodeJS.ProcessEnv {
   const out = { ...env };
   for (const name of [
-    ...AUTH_VARIABLES,
-    ...ROUTING_VARIABLES,
+    ...REDIRECT_VARIABLES,
     "SKY_CLAUDE_API_KEY",
     "SKY_CLAUDE_AUTH",
   ]) {
