@@ -3510,7 +3510,7 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
   await sessionOpened(2);
 });
 
-test("a follow-up a while after stop may SIGTERM a runner still alive: it is wedged, not committing", async () => {
+test("a follow-up a while after stop waits in term mode: a runner alive that long is wedged, not committing", async () => {
   const { agent, run } = await runningRun();
   expect((await action(agent.id, "stop")).status).toBe(200);
   endedAgo(run.id, SIGNAL_WINDOW_MS + 60_000);
