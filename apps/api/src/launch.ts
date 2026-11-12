@@ -230,17 +230,18 @@ const QUIET_WAIT_S = 5;
 const TERM_WAIT_S = 9;
 // $0 `term` or `wait`, $1 and $2 the seconds each wait lasts, $3 the pattern. Under `term` a runner
 // still alive after the first wait is SIGTERMed; under `wait` the second wait only waits. Exits 0
-// once nothing matches, 3 when that took the SIGTERM, 1 while a runner still lives; pgrep's own
-// errors exit 2
+// once nothing matches, 3 when that took the SIGTERM, 1 when a runner outlives both waits; pgrep's
+// own errors exit 2
 export const STOP_LINGERING = `gone() { for _ in $(seq "$1"); do pgrep -f "$2" >/dev/null; case $? in 1) return 0;; 0) sleep 1;; *) exit 2;; esac; done; pgrep -f "$2" >/dev/null; case $? in 1) return 0;; 0) return 1;; *) exit 2;; esac; }; gone "$1" "$3" && exit 0; if [ "$0" != term ]; then gone "$2" "$3" && exit 0; exit 1; fi; pkill -TERM -f "$3"; gone "$2" "$3" && exit 3; exit 1`;
 
 export type LingeringRunner = "gone" | "terminated" | "alive";
 
 /**
- * Leaves no runner of the run, an ended one's, alive on its sprite: gives it a few seconds to exit,
- * SIGTERMs it when `maySignal`, then gives it time to commit and exit. Without `maySignal` both
- * waits only wait, for a runner something already signalled. One exec, bounded by `deadlineMs`,
- * which must cover both waits. Throws when the sprite can't answer in time.
+ * Waits out the runner of an ended run on its sprite: gives it a few seconds to exit, SIGTERMs it
+ * when `maySignal`, then gives it time to commit and exit; `alive` when it outlasts both waits.
+ * Without `maySignal` both waits only wait, for a runner something already signalled. One exec,
+ * bounded by `deadlineMs`, which must cover both waits. Throws when the sprite can't answer in time
+ * or pgrep fails on it.
  */
 export async function stopLingeringRunner(
   sprites: SpriteOps,
@@ -652,7 +653,7 @@ export function createLauncher({
       ),
     );
     await holdSprite(launch, "starting the runner anyway");
-    // from here a failure may leave a runner that did start; see `start`
+    // from here a failure may leave a runner that did start, which `start` signals
     maybeStarted.add(launch.runId);
     await step(launch, "start runner", () =>
       startDetached(

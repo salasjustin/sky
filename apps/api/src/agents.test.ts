@@ -3487,7 +3487,7 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
   expect(
     db.$client.prepare("select status from agents where id = ?").get(agent.id),
   ).toEqual({ status: "idle" });
-  // the wait is bounded on the sprite, to the same 30 s archive allows
+  // the wait is one bash exec on the sprite, bounded by the pre-launch deadline
   const wait = wire.calls.at(-1) ?? "";
   expect(wait.startsWith(`exec ${spriteNameFor(envId)} - bash -c `)).toBe(true);
   // the stop already signalled it: a second SIGTERM would kill it mid-commit, so both waits only wait

@@ -27,8 +27,8 @@ const SWEEP_EVERY_MS = 60_000;
  * process left unfinished, and fails silent runs and abandoned waits now and every minute after. Runs
  * outlive a restart: their runners keep posting, so only silence fails one. A run failed for missing its
  * launch deadline, for going quiet (`runner_timeout`) or for an abandoned wait has its runner signalled
- * too, without waiting on the sprite. A `running` run silent
- * past the probe window has its runner looked for on its sprite, also unawaited (see
+ * too, without waiting on the sprite. A `running` run silent past the probe window has its runner
+ * looked for on its sprite, also unawaited (see
  * `createRunProber`). The same sweep deletes run envVars past their TTL and `claude.*` and
  * `runner.heartbeat` events past 7 days. Webhook deliveries left pending resume at once.
  */
@@ -75,8 +75,8 @@ export function boot(config: Config, log: (line: string) => void) {
     signalAll(late);
     const stale = failStaleRuns(db, config.runTimeoutMs);
     for (const id of stale) log(`run ${id} failed: runner_timeout`);
-    // a runner that went quiet may be wedged yet alive, and would hold its agent's next follow-up
-    // up; the sweep after a restart finds the runs a dead process left, so they are signalled too
+    // a runner that went quiet may be wedged yet alive, and would hold up its agent's next
+    // follow-up; the sweep after a restart finds the runs a dead process left, so they are signalled too
     signalAll(spritesOfRuns(db, stale));
     // after the timeout sweep, so a run it just failed isn't probed; not awaited, so a sprite
     // that is slow to wake never holds up the sweep (the prober logs, never throws)

@@ -165,8 +165,8 @@ function endRun(
 }
 
 /**
- * Fails a still-active run with `error`, recording it as the run's `run.failed` event; no-op on an
- * ended run. Whether this call ended it.
+ * Fails a still-active run with `error`, recording it as the run's `run.failed` event; true when this
+ * call ended it, false (a no-op) on an already ended run.
  */
 export function failRun(tx: Tx, runId: RunId, error: string): boolean {
   return endRun(tx, runId, "failed", { error }) !== undefined;
