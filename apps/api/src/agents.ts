@@ -13,6 +13,7 @@ import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
 import { mintAgentToken } from "./agent-token.js";
+import { canUseEnv, ownAgents, ownerKeyOf, type Principal } from "./auth.js";
 import type { BranchCheck, BranchChecker } from "./branch-check.js";
 import { apiError } from "./errors.js";
 import { type AppEnv, factory } from "./factory.js";
@@ -206,19 +207,21 @@ const atCap = (c: Context, limit: number) =>
     409,
   );
 
-const agentWithSprite = (tx: Tx, id: AgentId) =>
+/** The agent and its sprite, when `principal` may act on it. */
+const agentWithSprite = (tx: Tx, id: AgentId, principal: Principal) =>
   tx
     .select({ agent: agents, spriteName: environments.spriteName })
     .from(agents)
     .innerJoin(environments, eq(agents.envId, environments.id))
-    .where(eq(agents.id, id))
+    .where(and(eq(agents.id, id), ownAgents(principal)))
     .get();
 
 /**
  * The agent's latest run, when it has ended and so may leave a runner still exiting; undefined for
- * an unknown or archived agent, or one whose latest run is active, which the follow-up refuses.
+ * an unknown, not-owned or archived agent, or one whose latest run is active, which the follow-up
+ * refuses.
  */
-function previousRunnerOf(db: Db, id: AgentId) {
+function previousRunnerOf(db: Db, id: AgentId, principal: Principal) {
   const row = db
     .select({
       runId: runs.id,
@@ -229,7 +232,7 @@ function previousRunnerOf(db: Db, id: AgentId) {
     .from(runs)
     .innerJoin(agents, eq(runs.agentId, agents.id))
     .innerJoin(environments, eq(agents.envId, environments.id))
-    .where(eq(runs.agentId, id))
+    .where(and(eq(runs.agentId, id), ownAgents(principal)))
     .orderBy(desc(runs.createdAt), desc(sql`${runs}.rowid`))
     .get();
   if (!row || row.archivedAt || isActive(row.status)) return undefined;
@@ -263,10 +266,11 @@ async function decide(
 ) {
   const outcome = c.var.db.transaction(
     (tx) => {
+      // a not-owned agent answers as an unknown one: its requests are not found
+      const found = agentWithSprite(tx, agentId, c.var.principal);
+      if (!found) return { kind: "not_found" } as const;
       const decided = decideRequest(tx, agentId, decision);
       if (decided.kind !== "decided") return decided;
-      const found = agentWithSprite(tx, agentId);
-      if (!found) throw new Error(`agent ${agentId} vanished mid-transaction`);
       return { ...decided, spriteName: found.spriteName };
     },
     { behavior: "immediate" },
@@ -371,6 +375,7 @@ export function agentRoutes(
         c.req.valid("json");
       const reserved = reservedIn(envVars);
       if (reserved) return reservedName(c, reserved);
+      if (!canUseEnv(c.var.principal, envId)) return refuseEnv(c, "not_found");
       // the check execs in the env's sprite, so it runs before the transaction, which re-checks the env
       // and its cap
       if (branch !== undefined) {
@@ -402,6 +407,7 @@ export function agentRoutes(
               branch: agentBranch(agentId),
               remoteBranch: branch ?? null,
               status: "running",
+              ownerKeyId: ownerKeyOf(c.var.principal),
             })
             .returning()
             .get();
@@ -455,7 +461,7 @@ export function agentRoutes(
       const reserved = reservedIn(envVars);
       if (reserved) return reservedName(c, reserved);
       // an ended run's runner may still be aborting and committing in the worktree a new one resumes in
-      const previous = previousRunnerOf(c.var.db, id);
+      const previous = previousRunnerOf(c.var.db, id, c.var.principal);
       if (previous) {
         let exited: boolean;
         try {
@@ -489,7 +495,7 @@ export function agentRoutes(
             .select({ agent: agents, env: environments })
             .from(agents)
             .innerJoin(environments, eq(agents.envId, environments.id))
-            .where(eq(agents.id, id))
+            .where(and(eq(agents.id, id), ownAgents(c.var.principal)))
             .get();
           if (!found) return { kind: "not_found" } as const;
           const { agent, env } = found;
@@ -563,7 +569,7 @@ export function agentRoutes(
       const { id } = c.req.valid("param");
       const outcome = c.var.db.transaction(
         (tx) => {
-          const found = agentWithSprite(tx, id);
+          const found = agentWithSprite(tx, id, c.var.principal);
           if (!found) return { kind: "not_found" } as const;
           if (found.agent.archivedAt) return { kind: "archived" } as const;
           const run = stopActiveRun(tx, id);
@@ -598,7 +604,7 @@ export function agentRoutes(
       const { id } = c.req.valid("param");
       const outcome = c.var.db.transaction(
         (tx) => {
-          const found = agentWithSprite(tx, id);
+          const found = agentWithSprite(tx, id, c.var.principal);
           if (!found) return undefined;
           const run = stopActiveRun(tx, id);
           const agent = found.agent.archivedAt
@@ -647,7 +653,11 @@ export function agentRoutes(
     .get("/:id", agentParam, (c) => {
       const { id } = c.req.valid("param");
       const db = c.var.db;
-      const agent = db.select().from(agents).where(eq(agents.id, id)).get();
+      const agent = db
+        .select()
+        .from(agents)
+        .where(and(eq(agents.id, id), ownAgents(c.var.principal)))
+        .get();
       if (!agent) return apiError(c, 404, "not_found", "no such agent");
       return c.json({ ...presentAgent(agent), usage: agentUsage(db, id) }, 200);
     })
@@ -662,7 +672,7 @@ export function agentRoutes(
         })
         .from(agents)
         .innerJoin(environments, eq(agents.envId, environments.id))
-        .where(eq(agents.id, id))
+        .where(and(eq(agents.id, id), ownAgents(c.var.principal)))
         .get();
       if (!found) return apiError(c, 404, "not_found", "no such agent");
       const rows = db
@@ -691,7 +701,13 @@ export function agentRoutes(
         .from(runs)
         .innerJoin(agents, eq(runs.agentId, agents.id))
         .innerJoin(environments, eq(agents.envId, environments.id))
-        .where(and(eq(runs.id, runId), eq(runs.agentId, id)))
+        .where(
+          and(
+            eq(runs.id, runId),
+            eq(runs.agentId, id),
+            ownAgents(c.var.principal),
+          ),
+        )
         .get();
       if (!found) return apiError(c, 404, "not_found", "no such run");
       const { run, agent, spriteName, repo } = found;
@@ -735,7 +751,14 @@ export function agentRoutes(
       const run = c.var.db
         .select({ id: runs.id })
         .from(runs)
-        .where(and(eq(runs.id, runId), eq(runs.agentId, id)))
+        .innerJoin(agents, eq(runs.agentId, agents.id))
+        .where(
+          and(
+            eq(runs.id, runId),
+            eq(runs.agentId, id),
+            ownAgents(c.var.principal),
+          ),
+        )
         .get();
       if (!run) return apiError(c, 404, "not_found", "no such run");
       // a reconnecting EventSource keeps its original URL, so the header is the fresher cursor

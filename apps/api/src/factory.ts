@@ -1,10 +1,13 @@
 import type { Db } from "@sky/db";
 import { createFactory } from "hono/factory";
+import type { Principal } from "./auth.js";
 import type { Config } from "./config.js";
 import type { KnownSecrets } from "./redact.js";
 
 export type AppEnv = {
   Variables: {
+    /** The caller `/v1` and `/mcp` act as; set by their guard, absent on public and `/internal` routes. */
+    principal: Principal;
     db: Db;
     config: Config;
     secrets: KnownSecrets;

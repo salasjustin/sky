@@ -2,18 +2,18 @@ import { readFile } from "node:fs/promises";
 import type { SpritesClient } from "@fly/sprites";
 import type { Db } from "@sky/db";
 import { createMcpHandler } from "@sky/mcp";
-import type { Context } from "hono";
-import { bearerAuth } from "hono/bearer-auth";
 import { HTTPException } from "hono/http-exception";
 import { logger } from "hono/logger";
 import { accountEventRoutes } from "./account-events.js";
 import { agentRoutes } from "./agents.js";
+import { apiKeyGuard } from "./auth.js";
 import { createBranchChecker } from "./branch-check.js";
 import type { Config } from "./config.js";
 import { environmentRoutes } from "./environments.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { internalRoutes } from "./internal.js";
+import { keyRoutes } from "./keys.js";
 import { createLauncher } from "./launch.js";
 import { wakeLaunch } from "./probe.js";
 import { createProvisioner } from "./provision.js";
@@ -63,10 +63,6 @@ export function createApp({
   secrets = KnownSecrets.fromConfig(config),
   closing = new AbortController().signal,
 }: AppDeps) {
-  // bearerAuth answers a malformed header with 400; every auth failure here is one 401
-  const unauthorized = (message: string) => (c: Context) =>
-    apiError(c, 401, "unauthorized", message);
-
   registerStoredValues(db, config.secretEncryptionKey, secrets);
   const spriteOps: SpriteOps = {
     client: sprites,
@@ -109,19 +105,12 @@ export function createApp({
     ensureBundle,
     log,
   });
-  const apiKeyGuard = bearerAuth({
-    token: config.apiKey,
-    noAuthenticationHeader: { message: unauthorized("missing bearer token") },
-    invalidAuthenticationHeader: {
-      message: unauthorized("malformed Authorization header"),
-    },
-    invalidToken: { message: unauthorized("invalid bearer token") },
-  });
-  // the MCP tools call /v1 in-process through the whole app, so its guard checks them too
+  const guard = apiKeyGuard(db, config.apiKey);
+  // the MCP tools call /v1 in-process through the whole app with the caller's own header, so its
+  // guard checks them too and an issued key keeps its limits
   const mcp = createMcpHandler({
     baseUrl: "http://sky.internal",
     fetch: (request) => app.fetch(request),
-    apiKey: config.apiKey,
   });
   const v1 = factory
     .createApp()
@@ -132,6 +121,7 @@ export function createApp({
       agentRoutes(launcher, checkBranch, spriteOps, log, heartbeatMs),
     )
     .route("/webhooks", webhookRoutes())
+    .route("/keys", keyRoutes())
     .route("/", accountEventRoutes(heartbeatMs, log));
 
   const app = factory
@@ -167,9 +157,9 @@ export function createApp({
     })
     // the runner's own channel, authenticated per run by its agent token rather than the API key
     .route("/internal", internalRoutes(longPollMs, log))
-    .use("/v1/*", apiKeyGuard)
+    .use("/v1/*", guard)
     .route("/v1", v1)
-    .use("/mcp", apiKeyGuard)
+    .use("/mcp", guard)
     .all("/mcp", (c) => mcp(c.req.raw));
 
   app.onError((err, c) => {

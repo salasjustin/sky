@@ -4,6 +4,7 @@ import { type Api, ApiError, createApi } from "./api.js";
 import { apply } from "./apply.js";
 import { type Config, configPath, type Env, resolveConfig } from "./config.js";
 import { env } from "./env.js";
+import { key } from "./key.js";
 import { createOutput, type Output, UsageError } from "./output.js";
 import { secretDelete, secretList, secretSet } from "./secret.js";
 import { version } from "./version.js";
@@ -68,6 +69,18 @@ const help = (io: Io) => `Usage:
       are never printed.
   sky webhook delete <id> [options]
       Remove a webhook.
+  sky key create <name> --env=<id|name>,... [--role=runs] [options]
+      Issue an API key that can run agents only in those environments.
+      --env repeats or takes a comma list. Names are resolved to ids when
+      the key is created, so an environment deleted and recreated must be
+      added to a new key. Prints "<id> <secret>"; the secret is shown only
+      this once. Needs the admin key, as do key list and key revoke.
+  sky key list [options]
+      Print "<id> <role> <active|revoked> <name> <env ids>" per key, oldest
+      first; secrets are never printed.
+  sky key revoke <id> [options]
+      Revoke a key: requests made with it are refused from then on, and the
+      webhooks it created are deleted.
   sky agent start <env> [--branch=<name>] --prompt=<text|@file> [options]
   sky agent follow-up <agent> --prompt=<text|@file> [options]
       Start an agent on an environment (<env> is its id or name), or start
@@ -109,7 +122,10 @@ Options:
   --json                 print the API's object on stdout (inbox, wait and
                          status: the newest run; secret list: only each
                          name and kind; env delete, secret delete and
-                         webhook delete: {"id"|"name": …, "deleted": true})
+                         webhook delete: {"id"|"name": …, "deleted": true};
+                         key create: the key with its secret; key list:
+                         {"data": [keys]}, never a secret;
+                         key revoke: {"id": …, "revoked": true})
   -h, --help             show this help
   -v, --version          print the version (on its own: sky --version)
 
@@ -118,8 +134,9 @@ Configuration, first found wins:
   API key: --api-key-env, SKY_API_KEY, "apiKey" in the config file
   config file: ${configPath(io.env, io.home)}
 
-Exit status: 0 done; 1 failed (API error, provisioning failed); 2 usage or
-  config error, a rejected API key included
+Exit status: 0 done; 1 failed (API error, including a key not allowed the
+  command; provisioning failed); 2 usage or config error, a rejected API
+  key included
   inbox, wait and status exit with the newest run's state:
   0 finished; 3 waiting (needs input); 4 starting or running (wait: timed
   out); 5 failed; 6 stopped
@@ -171,7 +188,10 @@ export async function run(io: Io): Promise<number> {
 }
 
 function parse<
-  O extends Record<string, { type: "string" | "boolean"; short?: string }>,
+  O extends Record<
+    string,
+    { type: "string" | "boolean"; short?: string; multiple?: boolean }
+  >,
 >(args: string[], options: O, unknownOptionHint?: string) {
   try {
     return parseArgs({ args, options, allowPositionals: true, strict: true });
@@ -277,6 +297,7 @@ async function runSecret(args: string[], io: Io): Promise<number> {
 const commands: Record<string, AgentCommand> = {
   ...agentCommands,
   env,
+  key,
   webhook,
 };
 
@@ -297,9 +318,12 @@ async function runCommand(
     io.stdout(help(io));
     return 0;
   }
-  // parseArgs types a spread option set as string | boolean
-  const text = (v: string | boolean | undefined) =>
-    typeof v === "string" ? v : undefined;
+  // parseArgs types a spread option set's values as string | boolean or an array of either
+  const text = (v: unknown) => (typeof v === "string" ? v : undefined);
+  const list = (v: unknown) =>
+    Array.isArray(v)
+      ? v.filter((s) => typeof s === "string").join(",")
+      : text(v);
   const action = spec.prepare(positionals, {
     prompt: text(values.prompt),
     timeout: text(values.timeout),
@@ -309,7 +333,8 @@ async function runCommand(
     events: text(values.events),
     format: text(values.format),
     secret: text(values.secret),
-    env: text(values.env),
+    env: list(values.env),
+    role: text(values.role),
   });
   return await withApi(values, io, (api, out) => action(api, io, out));
 }

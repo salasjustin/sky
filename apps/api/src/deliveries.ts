@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 import {
   agents,
+  apiKeys,
   type Db,
   events,
   runs,
@@ -8,7 +9,7 @@ import {
   webhooks,
 } from "@sky/db";
 import type { AgentId, EnvironmentId, Event, EventType } from "@sky/shared";
-import { and, asc, eq, lt, lte, ne } from "drizzle-orm";
+import { and, asc, eq, isNull, lt, lte, ne } from "drizzle-orm";
 import { open, type Sealed, webhookSecretAad } from "./crypto.js";
 import { presentEvent } from "./run-events.js";
 import type { Tx } from "./runs.js";
@@ -86,21 +87,28 @@ export function enqueueDeliveries(
       id: webhooks.id,
       eventTypes: webhooks.eventTypes,
       environmentIds: webhooks.environmentIds,
+      ownerKeyId: webhooks.ownerKeyId,
     })
     .from(webhooks)
+    // a create racing its key's revoke can land after the revoke deleted the key's webhooks
+    .leftJoin(apiKeys, eq(apiKeys.id, webhooks.ownerKeyId))
+    .where(isNull(apiKeys.revokedAt))
     .all()
     .filter((w) => w.eventTypes.includes(type));
   if (subscribers.length === 0) return 0;
-  const env = tx
-    .select({ id: agents.envId })
+  const agent = tx
+    .select({ envId: agents.envId, ownerKeyId: agents.ownerKeyId })
     .from(events)
     .innerJoin(runs, eq(runs.id, events.runId))
     .innerJoin(agents, eq(agents.id, runs.agentId))
     .where(eq(events.id, eventId))
     .get();
+  // an issued key's webhook hears only its own agents; an admin's (null owner) hears every agent
   const matching = subscribers.filter(
     (w) =>
-      w.environmentIds === null || (env && w.environmentIds.includes(env.id)),
+      (w.environmentIds === null ||
+        (agent && w.environmentIds.includes(agent.envId))) &&
+      (w.ownerKeyId === null || w.ownerKeyId === agent?.ownerKeyId),
   );
   if (matching.length === 0) return 0;
   tx.insert(webhookDeliveries)

@@ -15,6 +15,7 @@ type Values = {
   format?: string;
   secret?: string;
   env?: string;
+  role?: string;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;
@@ -23,6 +24,8 @@ export interface AgentCommand {
   options: {
     [K in keyof Values]?: {
       type: NonNullable<Values[K]> extends boolean ? "boolean" : "string";
+      /** Repeats arrive comma-joined, so `--env=a --env=b` reads as `--env=a,b`. */
+      multiple?: true;
     };
   };
   prepare(positionals: string[], values: Values): Action;

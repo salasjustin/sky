@@ -4,6 +4,7 @@ export * from "./base-profile.js";
 export * from "./environment.js";
 export * from "./event.js";
 export * from "./ids.js";
+export * from "./key.js";
 export * from "./run.js";
 export * from "./sprite-task.js";
 export * from "./webhook.js";
