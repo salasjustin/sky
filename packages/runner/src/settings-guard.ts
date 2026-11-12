@@ -16,8 +16,9 @@ export const REDIRECT_SETTINGS = [
   "forceLoginGatewayUrl",
 ];
 
-// a settings `env` entry that moves Claude Code's own config, and with it the credential it reads, or
-// that tries to switch off the host-managed mode the runner sets
+// the session's redirect variables, plus two only a settings `env` entry is refused for: one moving
+// Claude Code's own config, and with it the credential it reads, and one switching off the
+// host-managed mode the runner sets
 export const REDIRECT_SETTINGS_ENV = [
   ...REDIRECT_VARIABLES,
   "CLAUDE_CONFIG_DIR",

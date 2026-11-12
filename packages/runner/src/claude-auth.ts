@@ -69,8 +69,9 @@ export const REDIRECT_VARIABLES = [
 ];
 
 // the names `claudeProcessEnv` drops whose values are the project's, handed back to its commands by
-// `commandEnvScript`, and unset for a check's nested `claude`. CLAUDE_CODE_OAUTH_TOKEN is only ever the
-// run's chosen token: the API reserves it
+// `commandEnvScript`, and unset for a check's nested `claude`. The `CLAUDE_CODE_OAUTH_` names are a
+// Claude login rather than a project value, so commands never get them back: CLAUDE_CODE_OAUTH_TOKEN
+// is only ever the run's chosen token, which the API reserves
 export const PROJECT_VARIABLES = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
@@ -122,11 +123,12 @@ const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
 /**
  * Gives the session's Bash commands back the project's own values of what `claudeProcessEnv` drops
- * (its API key, auth token, base URL and provider switches, read from `env`, the session's env before
- * the credential is chosen), so its commands work as they always did; and on an API-key run with no
- * project key, unsets Sky's. A SessionStart hook has the file Claude Code sources before each command
- * source this in turn, which reaches the commands and not Claude itself. Sky's key and the
- * subscription token are never written here. Undefined when there is nothing to say.
+ * (`PROJECT_VARIABLES`: its API key, auth token, base URL, provider switches, proxies and the like,
+ * read from `env`, the session's env before the credential is chosen), so its commands work as they
+ * always did; and on an API-key run with no project key, unsets Sky's. A SessionStart hook has the
+ * file Claude Code sources before each command source this in turn, which reaches the commands and not
+ * Claude itself. Sky's key and the OAuth token, refresh token and scopes are never written here.
+ * Undefined when there is nothing to say.
  */
 export function commandEnvScript(
   auth: ClaudeAuth,
