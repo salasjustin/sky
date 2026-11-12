@@ -168,7 +168,8 @@ test("boot fails runs a previous process left silent past the timeout; fresh one
   `);
   first.$client.close();
 
-  db = booted().db;
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
   expect(
     db.$client.prepare("select id, status from runs order by id").all(),
   ).toEqual([
@@ -182,11 +183,46 @@ test("boot fails runs a previous process left silent past the timeout; fresh one
     db.$client.prepare("select status from agents where id = 'agt_old'").get(),
   ).toEqual({ status: "idle" });
   // the failed run's runner may be alive and wedged, and would hold its agent's follow-up; the fresh run's is left
+  // the signal isn't awaited by the sweep: its end line says the exec has settled
   await expect
-    .poll(() => wire.calls)
-    .toEqual([
-      `exec sky-env_a - pkill -TERM -f ${runnerPattern("run_old" as RunId)}`,
-    ]);
+    .poll(() => lines.some((l) => l.startsWith("sprite sky-env_a pkill: ok")))
+    .toBe(true);
+  expect(wire.calls).toEqual([
+    `exec sky-env_a - pkill -TERM -f ${runnerPattern("run_old" as RunId)}`,
+  ]);
+});
+
+test("boot fails a run left waiting past the wait timeout and signals its runner; a fresh waiting run's is left", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-env_a");
+  const first = booted().db;
+  first.$client.exec(`
+    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a');
+    insert into agents (id, env_id, branch, status) values ('agt_old', 'env_a', 'claude/agt_old', 'running'), ('agt_new', 'env_a', 'claude/agt_new', 'running');
+    insert into runs (id, agent_id, status, created_at) values ('run_old', 'agt_old', 'waiting', '2026-01-01T00:00:00.000Z'), ('run_new', 'agt_new', 'waiting', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+    insert into run_requests (id, run_id, kind, request, created_at) values
+      ('req_old', 'run_old', 'question', '{"kind":"question"}', '2026-01-01T00:00:00.000Z'),
+      ('req_new', 'run_new', 'question', '{"kind":"question"}', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+  `);
+  first.$client.close();
+
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
+  expect(
+    db.$client.prepare("select id, status from runs order by id").all(),
+  ).toEqual([
+    { id: "run_new", status: "waiting" },
+    { id: "run_old", status: "failed" },
+  ]);
+  expect(db.$client.prepare("select type, payload from events").all()).toEqual([
+    { type: "run.failed", payload: '{"error":"waiting_timeout"}' },
+  ]);
+  await expect
+    .poll(() => lines.some((l) => l.startsWith("sprite sky-env_a pkill: ok")))
+    .toBe(true);
+  expect(wire.calls).toEqual([
+    `exec sky-env_a - pkill -TERM -f ${runnerPattern("run_old" as RunId)}`,
+  ]);
 });
 
 test("a sprite that can't be reached for the runner_timeout signal doesn't stop the run failing; the failure is logged", async () => {
