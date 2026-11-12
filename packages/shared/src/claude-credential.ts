@@ -13,23 +13,30 @@ export const API_KEY_CREDENTIAL = "api-key";
  */
 export const POOL_CREDENTIAL = "pool";
 
-/** A subscription's name: lowercase letters, digits and `_`; the server's `CLAUDE_OAUTH_TOKEN_<NAME>`. */
+/**
+ * A subscription's name: lowercase letters, digits and `_`; the server's `CLAUDE_OAUTH_TOKEN_<NAME>`.
+ * Never `pool`, which is the assignment {@link POOL_CREDENTIAL}.
+ */
 export const ClaudeSubscriptionName = z
   .string()
   .regex(
     /^[a-z0-9_]{1,64}$/,
     "expected a subscription name: lowercase letters, digits and _",
+  )
+  .refine(
+    (name) => name !== POOL_CREDENTIAL,
+    "pool is reserved and can't be a subscription name",
   );
 
 /**
  * What an environment is assigned: the name of a subscription token (`CLAUDE_OAUTH_TOKEN_<NAME>`,
- * lowercased), `api-key`, or `default`. Names only; no value ever travels with one.
+ * lowercased), `default`, `pool` or `api-key`. Names only; no value ever travels with one.
  */
 export const ClaudeCredentialName = z
   .string()
   .regex(
     /^(?:[a-z0-9_]{1,64}|api-key)$/,
-    "expected a credential name: lowercase letters, digits and _, api-key or pool",
+    "expected a credential name: a subscription (lowercase letters, digits, _), default, pool or api-key",
   );
 
 /** Whether a limited subscription's environment may spend the API key until the reset. */
