@@ -65,7 +65,17 @@ function weeklyLimit(days = 3, hour = 10) {
   return { text, at: at.toISOString() };
 }
 
-const FIVE_HOUR = "You've hit your 5-hour limit · resets 10:20am (UTC)";
+/**
+ * A 5-hour-limit message whose reset is the next :20 past an hour three hours ahead of the real now
+ * (UTC), so the hold outlives the test whatever time of day the suite runs.
+ */
+function fiveHourLimit() {
+  const hour = (new Date().getUTCHours() + 3) % 24;
+  const clock = `${hour % 12 === 0 ? 12 : hour % 12}:20${hour < 12 ? "am" : "pm"}`;
+  return `You've hit your 5-hour limit · resets ${clock} (UTC)`;
+}
+
+const FIVE_HOUR = fiveHourLimit();
 const WEEKLY = weeklyLimit().text;
 
 let dir: string;
@@ -224,7 +234,11 @@ const credentialsOf = async () => {
 const NOW = new Date("2026-11-12T08:00:00Z");
 
 test.each([
-  [FIVE_HOUR, "5-hour", "2026-11-12T10:20:00.000Z"],
+  [
+    "You've hit your 5-hour limit · resets 10:20am (UTC)",
+    "5-hour",
+    "2026-11-12T10:20:00.000Z",
+  ],
   [
     "You've hit your 5-hour limit · resets 8am (UTC)",
     "5-hour",
@@ -785,4 +799,12 @@ test("a runs key can still read its environment's assignment, a name and no more
   const text = await res.text();
   expect(JSON.parse(text)).toMatchObject({ claudeCredential: "personal" });
   for (const value of ALL_VALUES) expect(text).not.toContain(value);
+});
+
+test("markLimited holds a reset a month out no later than a week ahead", () => {
+  const before = Date.now();
+  markLimited(db, "personal", new Date(before + 30 * 86_400_000));
+  const until = limitedUntil(db, "personal")?.getTime();
+  expect(until).toBeGreaterThanOrEqual(before + MAX_RESET_MS);
+  expect(until).toBeLessThanOrEqual(Date.now() + MAX_RESET_MS);
 });

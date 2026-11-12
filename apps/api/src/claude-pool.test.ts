@@ -67,7 +67,17 @@ function weeklyLimit(days = 3, hour = 10) {
   return { text, at: at.toISOString() };
 }
 
-const FIVE_HOUR = "You've hit your 5-hour limit · resets 10:20am (UTC)";
+/**
+ * A 5-hour-limit message whose reset is the next :20 past an hour three hours ahead of the real now
+ * (UTC), so the hold outlives the test whatever time of day the suite runs.
+ */
+function fiveHourLimit() {
+  const hour = (new Date().getUTCHours() + 3) % 24;
+  const clock = `${hour % 12 === 0 ? 12 : hour % 12}:20${hour < 12 ? "am" : "pm"}`;
+  return `You've hit your 5-hour limit · resets ${clock} (UTC)`;
+}
+
+const FIVE_HOUR = fiveHourLimit();
 const WEEKLY = weeklyLimit().text;
 
 /** A reset left out falls a few hours or days ahead; null sends none. The status is 200 unless given. */
@@ -392,12 +402,13 @@ test("a subscription the pool is limited on is skipped, however much headroom it
 });
 
 test("a subscription the probe finds full is marked limited until its window resets, and skipped", async () => {
-  readings[DEFAULT_TOKEN] = { h5: 1, h5Reset: inHours(2), d7: 0.2 };
+  const reset = inHours(2);
+  readings[DEFAULT_TOKEN] = { h5: 1, h5Reset: reset, d7: 0.2 };
   readings[PERSONAL_TOKEN] = { h5: 0.6, d7: 0.6 };
   readings[WORK_TOKEN] = { h5: 0.7, d7: 0.7 };
   const r = await launchedRun(poolEnv());
   expect(r.file.CLAUDE_CODE_OAUTH_TOKEN).toBe(PERSONAL_TOKEN);
-  expect(limitedUntil(db, "default")).toBeDefined();
+  expect(limitedUntil(db, "default")?.getTime()).toBe(reset * 1000);
 });
 
 test("a subscription the probe finds full with no reset given is held for the unknown-reset window", async () => {
@@ -1039,6 +1050,7 @@ test("a patch that doesn't name claudePool leaves an ordered pool's list as it i
     { claudeCredential: "pool", claudeFallback: "api-key" },
   ]) {
     const res = await call(admin, "PATCH", `/v1/environments/${id}`, patch);
+    expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({
       claudeCredential: "pool",
       claudePool: ["work", "personal"],
@@ -1047,5 +1059,6 @@ test("a patch that doesn't name claudePool leaves an ordered pool's list as it i
   const reset = await call(admin, "PATCH", `/v1/environments/${id}`, {
     claudePool: null,
   });
+  expect(reset.status).toBe(200);
   expect(await reset.json()).toMatchObject({ claudePool: null });
 });
