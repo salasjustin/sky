@@ -605,14 +605,13 @@ async function forkPoint(
  * title. The base is first refreshed to GitHub's current head, with the branch's commits rebased
  * onto it when it moved (`refreshBase`), unless the branch is a continued one. That rebase flattens
  * a merge: the merge commit is dropped and the commits it brought in that the base lacks are
- * replayed one by one. Where the base hasn't moved, first-parent
- * history is replayed and a merge commit is sent with its other parents as they are, so a merge of
- * the base leaves the base an ancestor of the published head; a merge of a commit GitHub doesn't
- * hold, or one whose `.github/workflows/` would be sent without its merged-in changes there, is
- * refused before anything is sent. A branch on GitHub whose head this branch held before a
- * rebase or amend here is force-updated to the rewritten history; one holding a commit neither this
- * branch nor the base has
- * is refused before anything is sent, and the GitHub branch a continued agent works on is only ever
+ * replayed one by one. Otherwise first-parent history is replayed and a merge commit is sent with
+ * its other parents as they are, so a merge of the base leaves the base an ancestor of the
+ * published head; a merge of a commit GitHub doesn't hold, or one whose `.github/workflows/` would
+ * be sent without its merged-in changes there, is refused before anything is sent. A branch on
+ * GitHub whose head this branch held before a rebase or amend here is force-updated to the
+ * rewritten history; one holding a commit neither this branch nor the base has is refused before
+ * anything is sent, and the GitHub branch a continued agent works on is only ever
  * fast-forwarded. The connector can't write under `.github/workflows/`, so sent trees keep that
  * directory as the base has it, or as GitHub's head of the branch has it once the branch exists,
  * and the paths there the branch itself changed come back as `held`.
