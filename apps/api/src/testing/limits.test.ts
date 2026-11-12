@@ -16,7 +16,7 @@ test.each([
   expect(clock12(hour, minute)).toBe(words);
 });
 
-// the hours the fixtures once got wrong or could: midnight, just before noon, noon, after it, late;
+// the 12-hour clock's edges: midnight, just before noon, noon, after it, late;
 // 9 and 21 reset at 12:20pm and 12:20am
 const hours = [0, 1, 9, 11, 12, 13, 21, 22, 23];
 
