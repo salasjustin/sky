@@ -8,7 +8,8 @@ import { accountEventRoutes } from "./account-events.js";
 import { agentRoutes } from "./agents.js";
 import { apiKeyGuard } from "./auth.js";
 import { createBranchChecker } from "./branch-check.js";
-import { claudeCredentialRoutes } from "./claude-credentials.js";
+import { claudeCredentialRoutes } from "./claude-credential-routes.js";
+import { createUsageProbe } from "./claude-usage.js";
 import type { Config } from "./config.js";
 import { environmentRoutes } from "./environments.js";
 import { apiError } from "./errors.js";
@@ -86,10 +87,12 @@ export function createApp({
     baseProfiles: config.baseProfiles,
     log,
   });
+  const usage = createUsageProbe({ db, config, log });
   const launcher = createLauncher({
     db,
     config,
     secrets,
+    usage,
     sprites: spriteOps,
     ensureBundle,
     log,

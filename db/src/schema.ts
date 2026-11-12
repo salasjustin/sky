@@ -89,6 +89,8 @@ export const environments = sqliteTable(
       .default({ defaults: true, commands: [] }),
     // a subscription name, "api-key", or null for the default token; names only, never a value
     claudeCredential: text("claude_credential"),
+    // with claude_credential "pool": the subscription names it may use, in order; null means every one. No CHECK, for the same reason
+    claudePool: text("claude_pool", { mode: "json" }).$type<string[] | null>(),
     claudeFallback: text("claude_fallback", { enum: claudeFallbacks })
       .notNull()
       .default("api-key"),
@@ -434,6 +436,21 @@ export const claudeLimits = sqliteTable(
     check("claude_limits_limited_until", isoUtc(t.limitedUntil)),
     check("claude_limits_created_at", isoUtc(t.createdAt)),
   ],
+);
+
+// a subscription's last-seen usage from the latest probe, for pool environments to pick by
+export const claudeUsage = sqliteTable(
+  "claude_usage",
+  {
+    credential: text().primaryKey(),
+    // fractions of the window used, with when it resets; null when the probe didn't report that window
+    fiveHourUtilization: real("five_hour_utilization"),
+    fiveHourResetsAt: text("five_hour_resets_at"),
+    sevenDayUtilization: real("seven_day_utilization"),
+    sevenDayResetsAt: text("seven_day_resets_at"),
+    probedAt: text("probed_at").notNull(),
+  },
+  (t) => [check("claude_usage_probed_at", isoUtc(t.probedAt))],
 );
 
 // a run's own env values, encrypted by the API like secrets and purged once expired

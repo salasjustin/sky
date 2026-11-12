@@ -170,6 +170,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     approvalPolicy: [],
     autoApprove: { defaults: true, commands: [] },
     claudeCredential: null,
+    claudePool: null,
     claudeFallback: "api-key",
     failure: null,
     createdAt: expect.stringMatching(

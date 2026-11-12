@@ -493,7 +493,7 @@ test("the API refusing a credential its server doesn't hold is the CLI's failure
 });
 
 test.each([
-  [["env", "set-claude", "web"], /takes <env> <name\|api-key\|default>/],
+  [["env", "set-claude", "web"], /takes <env> <name\|api-key\|pool\|default>/],
   [["env", "set-claude", "web", "Not A Name"], /not a credential name/],
   [["env", "set-claude", "web", "x", "--fallback=maybe"], /api-key or none/],
   [["env", "list", "--fallback=none"], /only goes with env set-claude/],
@@ -516,4 +516,40 @@ test("env show says which credential an environment uses once it isn't the defau
   expect(r.stdout).toBe(
     "env_1 ready acme/web web\nclaude credential: work (fallback: none)\n",
   );
+});
+
+test("env set-claude pool sets the pool, with --pool its subscriptions in order", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      const body = await request.json();
+      bodies.push(body);
+      return HttpResponse.json(
+        claudeAssignment({
+          claudeCredential: "pool",
+          claudePool: (body as { claudePool: string[] | null }).claudePool,
+        }),
+      );
+    }),
+  );
+  expect((await runCli(["env", "set-claude", "web", "pool"])).code).toBe(0);
+  const r = await runCli([
+    "env",
+    "set-claude",
+    "web",
+    "pool",
+    "--pool=work, personal",
+  ]);
+  expect(bodies).toEqual([
+    { claudeCredential: "pool", claudePool: null },
+    { claudeCredential: "pool", claudePool: ["work", "personal"] },
+  ]);
+  expect(r.stdout).toContain("claude credential: pool [work, personal]");
+});
+
+test("--pool goes only with the pool credential", async () => {
+  const r = await runCli(["env", "set-claude", "web", "personal", "--pool=a"]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toMatch(/--pool goes with the credential pool/);
 });

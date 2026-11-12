@@ -5,6 +5,7 @@ import {
   type AutoApprove,
   type BaseProfile,
   type EnvironmentId,
+  POOL_CREDENTIAL,
   type RunId,
   spriteTaskNameFor,
 } from "@sky/shared";
@@ -18,8 +19,17 @@ import {
   markLimited,
   parseUsageLimit,
   resolveClaudeAuth,
+  subscriptionAuth,
   UNKNOWN_RESET_MS,
 } from "./claude-credentials.js";
+import {
+  credentialsTried,
+  nextInPool,
+  poolExhausted,
+  poolMembers,
+  resolvePoolAuth,
+} from "./claude-pool.js";
+import type { UsageProbe } from "./claude-usage.js";
 import type { Config } from "./config.js";
 import { mintId } from "./ids.js";
 import { readMemory } from "./memory.js";
@@ -32,7 +42,13 @@ import {
 } from "./provision.js";
 import { type KnownSecrets, redact } from "./redact.js";
 import type { BundleInstaller } from "./runner-bundle.js";
-import { activeRunOf, failRun, isActive, isSilentLaunch } from "./runs.js";
+import {
+  activeRunOf,
+  failRun,
+  isActive,
+  isSilentLaunch,
+  recordEvent,
+} from "./runs.js";
 import {
   hasConnectorSecret,
   isReservedName,
@@ -239,6 +255,8 @@ type Deps = {
   db: Db;
   config: Config;
   secrets: KnownSecrets;
+  /** Keeps pool subscriptions' usage fresh. */
+  usage: UsageProbe;
   sprites: SpriteOps;
   ensureBundle: BundleInstaller;
   log: (line: string) => void;
@@ -267,8 +285,11 @@ export type Launch = {
   autoApprove: AutoApprove;
   /** The existing GitHub branch the runner starts from and publishes to; null for the agent's own. */
   remoteBranch: string | null;
-  /** Set on the one retry of a run that hit its subscription's usage limit: it runs on the API key. */
-  forceApiKey?: boolean;
+  /**
+   * Set on a retry of a run that hit its subscription's usage limit: the credential it runs on, the
+   * API key or, in a pool environment, the next subscription, whatever the environment's assignment.
+   */
+  forceCredential?: string;
 };
 
 // how long a launch is kept in memory for a retry after a usage limit; a run that long has ended
@@ -288,6 +309,7 @@ export function createLauncher({
   db,
   config,
   secrets,
+  usage,
   sprites,
   ensureBundle,
   log,
@@ -433,24 +455,37 @@ export function createLauncher({
   }
 
   /** The credential the launch runs on, by its environment's assignment; throws a `ClaudeCredentialError` when none is usable. */
-  function claudeAuthFor(launch: Launch) {
-    if (launch.forceApiKey) return apiKeyAuth(config, "the retry");
-    const assignment = db
+  async function claudeAuthFor(launch: Launch): Promise<ClaudeAuth> {
+    if (launch.forceCredential === API_KEY_CREDENTIAL) {
+      return apiKeyAuth(config, "the retry");
+    }
+    if (launch.forceCredential) {
+      return subscriptionAuth(config, launch.forceCredential);
+    }
+    const assignment = assignmentOf(launch.envId);
+    if (!assignment) throw new Error(`environment ${launch.envId} is gone`);
+    // only a pool environment's launch may land on a subscription it isn't assigned
+    return assignment.claudeCredential === POOL_CREDENTIAL
+      ? resolvePoolAuth({ db, config, usage }, assignment)
+      : resolveClaudeAuth(db, config, assignment);
+  }
+
+  const assignmentOf = (envId: EnvironmentId) =>
+    db
       .select({
+        status: environments.status,
         claudeCredential: environments.claudeCredential,
         claudeFallback: environments.claudeFallback,
+        claudePool: environments.claudePool,
       })
       .from(environments)
-      .where(eq(environments.id, launch.envId))
+      .where(eq(environments.id, envId))
       .get();
-    if (!assignment) throw new Error(`environment ${launch.envId} is gone`);
-    return resolveClaudeAuth(db, config, assignment);
-  }
 
   async function run(launch: Launch, agentToken: string): Promise<void> {
     const known = [agentToken];
     // before any sprite work: a launch with no usable credential fails at once, not after a dead run
-    const auth = claudeAuthFor(launch);
+    const auth = await claudeAuthFor(launch);
     known.push(auth.kind === "api-key" ? auth.key : auth.token);
     db.update(runs)
       .set({ claudeCredential: auth.credential })
@@ -607,8 +642,10 @@ export function createLauncher({
   /**
    * A run failed with `error`. When that is its subscription reaching its usage limit, the
    * subscription is marked limited until the reset time the error gives, and the run is retried
-   * once on the API key, resuming its session, unless its environment turns the fallback off or the
-   * server has no key. Never another subscription.
+   * once, resuming its session. An environment that isn't a pool retries on the API key, unless it
+   * turns the fallback off or the server has none: never on another subscription. A pool
+   * environment goes on to the next subscription in its pool that its chain of retries hasn't
+   * tried, then to the API key on the same terms, else notes the earliest reset on the run.
    */
   function onRunFailed(runId: RunId, error: string): void {
     const limit = parseUsageLimit(error);
@@ -625,30 +662,54 @@ export function createLauncher({
     log(
       `Claude credential ${credential} is at its ${limit.window} usage limit until ${until.toISOString()}`,
     );
-    void retryOnApiKey(runId).catch((err: unknown) => {
-      log(`retrying ${runId} on the API key failed: ${err}`);
+    void retryAfterLimit(runId).catch((err: unknown) => {
+      log(`retrying ${runId} after its usage limit failed: ${err}`);
     });
   }
 
-  async function retryOnApiKey(failedId: RunId): Promise<void> {
+  /** Where a run that hit its subscription's limit goes next, if anywhere. */
+  function retryTarget(failedId: RunId, launch: Launch): string | undefined {
+    const env = assignmentOf(launch.envId);
+    if (env?.status !== "ready") return undefined;
+    const fallback =
+      env.claudeFallback !== "none" && config.anthropicApiKey
+        ? API_KEY_CREDENTIAL
+        : undefined;
+    if (env.claudeCredential !== POOL_CREDENTIAL) return fallback;
+    const next = nextInPool(
+      { db, config },
+      env,
+      credentialsTried(db, failedId),
+    );
+    if (next) return next;
+    if (fallback) return fallback;
+    // nothing is left to try: say when the pool is next available
+    const members = poolMembers(config, env.claudePool);
+    const warning = poolExhausted(
+      db,
+      members,
+      new Date(),
+      "this run is not retried",
+    ).message;
+    db.transaction(
+      (tx) => recordEvent(tx, failedId, "runner.warning", { message: warning }),
+      { behavior: "immediate" },
+    );
+    log(`${failedId}: ${warning}`);
+    return undefined;
+  }
+
+  async function retryAfterLimit(failedId: RunId): Promise<void> {
     const entry = launches.get(failedId);
     if (!entry) {
       log(`no launch of ${failedId} is held; it is not retried`);
       return;
     }
-    // once: a second failure of the same run, or a retry's own, finds nothing
+    // once: a second failure of the same run finds nothing
     launches.delete(failedId);
     const { launch } = entry;
-    const env = db
-      .select({
-        status: environments.status,
-        claudeFallback: environments.claudeFallback,
-      })
-      .from(environments)
-      .where(eq(environments.id, launch.envId))
-      .get();
-    if (env?.status !== "ready" || env.claudeFallback === "none") return;
-    if (!config.anthropicApiKey) return;
+    const target = retryTarget(failedId, launch);
+    if (!target) return;
     // the failed runner commits in the worktree the retry resumes in
     if (!(await awaitRunnerExit(sprites, launch.spriteName, failedId))) {
       log(`the runner of ${failedId} is still exiting; not retried`);
@@ -674,7 +735,7 @@ export function createLauncher({
             id: retryId,
             agentId: found.id,
             status: "starting",
-            claudeCredential: API_KEY_CREDENTIAL,
+            claudeCredential: target,
             retryOf: failedId,
           })
           .run();
@@ -695,13 +756,13 @@ export function createLauncher({
     );
     if (!agent) return;
     registerRunEnvVars(secrets, retryId, envVars);
-    log(`retrying ${failedId} as ${retryId} on the API key`);
+    log(`retrying ${failedId} as ${retryId} on Claude credential ${target}`);
     api.start({
       ...launch,
       runId: retryId,
       sessionId: agent.sessionId,
       prompt: agent.sessionId ? resumedPrompt(launch.prompt) : launch.prompt,
-      forceApiKey: true,
+      forceCredential: target,
     });
   }
 

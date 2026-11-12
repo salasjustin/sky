@@ -32,7 +32,7 @@ A missing, unknown or revoked key returns `401`.
 sky key create better-giving --role=runs --env=bg-platform   # --env takes ids or names, comma-separated
 sky key list                    # id, role, active|revoked, name and environments; secrets are never printed
 sky key revoke key_…
-sky env set-claude web personal   # admin only: the Claude credential web's runs use: a name, api-key or default
+sky env set-claude web personal   # admin only: the Claude credential web's runs use: a name, api-key, pool or default
 sky claude-credentials            # admin only: each credential, its environments, limit and runs today
 ```
 
@@ -160,9 +160,9 @@ Runs authenticate to Claude with a credential the server holds as a secret. Each
 | `CLAUDE_OAUTH_TOKEN_<NAME>` | another subscription, named by `<NAME>` in lowercase: `CLAUDE_OAUTH_TOKEN_PERSONAL` is `personal` (letters, digits and `_`)    |
 | `SKY_ANTHROPIC_API_KEY`     | `api-key`, a pay-per-use Anthropic API key                                                                                     |
 
-**Each environment has one credential.** Assign it with `sky env set-claude <env> <name|api-key|default>`, the `claudeCredential` field of `env.yaml`, or `PATCH /v1/environments/:id`; only the admin key can. Unset (or `default`) is the default token. A run records the name of the credential it used: `sky status` prints it and a run's `claudeCredential` carries it. `GET /v1/claude-credentials` (admin only) and `sky claude-credentials` list each credential with its kind (`subscription` or `api-key`), the environments assigned it, when its limit lifts if it is limited, and how many runs started on it since midnight UTC.
+**Each environment has one credential.** Assign it with `sky env set-claude <env> <name|api-key|pool|default>`, the `claudeCredential` field of `env.yaml`, or `PATCH /v1/environments/:id`; only the admin key can. Unset (or `default`) is the default token. A run records the name of the credential it used: `sky status` prints it and a run's `claudeCredential` carries it. `GET /v1/claude-credentials` (admin only) and `sky claude-credentials` list each credential with its kind (`subscription` or `api-key`), the environments assigned it, when its limit lifts if it is limited, and how many runs started on it since midnight UTC, its last-seen 5-hour and 7-day usage, and the pool environments that may use it.
 
-**Sky never moves work between subscriptions.** It does not balance runs across tokens, and a run that fails on one subscription is never retried on another. The only fallback is the API key.
+**Only a `pool` environment moves work between subscriptions, and pools are off by default.** An environment assigned a subscription, `api-key` or the default token uses that credential alone: Sky does not balance its runs across tokens, and a run that fails on its subscription is never retried on another. Its only fallback is the API key. Moving between subscriptions is something you opt an environment into, with `claudeCredential: pool` ([below](#opt-in-subscription-pool)).
 
 **When a subscription reaches its usage limit** (the 5-hour or the weekly one), Sky marks it limited until the reset time Claude reports, kept across restarts, and:
 
@@ -173,6 +173,16 @@ Runs authenticate to Claude with a credential the server holds as a secret. Each
 If the message gives no reset time Sky can read, it holds the limit for 15 minutes. Set `claudeFallback: none` on an environment to turn the fallback off: its limited launches fail with the same error and the reset time, and no API money is spent. A run is retried from the server's memory of its launch, so a restart between a run's launch and its limit failure loses that one retry, not the limited state.
 
 **The API key stays out of the project's way.** Claude Code prefers `ANTHROPIC_API_KEY` over a subscription token, and an environment may hold its own `ANTHROPIC_API_KEY` secret for its commands. The runner gives the Claude session exactly the run's credential. On a subscription run no API key of any kind reaches it; the project's key still works for the commands the session runs. On an API-key run Sky's key is used for the session alone: the commands never see it, and they keep the project's own key, or have none. A nested `claude -p` (such as a Kru check) is logged in with the sandbox's subscription, so on an API-key run it isn't logged in and the agent is told to report such a check as not run.
+
+#### Opt-in subscription pool
+
+`claudeCredential: pool` lets one environment spread its runs over several subscriptions. It is the only assignment that does, and nothing is a pool until you set it. `claudePool: [work, personal]` (`sky env set-claude <env> pool --pool=work,personal`) lists the subscriptions it may use, in failover order; without a list the pool is every subscription the server holds, the default included. `pool` is not a valid `<NAME>` for a token.
+
+- **Usage.** For each subscription Sky keeps its last-seen 5-hour and 7-day usage and their reset times, read from the `anthropic-ratelimit-unified-*` headers of a one-token probe (`POST /v1/messages` on the cheapest model, with the Claude Code system prompt and the OAuth beta header). A pool launch probes the subscriptions whose reading is older than 5 minutes, one probe at a time per subscription and never more often than that, and stores the readings, so a restart keeps them. A probe that fails is logged by name and never fails the launch. A subscription the probe finds full is marked limited until its window resets.
+- **Pick.** A pool launch runs on the subscription in the pool that isn't limited and has the most headroom: the lowest of the larger of its 5-hour and 7-day use, a window already past its reset counting as unused. Ties go to the earlier in the list, and a subscription that was never probed ranks after those that were.
+- **Failover.** A pool run that fails with a usage limit, 5-hour or weekly, marks that subscription limited until its reset and is retried once on the next subscription in the pool's order that isn't limited, resuming the same session. A chain tries each subscription at most once. After the list it goes to the API key on the terms above, or, when the server has no key or `claudeFallback` is `none`, stays failed with a `runner.warning` naming the earliest reset in UTC. A pool launch with every subscription limited goes straight to the key, or fails with `claude_limited` naming the earliest reset.
+
+`sky claude-credentials` shows each subscription's usage and which pool environments use it. The API key rules above are unchanged for pools: the key reaches only the Claude session of a run that is on it.
 
 ### Base profiles
 

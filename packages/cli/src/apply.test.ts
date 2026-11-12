@@ -17,6 +17,7 @@ const spec = {
   approvalPolicy: [],
   autoApprove: { defaults: true, commands: [] },
   claudeCredential: null,
+  claudePool: null,
   claudeFallback: "api-key" as const,
 };
 const env = (over: Record<string, unknown> = {}) => ({

@@ -19,6 +19,7 @@ const {
   approvalPolicy,
   autoApprove,
   claudeCredential,
+  claudePool,
   claudeFallback,
 } = Environment.shape;
 
@@ -32,6 +33,7 @@ export const EnvSpec = z.strictObject({
   approvalPolicy,
   autoApprove,
   claudeCredential,
+  claudePool,
   claudeFallback,
 });
 export type EnvSpec = z.infer<typeof EnvSpec>;

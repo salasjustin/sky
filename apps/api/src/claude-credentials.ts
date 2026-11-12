@@ -1,14 +1,12 @@
-import { claudeLimits, type Db, environments, runs } from "@sky/db";
+import { claudeLimits, type Db } from "@sky/db";
 import {
   API_KEY_CREDENTIAL,
-  type ClaudeCredentialSummary,
   type ClaudeFallback,
   DEFAULT_CLAUDE_CREDENTIAL,
+  POOL_CREDENTIAL,
 } from "@sky/shared";
-import { asc, eq, gte, sql } from "drizzle-orm";
-import { adminOnly } from "./auth.js";
+import { eq } from "drizzle-orm";
 import type { Config } from "./config.js";
-import { factory } from "./factory.js";
 
 /** What a run's Claude session authenticates with; `credential` is the name recorded on the run. */
 export type ClaudeAuth =
@@ -39,7 +37,11 @@ export function assignmentProblem(
   config: Config,
   assigned: string | null,
 ): string | undefined {
-  if (assigned === null || assigned === DEFAULT_CLAUDE_CREDENTIAL) {
+  if (
+    assigned === null ||
+    assigned === DEFAULT_CLAUDE_CREDENTIAL ||
+    assigned === POOL_CREDENTIAL
+  ) {
     return undefined;
   }
   if (assigned === API_KEY_CREDENTIAL) {
@@ -52,7 +54,7 @@ export function assignmentProblem(
     : `unknown Claude credential ${JSON.stringify(assigned)}; this server has: ${[...subscriptionNames(config), ...(config.anthropicApiKey ? [API_KEY_CREDENTIAL] : [])].join(", ")}`;
 }
 
-const tokenOf = (config: Config, name: string): string | undefined =>
+export const tokenOf = (config: Config, name: string): string | undefined =>
   name === DEFAULT_CLAUDE_CREDENTIAL
     ? config.claudeOauthToken
     : config.claudeOauthTokens[name];
@@ -97,6 +99,10 @@ export function resolveClaudeAuth(
   now: Date = new Date(),
 ): ClaudeAuth {
   const name = credentialNameOf(env.claudeCredential);
+  // a pool is resolved by `resolvePoolAuth`; reaching here with one would use a subscription by luck
+  if (name === POOL_CREDENTIAL) {
+    throw new Error("a pool assignment goes through resolvePoolAuth");
+  }
   if (name === API_KEY_CREDENTIAL) return apiKeyAuth(config, "the environment");
   const token = tokenOf(config, name);
   if (!token) {
@@ -118,6 +124,17 @@ export function resolveClaudeAuth(
     );
   }
   return apiKeyAuth(config, "the fallback");
+}
+
+/** A subscription as a credential, by name; throws when this server holds no token for it. */
+export function subscriptionAuth(config: Config, name: string): ClaudeAuth {
+  const token = tokenOf(config, name);
+  if (!token) {
+    throw new ClaudeCredentialError(
+      `claude_credential_missing: this server has no token for the Claude credential ${JSON.stringify(name)}`,
+    );
+  }
+  return { kind: "subscription", credential: name, token };
 }
 
 /** The API key as a credential, for an env assigned it or a launch that fell back to it. */
@@ -261,54 +278,3 @@ export function parseUsageLimit(
 
 /** How long a limit whose reset the message didn't give is held: short, so a wrong guess costs one failed launch. */
 export const UNKNOWN_RESET_MS = 15 * 60_000;
-
-/** `GET /v1/claude-credentials`: every credential this server holds, who uses it and whether it is limited. Admin only. */
-export function claudeCredentialRoutes() {
-  return factory.createApp().get("/", adminOnly, (c) => {
-    const { db, config } = c.var;
-    const now = new Date();
-    const midnight = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-    ).toISOString();
-    const assigned = db
-      .select({
-        id: environments.id,
-        name: environments.name,
-        credential: environments.claudeCredential,
-      })
-      .from(environments)
-      .orderBy(asc(environments.createdAt), asc(sql`rowid`))
-      .all();
-    const todays = new Map(
-      db
-        .select({ credential: runs.claudeCredential, n: sql<number>`count(*)` })
-        .from(runs)
-        .where(gte(runs.createdAt, midnight))
-        .groupBy(runs.claudeCredential)
-        .all()
-        .map((r) => [r.credential, Number(r.n)]),
-    );
-    const summary = (
-      name: string,
-      kind: ClaudeCredentialSummary["kind"],
-    ): ClaudeCredentialSummary => ({
-      name,
-      kind,
-      environments: assigned
-        .filter((e) => credentialNameOf(e.credential) === name)
-        .map(({ id, name }) => ({ id, name })),
-      limitedUntil:
-        kind === "subscription"
-          ? (limitedUntil(db, name, now)?.toISOString() ?? null)
-          : null,
-      runsToday: todays.get(name) ?? 0,
-    });
-    const data = [
-      ...subscriptionNames(config).map((name) => summary(name, "subscription")),
-      ...(config.anthropicApiKey
-        ? [summary(API_KEY_CREDENTIAL, "api-key")]
-        : []),
-    ];
-    return c.json({ data }, 200);
-  });
-}

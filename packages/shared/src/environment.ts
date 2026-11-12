@@ -1,7 +1,11 @@
 import { z } from "zod";
 import { commandEntryProblem } from "./auto-approve.js";
 import { BaseProfileName } from "./base-profile.js";
-import { ClaudeCredentialName, ClaudeFallback } from "./claude-credential.js";
+import {
+  ClaudeCredentialName,
+  ClaudeFallback,
+  ClaudeSubscriptionName,
+} from "./claude-credential.js";
 import { EnvironmentId } from "./ids.js";
 
 export const EnvironmentStatus = z.enum(["provisioning", "ready", "failed"]);
@@ -55,6 +59,16 @@ export const Environment = z.object({
   })),
   /** Which Claude credential this environment's runs use: a subscription name or `api-key`; null is the default token. */
   claudeCredential: ClaudeCredentialName.nullable().default(null),
+  /** With `claudeCredential: pool`, the subscriptions it may use, in failover order; null is every one the server holds. */
+  claudePool: z
+    .array(ClaudeSubscriptionName)
+    .min(1)
+    .max(32)
+    .refine((names) => new Set(names).size === names.length, {
+      error: "a subscription is named once",
+    })
+    .nullable()
+    .default(null),
   /** What a run does while its subscription is at its usage limit: use the API key, or fail the launch. */
   claudeFallback: ClaudeFallback.default("api-key"),
 });

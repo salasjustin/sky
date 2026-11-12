@@ -10,6 +10,12 @@ const data = [
     environments: [{ id: "env_1", name: "web" }],
     limitedUntil: null,
     runsToday: 4,
+    usage: {
+      fiveHour: { utilization: 0.42, resetsAt: "2026-11-12T13:00:00.000Z" },
+      sevenDay: { utilization: 0.1, resetsAt: null },
+      probedAt: "2026-11-12T08:00:00.000Z",
+    },
+    poolEnvironments: [{ id: "env_4", name: "pooled" }],
   },
   {
     name: "personal",
@@ -20,6 +26,8 @@ const data = [
     ],
     limitedUntil: "2026-11-12T10:20:00.000Z",
     runsToday: 2,
+    usage: null,
+    poolEnvironments: [],
   },
   {
     name: "api-key",
@@ -27,6 +35,8 @@ const data = [
     environments: [],
     limitedUntil: null,
     runsToday: 1,
+    usage: null,
+    poolEnvironments: [],
   },
 ];
 
@@ -40,9 +50,9 @@ test("claude-credentials prints name, kind, limit, runs today and env ids per cr
   expect(r.code).toBe(0);
   expect(r.stdout).toBe(
     [
-      "default subscription - 4 env_1",
-      "personal subscription limited-until=2026-11-12T10:20:00.000Z 2 env_2,env_3",
-      "api-key api-key - 1 -",
+      "default subscription - 4 env_1 5h=42% 7d=10% env_4",
+      "personal subscription limited-until=2026-11-12T10:20:00.000Z 2 env_2,env_3 - - -",
+      "api-key api-key - 1 - - - -",
       "",
     ].join("\n"),
   );

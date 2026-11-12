@@ -58,18 +58,23 @@ const help = (io: Io) => `Usage:
   sky env retry <env> [options]
       Provision a failed environment again. Prints its line, now
       provisioning; sky env show reports when it's ready.
-  sky env set-claude <env> <name|api-key|default> [--fallback=api-key|none]
-      [options]
+  sky env set-claude <env> <name|api-key|pool|default>
+      [--pool=<name,...>] [--fallback=api-key|none] [options]
       Choose the Claude credential the environment's runs use: the name of
       a subscription token the server holds (CLAUDE_OAUTH_TOKEN_<NAME>),
       api-key for the pay-per-use Anthropic API key, or default for the
       server's default token. --fallback=none stops a run from using the
       API key while its subscription is at its usage limit; the launch
       fails with the reset time instead. Sky never moves a run to another
-      subscription. Needs the admin key.
+      subscription. pool is the one exception, and opt-in: the
+      environment's runs go to the subscription with the most headroom
+      (--pool=a,b limits and orders the choice) and, on a usage limit,
+      on to the next one. Needs the admin key.
   sky claude-credentials [options]
       Print "<name> <subscription|api-key> <limited-until=<time>|-> <runs
-      today> <env ids|->" per credential. Values are never printed. Needs
+      today> <env ids|-> <5h=N%|-> <7d=N%|-> <pool env ids|->" per
+      credential: its limit, its environments, its last-seen usage and the
+      pool environments that may use it. Values are never printed. Needs
       the admin key.
   sky webhook add <url> --events=<types,...> [options]
       [--format=standard --secret=@file|-] [--env=<id|name>,...]
@@ -352,6 +357,7 @@ async function runCommand(
     env: list(values.env),
     role: text(values.role),
     fallback: text(values.fallback),
+    pool: text(values.pool),
   });
   return await withApi(values, io, (api, out) => action(api, io, out));
 }

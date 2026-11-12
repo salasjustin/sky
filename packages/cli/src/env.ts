@@ -38,10 +38,14 @@ function filteringWebhookIds(err: unknown): string[] | undefined {
 
 /** The claude assignment `env show` and `env set-claude` print: names only. */
 const claudeLine = (env: ApiEnvironment) =>
-  `claude credential: ${env.claudeCredential ?? "default"} (fallback: ${env.claudeFallback})`;
+  `claude credential: ${env.claudeCredential ?? "default"}${env.claudePool ? ` [${env.claudePool.join(", ")}]` : ""} (fallback: ${env.claudeFallback})`;
 
 export const env: AgentCommand = {
-  options: { yes: { type: "boolean" }, fallback: { type: "string" } },
+  options: {
+    yes: { type: "boolean" },
+    fallback: { type: "string" },
+    pool: { type: "string" },
+  },
   prepare(positionals, values) {
     const [sub, ...rest] = positionals;
     if (values.yes && sub !== "delete") {
@@ -49,6 +53,9 @@ export const env: AgentCommand = {
     }
     if (values.fallback !== undefined && sub !== "set-claude") {
       throw new UsageError("--fallback only goes with env set-claude", true);
+    }
+    if (values.pool !== undefined && sub !== "set-claude") {
+      throw new UsageError("--pool only goes with env set-claude", true);
     }
     if (sub === "list") {
       if (rest.length > 0) {
@@ -133,7 +140,7 @@ export const env: AgentCommand = {
       const [ref, credential, ...extra] = rest;
       if (ref === undefined || credential === undefined || extra.length > 0) {
         throw new UsageError(
-          "env set-claude takes <env> <name|api-key|default> [--fallback=api-key|none]",
+          "env set-claude takes <env> <name|api-key|pool|default> [--pool=<names>] [--fallback=api-key|none]",
           true,
         );
       }
@@ -142,9 +149,22 @@ export const env: AgentCommand = {
         !ClaudeCredentialName.safeParse(credential).success
       ) {
         throw new UsageError(
-          `${JSON.stringify(credential)} is not a credential name: use a subscription's name, api-key or default`,
+          `${JSON.stringify(credential)} is not a credential name: use a subscription's name, api-key, pool or default`,
           true,
         );
+      }
+      if (values.pool !== undefined && credential !== "pool") {
+        throw new UsageError("--pool goes with the credential pool", true);
+      }
+      const poolNames =
+        values.pool === undefined
+          ? undefined
+          : values.pool
+              .split(",")
+              .map((n) => n.trim())
+              .filter((n) => n !== "");
+      if (poolNames && poolNames.length === 0) {
+        throw new UsageError("--pool names no subscription", true);
       }
       const fallback =
         values.fallback === undefined
@@ -158,6 +178,8 @@ export const env: AgentCommand = {
         if (envId === undefined) return 1;
         const { raw, env } = await api.patchEnvironment(envId, {
           claudeCredential: credential === "default" ? null : credential,
+          // a pool with no list is every subscription the server holds
+          ...(credential === "pool" && { claudePool: poolNames ?? null }),
           ...(fallback?.success && { claudeFallback: fallback.data }),
         });
         out.result(raw, `${envLine(env)}\n${claudeLine(env)}`);

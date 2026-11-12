@@ -1,5 +1,9 @@
 import { fileURLToPath } from "node:url";
-import { BaseProfiles, DEFAULT_CLAUDE_CREDENTIAL } from "@sky/shared";
+import {
+  BaseProfiles,
+  DEFAULT_CLAUDE_CREDENTIAL,
+  POOL_CREDENTIAL,
+} from "@sky/shared";
 import { z } from "zod";
 
 // the build copies the runner bundle next to the API bundle, which is where this module lands
@@ -113,7 +117,11 @@ function namedClaudeTokens(env: Env) {
     const suffix = NAMED_TOKEN.exec(variable)?.[1];
     if (suffix === undefined || !value) continue;
     const name = suffix.toLowerCase();
-    if (!/^[a-z0-9_]{1,64}$/.test(name) || name === DEFAULT_CLAUDE_CREDENTIAL) {
+    if (
+      !/^[a-z0-9_]{1,64}$/.test(name) ||
+      name === DEFAULT_CLAUDE_CREDENTIAL ||
+      name === POOL_CREDENTIAL
+    ) {
       invalid.push(variable);
     } else {
       tokens[name] = value;
@@ -187,7 +195,7 @@ export function loadConfig(
   problems.push(
     ...named.invalid.map(
       (variable) =>
-        `${variable} is invalid: a name is lowercase letters, digits and _ (up to 64), and not "default", which is CLAUDE_CODE_OAUTH_TOKEN`,
+        `${variable} is invalid: a name is lowercase letters, digits and _ (up to 64), and not "default" (which is CLAUDE_CODE_OAUTH_TOKEN) or "pool"`,
     ),
   );
   return { ok: false, message: `invalid config: ${problems.join("; ")}` };

@@ -13,11 +13,13 @@ import {
   DEFAULT_CLAUDE_CREDENTIAL,
   Environment,
   EnvironmentId,
+  POOL_CREDENTIAL,
 } from "@sky/shared";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import { adminOnly, canUseEnv } from "./auth.js";
 import { assignmentProblem } from "./claude-credentials.js";
+import { poolProblem } from "./claude-pool.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
@@ -35,6 +37,7 @@ const {
   approvalPolicy,
   autoApprove,
   claudeCredential,
+  claudePool,
   claudeFallback,
 } = Environment.shape;
 const EnvironmentInput = z.strictObject({
@@ -46,6 +49,7 @@ const EnvironmentInput = z.strictObject({
   approvalPolicy,
   autoApprove,
   claudeCredential,
+  claudePool,
   claudeFallback,
 });
 // unwrapped: zod 4 applies a default even inside .optional(), which would reset omitted fields;
@@ -65,6 +69,7 @@ const EnvironmentPatch = z.strictObject({
     })
     .optional(),
   claudeCredential: claudeCredential.unwrap().optional(),
+  claudePool: claudePool.unwrap().optional(),
   claudeFallback: claudeFallback.unwrap().optional(),
 });
 
@@ -84,6 +89,7 @@ const present = (row: EnvRow) => ({
     approvalPolicy: row.approvalPolicy,
     autoApprove: row.autoApprove,
     claudeCredential: row.claudeCredential,
+    claudePool: row.claudePool ?? null,
     claudeFallback: row.claudeFallback,
   } satisfies Environment),
   // while provisioning, failure_step holds the step in progress
@@ -211,6 +217,12 @@ export function environmentRoutes(
       if (credentialProblem) {
         return apiError(c, 400, "unknown_credential", credentialProblem);
       }
+      const poolIssue = poolProblem(
+        c.var.config,
+        input.claudeCredential,
+        input.claudePool,
+      );
+      if (poolIssue) return apiError(c, 400, "invalid_pool", poolIssue);
       const profiles = Object.keys(c.var.config.baseProfiles);
       if (input.base !== null && !profiles.includes(input.base)) {
         return apiError(
@@ -307,7 +319,23 @@ export function environmentRoutes(
             ) {
               return nameTakenResult;
             }
+            // a pool list goes with the pool assignment, and leaves with it
+            const credential =
+              patch.claudeCredential !== undefined
+                ? patch.claudeCredential
+                : env.claudeCredential;
+            const poolIssue = poolProblem(
+              c.var.config,
+              credential,
+              patch.claudePool !== undefined
+                ? patch.claudePool
+                : credential === POOL_CREDENTIAL
+                  ? env.claudePool
+                  : null,
+            );
+            if (poolIssue) return { kind: "invalid_pool", poolIssue } as const;
             const { autoApprove: sentAutoApprove, ...rest } = patch;
+            if (credential !== POOL_CREDENTIAL) rest.claudePool = null;
             const fields =
               sentAutoApprove === undefined
                 ? rest
@@ -342,6 +370,8 @@ export function environmentRoutes(
           return apiError(c, 409, "provisioning", stillProvisioning);
         case "name_taken":
           return apiError(c, 409, "name_taken", nameTakenMessage);
+        case "invalid_pool":
+          return apiError(c, 400, "invalid_pool", outcome.poolIssue);
         case "agents_exist":
           return apiError(
             c,

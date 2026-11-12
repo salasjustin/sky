@@ -6,6 +6,11 @@ import { UsageError } from "./output.js";
  * Name and kind, when it resets (a dash when not limited), runs since midnight UTC, then the
  * assigned env ids, comma-joined (a dash for none). No field can hold a value: the API has none to send.
  */
+const percent = (
+  label: string,
+  window: { utilization: number } | null | undefined,
+) => (window ? `${label}=${Math.round(window.utilization * 100)}%` : "-");
+
 const credentialLine = (c: ClaudeCredentialSummary) =>
   [
     c.name,
@@ -15,6 +20,11 @@ const credentialLine = (c: ClaudeCredentialSummary) =>
     c.environments.length === 0
       ? "-"
       : c.environments.map((e) => e.id).join(","),
+    percent("5h", c.usage?.fiveHour),
+    percent("7d", c.usage?.sevenDay),
+    c.poolEnvironments.length === 0
+      ? "-"
+      : c.poolEnvironments.map((e) => e.id).join(","),
   ].join(" ");
 
 export const claudeCredentials: AgentCommand = {

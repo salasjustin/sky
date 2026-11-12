@@ -83,6 +83,7 @@ const TABLES = [
   "agents",
   "api_keys",
   "claude_limits",
+  "claude_usage",
   "environments",
   "events",
   "run_env_vars",
@@ -239,7 +240,8 @@ test("migrating a populated 0000 file keeps every row, cascade children included
       t !== "run_requests" &&
       t !== "run_env_vars" &&
       t !== "api_keys" &&
-      t !== "claude_limits",
+      t !== "claude_limits" &&
+      t !== "claude_usage",
   );
   for (const table of atInit) expect([table, count(table)]).toEqual([table, 1]);
   const createdAt = db.$client
