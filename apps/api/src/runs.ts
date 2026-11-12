@@ -164,9 +164,12 @@ function endRun(
   return ended;
 }
 
-/** Fails a still-active run with `error`, recording it as the run's `run.failed` event; no-op on an ended run. */
-export function failRun(tx: Tx, runId: RunId, error: string): void {
-  endRun(tx, runId, "failed", { error });
+/**
+ * Fails a still-active run with `error`, recording it as the run's `run.failed` event; true when this
+ * call ended it, false (a no-op) on an already ended run.
+ */
+export function failRun(tx: Tx, runId: RunId, error: string): boolean {
+  return endRun(tx, runId, "failed", { error }) !== undefined;
 }
 
 /** Stops the agent's active run, recording a `run.stopped` event; the stopped run, or undefined when none was active. */
@@ -298,6 +301,21 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
     },
     { behavior: "immediate" },
   );
+}
+
+/** The sprite each of `runIds` ran on, for the runners of runs just failed that may live on there. */
+export function spritesOfRuns(
+  db: Db,
+  runIds: RunId[],
+): { runId: RunId; spriteName: string }[] {
+  if (runIds.length === 0) return [];
+  return db
+    .select({ runId: runs.id, spriteName: environments.spriteName })
+    .from(runs)
+    .innerJoin(agents, eq(runs.agentId, agents.id))
+    .innerJoin(environments, eq(agents.envId, environments.id))
+    .where(inArray(runs.id, runIds))
+    .all();
 }
 
 /**

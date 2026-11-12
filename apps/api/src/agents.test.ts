@@ -18,6 +18,7 @@ import { eq } from "drizzle-orm";
 import { HttpResponse, http, ws } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
+import { DIFF } from "./agents.js";
 import { createApp } from "./app.js";
 import { BASE_ENV_NAMES } from "./base-profile.js";
 import { boot } from "./boot.js";
@@ -688,6 +689,33 @@ test("a runner that fails to start deletes the run's keep-awake task and still r
   );
   expect(release).toHaveLength(1);
   expect(release[0]).toContain(spriteTaskNameFor(run.id as RunId));
+});
+
+test("a launch that fails at the runner's start signals the runner, which may have spawned after all", async () => {
+  wire.sessionExit = { output: "node: bad option\r\n", code: 1 };
+  const envId = readyEnv();
+  const sprite = spriteNameFor(envId);
+  const { run } = await launched(envId);
+  // the signal isn't awaited by the launch: its end line says the exec has settled
+  await vi.waitFor(() =>
+    expect(logs.some((l) => l.startsWith(`sprite ${sprite} pkill: ok`))).toBe(
+      true,
+    ),
+  );
+  expect(wire.calls.filter((c) => c.includes(" - pkill "))).toEqual([
+    `exec ${sprite} - pkill -TERM -f ${runnerPattern(run.id as RunId)}`,
+  ]);
+});
+
+test("a launch that fails before the runner starts sends no signal", async () => {
+  wire.writeStatus = 500;
+  const { run } = await launched(readyEnv());
+  await vi.waitFor(() =>
+    expect(runStatus(run.id)).toEqual({ status: "failed" }),
+  );
+  // a signal's exec logs its start in the same turn as the failure it follows
+  expect(logs.filter((l) => l.includes(" pkill: "))).toEqual([]);
+  expect(wire.calls.filter((c) => c.includes(" - pkill "))).toEqual([]);
 });
 
 test("a cleanup that fails after a failed start never masks the start error", async () => {
@@ -1398,12 +1426,74 @@ async function finishedRun() {
   return r;
 }
 
+// nothing here reads the machine's git config or the clock
+const gitEnv = {
+  PATH: process.env.PATH,
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_AUTHOR_NAME: "Test Author",
+  GIT_AUTHOR_EMAIL: "author@example.com",
+  GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
+  GIT_COMMITTER_NAME: "Test Committer",
+  GIT_COMMITTER_EMAIL: "committer@example.com",
+  GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
+};
+
+/** A temp repo with `main` holding a.txt and `claude/agt_x` one commit ahead of it. */
+function repoWithBranch() {
+  const repo = mkdtempSync(join(dir, "repo-"));
+  const git = (...args: string[]) => {
+    const out = spawnSync("git", args, {
+      cwd: repo,
+      env: gitEnv,
+      encoding: "utf8",
+    });
+    expect(out.status, `git ${args.join(" ")}: ${out.stderr}`).toBe(0);
+    return out.stdout;
+  };
+  git("init", "-q", "-b", "main");
+  writeFileSync(join(repo, "a.txt"), "one\n");
+  git("add", "a.txt");
+  git("commit", "-q", "-m", "base");
+  git("checkout", "-q", "-b", "claude/agt_x");
+  writeFileSync(join(repo, "a.txt"), "one\ntwo\n");
+  git("commit", "-q", "-a", "-m", "work");
+  git("checkout", "-q", "main");
+  return { repo, git };
+}
+
+const runDiff = (repo: string, base: string, branch: string) =>
+  spawnSync("sh", ["-c", DIFF, "sh", base, branch], {
+    cwd: repo,
+    env: gitEnv,
+    encoding: "utf8",
+  });
+
+test("the diff script prints git's three-dot diff of an existing branch against the base", () => {
+  const { repo, git } = repoWithBranch();
+  const out = runDiff(repo, "main", "claude/agt_x");
+  expect(out.status).toBe(0);
+  expect(out.stdout).toContain("+two");
+  expect(out.stdout).toBe(git("diff", "main...claude/agt_x"));
+});
+
+test("the diff script exits 3 with nothing on stdout or stderr for a branch that was never created", () => {
+  const { repo } = repoWithBranch();
+  const out = runDiff(repo, "main", "claude/agt_never");
+  expect(out.status).toBe(3);
+  expect(out.stdout).toBe("");
+  expect(out.stderr).toBe("");
+});
+
 const patch = "diff --git a/x b/x\n+fixed\n";
+/** The run-detail diff exec: `sh -c <script> sh <base> <branch>`. */
+const isDiff = (argv: string[]) =>
+  argv[0] === "sh" && argv[2]?.includes("git diff") === true;
 
 test("GET of an ended run returns its branch and its diff against the env's base branch", async () => {
   const { agent, run, envId } = await finishedRun();
   wire.exec = (argv) =>
-    argv[0] === "git" ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+    isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
   const { status, body } = await getRun(agent.id, run.id);
   expect(status).toBe(200);
   expect(body).toEqual({
@@ -1423,8 +1513,10 @@ test("GET of an ended run returns its branch and its diff against the env's base
     compareUrl: null,
     secretNames: [],
   });
-  expect(wire.calls.at(-1)).toBe(
-    `exec ${spriteNameFor(envId)} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
+  expect(wire.calls.at(-1)).toMatch(
+    new RegExp(
+      `^exec ${spriteNameFor(envId)} /workspace/repo sh -c .* sh origin/HEAD claude/${agent.id}$`,
+    ),
   );
 });
 
@@ -1597,10 +1689,26 @@ test("GET of an active run has a null diff and never wakes the sprite", async ()
   expect(wire.calls).toHaveLength(calls);
 });
 
-test("GET of an ended run whose branch never existed has a null diff", async () => {
+test("GET of a run whose runner was killed before it made its branch is a 200 with no diff, and the exec never carries git's complaint", async () => {
   const { agent, run } = await finishedRun();
-  wire.exec = () => ({ exitCode: 128, stderr: "fatal: bad revision\n" });
-  expect((await getRun(agent.id, run.id)).body).toMatchObject({ diff: null });
+  // the script's own answer for a missing branch: its exit, with nothing on stderr to share a chunk with it
+  wire.exec = (argv) => (isDiff(argv) ? { exitCode: 3 } : { exitCode: 0 });
+  const { status, body } = await getRun(agent.id, run.id);
+  expect(status).toBe(200);
+  expect(body).toMatchObject({ id: run.id, status: "finished", diff: null });
+  // a branch never created is a normal answer, not worth a line
+  expect(logs.filter((l) => l.startsWith(`diff of ${run.id}`))).toEqual([]);
+});
+
+test("GET of a run whose diff fails in git is still a 200 with no diff, and logs the run, agent and exit", async () => {
+  const { agent, run } = await finishedRun();
+  wire.exec = (argv) => (isDiff(argv) ? { exitCode: 128 } : { exitCode: 0 });
+  const { status, body } = await getRun(agent.id, run.id);
+  expect(status).toBe(200);
+  expect(body).toMatchObject({ id: run.id, diff: null });
+  expect(logs).toContain(
+    `diff of ${run.id} (agent ${agent.id}) exited 128; answered without one`,
+  );
 });
 
 test("GET while the sprite is unreachable gets 502", async () => {
@@ -3250,7 +3358,7 @@ test("GET of a follow-up run shows its own summary and the cumulative branch dif
     payload: { summary: "added the test", usage },
   });
   wire.exec = (argv) =>
-    argv[0] === "git" ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+    isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
   expect((await getRun(agent.id, run.id)).body).toMatchObject({
     id: run.id,
     summary: "added the test",
@@ -3258,7 +3366,7 @@ test("GET of a follow-up run shows its own summary and the cumulative branch dif
   });
   // against the base branch, not run 1's end: the diff spans every run on the branch
   expect(wire.calls.at(-1)).toMatch(
-    new RegExp(`git diff origin/HEAD\\.\\.\\.claude/${agent.id}$`),
+    new RegExp(` sh origin/HEAD claude/${agent.id}$`),
   );
   expect((await getRun(agent.id, first.id)).body.summary).toBe("done");
 });
@@ -3343,9 +3451,28 @@ function runnerAlive(runId: string, alive: () => boolean) {
       : exec(argv);
 }
 
+/** The stop-lingering exec's argv after the script: `[mode, quietS, termS, pattern]`. */
+const stopLingeringArgs = (runId: string) =>
+  wire.execUrls
+    .map((u) => new URL(u).searchParams.getAll("cmd"))
+    .filter((cmd) => cmd[0] === "bash" && cmd.at(-1) === runnerPattern(runId))
+    .map((cmd) => cmd.slice(3));
+
+/** Moves the run's terminal event `ms` before now, as though the run ended that long ago. */
+const endedAgo = (runId: string, ms: number) =>
+  db.$client
+    .prepare(
+      "update events set ts = ? where run_id = ? and type in ('run.finished', 'run.failed', 'run.stopped')",
+    )
+    .run(new Date(Date.now() - ms).toISOString(), runId);
+
+// the follow-up may SIGTERM a previous runner only once its run ended this long ago
+const SIGNAL_WINDOW_MS = 60_000;
+
 test("a follow-up right after stop waits for the stopped runner; still alive, it gets 409 runner_still_exiting and starts nothing", async () => {
   const { agent, run, envId } = await runningRun();
   expect((await action(agent.id, "stop")).status).toBe(200);
+  // the stop's run.stopped carries the real time; this test's own timeout keeps it far inside the window
   let alive = true;
   runnerAlive(run.id, () => alive);
 
@@ -3360,16 +3487,191 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
   expect(
     db.$client.prepare("select status from agents where id = ?").get(agent.id),
   ).toEqual({ status: "idle" });
-  // the wait is bounded on the sprite, to the same 30 s archive allows
+  // the wait is one bash exec on the sprite, bounded by the pre-launch deadline
   const wait = wire.calls.at(-1) ?? "";
   expect(wait.startsWith(`exec ${spriteNameFor(envId)} - bash -c `)).toBe(true);
-  expect(wait).toContain("seq 30");
+  // the stop already signalled it: a second SIGTERM would kill it mid-commit, so both waits only wait
+  expect(stopLingeringArgs(run.id)).toEqual([
+    ["wait", "5", "9", runnerPattern(run.id)],
+  ]);
 
+  // the retry the 409 asks for is just as soon after the stop, and waits the same way
   alive = false;
   expect((await followUp(agent.id, { prompt: "go another way" })).status).toBe(
     202,
   );
+  expect(stopLingeringArgs(run.id).map(([mode]) => mode)).toEqual([
+    "wait",
+    "wait",
+  ]);
+  // the stop's own pkill is the only signal the runner got
+  expect(wire.calls.filter((c) => c.includes(" - pkill "))).toHaveLength(1);
+  expect(logs.join("\n")).not.toContain("SIGTERMed");
   await sessionOpened(2);
+});
+
+test("a follow-up a while after stop waits in term mode: a runner alive that long is wedged, not committing", async () => {
+  const { agent, run } = await runningRun();
+  expect((await action(agent.id, "stop")).status).toBe(200);
+  endedAgo(run.id, SIGNAL_WINDOW_MS + 60_000);
+  runnerAlive(run.id, () => false);
+  expect((await followUp(agent.id, { prompt: "go another way" })).status).toBe(
+    202,
+  );
+  expect(stopLingeringArgs(run.id)).toEqual([
+    ["term", "5", "9", runnerPattern(run.id)],
+  ]);
+  await sessionOpened(2);
+});
+
+test("a follow-up within a minute of the sweep failing a run as quiet only waits for its runner", async () => {
+  const { agent, run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  // the sweep's run.failed carries the real time; the boot sweep signals the runner of each run it fails
+  expect(failStaleRuns(db, 0, Date.now() + 1000)).toEqual([run.id]);
+  runnerAlive(run.id, () => true);
+  expect((await followUp(agent.id, { prompt: "carry on" })).status).toBe(409);
+  expect(stopLingeringArgs(run.id).map(([mode]) => mode)).toEqual(["wait"]);
+});
+
+/** A deadline of `ms` on the sprite calls before a launch, with every other bound at the test default. */
+function appWithDeadline(ms: number) {
+  app = createApp({
+    db,
+    config,
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logs.push(line),
+    nudgeDeliveries: () => {},
+    launchWatchMs: 50,
+    preLaunchDeadlineMs: ms,
+  });
+}
+
+test("a follow-up whose previous runner outlived its timed-out run SIGTERMs it, then launches", async () => {
+  const { agent, run, envId, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  // the sweep failed it as quiet long ago; its runner is still there
+  expect(failStaleRuns(db, 0, Date.now() + 1000)).toEqual([run.id]);
+  endedAgo(run.id, SIGNAL_WINDOW_MS + 60_000);
+  // exit 3: still alive after the quiet wait, gone after the SIGTERM
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "bash" && argv.at(-1) === runnerPattern(run.id)
+      ? { exitCode: 3 }
+      : exec(argv);
+  const res = await followUp(agent.id, { prompt: "carry on" });
+  expect(res.status).toBe(202);
+  const call = wire.calls.find((c) => c.includes('pkill -TERM -f "$3"'));
+  expect(call).toContain(`exec ${spriteNameFor(envId)} - bash -c `);
+  expect(logs).toContain(`the runner of ${run.id} outlived its run; SIGTERMed`);
+  await sessionOpened(2);
+});
+
+test("a follow-up whose previous runner won't exit even after the SIGTERM gets 409 runner_still_exiting", async () => {
+  appWithDeadline(30_000);
+  const { agent, run } = await finishedRun();
+  endedAgo(run.id, SIGNAL_WINDOW_MS + 60_000);
+  runnerAlive(run.id, () => true);
+  const res = await followUp(agent.id, { prompt: "again" });
+  expect(stopLingeringArgs(run.id).map(([mode]) => mode)).toEqual(["term"]);
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({
+    error: { code: "runner_still_exiting" },
+  });
+  expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+    n: 1,
+  });
+});
+
+/** Every stop-lingering exec's argv after the script, whichever run's runner it waits on. */
+const stopLingeringExecs = () =>
+  wire.execUrls
+    .map((u) => new URL(u).searchParams.getAll("cmd"))
+    .filter(
+      (cmd) => cmd[0] === "bash" && ["term", "wait"].includes(cmd[3] ?? ""),
+    )
+    .map((cmd) => cmd.slice(3));
+
+test("a follow-up whose previous runner is already gone launches after one wait and logs no SIGTERM", async () => {
+  const { agent, run } = await finishedRun();
+  endedAgo(run.id, SIGNAL_WINDOW_MS + 60_000);
+  runnerAlive(run.id, () => false);
+  expect((await followUp(agent.id, { prompt: "carry on" })).status).toBe(202);
+  expect(stopLingeringArgs(run.id)).toEqual([
+    ["term", "5", "9", runnerPattern(run.id)],
+  ]);
+  expect(logs.join("\n")).not.toContain("SIGTERMed");
+  await sessionOpened(2);
+});
+
+test("a follow-up whose wait for the previous runner fails in the script gets 502, logs it and starts nothing", async () => {
+  const { agent, run } = await finishedRun();
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "bash" && argv.at(-1) === runnerPattern(run.id)
+      ? { exitCode: 2, stderr: "pgrep: cannot read /proc\n" }
+      : exec(argv);
+  const res = await followUp(agent.id, { prompt: "carry on" });
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: { code: "sprite_unreachable" },
+  });
+  expect(
+    logs.some(
+      (l) =>
+        l.startsWith(`waiting for the runner of ${run.id} failed:`) &&
+        l.includes("exit 2: pgrep: cannot read /proc"),
+    ),
+  ).toBe(true);
+  expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+    n: 1,
+  });
+  expect(wire.sessions).toHaveLength(1);
+});
+
+test("a follow-up while the previous run is still active waits for no runner", async () => {
+  const { agent } = await runningRun();
+  const res = await followUp(agent.id, { prompt: "carry on" });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({ error: { code: "agent_busy" } });
+  expect(stopLingeringExecs()).toEqual([]);
+});
+
+test("a follow-up on an agent that never had a run waits for no runner", async () => {
+  const envId = readyEnv();
+  const agentId = "agt_norun";
+  db.$client
+    .prepare(
+      "insert into agents (id, env_id, branch, status) values (?, ?, ?, 'idle')",
+    )
+    .run(agentId, envId, `claude/${agentId}`);
+  expect((await followUp(agentId, { prompt: "start" })).status).toBe(202);
+  await sessionOpened(1);
+  expect(stopLingeringExecs()).toEqual([]);
+});
+
+test("a follow-up never takes longer than the deadline: a sprite that stops answering gets the API's own 502, not a client timeout", async () => {
+  appWithDeadline(400);
+  const { agent } = await finishedRun();
+  wire.hangs = (call) => call.includes(" bash -c ");
+  const res = await followUp(agent.id, { prompt: "again" });
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: { code: "sprite_unreachable" },
+  });
+  expect(logs.join("\n")).toContain("stop-lingering: timed out after 400ms");
+  expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+    n: 1,
+  });
+  await wire.hangsSettled();
 });
 
 test("a follow-up whose wait for the previous runner can't reach the sprite gets 502 and starts nothing", async () => {
@@ -3916,6 +4218,24 @@ test("start with the default branch answers 422 branch_is_default", async () => 
   expect(agentCount()).toEqual({ n: 0 });
 });
 
+test("start with a branch whose check outlasts the deadline answers 502 branch_check_failed", async () => {
+  appWithDeadline(300);
+  const envId = await connectedEnv();
+  wire.hangs = (call) => call.includes(" sh -c ");
+  // the check itself isn't cut at the deadline, only answered past it
+  wire.hangMs = 600;
+  const res = await launch({ envId, prompt: "go", branch: "feature/login" });
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: {
+      code: "branch_check_failed",
+      message: expect.stringContaining("no answer within 0.3s"),
+    },
+  });
+  expect(agentCount()).toEqual({ n: 0 });
+  await wire.hangsSettled();
+});
+
 test("start with a branch on an env with no connector secret answers 422 branch_needs_connector before any check", async () => {
   const envId = readyEnv();
   const checks = branchCheckAnswers({ exitCode: 0 });
@@ -4111,14 +4431,14 @@ test("compareUrl escapes # and % within a branch segment, keeping its slashes", 
 });
 
 test("an ended run's diff on a remote branch is against the start point the runner pinned, so outside pushes never shrink it", async () => {
-  const { agent, run, envId } = await finishedOnBranch("feature/login");
+  const { agent, run } = await finishedOnBranch("feature/login");
   wire.exec = (argv) =>
-    argv[0] === "git" ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+    isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
   const { status, body } = await getRun(agent.id, run.id);
   expect(status).toBe(200);
   expect(body.diff).toBe(patch);
-  expect(wire.calls.at(-1)).toBe(
-    `exec ${spriteNameFor(envId)} /workspace/repo git diff refs/sky/starts/${agent.id}...claude/${agent.id}`,
+  expect(wire.calls.at(-1)).toMatch(
+    new RegExp(` sh refs/sky/starts/${agent.id} claude/${agent.id}$`),
   );
 });
 

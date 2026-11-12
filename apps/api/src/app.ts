@@ -42,6 +42,8 @@ export type AppDeps = {
   launchWakeMs?: number;
   /** The bound on a Sprites call that should answer promptly; 60 s unless a test shortens it. */
   spritesTimeoutMs?: number;
+  /** How long the sprite calls before a launch may take (the follow-up's wait for the previous runner, the branch check); 20 s, inside the CLI's 30 s request timeout, unless a test shortens it. */
+  preLaunchDeadlineMs?: number;
   /** Called with a sprite's name when an exec on it exits 137; `boot` probes that sprite's running runs. */
   onExecKilled?: (spriteName: string) => void;
   /** The redaction registry, shared with whatever else purges from it; one from `config` by default. */
@@ -61,6 +63,7 @@ export function createApp({
   launchWatchMs = 3_000,
   launchWakeMs = 90_000,
   spritesTimeoutMs = SPRITES_TIMEOUT_MS,
+  preLaunchDeadlineMs = 20_000,
   onExecKilled,
   secrets = KnownSecrets.fromConfig(config),
   closing = new AbortController().signal,
@@ -122,7 +125,14 @@ export function createApp({
     .route("/environments", secretRoutes())
     .route(
       "/agents",
-      agentRoutes(launcher, checkBranch, spriteOps, log, heartbeatMs),
+      agentRoutes(
+        launcher,
+        checkBranch,
+        spriteOps,
+        log,
+        heartbeatMs,
+        preLaunchDeadlineMs,
+      ),
     )
     .route("/webhooks", webhookRoutes())
     .route("/keys", keyRoutes())
