@@ -25,8 +25,10 @@ export function clock12(hour: number, minute = 0): string {
 export type LimitFixture = { text: string; at: string };
 
 /**
- * A weekly-limit message whose reset is `hour` o'clock (UTC) `days` days after `now`, which stays
- * inside the week a reset is held to, whatever day the suite runs.
+ * A weekly-limit message whose reset is `hour` o'clock (UTC) on the calendar day `days` after
+ * `now`'s, so between `days - 1` and `days + 1` days ahead of it, whatever day the suite runs. Keep
+ * `days` within 1..6: below that the reset can fall at or before `now` and read as no reset, above
+ * it can pass the 7-day cap `markLimited` holds a reset to.
  */
 export function weeklyLimit(
   days = 3,
@@ -42,8 +44,9 @@ export function weeklyLimit(
 }
 
 /**
- * A 5-hour-limit message whose reset is 20 past the hour, at least 2h50m after `now` and at most
- * 3h20m: ahead of the test whatever time of day it runs, midnight included.
+ * A 5-hour-limit message whose reset is 20 past an hour, more than 2h20m after `now` (at hh:59:59.999)
+ * and at most 3h20m (at hh:00:00.000): ahead of the test whatever time of day it runs, midnight
+ * included.
  */
 export function fiveHourLimit(now: number = Date.now()): LimitFixture {
   const at = new Date(now);

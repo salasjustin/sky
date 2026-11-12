@@ -78,6 +78,8 @@ beforeEach(() => {
   buildApp();
 });
 afterEach(() => {
+  // a test that timed out or threw under fake timers must not leave Date frozen for the next
+  vi.useRealTimers();
   if (db.$client.open) db.$client.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -313,49 +315,55 @@ test("an environment assigned a credential the server no longer holds fails its 
 
 // --- the usage limit and the API key fallback -------------------------------------------------------
 
-// the clock is faked (Date only) so the fixture's reset lands at every kind of hour: around midnight, noon and after
-test.each([0, 11, 12, 13, 23])(
-  "a limit error marks that subscription limited until its reset and retries the run once on the API key, in the same session, at %i:05 UTC",
-  async (hour) => {
+// the clock is faked (Date only; the afterEach restores it) so the fixture's reset lands at every
+// kind of hour (12:20am from 21:xx, 12:20pm from 09:xx, past midnight, noon and after) and across a year end
+test.each([
+  "2026-11-12T00:05:00Z",
+  "2026-11-12T09:05:00Z",
+  "2026-11-12T11:05:00Z",
+  "2026-11-12T12:05:00Z",
+  "2026-11-12T13:05:00Z",
+  "2026-11-12T21:05:00Z",
+  "2026-11-12T23:05:00Z",
+  "2026-12-31T23:05:00Z",
+])(
+  "a limit error marks that subscription limited until its reset and retries the run once on the API key, in the same session, at %s",
+  async (instant) => {
     vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date(Date.UTC(2026, 10, 12, hour, 5)));
-    try {
-      const limit = fiveHourLimit();
-      const personal = readyEnv({ claudeCredential: "personal" });
-      const r = await launchedRun(personal);
-      await failWith(r, limit.text);
+    vi.setSystemTime(new Date(instant));
+    const limit = fiveHourLimit();
+    const personal = readyEnv({ claudeCredential: "personal" });
+    const r = await launchedRun(personal);
+    await failWith(r, limit.text);
 
-      await sessionOpened(2);
-      // the signal the no-retry tests read is live: a real retry raises it
-      expect(exitWaits()).toBe(1);
-      const retry = wire.sessions[1];
-      const file = envFileOf(wire, retry);
-      expect(file).toMatchObject({
-        SKY_CLAUDE_AUTH: "api-key",
-        SKY_CLAUDE_API_KEY: API_KEY,
-      });
-      expect(file).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
-      expect(retry?.env.SESSION_ID).toBe("sess-1");
-      expect(retry?.env.RUN_ID).not.toBe(r.run.id);
+    await sessionOpened(2);
+    // the signal the no-retry tests read is live: a real retry raises it
+    expect(exitWaits()).toBe(1);
+    const retry = wire.sessions[1];
+    const file = envFileOf(wire, retry);
+    expect(file).toMatchObject({
+      SKY_CLAUDE_AUTH: "api-key",
+      SKY_CLAUDE_API_KEY: API_KEY,
+    });
+    expect(file).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(retry?.env.SESSION_ID).toBe("sess-1");
+    expect(retry?.env.RUN_ID).not.toBe(r.run.id);
 
-      // held until the reset the message gave, which is still ahead
-      const until = limitedUntil(db, "personal");
-      expect(until?.toISOString()).toBe(limit.at);
-      expect(until && until.getTime() > Date.now()).toBe(true);
+    // held until the reset the message gave, which is still ahead
+    const until = limitedUntil(db, "personal");
+    expect(until?.toISOString()).toBe(limit.at);
+    expect(until && until.getTime() > Date.now()).toBe(true);
 
-      const retried = runRow(String(retry?.env.RUN_ID));
-      expect(retried).toMatchObject({
-        claudeCredential: "api-key",
-        retryOf: r.run.id,
-        agentId: r.agent.id,
-      });
-      expect(runRow(r.run.id)?.status).toBe("failed");
-      // the same agent: its worktree and session carry on
-      const prompt = wire.files.get(`/workspace/runs/${retried?.id}.prompt`);
-      expect(new TextDecoder().decode(prompt)).toContain("fix the flaky test");
-    } finally {
-      vi.useRealTimers();
-    }
+    const retried = runRow(String(retry?.env.RUN_ID));
+    expect(retried).toMatchObject({
+      claudeCredential: "api-key",
+      retryOf: r.run.id,
+      agentId: r.agent.id,
+    });
+    expect(runRow(r.run.id)?.status).toBe("failed");
+    // the same agent: its worktree and session carry on
+    const prompt = wire.files.get(`/workspace/runs/${retried?.id}.prompt`);
+    expect(new TextDecoder().decode(prompt)).toContain("fix the flaky test");
   },
 );
 

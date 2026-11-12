@@ -150,6 +150,8 @@ beforeEach(() => {
   buildApp();
 });
 afterEach(() => {
+  // a test that timed out or threw under fake timers must not leave Date frozen for the next
+  vi.useRealTimers();
   if (db.$client.open) db.$client.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -484,12 +486,9 @@ test("a failed probe is not asked again for a few minutes, then is", async () =>
   expect(storedUsage(db, "personal")).toBeUndefined();
 
   vi.useFakeTimers({ toFake: ["Date"] });
-  try {
-    vi.setSystemTime(Date.now() + 5 * 60_000 + 1_000);
-    await launchedRun(env);
-  } finally {
-    vi.useRealTimers();
-  }
+  vi.setSystemTime(Date.now() + 5 * 60_000 + 1_000);
+  await launchedRun(env);
+  vi.useRealTimers();
   expect(probesOf(PERSONAL_TOKEN)).toBe(2);
 });
 
