@@ -88,7 +88,7 @@ export function keyRoutes() {
             .where(eq(apiKeys.id, id))
             .get();
           if (!found) return undefined;
-          // the key's subscriptions end with it; their deliveries cascade
+          // the key's webhooks go with it; their deliveries cascade
           tx.delete(webhooks).where(eq(webhooks.ownerKeyId, id)).run();
           if (found.revokedAt !== null) return found;
           return tx

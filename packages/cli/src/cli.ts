@@ -79,7 +79,8 @@ const help = (io: Io) => `Usage:
       Print "<id> <role> <active|revoked> <name> <env ids>" per key, oldest
       first; secrets are never printed.
   sky key revoke <id> [options]
-      Revoke a key; requests made with it are refused from then on.
+      Revoke a key: requests made with it are refused from then on, and the
+      webhooks it created are deleted.
   sky agent start <env> [--branch=<name>] --prompt=<text|@file> [options]
   sky agent follow-up <agent> --prompt=<text|@file> [options]
       Start an agent on an environment (<env> is its id or name), or start
@@ -133,9 +134,9 @@ Configuration, first found wins:
   API key: --api-key-env, SKY_API_KEY, "apiKey" in the config file
   config file: ${configPath(io.env, io.home)}
 
-Exit status: 0 done; 1 failed (API error, a key without access to the
-  command included; provisioning failed); 2 usage or config error, a
-  rejected API key included
+Exit status: 0 done; 1 failed (API error, including a key not allowed the
+  command; provisioning failed); 2 usage or config error, a rejected API
+  key included
   inbox, wait and status exit with the newest run's state:
   0 finished; 3 waiting (needs input); 4 starting or running (wait: timed
   out); 5 failed; 6 stopped
@@ -317,7 +318,7 @@ async function runCommand(
     io.stdout(help(io));
     return 0;
   }
-  // parseArgs types a spread option set as string | boolean, arrays included
+  // parseArgs types a spread option set's values as string | boolean or an array of either
   const text = (v: unknown) => (typeof v === "string" ? v : undefined);
   const list = (v: unknown) =>
     Array.isArray(v)

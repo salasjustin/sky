@@ -47,14 +47,14 @@ function principalOf(
       ),
     )
     .run();
-  // only `runs` keys are issued; a stored row of any other role gets nothing past its own agents either
+  // only `runs` keys are issued, so a stored row of any other role is still held to its own agents
   return { role: "runs", keyId: row.id, environmentIds: row.environmentIds };
 }
 
 const unauthorized = (message: string) => (c: Context) =>
   apiError(c, 401, "unauthorized", message);
 
-/** Authenticates `/v1` and `/mcp`, setting `c.var.principal`; every failure is one 401 envelope. */
+/** Authenticates `/v1` and `/mcp`, setting `c.var.principal`. */
 export const apiKeyGuard = (db: Db, adminKey: string) =>
   // bearerAuth answers a malformed header with 400; every auth failure here is one 401
   bearerAuth<AppEnv>({
@@ -77,7 +77,7 @@ export const adminOnly = factory.createMiddleware(async (c, next) => {
       c,
       403,
       "forbidden",
-      "this key can't do that; it needs the admin key",
+      "only the admin key (SKY_API_KEY) can do this",
     );
   }
   await next();

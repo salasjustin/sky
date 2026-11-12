@@ -245,7 +245,7 @@ function buildServer(call: Call) {
     "create_env",
     {
       description:
-        "Create an environment: a sprite with repo cloned and setup run once. Provisioning is asynchronous; poll status with envId until its status is ready, then launch. Needs the admin key; a runs key is refused.",
+        "Create an environment: a sprite with repo cloned and setup run once. Provisioning is asynchronous; poll status with envId until its status is ready, then launch. Needs the admin key.",
       inputSchema: { name, repo, setup },
     },
     (input) => api("POST", "/v1/environments", input),

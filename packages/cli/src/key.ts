@@ -69,7 +69,7 @@ export const key: AgentCommand = {
       );
     }
     if ((values.role ?? "runs") !== "runs") {
-      throw new UsageError("--role is runs, the only role a key gets", true);
+      throw new UsageError("--role can only be runs", true);
     }
     if (values.env === undefined) {
       throw new UsageError("key create needs --env=<id|name>,...", true);
@@ -90,7 +90,7 @@ export const key: AgentCommand = {
         role: "runs",
         environmentIds,
       });
-      out.progress("the secret is shown only now; it can't be retrieved again");
+      out.progress("save the secret now; it can't be shown again");
       out.result(created, `${created.id} ${created.secret}`);
       return 0;
     };
