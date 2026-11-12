@@ -486,9 +486,7 @@ function waitingOn(
     .set({ status: "waiting" })
     .where(eq(agents.id, agentId))
     .run();
-  db.insert(runRequests)
-    .values({ id: requestId, runId, kind, request })
-    .run();
+  db.insert(runRequests).values({ id: requestId, runId, kind, request }).run();
   return requestId;
 }
 
