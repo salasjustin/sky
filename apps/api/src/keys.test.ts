@@ -22,6 +22,7 @@ import {
   type ApiKeyId,
   CreatedApiKey,
   type EnvironmentId,
+  type RequestId,
   type RunId,
   type RunStatus,
   type WebhookId,
@@ -589,7 +590,7 @@ test("a runs key denies, answers and archives its own agent", async () => {
     { requestId: denyId, decision: "deny" },
   );
   expect(denied.status).toBe(200);
-  const decisionOf = (requestId: string) =>
+  const decisionOf = (requestId: RequestId) =>
     db
       .select({ decision: runRequests.decision })
       .from(runRequests)
