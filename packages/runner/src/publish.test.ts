@@ -2417,3 +2417,92 @@ test("a merge of the base GitHub holds is sent with the base tip as its second p
   ]);
   expect(result.sha).toBe("commit1");
 });
+
+test("an octopus merge of commits GitHub holds keeps every parent, in order", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const gh = fakeGitHub();
+  // another branch's head on GitHub
+  const other = nextBase({ "x.txt": "from another branch\n" });
+  server.use(
+    http.get(`${REPO}/git/commits/${other}`, () =>
+      HttpResponse.json(apiCommit(other)),
+    ),
+  );
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base, other);
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([
+    [base],
+    ["commit1", base, other],
+  ]);
+  expect(gh.refWrites).toEqual([
+    {
+      method: "POST",
+      body: { ref: "refs/heads/claude/agt_1", sha: "commit2" },
+    },
+  ]);
+});
+
+test("a merge of a branch only this clone has is refused, naming the merge, before anything is sent", async () => {
+  // a branch made here and never pushed
+  const side = nextBase({ "s.txt": "local only\n" });
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const gh = fakeGitHub();
+  const merged = merge(side);
+
+  const error = await run().catch((e: unknown) => e);
+
+  expect(String(error)).toContain(
+    `commit ${merged} on claude/agt_1 merges ${side}, which GitHub doesn't have`,
+  );
+  expect(String(error)).toMatch(
+    /merge only branches GitHub has, or replace the merge with its commits: `git rebase [0-9a-f]{40}`/,
+  );
+  expectNothingSent(gh);
+});
+
+test("history without a merge sends one parent per commit and looks up no commit on GitHub", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Add b");
+  const gh = fakeGitHub();
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[baseSha], ["commit1"]]);
+  expect(gh.gets.filter((path) => path.includes("/git/commits/"))).toEqual([]);
+});
+
+test("a merge of the base after a held workflow change keeps both parents and still holds the change", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a, change CI");
+  const base = baseMoves({ "b.txt": "from main\n" });
+  merge(base);
+
+  const result = await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[base], ["commit1", base]]);
+  expect(treePaths(gh)).not.toContain(".github/workflows/ci.yml");
+  expect(result.held?.files).toEqual(["M .github/workflows/ci.yml"]);
+});
+
+test("a merge whose only change past its first parent is under .github/workflows is still sent, not skipped as held", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const base = baseMoves({ ".github/workflows/ci.yml": "name: ci v2\n" });
+  merge(base);
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[base], ["commit1", base]]);
+});

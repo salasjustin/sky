@@ -604,11 +604,12 @@ async function forkPoint(
  * Code's attribution is stripped from each commit message and the pull request's body, never its
  * title. The base is first refreshed to GitHub's current head, with the branch's commits rebased
  * onto it when it moved (`refreshBase`). That rebase flattens a merge: the merge commit is dropped
- * and the commits it brought in are replayed one by one. Where the base hasn't moved, only
- * first-parent history is replayed, so a merge commit arrives as a plain commit with the same
- * content, and a merge from the base shows the base's changes in the pull request's diff as the
- * branch's own. A branch on GitHub whose head this branch held before a rebase or amend here is
- * force-updated to the rewritten history; one holding a commit neither this branch nor the base has
+ * and the commits it brought in are replayed one by one. Where the base hasn't moved, first-parent
+ * history is replayed and a merge commit is sent with its other parents as they are, so a merge of
+ * the base leaves the base an ancestor of the published head; a merge of a commit GitHub doesn't
+ * hold is refused before anything is sent. A branch on GitHub whose head this branch held before a
+ * rebase or amend here is force-updated to the rewritten history; one holding a commit neither this
+ * branch nor the base has
  * is refused before anything is sent, and the GitHub branch a continued agent works on is only ever
  * fast-forwarded. The connector can't write under `.github/workflows/`, so sent trees keep that
  * directory as the base has it, or as GitHub's head of the branch has it once the branch exists,
@@ -962,6 +963,36 @@ export async function publish(options: {
     }
   }
 
+  // a merge's other parents are sent as they are, so GitHub must already hold each: one only this
+  // clone has would need its own history replayed, and leaving it out would flatten the merge
+  const mergedIn = new Map<string, string[]>();
+  const onGitHub = new Map<string, Promise<boolean>>();
+  for (const sha of known.slice(start + 1)) {
+    const [, ...others] = lines(await git(cwd, "rev-parse", `${sha}^@`));
+    if (others.length === 0) continue;
+    mergedIn.set(sha, others);
+    for (const other of others) {
+      let found = onGitHub.get(other);
+      if (!found) {
+        found = call("GET", `/git/commits/${other}`).then(
+          () => true,
+          (error: unknown) => {
+            if (error instanceof GatewayError && error.status === 404) {
+              return false;
+            }
+            throw error;
+          },
+        );
+        onGitHub.set(other, found);
+      }
+      if (!(await found)) {
+        throw new PublishError(
+          `commit ${sha} on ${localBranch} merges ${other}, which GitHub doesn't have (as from a branch made only here), and publish sends a merge only with parents GitHub already holds, so nothing was sent; merge only branches GitHub has, or replace the merge with its commits: \`git rebase ${mergeBase}\` replays them onto this branch's own, then publish again`,
+        );
+      }
+    }
+  }
+
   // the connector can't write under .github/workflows/, so every commit is sent with the baseline's
   // version of it; with no commit differing there, nothing differs from a plain publish
   const holding = (await Promise.all(known.slice(start).map(workflowsOf))).some(
@@ -1080,12 +1111,14 @@ export async function publish(options: {
         sha: remoteSha,
       });
     }
+    const merged = mergedIn.get(sha) ?? [];
     const wasHeld = entries.length === 0 && raw !== fromRaw;
     fromShown = shown;
     fromRaw = raw;
     from = sha;
-    // a commit that only touched held-back workflows has nothing left to send
-    if (wasHeld) continue;
+    // a commit that only touched held-back workflows has nothing left to send; a merge still has
+    // its other parents
+    if (wasHeld && merged.length === 0) continue;
     // an empty commit keeps its parent's tree; GitHub refuses a tree request with no entries
     if (entries.length > 0) {
       tree = (
@@ -1100,7 +1133,7 @@ export async function publish(options: {
       await call<{ sha: string }>("POST", "/git/commits", {
         message: local.message,
         tree,
-        parents: [parent],
+        parents: [parent, ...merged],
         author: local.author,
         committer: local.committer,
       })
