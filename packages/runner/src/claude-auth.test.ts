@@ -414,7 +414,7 @@ describe("a nested login's link and the directories it is written to", () => {
       mkdirSync(elsewhere);
       symlinkSync(elsewhere, target());
       await expect(prepare()).rejects.toThrow(
-        `${target()} is not a directory of this user`,
+        `${target()} is not a directory of this user; remove it, and the next run creates its own`,
       );
       expect(readdirSync(elsewhere)).toEqual([]);
     });
@@ -427,7 +427,7 @@ describe("a nested login's link and the directories it is written to", () => {
       if (afterLinks) getuid.mockReturnValueOnce(owner);
       getuid.mockReturnValue(owner + 1);
       await expect(prepare()).rejects.toThrow(
-        `${target()} is not a directory of this user`,
+        `${target()} is not a directory of this user; remove it, and the next run creates its own`,
       );
       expect(readdirSync(target())).toEqual([]);
     });

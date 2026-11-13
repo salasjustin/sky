@@ -171,10 +171,10 @@ const uid = () => process.getuid?.() ?? "user";
 const NESTED_DIR = /^sky-nested-claude-/;
 
 /**
- * Where an agent's nested login is named, the same for every run of every runner of this user: the
- * path the agent's resumed session still holds from an earlier run has to be live in a later one.
- * Holds a symlink per agent to that run's credential file, which sits in the runner's own pid-named
- * directory.
+ * The directory of the agents' nested login links, one path for every run of every runner of this
+ * user: the path the agent's resumed session still holds from an earlier run has to be live in a
+ * later one. Holds a symlink per agent to its current run's credential file, which sits in that
+ * runner's own pid-named directory.
  */
 export const nestedLoginDir = (root: string = tmpdir()) =>
   join(root, `sky-nested-claude-${uid()}`);
@@ -245,7 +245,7 @@ export async function prepareNestedLogin(
       unremoved.delete(file);
       if (unremovedLinks.get(path) === file) unremovedLinks.delete(path);
       await rm(file, { force: true });
-      // only this run's link: it is never another run's to delete
+      // only while it points at this run's file: a later run of the agent may have re-pointed it
       if ((await readlink(path).catch(() => undefined)) === file)
         await rm(path, { force: true });
     },
@@ -261,7 +261,9 @@ async function ownDirectory(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const info = await lstat(dir);
   if (!info.isDirectory() || info.uid !== (process.getuid?.() ?? info.uid))
-    throw new Error(`${dir} is not a directory of this user`);
+    throw new Error(
+      `${dir} is not a directory of this user; remove it, and the next run creates its own`,
+    );
   // `mkdir`'s mode is masked by the umask and never applies to a directory already there
   await chmod(dir, 0o700);
 }
@@ -284,7 +286,7 @@ async function linkInPlace(file: string, path: string): Promise<void> {
   } catch (error) {
     await rm(staged, { force: true });
     throw new Error(
-      `${path} can't be replaced by this run's nested login link`,
+      `${path} can't be replaced by this run's nested login link; if it is a directory, remove it`,
       { cause: error },
     );
   } finally {

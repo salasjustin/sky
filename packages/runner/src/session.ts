@@ -266,7 +266,7 @@ const checkInstructions = (checks: string[], login: NestedPrefix | undefined) =>
     ...(login
       ? [
           `Run each command that calls \`claude\` with the project's Anthropic key, auth token, base URL and provider switches unset, as \`${nestedClaude(login)}\`, even where the check leaves that prefix out.`,
-          `This is the form to use on this run: a nested \`claude\` command or credential file path from an earlier run of this session is superseded by it.`,
+          `Use that form on this run in place of any nested \`claude\` command or credential file path from an earlier run of this session.`,
           `A nested \`claude\` session run that way is logged in with this run's subscription: the command reads it from the file it names, which is expected, so run the command as given. Leave that file to the command: never read, print, copy or edit it yourself, never set or use another credential for the nested session, and never print or read any other credential file or token. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
         ]
       : [

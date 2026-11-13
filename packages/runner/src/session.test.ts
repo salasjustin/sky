@@ -1469,7 +1469,7 @@ describe("the Claude credential of a run", () => {
       expect(commandOf(append)).not.toContain("run_1");
       expect(commandOf(again)).toBe(commandOf(append));
       expect(append).toContain(
-        "a nested `claude` command or credential file path from an earlier run of this session is superseded by it.",
+        "Use that form on this run in place of any nested `claude` command or credential file path from an earlier run of this session.",
       );
     });
 
