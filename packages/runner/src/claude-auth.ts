@@ -9,13 +9,7 @@ import {
   rmSync,
   unlinkSync,
 } from "node:fs";
-import {
-  readlink,
-  rename,
-  rm,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
