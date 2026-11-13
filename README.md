@@ -200,7 +200,7 @@ Before Claude starts, the runner reads every settings file the session would loa
 
 The error names the file and the key and never the value: `settings_redirect: .claude/settings.json sets env.ANTHROPIC_BASE_URL; Sky runs Claude only with its own credential. Remove it to run on Sky.` It is a final failure: Sky doesn't retry it or try another credential. Remove the key and launch again. Everything else in these files still works: `CLAUDE.md`, hooks, skills, permissions and other `env` entries.
 
-Sky starts Claude, and a check's nested `claude`, with `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`, so Claude ignores the endpoint and credential `env` entries a settings file gains mid-run. In that mode Claude also ignores a login stored in its config dir, so the nested command is given the run's credential in its env. The check above covers what is on disk when the run starts.
+Sky starts Claude, and a check's nested `claude`, with `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`, so Claude ignores the endpoint and credential `env` entries a settings file gains mid-run. In that mode Claude also ignores a login stored in its config dir, so on a subscription or pool run the nested command is given the run's token in its env. The check above covers what is on disk when the run starts.
 
 The same names (less `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`) are kept out of the Claude process's own env when they come from the environment's secrets or a base profile's session env. The commands the session runs get the project's values back, except `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` and `CLAUDE_CODE_OAUTH_SCOPES`, which reach neither Claude nor its commands.
 

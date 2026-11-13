@@ -177,8 +177,8 @@ export type NestedLogin = {
  * host-managed mode, and it always wins over a value of that name already in the command's env. The
  * value never reaches the prompt, any program's argv, Claude's env or its env file.
  *
- * An API-key run gets no file and no prefix: Sky's key must stay out of reach of the repo's
- * processes, and a file the sprite's user can read does not do that.
+ * An API-key run gets no file and no prefix: every process of the sprite's user could read Sky's key
+ * from that file.
  */
 export async function prepareNestedLogin(
   auth: ClaudeAuth,
