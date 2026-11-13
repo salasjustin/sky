@@ -1075,3 +1075,96 @@ test("migrating a populated 0012 file adds owner_key_id as NULL and keeps every 
   expect(count("webhook_deliveries")).toBe(1);
   expect(count("api_keys")).toBe(0);
 });
+
+const sealedRow = () => [
+  "whk_std",
+  "https://b.test",
+  '["run.started"]',
+  "standard",
+  Buffer.from([0x00, 0x01, 0x02, 0xff, 0x00, 0x80]),
+  Buffer.from([9, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+  3,
+  '["env_1"]',
+  "2026-02-01T00:00:00.000Z",
+  "key_1",
+];
+
+const insertWebhook = (values: unknown[]) =>
+  run(
+    "insert into webhooks (id, url, event_types, format, secret_ciphertext, secret_nonce, secret_key_version, environment_ids, created_at, owner_key_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ...values,
+  );
+
+const webhookColumns = () =>
+  db.$client
+    .prepare(
+      "select id, url, event_types, format, hex(secret_ciphertext) as ciphertext, typeof(secret_ciphertext) as ciphertext_type, hex(secret_nonce) as nonce, secret_key_version, typeof(secret_key_version) as key_version_type, environment_ids, created_at, owner_key_id from webhooks order by id",
+    )
+    .all();
+
+test("migrating a populated 0015 file keeps a sealed webhook's columns byte for byte and its delivery, then takes openbot and still cascades", () => {
+  migrateThrough("0015_absent_the_hood");
+  seedRun();
+  seedKey();
+  const eventId = insertEvent();
+  insertWebhook(sealedRow());
+  insertWebhook([
+    "whk_sky",
+    "https://a.test",
+    '["run.started"]',
+    "sky",
+    null,
+    null,
+    null,
+    null,
+    "2026-01-01T00:00:00.123Z",
+    null,
+  ]);
+  for (const id of ["whk_std", "whk_sky"]) {
+    run(
+      "insert into webhook_deliveries (webhook_id, event_id, status, next_attempt_at, attempts, last_status) values (?, ?, 'pending', '2026-11-12T00:00:00.000Z', 2, 500)",
+      id,
+      eventId,
+    );
+  }
+  const webhooksBefore = webhookColumns();
+  const deliveriesBefore = db.$client
+    .prepare("select * from webhook_deliveries order by id")
+    .all();
+
+  migrate(db);
+
+  expect(webhookColumns()).toEqual(webhooksBefore);
+  expect(webhookColumns()[1]).toEqual({
+    id: "whk_std",
+    url: "https://b.test",
+    event_types: '["run.started"]',
+    format: "standard",
+    ciphertext: "000102FF0080",
+    ciphertext_type: "blob",
+    nonce: "090009000000000000000000",
+    secret_key_version: 3,
+    key_version_type: "integer",
+    environment_ids: '["env_1"]',
+    created_at: "2026-02-01T00:00:00.000Z",
+    owner_key_id: "key_1",
+  });
+  expect(
+    db.$client.prepare("select * from webhook_deliveries order by id").all(),
+  ).toEqual(deliveriesBefore);
+  expect(deliveriesBefore).toHaveLength(2);
+
+  insertWebhook(
+    sealedRow().map((v, i) => (i === 0 ? "whk_ob" : i === 3 ? "openbot" : v)),
+  );
+  expect(() =>
+    insertWebhook(
+      sealedRow().map((v, i) => (i === 0 ? "whk_bad" : i === 3 ? "bogus" : v)),
+    ),
+  ).toThrow(/CHECK constraint failed/);
+
+  run("delete from webhooks where id = 'whk_std'");
+  expect(
+    db.$client.prepare("select webhook_id from webhook_deliveries").all(),
+  ).toEqual([{ webhook_id: "whk_sky" }]);
+});
