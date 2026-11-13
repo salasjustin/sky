@@ -1,6 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { readdirSync, rmSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { existsSync, readdirSync, rmSync } from "node:fs";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readlink,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
@@ -152,6 +160,18 @@ const RUNNER_DIR = /^sky-runner-(\d+)$/;
 export const credentialDir = (root: string = tmpdir(), pid = process.pid) =>
   join(root, `sky-runner-${pid}`);
 
+const uid = () => process.getuid?.() ?? "user";
+const NESTED_DIR = /^sky-nested-claude-/;
+
+/**
+ * Where an agent's nested login is named, the same for every run of every runner of this user: the
+ * path the agent's resumed session still holds from an earlier run has to be live in a later one.
+ * Holds a symlink per agent to that run's credential file, which sits in the runner's own pid-named
+ * directory.
+ */
+export const nestedLoginDir = (root: string = tmpdir()) =>
+  join(root, `sky-nested-claude-${uid()}`);
+
 /**
  * The shell assignment that logs a check's nested `claude` in: it sets `variable` from the credential
  * file as the command runs, ahead of `env`, so the value is in that command's environment alone.
@@ -171,11 +191,16 @@ export type NestedLogin = {
 /**
  * Host-managed mode makes Claude Code ignore a stored login, and Claude Code removes
  * `CLAUDE_CODE_OAUTH_TOKEN` from the env of the commands it runs, so a nested `claude -p` finds its
- * credential in neither place. A subscription or pool run's token goes in a 0600 file named for the
- * run; every process of the sprite's user can still read it while it exists. `prefix` has the shell
- * read it into the nested command's environment, the one place Claude Code takes the credential in
- * host-managed mode, and it always wins over a value of that name already in the command's env. The
- * value never reaches the prompt, any program's argv, Claude's env or its env file.
+ * credential in neither place. A subscription or pool run's token goes in a 0600 file of the runner's
+ * credential directory, named for the run; every process of the sprite's user can still read it while
+ * it exists. The path the agent is given is stable across the agent's runs: a symlink named for
+ * `agentId` in `dir` (a 0700 directory of this user's), which each run points at its own file at start
+ * and deletes at its end. A follow-up resumes the session that holds the first run's instructions, so
+ * its nested `claude` must find a live credential at that same path, holding this run's token. Two
+ * runs of one agent never overlap. `prefix` has the shell read the link into the nested command's
+ * environment, the one place Claude Code takes the credential in host-managed mode, and it always wins
+ * over a value of that name already in the command's env. The value never reaches the prompt, any
+ * program's argv, Claude's env or its env file.
  *
  * An API-key run gets no file and no prefix: every process of the sprite's user could read Sky's key
  * from that file.
@@ -184,22 +209,39 @@ export async function prepareNestedLogin(
   auth: ClaudeAuth,
   runnerEnv: NodeJS.ProcessEnv,
   runId: string,
-  dir: string = credentialDir(),
+  dir: string = nestedLoginDir(),
+  agentId: string = runId,
+  fileDir: string = credentialDir(),
 ): Promise<NestedLogin> {
   const value =
     auth === "oauth" ? runnerEnv.CLAUDE_CODE_OAUTH_TOKEN : undefined;
   if (!value) return { prefix: undefined, remove: async () => {} };
   await mkdir(dir, { recursive: true, mode: 0o700 });
-  const path = join(dir, `sky-nested-claude-${runId}-${randomUUID()}`);
+  // a directory another user made first, or one of looser mode, would let them read or swap the link
+  const info = await lstat(dir);
+  if (!info.isDirectory() || info.uid !== (process.getuid?.() ?? info.uid))
+    throw new Error(`${dir} is not a directory of this user`);
+  await chmod(dir, 0o700);
+  await mkdir(fileDir, { recursive: true, mode: 0o700 });
+  const file = join(fileDir, `sky-nested-claude-${runId}-${randomUUID()}`);
+  const path = join(dir, `sky-nested-claude-${agentId}`);
+  unremoved.add(file);
   unremoved.add(path);
-  await writeFile(path, value, { mode: 0o600, flag: "wx" });
+  await writeFile(file, value, { mode: 0o600, flag: "wx" });
+  // the earlier run's link, dangling or not; `symlink` never follows what it finds
+  await rm(path, { force: true });
+  await symlink(file, path);
   const variable = "CLAUDE_CODE_OAUTH_TOKEN";
   return {
     // quoted, so the value is never split or globbed
     prefix: { variable, assignment: `${variable}="$(<${shellQuote(path)})"` },
-    remove: () => {
+    remove: async () => {
+      unremoved.delete(file);
       unremoved.delete(path);
-      return rm(path, { force: true });
+      await rm(file, { force: true });
+      // only this run's link: it is never another run's to delete
+      if ((await readlink(path).catch(() => undefined)) === file)
+        await rm(path, { force: true });
     },
   };
 }
@@ -263,6 +305,14 @@ export function sweepCredentialFiles(
       rmSync(join(root, name), { recursive: true, force: true });
     } catch {}
   }
+  // an agent's nested login link outlives its run's file when the runner was killed outright: one
+  // whose file is gone is dead
+  const links = nestedLoginDir(root);
+  try {
+    for (const name of readdirSync(links))
+      if (NESTED_DIR.test(name) && !existsSync(join(links, name)))
+        rmSync(join(links, name), { force: true });
+  } catch {}
 }
 
 /**
