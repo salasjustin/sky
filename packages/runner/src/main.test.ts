@@ -303,26 +303,69 @@ describe("a stray runner.mjs started in a run's shell, which inherits PROMPT_FIL
   }, 20_000);
 });
 
-test(
-  "a failed run posts run.failed to the API with the agent token, exits 1, and leaves nothing running",
-  async () => {
-    const received: { auth?: string; body: unknown }[] = [];
-    const api = createServer((req, res) => {
-      let body = "";
-      req.on("data", (d) => (body += d));
-      req.on("end", () => {
-        received.push({
-          auth: req.headers.authorization,
-          body: JSON.parse(body),
-        });
-        res.writeHead(204).end();
+test("a failed run posts run.failed to the API with the agent token, exits 1, and leaves nothing running", async () => {
+  const received: { auth?: string; body: unknown }[] = [];
+  const api = createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      received.push({
+        auth: req.headers.authorization,
+        body: JSON.parse(body),
       });
+      res.writeHead(204).end();
     });
-    api.listen(0, "127.0.0.1");
-    await once(api, "listening");
-    const { port } = api.address() as AddressInfo;
-    try {
-      const { code, stdout } = await runBundle({
+  });
+  api.listen(0, "127.0.0.1");
+  await once(api, "listening");
+  const { port } = api.address() as AddressInfo;
+  try {
+    const { code, stdout } = await runBundle({
+      AGENT_ID: "agt_1",
+      RUN_ID: "run_1",
+      PROMPT: "do it",
+      API_BASE_URL: `http://127.0.0.1:${port}`,
+      AGENT_TOKEN: "agent-secret",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+      REPO_DIR: "/nonexistent/repo",
+      WORKTREES_DIR: "/nonexistent/worktrees",
+    });
+    expect(code).toBe(1);
+    expect(stdout).toBe("");
+    expect(received).toEqual([
+      {
+        auth: "Bearer agent-secret",
+        body: {
+          runId: "run_1",
+          type: "run.failed",
+          payload: { error: expect.stringMatching(/worktree setup failed/) },
+        },
+      },
+    ]);
+  } finally {
+    api.closeAllConnections();
+    api.close();
+  }
+  // an idle keep-alive socket or a live child would hold the process open: runBundle then never
+  // resolves and the timeout fails the test, with no wall-clock threshold to tune
+}, 20_000);
+
+test("a host whose runner can't change its effective user fails the run as credential_exposed, before any worktree work", async () => {
+  const received: { body: unknown }[] = [];
+  const api = createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      received.push({ body: JSON.parse(body) });
+      res.writeHead(204).end();
+    });
+  });
+  api.listen(0, "127.0.0.1");
+  await once(api, "listening");
+  const { port } = api.address() as AddressInfo;
+  try {
+    const { code } = await runBundle(
+      {
         AGENT_ID: "agt_1",
         RUN_ID: "run_1",
         PROMPT: "do it",
@@ -331,81 +374,30 @@ test(
         CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
         REPO_DIR: "/nonexistent/repo",
         WORKTREES_DIR: "/nonexistent/worktrees",
-      });
-      expect(code).toBe(1);
-      expect(stdout).toBe("");
-      expect(received).toEqual([
-        {
-          auth: "Bearer agent-secret",
-          body: {
-            runId: "run_1",
-            type: "run.failed",
-            payload: { error: expect.stringMatching(/worktree setup failed/) },
+      },
+      undefined,
+      "unprivileged",
+    );
+    expect(code).toBe(1);
+    expect(received).toEqual([
+      {
+        body: {
+          runId: "run_1",
+          type: "run.failed",
+          payload: {
+            error: expect.stringMatching(
+              /^credential_exposed: .*can't change its effective user \(EPERM\).*the run did not start\.$/,
+            ),
           },
         },
-      ]);
-    } finally {
-      api.closeAllConnections();
-      api.close();
-    }
-    // an idle keep-alive socket or a live child would hold the process open: runBundle then never
-    // resolves and the timeout fails the test, with no wall-clock threshold to tune
-  },
-  20_000,
-);
-
-test(
-  "a host whose runner can't change its effective user fails the run as credential_exposed, before any worktree work",
-  async () => {
-    const received: { body: unknown }[] = [];
-    const api = createServer((req, res) => {
-      let body = "";
-      req.on("data", (d) => (body += d));
-      req.on("end", () => {
-        received.push({ body: JSON.parse(body) });
-        res.writeHead(204).end();
-      });
-    });
-    api.listen(0, "127.0.0.1");
-    await once(api, "listening");
-    const { port } = api.address() as AddressInfo;
-    try {
-      const { code } = await runBundle(
-        {
-          AGENT_ID: "agt_1",
-          RUN_ID: "run_1",
-          PROMPT: "do it",
-          API_BASE_URL: `http://127.0.0.1:${port}`,
-          AGENT_TOKEN: "agent-secret",
-          CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
-          REPO_DIR: "/nonexistent/repo",
-          WORKTREES_DIR: "/nonexistent/worktrees",
-        },
-        undefined,
-        "unprivileged",
-      );
-      expect(code).toBe(1);
-      expect(received).toEqual([
-        {
-          body: {
-            runId: "run_1",
-            type: "run.failed",
-            payload: {
-              error: expect.stringMatching(
-                /^credential_exposed: .*can't change its effective user \(EPERM\).*the run did not start\.$/,
-              ),
-            },
-          },
-        },
-      ]);
-      expect(JSON.stringify(received)).not.toContain("oauth-secret");
-    } finally {
-      api.closeAllConnections();
-      api.close();
-    }
-  },
-  20_000,
-);
+      },
+    ]);
+    expect(JSON.stringify(received)).not.toContain("oauth-secret");
+  } finally {
+    api.closeAllConnections();
+    api.close();
+  }
+}, 20_000);
 
 test("the runner holds the sprite through the Tasks API at SKY_SPRITE_API_SOCKET", async () => {
   const sockets = mkdtempSync(join(tmpdir(), "runner-main-sprite-"));
@@ -670,7 +662,10 @@ test.skipIf(!linux)(
             PATH: process.env.PATH ?? "",
             CLAUDE_CONFIG_DIR,
             SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
-            ...runEnv(`http://127.0.0.1:${port}`, join(dir, "run_reap2.prompt")),
+            ...runEnv(
+              `http://127.0.0.1:${port}`,
+              join(dir, "run_reap2.prompt"),
+            ),
             RUN_ID: "run_reap2",
           },
           stdio: "ignore",
@@ -751,7 +746,9 @@ describe("the Claude login stored in Claude Code's credential file", () => {
     expect(JSON.parse(readFileSync(credentials(), "utf8"))).toEqual({
       designOauth: { accessToken: "design", refreshToken: "refresh" },
     });
-    expect(stderr).toMatch(/runner: removed the Claude login an earlier runner stored/);
+    expect(stderr).toMatch(
+      /runner: removed the Claude login an earlier runner stored/,
+    );
   }, 20_000);
 });
 

@@ -153,8 +153,7 @@ async function main(): Promise<void> {
   });
   await step("sprite hold", () => hold.ready);
   // a stop while the hold was landing skips setup; the session reports it as run.failed
-  if (!controller.signal.aborted)
-    await setUpSession(controller.signal);
+  if (!controller.signal.aborted) await setUpSession(controller.signal);
   warn("runner: session starting");
   try {
     process.exitCode = await runSession(config, {

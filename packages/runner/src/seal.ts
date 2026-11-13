@@ -1,7 +1,7 @@
 import {
   type ChildProcess,
-  spawn as spawnChild,
   type SpawnOptions as ChildSpawnOptions,
+  spawn as spawnChild,
 } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -140,11 +140,7 @@ function rootOnlyProgram(
       const real = files.realpath(path);
       const file = files.stat(real);
       if ((file.mode & constants.S_IFMT) !== constants.S_IFREG) continue;
-      const chain = new Set([
-        real,
-        ...ancestorsOf(path),
-        ...ancestorsOf(real),
-      ]);
+      const chain = new Set([real, ...ancestorsOf(path), ...ancestorsOf(real)]);
       if ([...chain].every((at) => onlyRootChanges(files.stat(at))))
         return real;
     } catch {}
