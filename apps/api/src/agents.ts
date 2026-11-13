@@ -274,9 +274,8 @@ const agentRow = (tx: Tx, id: AgentId) => {
   return row;
 };
 
-// $1 the base, $2 the agent's branch. A branch that was never created is a normal answer, not an
-// error, and git's complaint about it stays off the wire: the SDK's HTTP exec reads each chunk as a
-// frame, so a failing command's stderr and exit status in one chunk fail the whole call
+// $1 the base, $2 the agent's branch. A branch that was never created is a normal answer (exit 3),
+// not an error. git's stderr is dropped, since it would share the HTTP exec with the exit frame
 export const DIFF = `git rev-parse --verify --quiet "refs/heads/$2" >/dev/null 2>&1 || exit 3; exec git diff "$1...$2" 2>/dev/null`;
 
 /** The most of a run's diff the run detail carries; a larger one is cut to it and flagged. */
@@ -815,7 +814,7 @@ export function agentRoutes(
               c,
               502,
               "sprite_exec_failed",
-              "the sprite answered, but the run's diff could not be read from it; retry",
+              "the sprite answered, but the run's diff could not be read back from it; retry, and if it fails again, check the sprite's free disk space",
             );
           }
           return apiError(

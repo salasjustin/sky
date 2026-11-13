@@ -1765,8 +1765,8 @@ test("GET of a truncated diff redacts a secret the cut would have split", async 
   const { body } = await getRun(agent.id, run.id);
   expect(body.diffTruncated).toBe(true);
   expect(body.diff).not.toContain("sk-proj");
-  // the cut lands inside the key's line and goes back to the filler's last newline; were the key's
-  // 13-character stub kept, it is under redact's pattern floor and would show
+  // the cut lands inside the key's line and goes back to the filler's last newline; a kept 13-character
+  // stub of the key would be under redact's pattern floor and would show
   expect(body.diff).toBe(filler);
 });
 
