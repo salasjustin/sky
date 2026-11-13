@@ -91,6 +91,8 @@ async function main(): Promise<void> {
   }
   // the session's `finally` never runs for an uncaught exception, which still fires 'exit'
   removeCredentialFilesOnExit();
+  // the copy of Claude's binary the session started from goes the same way
+  process.on("exit", removeSealedCopiesNow);
   // a runner killed outright (SIGKILL, the OOM killer) left its credential files behind
   sweepCredentialFiles(processAlive);
   // an earlier runner may have left its run's token in Claude Code's credential file, where any later

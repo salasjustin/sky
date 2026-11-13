@@ -1,24 +1,29 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   type CommandEnv,
   claudeProcessEnv,
   commandEnvScript,
   credentialDir,
   prepareCommandEnv,
+  prepareNestedLogin,
   removeCredentialFilesNow,
   sweepCredentialFiles,
   withdrawCredential,
@@ -300,11 +305,11 @@ test.each([
     const script = [
       `import * as auth from ${JSON.stringify(CLAUDE_AUTH_URL)};`,
       "auth.removeCredentialFilesOnExit();",
-      "const dir = process.env.DIR;",
+      "const { LINKS, FILES } = process.env;",
       'const login = { CLAUDE_CODE_OAUTH_TOKEN: "token" };',
-      'await auth.prepareNestedLogin("oauth", login, "run_1", dir);',
+      'await auth.prepareNestedLogin("oauth", login, "run_1", LINKS, "agt_1", FILES);',
       'const project = { ANTHROPIC_API_KEY: "project-key" };',
-      'await auth.prepareCommandEnv("oauth", project, dir);',
+      'await auth.prepareCommandEnv("oauth", project, FILES);',
       'process.stdout.write("written");',
       'const boom = new Error("boom");',
       death,
@@ -317,12 +322,20 @@ test.each([
         "-e",
         script,
       ],
-      { env: { PATH: process.env.PATH, DIR: dir }, encoding: "utf8" },
+      {
+        env: {
+          PATH: process.env.PATH,
+          LINKS: join(dir, "links"),
+          FILES: join(dir, "files"),
+        },
+        encoding: "utf8",
+      },
     );
     expect(child.stdout).toBe("written");
     expect(child.stderr).toContain("boom");
     expect(child.status).toBe(1);
-    expect(readdirSync(dir)).toEqual([]);
+    expect(readdirSync(join(dir, "links"))).toEqual([]);
+    expect(readdirSync(join(dir, "files"))).toEqual([]);
   },
 );
 
@@ -348,4 +361,121 @@ test("the sweep removes a dead runner's credential files and leaves a live runne
 test("the sweep of a missing directory does nothing and never throws", () => {
   const absent = join(dir, "absent");
   expect(() => sweepCredentialFiles(() => false, absent)).not.toThrow();
+});
+
+describe("a nested login's link and the directories it is written to", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const links = () => join(dir, "links");
+  const files = () => join(dir, "files");
+  const link = () => join(links(), "sky-nested-claude-agt_1");
+  const prepare = () =>
+    prepareNestedLogin(
+      "oauth",
+      { CLAUDE_CODE_OAUTH_TOKEN: "subscription-token" },
+      "run_1",
+      links(),
+      "agt_1",
+      files(),
+    );
+
+  test("removeCredentialFilesNow deletes this run's link and file", async () => {
+    const login = await prepare();
+    expect(readFileSync(link(), "utf8")).toBe("subscription-token");
+    removeCredentialFilesNow();
+    expect(readdirSync(links())).toEqual([]);
+    expect(readdirSync(files())).toEqual([]);
+    await expect(login.remove()).resolves.toBeUndefined();
+  });
+
+  test("removeCredentialFilesNow leaves the link once it points at another run's file", async () => {
+    await prepare();
+    const own = readlinkSync(link());
+    const other = join(dir, "other-run");
+    writeFileSync(other, "other-token");
+    rmSync(link());
+    symlinkSync(other, link());
+    removeCredentialFilesNow();
+    expect(readlinkSync(link())).toBe(other);
+    expect(readFileSync(other, "utf8")).toBe("other-token");
+    expect(existsSync(own)).toBe(false);
+  });
+
+  test("an earlier run's link is replaced, and the file it pointed at is untouched", async () => {
+    mkdirSync(links());
+    const victim = join(dir, "victim");
+    writeFileSync(victim, "victim");
+    symlinkSync(victim, link());
+    const login = await prepare();
+    expect(readFileSync(link(), "utf8")).toBe("subscription-token");
+    expect(readFileSync(victim, "utf8")).toBe("victim");
+    expect(readdirSync(links())).toEqual(["sky-nested-claude-agt_1"]);
+    await login.remove();
+  });
+
+  test("a dangling link is replaced, and nothing is written where it pointed", async () => {
+    mkdirSync(links());
+    const absent = join(dir, "absent");
+    symlinkSync(absent, link());
+    const login = await prepare();
+    expect(readFileSync(link(), "utf8")).toBe("subscription-token");
+    expect(existsSync(absent)).toBe(false);
+    await login.remove();
+  });
+
+  test("a regular file at the link's path is replaced by the link", async () => {
+    mkdirSync(links());
+    writeFileSync(link(), "planted");
+    const login = await prepare();
+    expect(lstatSync(link()).isSymbolicLink()).toBe(true);
+    expect(readFileSync(link(), "utf8")).toBe("subscription-token");
+    await login.remove();
+  });
+
+  test("a directory at the link's path refuses the run, naming it, and is left as it was", async () => {
+    mkdirSync(link(), { recursive: true });
+    writeFileSync(join(link(), "kept"), "");
+    await expect(prepare()).rejects.toThrow(link());
+    expect(readdirSync(link())).toEqual(["kept"]);
+    expect(readdirSync(links())).toEqual(["sky-nested-claude-agt_1"]);
+    expect(readdirSync(files())).toEqual([]);
+  });
+
+  // `afterLinks`: the links' directory is checked first, and must pass for the file's to be reached
+  describe.each([
+    ["the links' directory", links, false],
+    ["the credential file's directory", files, true],
+  ])("%s", (_, target, afterLinks) => {
+    test("is refused when it is a symlink, and nothing is written where it points", async () => {
+      const elsewhere = join(dir, "elsewhere");
+      mkdirSync(elsewhere);
+      symlinkSync(elsewhere, target());
+      await expect(prepare()).rejects.toThrow(
+        `${target()} is not a directory of this user; remove it, and the next run creates its own`,
+      );
+      expect(readdirSync(elsewhere)).toEqual([]);
+    });
+
+    test("is refused when another user owns it, and nothing is written there", async () => {
+      mkdirSync(target());
+      // lstat reports the real owner, so the runner's uid is moved instead
+      const owner = lstatSync(target()).uid;
+      const getuid = vi.spyOn(process, "getuid");
+      if (afterLinks) getuid.mockReturnValueOnce(owner);
+      getuid.mockReturnValue(owner + 1);
+      await expect(prepare()).rejects.toThrow(
+        `${target()} is not a directory of this user; remove it, and the next run creates its own`,
+      );
+      expect(readdirSync(target())).toEqual([]);
+    });
+
+    test("is held to this user alone when it already exists looser", async () => {
+      mkdirSync(target());
+      // set outright: a mode passed to mkdir is masked by the umask
+      chmodSync(target(), 0o755);
+      const login = await prepare();
+      expect(statSync(target()).mode & 0o777).toBe(0o700);
+      await login.remove();
+    });
+  });
 });

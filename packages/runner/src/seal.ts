@@ -13,12 +13,12 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
   SpawnedProcess,
   SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
+import { credentialDir } from "./claude-auth.js";
 
 // Every command the repo starts runs as the user the runner and Claude run as, and `/proc/<pid>/environ`,
 // `mem` and `fd` of a process are readable by every other process of its user, unless the kernel marks
@@ -177,7 +177,7 @@ export type Seal = {
 };
 
 export type SealOptions = {
-  /** Where the copy of Claude's binary lives while it runs; the temp directory when absent. */
+  /** Where the copy of Claude's binary lives while it runs; the runner's credential directory when absent. */
   dir?: string;
   /** Steps the runner out of its commands' reach; the real one when absent. */
   hideRunner?: () => string | undefined;
@@ -234,7 +234,9 @@ export function createSeal(
   platform: NodeJS.Platform = process.platform,
   options: SealOptions = {},
 ): Seal {
-  const { dir = tmpdir() } = options;
+  // in the runner's own credential directory by default, so the sweep of a killed runner's directory
+  // takes the copy of Claude's binary it left behind too
+  const { dir = credentialDir() } = options;
   const spawn: NonNullable<SealOptions["spawn"]> = options.spawn ?? spawnChild;
   const programs = sealPrograms(platform, options);
   let claude: ChildProcess | undefined;

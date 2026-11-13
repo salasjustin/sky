@@ -10,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { credentialDir, sweepCredentialFiles } from "./claude-auth.js";
 import {
   createSeal,
   hideRunner,
@@ -345,6 +346,27 @@ describe("createSeal", () => {
       start(sealOn(SANDBOX, { dir: copies, spawn: () => claude }));
       expect(readdirSync(copies)).toHaveLength(1);
       claude.emit(event, payload);
+      expect(readdirSync(copies)).toEqual([]);
+    });
+
+    test("by default it lands in the runner's credential directory, where a dead runner's sweep finds it", () => {
+      const seal = sealOn(SANDBOX, { spawn: () => fakeProcess() });
+      start(seal);
+      try {
+        expect(readdirSync(credentialDir())).toEqual([
+          expect.stringMatching(/^sky-claude-/),
+        ]);
+      } finally {
+        removeSealedCopiesNow();
+        rmSync(credentialDir(), { recursive: true, force: true });
+      }
+    });
+
+    test("a copy a killed runner left in its credential directory is swept with the directory", () => {
+      const runner = credentialDir(copies, 4242);
+      start(sealOn(SANDBOX, { dir: runner, spawn: () => fakeProcess() }));
+      expect(readdirSync(runner)).toHaveLength(1);
+      sweepCredentialFiles(() => false, copies, process.pid);
       expect(readdirSync(copies)).toEqual([]);
     });
 

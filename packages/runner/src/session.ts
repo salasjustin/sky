@@ -275,10 +275,11 @@ const checkInstructions = (checks: string[], login: NestedPrefix | undefined) =>
     ...(login
       ? [
           `Run each command that calls \`claude\` with the project's Anthropic key, auth token, base URL and provider switches unset, as \`${nestedClaude(login)}\`, even where the check leaves that prefix out.`,
+          `Use that form on this run in place of any nested \`claude\` command or credential file path from an earlier run of this session.`,
           `A nested \`claude\` session run that way is logged in with this run's subscription: the command reads it from the file it names, which is expected, so run the command as given. Leave that file to the command: never read, print, copy or edit it yourself, never set or use another credential for the nested session, and never print or read any other credential file or token. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
         ]
       : [
-          `A nested \`claude\` session is not logged in on this run, because Sky's API key isn't handed to nested sessions. Don't run a check that calls \`claude\`: report it as not run, with that reason. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
+          `A nested \`claude\` session is not logged in on this run, because Sky's API key isn't handed to nested sessions. A nested \`claude\` command or credential file path from an earlier run of this session doesn't apply on this run either. Don't run a check that calls \`claude\`: report it as not run, with that reason. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
         ]),
   ].join("\n");
 
@@ -762,6 +763,8 @@ export async function runSession(
         config.claudeAuth,
         deps.credentialEnv,
         config.runId,
+        undefined,
+        config.agentId,
       );
     const stream = deps.query({
       prompt: input.messages,

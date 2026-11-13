@@ -1,8 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { readdirSync, rmSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import {
+  existsSync,
+  readdirSync,
+  readlinkSync,
+  rmSync,
+  unlinkSync,
+} from "node:fs";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readlink,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 
 /** Which credential the run's Claude session authenticates with, as the API chose it. */
@@ -172,6 +187,18 @@ const RUNNER_DIR = /^sky-runner-(\d+)$/;
 export const credentialDir = (root: string = tmpdir(), pid = process.pid) =>
   join(root, `sky-runner-${pid}`);
 
+const uid = () => process.getuid?.() ?? "user";
+const NESTED_DIR = /^sky-nested-claude-/;
+
+/**
+ * The directory of the agents' nested login links, one path for every run of every runner of this
+ * user: the path the agent's resumed session still holds from an earlier run has to be live in a
+ * later one. Holds a symlink per agent to its current run's credential file, which sits in that
+ * runner's own pid-named directory.
+ */
+export const nestedLoginDir = (root: string = tmpdir()) =>
+  join(root, `sky-nested-claude-${uid()}`);
+
 /**
  * The shell assignment that logs a check's nested `claude` in: it sets `variable` from the credential
  * file as the command runs, ahead of `env`, so the value is in that command's environment alone.
@@ -184,18 +211,23 @@ export type NestedPrefix = {
 export type NestedLogin = {
   /** Undefined on an API-key run. */
   prefix: NestedPrefix | undefined;
-  /** Deletes the file holding the credential. */
+  /** Deletes the credential's file, and the agent's link while it still points there. */
   remove: () => Promise<void>;
 };
 
 /**
  * Host-managed mode makes Claude Code ignore a stored login, and Claude Code removes
  * `CLAUDE_CODE_OAUTH_TOKEN` from the env of the commands it runs, so a nested `claude -p` finds its
- * credential in neither place. A subscription or pool run's token goes in a 0600 file named for the
- * run; every process of the sprite's user can still read it while it exists. `prefix` has the shell
- * read it into the nested command's environment, the one place Claude Code takes the credential in
- * host-managed mode, and it always wins over a value of that name already in the command's env. The
- * value never reaches the prompt, any program's argv, Claude's env or its env file.
+ * credential in neither place. A subscription or pool run's token goes in a 0600 file of the runner's
+ * credential directory, named for the run; every process of the sprite's user can still read it while
+ * it exists. The path the agent is given is stable across the agent's runs: a symlink named for
+ * `agentId` in `dir` (a 0700 directory of this user's), which each run points at its own file at start
+ * and deletes at its end. A follow-up resumes the session that holds the first run's instructions, so
+ * its nested `claude` must find a live credential at that same path, holding this run's token. Two
+ * runs of one agent never overlap. `prefix` has the shell read the link into the nested command's
+ * environment, the one place Claude Code takes the credential in host-managed mode, and it always wins
+ * over a value of that name already in the command's env. The value never reaches the prompt, any
+ * program's argv, Claude's env or its env file.
  *
  * An API-key run gets no file and no prefix: every process of the sprite's user could read Sky's key
  * from that file.
@@ -204,24 +236,83 @@ export async function prepareNestedLogin(
   auth: ClaudeAuth,
   runnerEnv: NodeJS.ProcessEnv,
   runId: string,
-  dir: string = credentialDir(),
+  dir: string = nestedLoginDir(),
+  agentId: string = runId,
+  fileDir: string = credentialDir(),
 ): Promise<NestedLogin> {
   const value =
     auth === "oauth" ? runnerEnv.CLAUDE_CODE_OAUTH_TOKEN : undefined;
   if (!value) return { prefix: undefined, remove: async () => {} };
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const path = join(dir, `sky-nested-claude-${runId}-${randomUUID()}`);
-  unremoved.add(path);
-  await writeFile(path, value, { mode: 0o600, flag: "wx" });
+  await ownDirectory(dir);
+  await ownDirectory(fileDir);
+  const file = join(fileDir, `sky-nested-claude-${runId}-${randomUUID()}`);
+  const path = join(dir, `sky-nested-claude-${agentId}`);
+  // before the write: a signal can land while it is in flight
+  unremoved.add(file);
+  await writeFile(file, value, { mode: 0o600, flag: "wx" });
+  try {
+    await linkInPlace(file, path);
+  } catch (error) {
+    unremoved.delete(file);
+    await rm(file, { force: true });
+    throw error;
+  }
   const variable = "CLAUDE_CODE_OAUTH_TOKEN";
   return {
     // quoted, so the value is never split or globbed
     prefix: { variable, assignment: `${variable}="$(<${shellQuote(path)})"` },
-    remove: () => {
-      unremoved.delete(path);
-      return rm(path, { force: true });
+    remove: async () => {
+      unremoved.delete(file);
+      if (unremovedLinks.get(path) === file) unremovedLinks.delete(path);
+      await rm(file, { force: true });
+      // only while it points at this run's file: a later run of the agent may have re-pointed it
+      if ((await readlink(path).catch(() => undefined)) === file)
+        await rm(path, { force: true });
     },
   };
+}
+
+/**
+ * Creates `dir` as a 0700 directory of this user, or holds an existing one to that. Refuses a
+ * directory another user made first and a symlink standing in for one, so no other user can read or
+ * swap what this runner writes there; every process of this user still can.
+ */
+async function ownDirectory(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const info = await lstat(dir);
+  if (!info.isDirectory() || info.uid !== (process.getuid?.() ?? info.uid))
+    throw new Error(
+      `${dir} is not a directory of this user; remove it, and the next run creates its own`,
+    );
+  // `mkdir`'s mode is masked by the umask and never applies to a directory already there
+  await chmod(dir, 0o700);
+}
+
+/**
+ * Points `path` at `file` in one step: a link made beside it under a unique name and renamed over it,
+ * so `path` never goes missing and whatever stood there (the earlier run's link, dangling or not, or a
+ * file) is replaced rather than followed. A directory there refuses the run; it is never deleted.
+ */
+async function linkInPlace(file: string, path: string): Promise<void> {
+  // named like an agent's link, so a runner killed before the rename leaves one the sweep finds
+  const staged = join(
+    dirname(path),
+    `sky-nested-claude-${randomUUID()}.staged`,
+  );
+  await symlink(file, staged);
+  unremovedLinks.set(staged, file);
+  try {
+    await rename(staged, path);
+  } catch (error) {
+    await rm(staged, { force: true });
+    throw new Error(
+      `${path} can't be replaced by this run's nested login link; if it is a directory, remove it`,
+      { cause: error },
+    );
+  } finally {
+    unremovedLinks.delete(staged);
+  }
+  unremovedLinks.set(path, file);
 }
 
 type Settings = Exclude<Options["settings"], string | undefined>;
@@ -236,11 +327,15 @@ export type CommandEnv = {
 // every credential file `prepareCommandEnv` and `prepareNestedLogin` wrote that its `remove` hasn't
 // deleted yet
 const unremoved = new Set<string>();
+// every nested login link `prepareNestedLogin` put in place that its `remove` hasn't deleted yet, with
+// the file it points at
+const unremovedLinks = new Map<string, string>();
 
 /**
- * Deletes every command-env script and nested login file still on disk, synchronously: for a process
- * about to die by a signal or an uncaught exception, neither of which reaches the session's own
- * `remove`. Never throws, so the death goes ahead.
+ * Deletes every command-env script and nested login file still on disk, and each nested login link
+ * still pointing at this runner's file, synchronously: for a process about to die by a signal or an
+ * uncaught exception, neither of which reaches the session's own `remove`. A link a later run
+ * re-pointed is left to it. Never throws, so the death goes ahead.
  */
 export function removeCredentialFilesNow(): void {
   for (const path of unremoved)
@@ -248,6 +343,11 @@ export function removeCredentialFilesNow(): void {
       rmSync(path, { force: true });
     } catch {}
   unremoved.clear();
+  for (const [link, file] of unremovedLinks)
+    try {
+      if (readlinkSync(link) === file) unlinkSync(link);
+    } catch {}
+  unremovedLinks.clear();
 }
 
 /**
@@ -263,7 +363,8 @@ export function removeCredentialFilesOnExit(): void {
  * no exit handler reaches. Runs on one sprite share its tmpdir and pid space, so a directory is swept
  * only when `isAlive` finds no process with its pid; a pid reused by any process keeps its directory
  * until that one ends too. A directory under this runner's own pid is a dead process's and is swept
- * too, so this runs before the runner writes any. Never throws.
+ * too, so this runs before the runner writes any. Then each nested login link in `nestedLoginDir`
+ * whose file is gone is deleted. Never throws.
  */
 export function sweepCredentialFiles(
   isAlive: (pid: number) => boolean,
@@ -283,6 +384,14 @@ export function sweepCredentialFiles(
       rmSync(join(root, name), { recursive: true, force: true });
     } catch {}
   }
+  // an agent's nested login link outlives its run's file when the runner was killed outright: one
+  // whose file is gone is dead
+  const links = nestedLoginDir(root);
+  try {
+    for (const name of readdirSync(links))
+      if (NESTED_DIR.test(name) && !existsSync(join(links, name)))
+        rmSync(join(links, name), { force: true });
+  } catch {}
 }
 
 /**
@@ -298,7 +407,7 @@ export async function prepareCommandEnv(
 ): Promise<CommandEnv> {
   const script = commandEnvScript(auth, env);
   if (script === undefined) return { hooks: undefined, remove: async () => {} };
-  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await ownDirectory(dir);
   const path = join(dir, `sky-command-env-${randomUUID()}.sh`);
   // before the write: a signal can land while it is in flight
   unremoved.add(path);

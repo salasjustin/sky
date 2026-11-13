@@ -25,6 +25,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import {
   credentialDir,
+  nestedLoginDir,
   PROJECT_VARIABLES,
   prepareNestedLogin,
 } from "./claude-auth.js";
@@ -50,6 +51,10 @@ beforeEach(() => {
   // a sandbox host exports its own connector, which would send every run here through a refresh
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
   root = mkdtempSync(join(tmpdir(), "runner-session-"));
+  // a run's credential files and nested login link go under the machine's tmpdir, which parallel
+  // workers share: keep them in this test's own
+  mkdirSync(join(root, "os-tmp"));
+  vi.stubEnv("TMPDIR", join(root, "os-tmp"));
   const origin = join(root, "origin");
   execFileSync("git", ["init", "-q", "-b", "main", origin]);
   writeFileSync(join(origin, "README"), "hi\n");
@@ -1437,6 +1442,11 @@ describe("the Claude credential of a run", () => {
         "Don't run a check that calls `claude`: report it as not run, with that reason.",
       );
       expect(append).toContain("Never set or use an API key for it");
+      // a follow-up of a subscription run still holds that run's nested command in its transcript
+      expect(append).toContain(
+        "A nested `claude` command or credential file path from an earlier run of this session doesn't apply on this run either.",
+      );
+      expect(append).not.toContain("sky-nested-claude-");
       // no line tells the agent to run the check as the nested command
       expect(append).not.toContain("Run each command that calls `claude`");
       expect(append).not.toContain("env -u");
@@ -1458,6 +1468,28 @@ describe("the Claude credential of a run", () => {
       expect(append).toContain('`CLAUDE_CODE_OAUTH_TOKEN="$(<');
       expect(append).toContain("logged in with this run's subscription");
       expect(append).not.toContain(TOKEN);
+    });
+
+    test("a subscription run's prompt names the agent's own link, the same on every run, and supersedes an earlier run's command", async () => {
+      isolatedCredentialDir();
+      const append = await promptOf(
+        { claudeAuth: "oauth" },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      );
+      const again = await promptOf(
+        { claudeAuth: "oauth", runId: "run_2" },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      );
+      const commandOf = (prompt: string) =>
+        prompt
+          .split("\n")
+          .find((line) => line.startsWith("Run each command that calls"));
+      expect(commandOf(append)).toContain("/sky-nested-claude-agt_1')\"");
+      expect(commandOf(append)).not.toContain("run_1");
+      expect(commandOf(again)).toBe(commandOf(append));
+      expect(append).toContain(
+        "Use that form on this run in place of any nested `claude` command or credential file path from an earlier run of this session.",
+      );
     });
 
     test("a subscription run's prompt has each check that calls claude run as the nested command", async () => {
@@ -1538,17 +1570,20 @@ describe("the Claude credential of a run", () => {
     });
 
     describe("a run that does not finish", () => {
-      /** Runs a subscription run whose script ends as `tail` says, and lists the credential directory during the run and after it. */
+      /** Runs a subscription run whose script ends as `tail` says, and lists the credential and nested login link directories during the run and after it. */
       const credentialFilesAround = async (
         tail: unknown[],
         controller = new AbortController(),
       ) => {
         const dir = isolatedCredentialDir();
+        const links = nestedLoginDir(join(root, "tmp"));
         let during: string[] = [];
+        let linksDuring: string[] = [];
         const query = scripted([
           init,
           async () => {
             during = readdirSync(dir);
+            linksDuring = readdirSync(links);
           },
           ...tail,
         ]);
@@ -1562,29 +1597,41 @@ describe("the Claude credential of a run", () => {
             credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
           },
         );
-        return { code, during, after: readdirSync(dir) };
+        return {
+          code,
+          during,
+          after: readdirSync(dir),
+          linksDuring,
+          linksAfter: readdirSync(links),
+        };
       };
       const loginsIn = (names: string[]) =>
         names.filter((name) => name.startsWith("sky-nested-claude-run_1-"));
 
       test("an SDK that throws leaves no credential file behind", async () => {
-        const { code, during, after } = await credentialFilesAround([
-          new Error("Claude Code process exited with code 1"),
-        ]);
+        const { code, during, after, linksDuring, linksAfter } =
+          await credentialFilesAround([
+            new Error("Claude Code process exited with code 1"),
+          ]);
         expect(code).toBe(1);
         expect(loginsIn(during)).toHaveLength(1);
         expect(after).toEqual([]);
+        expect(linksDuring).toEqual(["sky-nested-claude-agt_1"]);
+        expect(linksAfter).toEqual([]);
       });
 
       test("a run aborted by its signal leaves no credential file behind", async () => {
         const controller = new AbortController();
-        const { code, during, after } = await credentialFilesAround(
-          [async () => controller.abort("SIGTERM"), success],
-          controller,
-        );
+        const { code, during, after, linksDuring, linksAfter } =
+          await credentialFilesAround(
+            [async () => controller.abort("SIGTERM"), success],
+            controller,
+          );
         expect(code).toBe(1);
         expect(loginsIn(during)).toHaveLength(1);
         expect(after).toEqual([]);
+        expect(linksDuring).toEqual(["sky-nested-claude-agt_1"]);
+        expect(linksAfter).toEqual([]);
       });
     });
 
