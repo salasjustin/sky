@@ -49,8 +49,7 @@ function suidDumpable(): string | undefined {
  * Why this machine can't be asked what the kernel does with a sealed process, or undefined when it can:
  * Linux, a user that isn't root (root's capabilities read any file), a `setpriv` and `sh` only root can
  * change, `fs.suid_dumpable` at 0 or 2 (either way a non-dumpable process's `/proc` entries are root's;
- * only 1 leaves them to its user), and a temp
- * directory that executes what is written to it.
+ * only 1 leaves them to its user), and a temp directory that executes what is written to it.
  */
 function kernelGapOf(): string | undefined {
   if (process.platform !== "linux")

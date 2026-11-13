@@ -31,7 +31,7 @@ beforeAll(() => {
   execFileSync("pnpm", ["run", "--silent", "build"], { cwd: pkg });
 }, 30_000);
 
-// the runner rewrites Claude Code's credential file; keep it out of the real home
+// the runner removes a stored login from Claude Code's credential file; keep it out of the real home
 const CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), "runner-claude-"));
 afterAll(() => rmSync(CLAUDE_CONFIG_DIR, { recursive: true, force: true }));
 // no sprite API here, whatever host the tests run on: the runner would otherwise hold a real sprite
@@ -41,8 +41,8 @@ const NO_SPRITE_SOCKET = join(CLAUDE_CONFIG_DIR, "absent.sock");
 // The runner refuses to start Claude where it can't keep the credential from the repo's commands, which
 // depends on the host: Linux, privileges its user may lack (a CI runner can't change its effective user),
 // and a `setpriv` and `sh` at fixed paths that only root can change. These bundle runs stand in for the
-// host so a test's outcome doesn't depend on it: a preload makes the platform, the effective user and the
-// fixed files the capable sandbox's, and the kernel's answer about `/proc` its too. `unprivileged` is the
+// host so a test's outcome doesn't depend on it: a preload gives the platform, the effective user, the
+// fixed files and the kernel's answer about `/proc` as a capable sandbox has them. `unprivileged` is the
 // host whose runner can't change its user.
 const HOST = join(CLAUDE_CONFIG_DIR, "host");
 mkdirSync(HOST, { recursive: true });
@@ -724,7 +724,7 @@ describe("the Claude login stored in Claude Code's credential file", () => {
       CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
     });
     expect(code).toBe(1);
-    // the setup that once stored it ran
+    // session setup ran, so the missing file isn't a run that ended before it
     expect(stderr).toMatch(/runner: plugin refresh done/);
     expect(existsSync(credentials())).toBe(false);
   }, 20_000);
@@ -751,7 +751,7 @@ describe("the Claude login stored in Claude Code's credential file", () => {
     expect(JSON.parse(readFileSync(credentials(), "utf8"))).toEqual({
       designOauth: { accessToken: "design", refreshToken: "refresh" },
     });
-    expect(stderr).toMatch(/runner: removed the Claude login a runner stored/);
+    expect(stderr).toMatch(/runner: removed the Claude login an earlier runner stored/);
   }, 20_000);
 });
 

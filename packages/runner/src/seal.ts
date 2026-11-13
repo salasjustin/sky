@@ -129,7 +129,7 @@ const ancestorsOf = (path: string) => {
 
 /**
  * The first of `paths` that is a regular file only root can change, through every directory above it
- * and above the file it links to, as that file's own path; undefined when none is.
+ * and above the file it links to, returned as the path it resolves to; undefined when none is.
  */
 function rootOnlyProgram(
   paths: readonly string[],

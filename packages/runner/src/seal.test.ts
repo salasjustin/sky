@@ -400,7 +400,8 @@ describe("createSeal", () => {
 
 // the kernel itself, where it can be asked (see testing/kernel.ts). CI installs what it takes, so a gap
 // there is a setup problem to fail on, not coverage to skip: without this the three tests below, which
-// hold the PR's central claim, could skip on every run and nobody would know
+// show that a sealed Claude's environment is closed to the repo's commands, could skip on every run and
+// nobody would know
 test.runIf(process.env.CI)(
   "the kernel can be asked, so the real-kernel tests below run",
   () => {

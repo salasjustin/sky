@@ -41,7 +41,7 @@ function isSkyLogin(entry: unknown): boolean {
 }
 
 /**
- * Removes the run's subscription token an earlier runner stored in Claude Code's credential file,
+ * Removes the subscription token an earlier runner stored in Claude Code's credential file,
  * where every later run's commands could read it; resolves to whether there was one. The runner's
  * `claude` processes run host-managed, which ignores a stored login, so nothing here writes one.
  *

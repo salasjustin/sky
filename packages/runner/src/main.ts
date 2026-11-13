@@ -94,15 +94,15 @@ async function main(): Promise<void> {
   // a runner killed outright (SIGKILL, the OOM killer) left its credential files behind
   sweepCredentialFiles(processAlive);
   // an earlier runner may have left its run's token in Claude Code's credential file, where any later
-  // run's commands can read it; gone before this run starts one. A failure is a warning, not the run's
+  // run's commands can read it; removed before this run starts any. A failure is a warning, not the run's
   try {
     if (await removeSkyLogin(process.env))
       warn(
-        "runner: removed the Claude login a runner stored in Claude Code's credential file",
+        "runner: removed the Claude login an earlier runner stored in Claude Code's credential file",
       );
   } catch (error) {
     warn(
-      `runner: a stored Claude login may remain: ${error instanceof Error ? error.message : String(error)}`,
+      `runner: a Claude login an earlier runner stored may remain in Claude Code's credential file: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 
