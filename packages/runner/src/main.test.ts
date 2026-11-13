@@ -1,7 +1,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -36,6 +38,40 @@ afterAll(() => rmSync(CLAUDE_CONFIG_DIR, { recursive: true, force: true }));
 // when run inside one, and retry a missing socket for 30 seconds when run outside
 const NO_SPRITE_SOCKET = join(CLAUDE_CONFIG_DIR, "absent.sock");
 
+// The runner refuses to start Claude where it can't keep the credential from the repo's commands, which
+// depends on the host's privileges (a CI runner can't change its effective user). These bundle runs stand
+// in for the host so a test's outcome doesn't: a preload that makes the kernel's answers the capable
+// sandbox's, and a `setpriv` that only has to exist. `unprivileged` is the host that can't.
+const HOST = join(CLAUDE_CONFIG_DIR, "host");
+mkdirSync(join(HOST, "bin"), { recursive: true });
+writeFileSync(join(HOST, "bin/setpriv"), "#!/bin/sh\n");
+chmodSync(join(HOST, "bin/setpriv"), 0o755);
+const PRELOADS = {
+  capable: `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const realStatSync = fs.statSync;
+process.seteuid = () => {};
+fs.statSync = (path, ...rest) => {
+  const stat = realStatSync(path, ...rest);
+  return String(path).endsWith("/environ") ? { ...stat, uid: stat.uid + 1 } : stat;
+};
+syncBuiltinESMExports();
+`,
+  unprivileged: `
+// stepping to another user is refused; stepping back to one's own is always allowed
+const own = process.geteuid();
+process.seteuid = (uid) => {
+  if (uid !== own) throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+};
+`,
+};
+const preload = (host: keyof typeof PRELOADS) => {
+  const path = join(HOST, `${host}.mjs`);
+  writeFileSync(path, PRELOADS[host]);
+  return path;
+};
+
 const servers: Server[] = [];
 afterEach(() => {
   for (const s of servers.splice(0)) {
@@ -45,13 +81,17 @@ afterEach(() => {
 });
 
 /** Runs the bundle as the launcher does: the run's id as its argument. `args` replaces that. */
-async function runBundle(env: Record<string, string>, args?: string[]) {
+async function runBundle(
+  env: Record<string, string>,
+  args?: string[],
+  host: keyof typeof PRELOADS = "capable",
+) {
   const child = spawn(
     process.execPath,
-    [bundle, ...(args ?? [env.RUN_ID ?? ""])],
+    ["--import", preload(host), bundle, ...(args ?? [env.RUN_ID ?? ""])],
     {
       env: {
-        PATH: process.env.PATH ?? "",
+        PATH: `${join(HOST, "bin")}:${process.env.PATH ?? ""}`,
         CLAUDE_CONFIG_DIR,
         SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
         ...env,
@@ -258,6 +298,55 @@ test("a failed run posts run.failed to the API with the agent token, exits 1, an
   }
   // an idle keep-alive socket or a live child would hold the process open: runBundle then never
   // resolves and the timeout fails the test, with no wall-clock threshold to tune
+}, 20_000);
+
+test("a host whose runner can't change its effective user fails the run as credential_exposed, before any worktree work", async () => {
+  const received: { body: unknown }[] = [];
+  const api = createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      received.push({ body: JSON.parse(body) });
+      res.writeHead(204).end();
+    });
+  });
+  api.listen(0, "127.0.0.1");
+  await once(api, "listening");
+  const { port } = api.address() as AddressInfo;
+  try {
+    const { code } = await runBundle(
+      {
+        AGENT_ID: "agt_1",
+        RUN_ID: "run_1",
+        PROMPT: "do it",
+        API_BASE_URL: `http://127.0.0.1:${port}`,
+        AGENT_TOKEN: "agent-secret",
+        CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+        REPO_DIR: "/nonexistent/repo",
+        WORKTREES_DIR: "/nonexistent/worktrees",
+      },
+      undefined,
+      "unprivileged",
+    );
+    expect(code).toBe(1);
+    expect(received).toEqual([
+      {
+        body: {
+          runId: "run_1",
+          type: "run.failed",
+          payload: {
+            error: expect.stringMatching(
+              /^credential_exposed: .*can't change its effective user \(EPERM\).*the run did not start\.$/,
+            ),
+          },
+        },
+      },
+    ]);
+    expect(JSON.stringify(received)).not.toContain("oauth-secret");
+  } finally {
+    api.closeAllConnections();
+    api.close();
+  }
 }, 20_000);
 
 test("the runner holds the sprite through the Tasks API at SKY_SPRITE_API_SOCKET", async () => {
