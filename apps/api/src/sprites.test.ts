@@ -2,7 +2,9 @@ import { APIError, SpritesClient } from "@fly/sprites";
 import { expect, test, vi } from "vitest";
 import { KnownSecrets } from "./redact.js";
 import {
+  execCapped,
   execInSprite,
+  SpriteExecStreamError,
   type SpriteOps,
   SpriteTimeoutError,
   spriteCall,
@@ -116,6 +118,83 @@ test("a hung exec is cut at its bound: the request is aborted and the call rejec
     "sprite sky-a: clone timed out after 50 ms",
   );
   expect(logged.at(-1)).toBe("sprite sky-a clone: timed out after 50ms");
+});
+
+test("an exec whose output arrives re-chunked fails as an undecodable stream, not as an unreachable sprite", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  // 0x74 is "t": the second chunk starts with output where the SDK expects a frame-type byte
+  wire.execChunkBytes = 1024;
+  wire.exec = () => ({ exitCode: 0, stdout: "t".repeat(5000) });
+  const { ops, logged } = opsWith();
+  const err = await execInSprite(ops, "sky-a", ["git", "diff"], {
+    op: "diff",
+  }).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(SpriteExecStreamError);
+  expect((err as Error).message).toContain(
+    "Unsupported HTTP exec frame type 0x74",
+  );
+  expect(((err as Error).cause as Error).message).toContain(
+    "preserved HTTP chunk boundaries",
+  );
+  expect(logged.at(-1)).toContain("failed in");
+});
+
+test("an exec that fails in transport is not an undecodable stream", async () => {
+  stubSprites();
+  const { ops } = opsWith();
+  const err = await execInSprite(ops, "sky-missing", ["true"], {
+    op: "check",
+  }).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(APIError);
+});
+
+test("a capped exec of large output re-chunked on the wire returns the first bytes, the full size and a truncated flag", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  wire.execChunkBytes = 1024;
+  const big = "t".repeat(5000);
+  wire.exec = () => ({ exitCode: 0, stdout: big });
+  const { ops } = opsWith();
+  const out = await execCapped(ops, "sky-a", ["git", "diff"], {
+    op: "diff",
+    maxBytes: 1000,
+  });
+  expect(out).toEqual({ exitCode: 0, stdout: "", size: 5000, truncated: true });
+  // a single line longer than the cap leaves nothing whole to return
+  wire.exec = () => ({ exitCode: 0, stdout: `${"a".repeat(99)}\n`.repeat(50) });
+  const lines = await execCapped(ops, "sky-a", ["git", "diff"], {
+    op: "diff",
+    maxBytes: 1000,
+  });
+  expect(lines).toEqual({
+    exitCode: 0,
+    stdout: `${"a".repeat(99)}\n`.repeat(10),
+    size: 5000,
+    truncated: true,
+  });
+});
+
+test("a capped exec of output within the cap returns all of it untruncated, and a nonzero exit reads nothing", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  const { ops } = opsWith();
+  wire.exec = () => ({ exitCode: 0, stdout: "small\n" });
+  expect(
+    await execCapped(ops, "sky-a", ["git", "diff"], {
+      op: "diff",
+      maxBytes: 1000,
+    }),
+  ).toEqual({ exitCode: 0, stdout: "small\n", size: 6, truncated: false });
+  wire.calls.length = 0;
+  wire.exec = () => ({ exitCode: 3 });
+  expect(
+    await execCapped(ops, "sky-a", ["git", "diff"], {
+      op: "diff",
+      maxBytes: 1000,
+    }),
+  ).toMatchObject({ exitCode: 3, stdout: "" });
+  expect(wire.calls.some((c) => c.startsWith("read "))).toBe(false);
 });
 
 test("a bound in whole minutes or seconds reads as such in the error", async () => {

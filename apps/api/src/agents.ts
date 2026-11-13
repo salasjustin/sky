@@ -47,7 +47,12 @@ import {
   reservedName,
   storeRunEnvVars,
 } from "./secrets.js";
-import { execInSprite, type SpriteOps } from "./sprites.js";
+import {
+  execCapped,
+  execInSprite,
+  SpriteExecStreamError,
+  type SpriteOps,
+} from "./sprites.js";
 import { body, jsonBody } from "./validation.js";
 
 const Prompt = z.string().min(1);
@@ -99,10 +104,15 @@ const presentRunDetail = (
   agent: Pick<AgentRow, "branch" | "remoteBranch">,
   repo: string,
   diff: string | null,
+  // the diff's full size in bytes, set only when `diff` is cut short of it
+  truncatedFrom: number | null = null,
 ) => ({
   ...presentRun(run, runError(db, run.id)),
   branch: agent.branch,
   diff,
+  ...(truncatedFrom === null
+    ? {}
+    : { diffTruncated: true, diffSize: truncatedFrom }),
   pendingRequest: openRequestOf(db, run.id)?.request ?? null,
   rollup: run.rollup,
   compareUrl: run.rollup
@@ -268,6 +278,9 @@ const agentRow = (tx: Tx, id: AgentId) => {
 // error, and git's complaint about it stays off the wire: the SDK's HTTP exec reads each chunk as a
 // frame, so a failing command's stderr and exit status in one chunk fail the whole call
 export const DIFF = `git rev-parse --verify --quiet "refs/heads/$2" >/dev/null 2>&1 || exit 3; exec git diff "$1...$2" 2>/dev/null`;
+
+/** The most of a run's diff the run detail carries; a larger one is cut to it and flagged. */
+export const DIFF_MAX_BYTES = 1024 * 1024;
 
 const archived = (c: Context) =>
   apiError(c, 409, "agent_archived", "the agent is archived");
@@ -765,6 +778,7 @@ export function agentRoutes(
       const { run, agent, spriteName, repo } = found;
       // the runner commits at run end, so an active run's branch doesn't hold its work yet
       let diff: string | null = null;
+      let diffSize: number | null = null;
       if (!isActive(run.status)) {
         // the runner pins refs/sky/starts/<agentId> where the worktree left the start branch and never
         // moves it, unlike origin/<remoteBranch>, which an outside push advances past the agent's work
@@ -772,11 +786,11 @@ export function agentRoutes(
           ? `refs/sky/starts/${agent.id}`
           : "origin/HEAD";
         try {
-          const out = await execInSprite(
+          const out = await execCapped(
             sprites,
             spriteName,
             ["sh", "-c", DIFF, "sh", base, agent.branch],
-            { op: "diff", cwd: REPO_DIR },
+            { op: "diff", cwd: REPO_DIR, maxBytes: DIFF_MAX_BYTES },
           );
           // 3: the runner never created the branch (a launch that failed, a runner killed first)
           if (out.exitCode !== 0 && out.exitCode !== 3) {
@@ -790,9 +804,20 @@ export function agentRoutes(
               ...c.var.secrets.values(),
               mintAgentToken(c.var.config.apiKey, run.id),
             ]);
+            if (out.truncated) diffSize = out.size;
           }
         } catch (err) {
-          log(`diff of ${run.id} failed: ${err}`);
+          log(
+            `diff of ${run.id} failed: ${err}${err instanceof Error && err.cause ? ` (cause: ${err.cause})` : ""}`,
+          );
+          if (err instanceof SpriteExecStreamError) {
+            return apiError(
+              c,
+              502,
+              "sprite_exec_failed",
+              "the sprite answered, but the run's diff could not be read from it; retry",
+            );
+          }
           return apiError(
             c,
             502,
@@ -801,7 +826,10 @@ export function agentRoutes(
           );
         }
       }
-      return c.json(presentRunDetail(db, run, agent, repo, diff), 200);
+      return c.json(
+        presentRunDetail(db, run, agent, repo, diff, diffSize),
+        200,
+      );
     })
     .get("/:id/runs/:runId/stream", runParam, afterQuery, lastEventId, (c) => {
       const { id, runId } = c.req.valid("param");

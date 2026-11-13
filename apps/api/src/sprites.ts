@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { APIError, ExecError, type SpritesClient } from "@fly/sprites";
 import { type KnownSecrets, redact } from "./redact.js";
 
@@ -152,6 +152,21 @@ export async function ensureSprite(
 export type ExecOutcome = { exitCode: number; stdout: string; stderr: string };
 
 /**
+ * The sprite answered, but the SDK could not read its HTTP exec stream: its frames carry no length,
+ * so output an intermediary re-chunks is misread. The sprite is reachable; the exec is not usable.
+ */
+export class SpriteExecStreamError extends Error {}
+
+// the plain `Error`s `execFileHTTP` throws for a stream it cannot parse; transport failures are not these
+const STREAM_DECODE =
+  /^(Unsupported HTTP exec frame|Invalid HTTP exec exit frame|HTTP exec response did not include|(stdout|stderr) maxBuffer exceeded)/;
+
+const isStreamDecodeError = (err: unknown): err is Error =>
+  err instanceof Error &&
+  err.constructor === Error &&
+  STREAM_DECODE.test(err.message);
+
+/**
  * Runs `argv` in the sprite over the SDK's HTTP exec (no WebSocket, no TTY) and waits for it to
  * exit. A nonzero exit resolves with its outcome; only transport and API errors throw, the bound
  * running out included, which also cuts the request (and with it the process).
@@ -174,6 +189,12 @@ export function execInSprite(
         return toOutcome(result);
       } catch (err) {
         if (err instanceof ExecError) return toOutcome(err.result);
+        if (isStreamDecodeError(err)) {
+          throw new SpriteExecStreamError(
+            `sprite ${name}: ${options.op} exec stream could not be decoded: ${err.message}`,
+            { cause: err },
+          );
+        }
         throw err;
       }
     },
@@ -238,6 +259,84 @@ export async function execLogged(
       ops.client.sprite(name).filesystem("/").readFile(`${log}.tail`, "utf8"),
   ).catch(() => "");
   return { exitCode, tail };
+}
+
+// $1 the output file, $2 the byte cap, the rest the argv. Stdout goes whole to `<out>.full`, which
+// never crosses the wire: `<out>` keeps its first $2 bytes, `<out>.size` the full byte count, and the
+// argv's own exit status is the script's. Stderr is dropped, as it would share the exec with the exit frame.
+export const CAPPED_EXEC =
+  'out=$1; cap=$2; shift 2; "$@" >"$out.full" 2>/dev/null; rc=$?; wc -c <"$out.full" >"$out.size"; head -c "$cap" "$out.full" >"$out"; rm -f "$out.full"; exit $rc';
+
+export type CappedOutput = {
+  exitCode: number;
+  /** The first `maxBytes` of stdout, cut back to a whole line when it was longer. */
+  stdout: string;
+  /** Stdout's full size in bytes. */
+  size: number;
+  truncated: boolean;
+};
+
+/**
+ * Runs `argv` like `execInSprite`, but its stdout goes to a file in the sprite so nothing but the
+ * exit frame crosses the HTTP exec, which misreads output an intermediary re-chunks. What comes back
+ * is read over the filesystem API and is never more than `maxBytes`, however large the output.
+ * Nothing is read for a nonzero exit.
+ */
+export async function execCapped(
+  ops: SpriteOps,
+  name: string,
+  argv: [string, ...string[]],
+  { maxBytes, ...options }: CallOptions & { cwd?: string; maxBytes: number },
+): Promise<CappedOutput> {
+  const out = `/tmp/sky-exec-${randomUUID()}`;
+  const fs = () => ops.client.sprite(name).filesystem("/");
+  const cleanup = () =>
+    spriteCall(ops, name, { op: "rm-capped" }, () =>
+      Promise.all([out, `${out}.size`].map((p) => fs().rm(p, { force: true }))),
+    ).catch(() => {});
+  try {
+    const { exitCode } = await execInSprite(
+      ops,
+      name,
+      ["sh", "-c", CAPPED_EXEC, "sh", out, `${maxBytes}`, ...argv],
+      options,
+    );
+    if (exitCode !== 0)
+      return { exitCode, stdout: "", size: 0, truncated: false };
+    const [head, size] = await Promise.all([
+      spriteCall(ops, name, { op: "read-capped", known: options.known }, () =>
+        fs().readFile(out, null),
+      ),
+      spriteCall(ops, name, { op: "read-size" }, () =>
+        fs().readFile(`${out}.size`, "utf8"),
+      ),
+    ]);
+    const total = Number.parseInt(size.trim(), 10);
+    if (!Number.isSafeInteger(total) || total < head.length) {
+      throw new SpriteExecStreamError(
+        `sprite ${name}: ${options.op} left an unreadable size file`,
+      );
+    }
+    if (total <= maxBytes) {
+      return {
+        exitCode,
+        stdout: head.toString("utf8"),
+        size: total,
+        truncated: false,
+      };
+    }
+    // back to the last newline: a secret redaction looks for is then whole or gone, never half of one
+    const text = head.toString("utf8");
+    const cut = text.lastIndexOf("\n");
+    return {
+      exitCode,
+      stdout: cut < 0 ? "" : text.slice(0, cut + 1),
+      size: total,
+      truncated: true,
+    };
+  } finally {
+    await cleanup();
+  }
 }
 
 // the API names the new checkpoint only in the `complete` message's text

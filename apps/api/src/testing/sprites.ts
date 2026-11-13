@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { HttpResponse, http, ws } from "msw";
 import { server } from "../../../../test/msw.js";
 import type { Config } from "../config.js";
-import { LOGGED_EXEC } from "../sprites.js";
+import { CAPPED_EXEC, LOGGED_EXEC } from "../sprites.js";
 
 export const spritesToken = "sprites-test-token";
 const SPRITES = "https://api.sprites.dev/v1/sprites";
@@ -94,7 +94,7 @@ export function stubSprites() {
      * One line per call, in order: `create <name>`, `exec <name> <dir> <argv…>` (`… &> <log>` for an
      * `execLogged` wrapper, its inner argv shown), `write <name> <path>`,
      * `session <name> <dir> <argv…>`, `checkpoint <name>`, `get <name>`, `read <name> <path>`,
-     * `delete <name>`, `label <name>` (the PUT that sets labels).
+     * `rm <name> <path>`, `delete <name>`, `label <name>` (the PUT that sets labels).
      */
     calls: [] as string[],
     /** The body of each sprite's last update, by name. */
@@ -206,8 +206,15 @@ export function stubSprites() {
         argv[0] === "sh" && argv[1] === "-c" && argv[2] === LOGGED_EXEC
           ? { log: argv[4] ?? "", bytes: Number(argv[5]), argv: argv.slice(6) }
           : undefined;
+      // execCapped's wrapper: `sh -c <script> sh <out> <cap> <argv…>`; stdout lands in files, as the shell leaves it
+      const capped =
+        argv[0] === "sh" && argv[1] === "-c" && argv[2] === CAPPED_EXEC
+          ? { out: argv[4] ?? "", cap: Number(argv[5]), argv: argv.slice(6) }
+          : undefined;
       const call = `exec ${name} ${url.searchParams.get("dir") ?? "-"} ${
-        logged ? `${logged.argv.join(" ")} &> ${logged.log}` : argv.join(" ")
+        logged
+          ? `${logged.argv.join(" ")} &> ${logged.log}`
+          : (capped?.argv ?? argv).join(" ")
       }`;
       wire.calls.push(call);
       if (wire.hangs(call)) return hang(request);
@@ -215,7 +222,13 @@ export function stubSprites() {
         return HttpResponse.json({ error: "not found" }, { status: 404 });
       }
       const enc = new TextEncoder();
-      let outcome = wire.exec(logged?.argv ?? argv);
+      let outcome = wire.exec(logged?.argv ?? capped?.argv ?? argv);
+      if (capped) {
+        const full = enc.encode(outcome.stdout ?? "");
+        wire.files.set(capped.out, full.slice(0, capped.cap));
+        wire.files.set(`${capped.out}.size`, enc.encode(`${full.length}\n`));
+        outcome = { exitCode: outcome.exitCode };
+      }
       if (logged) {
         if (outcome.exitCode !== 0) {
           const combined = enc.encode(
@@ -286,6 +299,18 @@ export function stubSprites() {
       return new HttpResponse(bytes, {
         headers: { "content-type": "application/octet-stream" },
       });
+    }),
+    http.delete(`${SPRITES}/:name/fs/delete`, ({ request, params }) => {
+      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
+      const path = new URL(request.url).searchParams.get("path") ?? "";
+      wire.calls.push(`rm ${String(params.name)} ${path}`);
+      if (!wire.files.delete(path)) {
+        return HttpResponse.json(
+          { error: "no such file", code: "ENOENT", path },
+          { status: 404 },
+        );
+      }
+      return HttpResponse.json({ path });
     }),
     // the WebSocket upgrade's headers are out of MSW's reach, so this one can't check the bearer
     execLink.addEventListener("connection", ({ client, params }) => {
