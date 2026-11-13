@@ -1418,6 +1418,11 @@ describe("the Claude credential of a run", () => {
         "Don't run a check that calls `claude`: report it as not run, with that reason.",
       );
       expect(append).toContain("Never set or use an API key for it");
+      // a follow-up of a subscription run still holds that run's nested command in its transcript
+      expect(append).toContain(
+        "A nested `claude` command or credential file path from an earlier run of this session doesn't apply on this run either.",
+      );
+      expect(append).not.toContain("sky-nested-claude-");
       // no line tells the agent to run the check as the nested command
       expect(append).not.toContain("Run each command that calls `claude`");
       expect(append).not.toContain("env -u");
@@ -1439,6 +1444,28 @@ describe("the Claude credential of a run", () => {
       expect(append).toContain('`CLAUDE_CODE_OAUTH_TOKEN="$(<');
       expect(append).toContain("logged in with this run's subscription");
       expect(append).not.toContain(TOKEN);
+    });
+
+    test("a subscription run's prompt names the agent's own link, the same on every run, and supersedes an earlier run's command", async () => {
+      isolatedCredentialDir();
+      const append = await promptOf(
+        { claudeAuth: "oauth" },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      );
+      const again = await promptOf(
+        { claudeAuth: "oauth", runId: "run_2" },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      );
+      const commandOf = (prompt: string) =>
+        prompt
+          .split("\n")
+          .find((line) => line.startsWith("Run each command that calls"));
+      expect(commandOf(append)).toContain("/sky-nested-claude-agt_1')\"");
+      expect(commandOf(append)).not.toContain("run_1");
+      expect(commandOf(again)).toBe(commandOf(append));
+      expect(append).toContain(
+        "a nested `claude` command or credential file path from an earlier run of this session is superseded by it.",
+      );
     });
 
     test("a subscription run's prompt has each check that calls claude run as the nested command", async () => {
