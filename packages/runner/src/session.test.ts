@@ -770,8 +770,12 @@ test("the session turns Claude Code's commit and pull request attribution off", 
     signal: new AbortController().signal,
     awaitDecision: noDecision,
   });
-  expect(query.calls[0]?.options.settings).toMatchObject({
+  // the SessionStart hook that gives the commands the project's own env is the one other key a run may add
+  const { hooks: _hooks, ...settings } = (query.calls[0]?.options.settings ??
+    {}) as Record<string, unknown>;
+  expect(settings).toEqual({
     attribution: { commit: "", pr: "" },
+    ...PINNED_SETTINGS,
   });
 });
 
@@ -4071,6 +4075,9 @@ describe("keeping the run's Claude credential from the repo's processes", () => 
       seal: sealed(),
     });
     expect(code).toBe(0);
+    // the worktree the failing seal above never gets
+    expect(existsSync(join(config.worktreesDir, config.agentId))).toBe(true);
+    expect(posted.posted.map((event) => event.type)).toContain("run.started");
     expect(posted.posted.at(-1)).toMatchObject({ type: "run.finished" });
   });
 
@@ -4098,7 +4105,8 @@ describe("keeping the run's Claude credential from the repo's processes", () => 
   );
 
   test.each([["oauth"], ["api-key"]] as const)(
-    "%s: every credential helper is pinned empty at the flag level, above the project, project-local and user files",
+    // the flag-level precedence over the settings files is the probe's to show; this guards the key list
+    "%s: the session's settings carry all seven credential helper keys, each empty",
     async (claudeAuth) => {
       const query = scripted([init, success]);
       await runSession({ ...config, claudeAuth }, deps(query));

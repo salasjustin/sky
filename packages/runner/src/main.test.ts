@@ -39,26 +39,62 @@ afterAll(() => rmSync(CLAUDE_CONFIG_DIR, { recursive: true, force: true }));
 const NO_SPRITE_SOCKET = join(CLAUDE_CONFIG_DIR, "absent.sock");
 
 // The runner refuses to start Claude where it can't keep the credential from the repo's commands, which
-// depends on the host's privileges (a CI runner can't change its effective user). These bundle runs stand
-// in for the host so a test's outcome doesn't: a preload that makes the kernel's answers the capable
-// sandbox's, and a `setpriv` that only has to exist. `unprivileged` is the host that can't.
+// depends on the host: Linux, privileges its user may lack (a CI runner can't change its effective user),
+// and a `setpriv` and `sh` at fixed paths that only root can change. These bundle runs stand in for the
+// host so a test's outcome doesn't depend on it: a preload makes the platform, the effective user and the
+// fixed files the capable sandbox's, and the kernel's answer about `/proc` its too. `unprivileged` is the
+// host whose runner can't change its user.
 const HOST = join(CLAUDE_CONFIG_DIR, "host");
-mkdirSync(join(HOST, "bin"), { recursive: true });
-writeFileSync(join(HOST, "bin/setpriv"), "#!/bin/sh\n");
-chmodSync(join(HOST, "bin/setpriv"), 0o755);
-const PRELOADS = {
-  capable: `
+mkdirSync(HOST, { recursive: true });
+// the files the seal reads (seal.ts: SETPRIV_PATHS, SH_PATHS), as a root-owned sandbox has them
+const FIXED_FILES = [
+  "/usr/bin/setpriv",
+  "/bin/setpriv",
+  "/bin/sh",
+  "/usr/bin/sh",
+];
+const FIXED_DIRS = ["/", "/usr", "/usr/bin", "/bin"];
+const STAND_IN_PLATFORM = `
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
+Object.defineProperty(process, "platform", { value: "linux" });
+if (!process.geteuid) process.geteuid = () => 1000;
+const FILES = new Set(${JSON.stringify(FIXED_FILES)});
+const DIRS = new Set(${JSON.stringify(FIXED_DIRS)});
 const realStatSync = fs.statSync;
-process.seteuid = () => {};
+const realRealpathSync = fs.realpathSync;
+const rootOwned = (mode) => ({
+  uid: 0,
+  mode,
+  isFile: () => (mode & 0o170000) === 0o100000,
+  isDirectory: () => (mode & 0o170000) === 0o040000,
+});
 fs.statSync = (path, ...rest) => {
-  const stat = realStatSync(path, ...rest);
-  return String(path).endsWith("/environ") ? { ...stat, uid: stat.uid + 1 } : stat;
+  const at = String(path);
+  if (FILES.has(at)) return rootOwned(0o100755);
+  if (DIRS.has(at)) return rootOwned(0o040755);
+  if (at.endsWith("/environ")) {
+    // another user's, as the kernel shows a non-dumpable process's; a host without /proc has none to stat
+    let stat = {};
+    try { stat = realStatSync(path, ...rest); } catch {}
+    return { ...stat, uid: process.geteuid() + 1 };
+  }
+  return realStatSync(path, ...rest);
 };
+fs.realpathSync = Object.assign(
+  (path, ...rest) => (FILES.has(String(path)) ? String(path) : realRealpathSync(path, ...rest)),
+  {
+    native: (path, ...rest) =>
+      FILES.has(String(path)) ? String(path) : realRealpathSync.native(path, ...rest),
+  },
+);
 syncBuiltinESMExports();
+`;
+const PRELOADS = {
+  capable: `${STAND_IN_PLATFORM}
+process.seteuid = () => {};
 `,
-  unprivileged: `
+  unprivileged: `${STAND_IN_PLATFORM}
 // stepping to another user is refused; stepping back to one's own is always allowed
 const own = process.geteuid();
 process.seteuid = (uid) => {
@@ -71,11 +107,6 @@ const preload = (host: keyof typeof PRELOADS) => {
   writeFileSync(path, PRELOADS[host]);
   return path;
 };
-// the seal the preloads stand in for is Linux's: elsewhere the runner fails every run as
-// credential_exposed before the worktree, and `unprivileged` needs `process.geteuid`, which
-// Windows lacks. A test whose outcome depends on how the seal turns out runs only here
-const sealHost =
-  process.platform === "linux" && typeof process.geteuid === "function";
 
 /**
  * A stand-in command at `<dir>/<name>` that prints `stdout` and exits `code`, appending its
@@ -110,7 +141,7 @@ async function runBundle(
     ["--import", preload(host), bundle, ...(args ?? [env.RUN_ID ?? ""])],
     {
       env: {
-        PATH: `${join(HOST, "bin")}:${process.env.PATH ?? ""}`,
+        PATH: process.env.PATH ?? "",
         CLAUDE_CONFIG_DIR,
         SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
         ...env,
@@ -272,7 +303,7 @@ describe("a stray runner.mjs started in a run's shell, which inherits PROMPT_FIL
   }, 20_000);
 });
 
-test.skipIf(!sealHost)(
+test(
   "a failed run posts run.failed to the API with the agent token, exits 1, and leaves nothing running",
   async () => {
     const received: { auth?: string; body: unknown }[] = [];
@@ -323,7 +354,7 @@ test.skipIf(!sealHost)(
   20_000,
 );
 
-test.skipIf(!sealHost)(
+test(
   "a host whose runner can't change its effective user fails the run as credential_exposed, before any worktree work",
   async () => {
     const received: { body: unknown }[] = [];
@@ -430,23 +461,27 @@ test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies
   if (!api) throw new Error("no server");
   await once(api, "listening");
   const { port } = api.address() as AddressInfo;
-  const child = spawn(process.execPath, [bundle, "run_1"], {
-    env: {
-      PATH: process.env.PATH ?? "",
-      CLAUDE_CONFIG_DIR,
-      SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
-      AGENT_ID: "agt_1",
-      RUN_ID: "run_1",
-      PROMPT: "do it",
-      API_BASE_URL: `http://127.0.0.1:${port}`,
-      AGENT_TOKEN: "agent-secret",
-      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
-      REPO_DIR: "/nonexistent/repo",
-      WORKTREES_DIR: "/nonexistent/worktrees",
-      PROMPT_FILE: join(runs, "run_1.prompt"),
+  const child = spawn(
+    process.execPath,
+    ["--import", preload("capable"), bundle, "run_1"],
+    {
+      env: {
+        PATH: process.env.PATH ?? "",
+        CLAUDE_CONFIG_DIR,
+        SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
+        AGENT_ID: "agt_1",
+        RUN_ID: "run_1",
+        PROMPT: "do it",
+        API_BASE_URL: `http://127.0.0.1:${port}`,
+        AGENT_TOKEN: "agent-secret",
+        CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+        REPO_DIR: "/nonexistent/repo",
+        WORKTREES_DIR: "/nonexistent/worktrees",
+        PROMPT_FILE: join(runs, "run_1.prompt"),
+      },
+      stdio: "ignore",
     },
-    stdio: "ignore",
-  });
+  );
   try {
     const exited = once(child, "exit");
     // the runner is mid-post of run.failed, the API holding its answer
@@ -583,6 +618,7 @@ const alive = (pid: number) => {
   }
 };
 
+// the reap scans `/proc`, which only Linux has
 const linux = existsSync("/proc/self/stat");
 
 test.skipIf(!linux)(
@@ -626,16 +662,20 @@ test.skipIf(!linux)(
     const { port } = api.address() as AddressInfo;
     try {
       const server = await leftover("run_reap2", dir, true);
-      const child = spawn(process.execPath, [bundle, "run_reap2"], {
-        env: {
-          PATH: process.env.PATH ?? "",
-          CLAUDE_CONFIG_DIR,
-          SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
-          ...runEnv(`http://127.0.0.1:${port}`, join(dir, "run_reap2.prompt")),
-          RUN_ID: "run_reap2",
+      const child = spawn(
+        process.execPath,
+        ["--import", preload("capable"), bundle, "run_reap2"],
+        {
+          env: {
+            PATH: process.env.PATH ?? "",
+            CLAUDE_CONFIG_DIR,
+            SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
+            ...runEnv(`http://127.0.0.1:${port}`, join(dir, "run_reap2.prompt")),
+            RUN_ID: "run_reap2",
+          },
+          stdio: "ignore",
         },
-        stdio: "ignore",
-      });
+      );
       const exited = once(child, "exit");
       // the first stop, while the runner is mid-post of run.failed
       await until(() => respond !== undefined);
@@ -715,8 +755,7 @@ describe("the Claude login stored in Claude Code's credential file", () => {
   }, 20_000);
 });
 
-// the git commands run only once the seal holds, which the preloads stand in for on Linux alone
-describe.skipIf(!sealHost)("the runner's own commands", () => {
+describe("the runner's own commands", () => {
   let dir: string;
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "runner-main-children-"));
@@ -748,7 +787,7 @@ describe.skipIf(!sealHost)("the runner's own commands", () => {
         // a directory git can start in
         REPO_DIR: dir,
         WORKTREES_DIR: join(dir, "worktrees"),
-        PATH: `${bin}:${join(HOST, "bin")}:${process.env.PATH ?? ""}`,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
         SKY_CLAUDE: join(bin, "claude"),
         TMPDIR: dir,
       });

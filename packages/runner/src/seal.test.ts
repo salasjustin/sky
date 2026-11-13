@@ -1,22 +1,28 @@
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
-  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   createSeal,
   hideRunner,
   isHidden,
   removeSealedCopiesNow,
 } from "./seal.js";
+import { kernelCanBeAsked, kernelGap } from "./testing/kernel.js";
+
+// the real `rmSync` unless a test makes one call fail
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, rmSync: vi.fn(actual.rmSync) };
+});
 
 let dir: string;
 beforeEach(() => {
@@ -282,30 +288,125 @@ describe("createSeal", () => {
   test("before Claude is started, its process can't be vouched for", () => {
     expect(sealOn(SANDBOX).check()).toMatch(/not started/);
   });
+
+  describe("the copy of Claude's binary", () => {
+    let copies: string;
+    let binary: string;
+    beforeEach(() => {
+      copies = join(dir, "copies");
+      binary = join(dir, "claude-binary");
+      writeFileSync(binary, "");
+    });
+    const fakeProcess = (over: object = {}) =>
+      Object.assign(new EventEmitter(), {
+        pid: process.pid,
+        exitCode: null,
+        signalCode: null,
+        ...over,
+      }) as unknown as ChildProcess;
+    const start = (seal: ReturnType<typeof createSeal>, command = binary) =>
+      seal.spawn({
+        command,
+        args: [],
+        env: {},
+        signal: new AbortController().signal,
+      });
+
+    test("a start that fails leaves no copy behind, and the failure reaches the caller", () => {
+      const seal = sealOn(SANDBOX, {
+        dir: copies,
+        spawn: () => {
+          throw new Error("exec failed");
+        },
+      });
+      expect(() => start(seal)).toThrow("exec failed");
+      expect(readdirSync(copies)).toEqual([]);
+    });
+
+    test("a binary that can't be copied is never started, leaves no copy, and the failure reaches the caller", () => {
+      const started: string[] = [];
+      const seal = sealOn(SANDBOX, {
+        dir: copies,
+        spawn: (command) => {
+          started.push(command);
+          return fakeProcess();
+        },
+      });
+      expect(() => start(seal, join(dir, "no-such-binary"))).toThrow(/ENOENT/);
+      expect(started).toEqual([]);
+      expect(readdirSync(copies)).toEqual([]);
+    });
+
+    test.each([
+      ["exit", 0],
+      ["error", new Error("spawn failed")],
+    ])("is removed when the process emits %s", (event, payload) => {
+      const claude = fakeProcess();
+      start(sealOn(SANDBOX, { dir: copies, spawn: () => claude }));
+      expect(readdirSync(copies)).toHaveLength(1);
+      claude.emit(event, payload);
+      expect(readdirSync(copies)).toEqual([]);
+    });
+
+    test("removeSealedCopiesNow goes on to the next copy when one can't be removed, and never throws", () => {
+      const spawnFake = () => fakeProcess();
+      start(sealOn(SANDBOX, { dir: join(dir, "a"), spawn: spawnFake }));
+      start(sealOn(SANDBOX, { dir: join(dir, "b"), spawn: spawnFake }));
+      // copies go in the order they were made: `a`'s is the one that fails
+      vi.mocked(rmSync).mockImplementationOnce(() => {
+        throw Object.assign(new Error("EBUSY"), { code: "EBUSY" });
+      });
+      expect(() => removeSealedCopiesNow()).not.toThrow();
+      expect(readdirSync(join(dir, "b"))).toEqual([]);
+      expect(readdirSync(join(dir, "a"))).toHaveLength(1);
+    });
+  });
+
+  describe("check", () => {
+    const started = (over: object) => {
+      const claude = Object.assign(new EventEmitter(), {
+        pid: process.pid,
+        exitCode: null,
+        signalCode: null,
+        ...over,
+      }) as unknown as ChildProcess;
+      const seal = sealOn(SANDBOX, { dir, spawn: () => claude });
+      const source = join(dir, "claude-binary");
+      writeFileSync(source, "");
+      seal.spawn({
+        command: source,
+        args: [],
+        env: {},
+        signal: new AbortController().signal,
+      });
+      return seal;
+    };
+
+    test.each([
+      ["exited", { exitCode: 0 }],
+      ["killed by a signal", { signalCode: "SIGKILL" }],
+    ])("a process that %s holds nothing to read", (_, over) => {
+      expect(started(over).check()).toBeUndefined();
+    });
+
+    // this test's own process: its environ is its user's to read, on any host
+    test("a running process whose /proc entries are its user's own is reported", () => {
+      expect(started({}).check()).toBe(
+        "the kernel lets the repo's commands read Claude's environment",
+      );
+    });
+  });
 });
 
-// the kernel itself, on a machine where it can be asked: Linux, not root (root's capabilities read any
-// file), with a `setpriv` that runs here, and core dumps of non-dumpable processes off
-const setprivRuns =
-  process.platform === "linux" &&
-  spawnSync("setpriv", [
-    "--inh-caps=-dac_override,-dac_read_search",
-    "--ambient-caps=-dac_override,-dac_read_search",
-    "true",
-  ]).status === 0;
-const dumpableRespected = (() => {
-  try {
-    return readFileSync("/proc/sys/fs/suid_dumpable", "utf8").trim() === "0";
-  } catch {
-    return false;
-  }
-})();
-const kernelCanBeAsked =
-  setprivRuns &&
-  dumpableRespected &&
-  process.getuid?.() !== 0 &&
-  // a host whose setpriv or sh isn't root's alone gets no seal at all
-  createSeal("linux", { hideRunner: () => undefined }).problem === undefined;
+// the kernel itself, where it can be asked (see testing/kernel.ts). CI installs what it takes, so a gap
+// there is a setup problem to fail on, not coverage to skip: without this the three tests below, which
+// hold the PR's central claim, could skip on every run and nobody would know
+test.runIf(process.env.CI)(
+  "the kernel can be asked, so the real-kernel tests below run",
+  () => {
+    expect(kernelGap).toBeUndefined();
+  },
+);
 
 // what a command the repo starts does: read its parent's environment, as `cat /proc/$PPID/environ` or
 // `ps auxe` do, and report whether the secret was there to be read
@@ -326,15 +427,24 @@ const ENV = {
   PROJECT_TEST_VALUE: "project-value",
 };
 
-/** Starts `child` and waits for the report its script prints first. */
-async function firstReport(child: ReturnType<typeof spawn>) {
-  let out = "";
-  for await (const chunk of child.stdout ?? []) {
-    out += chunk;
-    if (out.includes("\n")) break;
-  }
-  return JSON.parse(out) as { readable: boolean; project: string };
-}
+/** Starts `child` and waits for the report its script prints first; a child that ends without one is the failure. */
+const firstReport = (child: ReturnType<typeof spawn>) =>
+  new Promise<{ readable: boolean; project: string }>((resolve, reject) => {
+    let out = "";
+    child.stdout?.on("data", (chunk) => {
+      out += chunk;
+      const end = out.indexOf("\n");
+      if (end >= 0) resolve(JSON.parse(out.slice(0, end)));
+    });
+    // `close`: after the child's stdout has been read to its end
+    child.once("close", (code, signal) =>
+      reject(
+        new Error(
+          `the child ended (${code ?? signal}) before it reported; it printed ${JSON.stringify(out)}`,
+        ),
+      ),
+    );
+  });
 
 const ended = (child: ReturnType<typeof spawn>) =>
   new Promise<void>((resolve) => child.once("exit", () => resolve()));
