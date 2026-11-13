@@ -1,7 +1,8 @@
-import { APIError, SpritesClient } from "@fly/sprites";
+import { APIError, FilesystemError, SpritesClient } from "@fly/sprites";
 import { expect, test, vi } from "vitest";
 import { KnownSecrets } from "./redact.js";
 import {
+  CAPPED_EXEC,
   execCapped,
   execInSprite,
   SpriteExecStreamError,
@@ -10,7 +11,11 @@ import {
   spriteCall,
   spriteNameFor,
 } from "./sprites.js";
-import { spritesToken, stubSprites } from "./testing/sprites.js";
+import {
+  type SpritesWire,
+  spritesToken,
+  stubSprites,
+} from "./testing/sprites.js";
 
 test("names a sprite in the API's lowercase, digit and hyphen alphabet, deterministically and per env", () => {
   const ids = ["env_q9shK0hzD63HUeS9mmcuHz", "env_Q9shK0hzD63HUeS9mmcuHz", "x"];
@@ -173,6 +178,7 @@ test("a capped exec of large output re-chunked on the wire returns the first byt
     size: 5000,
     truncated: true,
   });
+  await wire.cleanedUp();
 });
 
 test("a capped exec of output within the cap returns all of it untruncated, and a nonzero exit reads nothing", async () => {
@@ -195,6 +201,165 @@ test("a capped exec of output within the cap returns all of it untruncated, and 
     }),
   ).toMatchObject({ exitCode: 3, stdout: "" });
   expect(wire.calls.some((c) => c.startsWith("read "))).toBe(false);
+  await wire.cleanedUp();
+});
+
+/** What capped execs left under the sprite's /tmp: files and directories. */
+const leftovers = (wire: SpritesWire) =>
+  [...wire.files.keys(), ...wire.dirs].filter((p) =>
+    p.startsWith("/tmp/sky-exec-"),
+  );
+
+/** The directory each capped exec was handed, in order. */
+const cappedDirs = (wire: SpritesWire) =>
+  wire.execUrls
+    .map((u) => new URL(u).searchParams.getAll("cmd"))
+    .filter((argv) => argv[2] === CAPPED_EXEC)
+    .map((argv) => argv[4]);
+
+test("a capped exec stages its output in a directory of its own and removes it whole, after a nonzero exit too", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  const { ops } = opsWith();
+  for (const exitCode of [0, 3]) {
+    wire.exec = () => ({ exitCode, stdout: "+x\n" });
+    await execCapped(ops, "sky-a", ["git", "diff"], {
+      op: "diff",
+      maxBytes: 1000,
+    });
+  }
+  expect(cappedDirs(wire)).toEqual([
+    expect.stringMatching(/^\/tmp\/sky-exec-[0-9a-f-]{36}$/),
+    expect.stringMatching(/^\/tmp\/sky-exec-[0-9a-f-]{36}$/),
+  ]);
+  await wire.cleanedUp();
+  expect(leftovers(wire)).toEqual([]);
+});
+
+test("a capped exec whose wrapper can't stage its output rejects as an unusable exec and removes what it left", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  wire.tmpFull = true;
+  wire.exec = () => ({ exitCode: 0, stdout: "+x\n" });
+  const { ops } = opsWith();
+  const err = await execCapped(ops, "sky-a", ["git", "diff"], {
+    op: "diff",
+    maxBytes: 1000,
+  }).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(SpriteExecStreamError);
+  expect((err as Error).message).toBe(
+    "sprite sky-a: diff could not stage its output in the sprite",
+  );
+  expect(wire.calls.some((c) => c.startsWith("read "))).toBe(false);
+  await wire.cleanedUp();
+  expect(leftovers(wire)).toEqual([]);
+});
+
+test("a capped exec whose read fails removes its directory", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  wire.readStatus = 500;
+  wire.exec = () => ({ exitCode: 0, stdout: "+x\n" });
+  const { ops } = opsWith();
+  const err = await execCapped(ops, "sky-a", ["git", "diff"], {
+    op: "diff",
+    maxBytes: 1000,
+  }).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(FilesystemError);
+  await wire.cleanedUp();
+  expect(leftovers(wire)).toEqual([]);
+});
+
+test("a capped exec whose stream drops mid-run rejects and removes the directory with the full output still in it", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  wire.execDrops = true;
+  wire.exec = () => ({ exitCode: 0, stdout: "+x\n" });
+  const { ops } = opsWith();
+  const err = await execCapped(ops, "sky-a", ["git", "diff"], {
+    op: "diff",
+    maxBytes: 1000,
+  }).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(SpriteExecStreamError);
+  expect(leftovers(wire)).toContain(`${cappedDirs(wire)[0]}/full`);
+  await wire.cleanedUp();
+  expect(leftovers(wire)).toEqual([]);
+});
+
+test("a head file swapped for a larger one after the exec is refused past the cap, without being read whole", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  wire.exec = () => ({ exitCode: 0, stdout: "+x\n" });
+  const swapped = new Uint8Array(4 * 1024 * 1024).fill(0x78);
+  // a process in the sprite rewrites the file between the exec and the read
+  wire.afterExec = () => {
+    const dir = cappedDirs(wire).at(-1);
+    wire.files.set(`${dir}/head`, swapped);
+  };
+  // counts the bytes the API pulls from the head file's body, as it pulls them
+  let pulled = 0;
+  const fetchOf = globalThis.fetch;
+  const spy = vi.spyOn(globalThis, "fetch");
+  spy.mockImplementation(async (input, init) => {
+    const res = await fetchOf(input, init);
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (!url.searchParams.get("path")?.endsWith("/head") || !res.body) {
+      return res;
+    }
+    const counted = res.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          pulled += chunk.length;
+          controller.enqueue(chunk);
+        },
+      }),
+    );
+    return new Response(counted, { status: res.status, headers: res.headers });
+  });
+  const { ops } = opsWith();
+  try {
+    const err = await execCapped(ops, "sky-a", ["git", "diff"], {
+      op: "diff",
+      maxBytes: 1000,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SpriteExecStreamError);
+    expect((err as Error).message).toMatch(/holds more than 1000 bytes$/);
+    expect(pulled).toBeLessThan(swapped.length / 4);
+    await wire.cleanedUp();
+  } finally {
+    spy.mockRestore();
+  }
+  expect(leftovers(wire)).toEqual([]);
+});
+
+test("two capped execs at once each stage in their own directory and get their own output", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  wire.exec = (argv) => ({ exitCode: 0, stdout: `${argv.at(-1)}\n` });
+  const { ops } = opsWith();
+  const [a, b] = await Promise.all(
+    ["a", "b"].map((which) =>
+      execCapped(ops, "sky-a", ["echo", which], { op: "echo", maxBytes: 1000 }),
+    ),
+  );
+  expect([a?.stdout, b?.stdout]).toEqual(["a\n", "b\n"]);
+  const dirs = cappedDirs(wire);
+  expect(dirs).toHaveLength(2);
+  expect(new Set(dirs).size).toBe(2);
+  await wire.cleanedUp();
+});
+
+test("an exec whose output passes the SDK's buffer limit is not reported as an undecodable stream", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  // 0x01 is the stdout frame type, so however the transport re-chunks this, each read parses as stdout
+  wire.exec = () => ({ exitCode: 0, stdout: "\x01".repeat(11 * 1024 * 1024) });
+  const { ops } = opsWith();
+  const err = await execInSprite(ops, "sky-a", ["cat", "big"], {
+    op: "cat",
+  }).catch((e: unknown) => e);
+  expect((err as Error).message).toBe("stdout maxBuffer exceeded");
+  expect(err).not.toBeInstanceOf(SpriteExecStreamError);
 });
 
 test("a bound in whole minutes or seconds reads as such in the error", async () => {

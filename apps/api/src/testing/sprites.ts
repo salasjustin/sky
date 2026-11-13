@@ -2,7 +2,11 @@ import { createHash } from "node:crypto";
 import { HttpResponse, http, ws } from "msw";
 import { server } from "../../../../test/msw.js";
 import type { Config } from "../config.js";
-import { CAPPED_EXEC, LOGGED_EXEC } from "../sprites.js";
+import {
+  CAPPED_EXEC,
+  CAPPED_WRAPPER_FAILED,
+  LOGGED_EXEC,
+} from "../sprites.js";
 
 export const spritesToken = "sprites-test-token";
 const SPRITES = "https://api.sprites.dev/v1/sprites";
@@ -69,6 +73,8 @@ export function envFileOf(
   );
 }
 
+const READ_PIECE_BYTES = 64 * 1024;
+
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
 
@@ -88,6 +94,8 @@ export function stubSprites() {
     files: new Map<string, Uint8Array>(),
     /** The octal mode each write asked for, by absolute path. */
     modes: new Map<string, string>(),
+    /** Directories a capped exec's wrapper made, until an rm removes them. */
+    dirs: new Set<string>(),
     /** Every exec URL, HTTP or WebSocket, query included. */
     execUrls: [] as string[],
     /**
@@ -135,6 +143,26 @@ export function stubSprites() {
      */
     execChunkBytes: undefined as number | undefined,
     /**
+     * When set, an exec's stream ends with no exit frame, as when the connection drops mid-run; a
+     * capped exec's wrapper is left where the drop caught it, its directory and `full` in place.
+     */
+    execDrops: false,
+    /**
+     * When set, a capped exec's wrapper can't write its `head` copy, as on a full /tmp: it exits
+     * `CAPPED_WRAPPER_FAILED` with its directory, `full` and `size` left behind.
+     */
+    tmpFull: false,
+    /**
+     * Runs once an exec has left its files and before it answers, as a process in the sprite acting
+     * between an exec and the reads that follow it.
+     */
+    afterExec: (_call: string): void => {},
+    /** Resolves once every directory a capped exec's wrapper made has been removed by an rm. */
+    cleanedUp: (): Promise<void> =>
+      Promise.all([...madeDirs.values()].map((d) => d.removed)).then(
+        () => undefined,
+      ),
+    /**
      * A call whose `calls` line this matches gets no answer until the client aborts it (or 5 s
      * pass, then a 503), as a Sprites API that hangs.
      */
@@ -147,10 +175,41 @@ export function stubSprites() {
     createStatus: 201,
     updateStatus: 200,
     writeStatus: 200,
+    readStatus: 200,
     checkpointLines: undefined as object[] | undefined,
     deleteStatus: 204,
   };
   let checkpoints = 0;
+  const madeDirs = new Map<
+    string,
+    { removed: Promise<void>; resolve: () => void }
+  >();
+  const enc = new TextEncoder();
+  // `mkdir -m 700 <dir>`, then `"$@" >"<dir>/full"`
+  const stageCapped = (dir: string, full: Uint8Array) => {
+    wire.dirs.add(dir);
+    let resolve = () => {};
+    const removed = new Promise<void>((r) => {
+      resolve = r;
+    });
+    madeDirs.set(dir, { removed, resolve });
+    wire.files.set(`${dir}/full`, full);
+  };
+  // CAPPED_EXEC as the shell runs it, `outcome` being the argv's; only the exit crosses the wire
+  const runCapped = (
+    { dir, cap }: { dir: string; cap: number },
+    outcome: ExecOutcome,
+  ): ExecOutcome => {
+    if (wire.dirs.has(dir)) return { exitCode: CAPPED_WRAPPER_FAILED };
+    const full = enc.encode(outcome.stdout ?? "");
+    stageCapped(dir, full);
+    if (wire.execDrops) return { exitCode: outcome.exitCode };
+    wire.files.set(`${dir}/size`, enc.encode(`${full.length}\n`));
+    if (wire.tmpFull) return { exitCode: CAPPED_WRAPPER_FAILED };
+    wire.files.set(`${dir}/head`, full.slice(0, cap));
+    wire.files.delete(`${dir}/full`);
+    return { exitCode: outcome.exitCode };
+  };
   const inflightHangs = new Set<Promise<Response>>();
   const hang = (request: Request) => {
     const answered = new Promise<Response>((resolve) => {
@@ -206,10 +265,10 @@ export function stubSprites() {
         argv[0] === "sh" && argv[1] === "-c" && argv[2] === LOGGED_EXEC
           ? { log: argv[4] ?? "", bytes: Number(argv[5]), argv: argv.slice(6) }
           : undefined;
-      // execCapped's wrapper: `sh -c <script> sh <out> <cap> <argv…>`; stdout lands in files, as the shell leaves it
+      // execCapped's wrapper: `sh -c <script> sh <dir> <cap> <argv…>`; stdout lands in files, as the shell leaves it
       const capped =
         argv[0] === "sh" && argv[1] === "-c" && argv[2] === CAPPED_EXEC
-          ? { out: argv[4] ?? "", cap: Number(argv[5]), argv: argv.slice(6) }
+          ? { dir: argv[4] ?? "", cap: Number(argv[5]), argv: argv.slice(6) }
           : undefined;
       const call = `exec ${name} ${url.searchParams.get("dir") ?? "-"} ${
         logged
@@ -217,18 +276,16 @@ export function stubSprites() {
           : (capped?.argv ?? argv).join(" ")
       }`;
       wire.calls.push(call);
-      if (wire.hangs(call)) return hang(request);
+      if (wire.hangs(call)) {
+        // a hung wrapper is still writing `full`
+        if (capped) stageCapped(capped.dir, new Uint8Array());
+        return hang(request);
+      }
       if (!wire.sprites.has(name)) {
         return HttpResponse.json({ error: "not found" }, { status: 404 });
       }
-      const enc = new TextEncoder();
       let outcome = wire.exec(logged?.argv ?? capped?.argv ?? argv);
-      if (capped) {
-        const full = enc.encode(outcome.stdout ?? "");
-        wire.files.set(capped.out, full.slice(0, capped.cap));
-        wire.files.set(`${capped.out}.size`, enc.encode(`${full.length}\n`));
-        outcome = { exitCode: outcome.exitCode };
-      }
+      if (capped) outcome = runCapped(capped, outcome);
       if (logged) {
         if (outcome.exitCode !== 0) {
           const combined = enc.encode(
@@ -238,18 +295,26 @@ export function stubSprites() {
         }
         outcome = { exitCode: outcome.exitCode };
       }
+      wire.afterExec(call);
       // one frame per chunk: a stream-id byte, then the payload; exit is [3, code]. A kill (137) is
       // modelled as this exit frame; a real SIGKILLed exec may instead drop the stream with no exit
       // frame, which the SDK raises as an error, not an exit 137 (unverified against the live API)
+      const framed = (stream: number, text: string) => {
+        const bytes = enc.encode(text);
+        const out = new Uint8Array(bytes.length + 1);
+        out[0] = stream;
+        out.set(bytes, 1);
+        return out;
+      };
       const frames = [
-        ...(outcome.stdout ? [[1, ...enc.encode(outcome.stdout)]] : []),
-        ...(outcome.stderr ? [[2, ...enc.encode(outcome.stderr)]] : []),
-        [3, outcome.exitCode],
-      ].flatMap((frame) => {
-        const size = wire.execChunkBytes ?? frame.length;
-        const pieces: number[][] = [];
-        for (let at = 0; at < frame.length; at += size) {
-          pieces.push(frame.slice(at, at + size));
+        ...(outcome.stdout ? [framed(1, outcome.stdout)] : []),
+        ...(outcome.stderr ? [framed(2, outcome.stderr)] : []),
+        ...(wire.execDrops ? [] : [Uint8Array.of(3, outcome.exitCode)]),
+      ].flatMap((whole) => {
+        const size = wire.execChunkBytes ?? whole.length;
+        const pieces: Uint8Array[] = [];
+        for (let at = 0; at < whole.length; at += size) {
+          pieces.push(whole.subarray(at, at + size));
         }
         return pieces;
       });
@@ -260,7 +325,7 @@ export function stubSprites() {
           const frame = frames.shift();
           if (!frame) return controller.close();
           await new Promise((resolve) => setTimeout(resolve, 0));
-          controller.enqueue(new Uint8Array(frame));
+          controller.enqueue(frame);
         },
       });
       return new HttpResponse(body, {
@@ -289,6 +354,12 @@ export function stubSprites() {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
       const path = new URL(request.url).searchParams.get("path") ?? "";
       wire.calls.push(`read ${String(params.name)} ${path}`);
+      if (wire.readStatus !== 200) {
+        return HttpResponse.json(
+          { error: "read failed" },
+          { status: wire.readStatus },
+        );
+      }
       const bytes = wire.files.get(path);
       if (!wire.sprites.has(String(params.name)) || !bytes) {
         return HttpResponse.json(
@@ -296,15 +367,38 @@ export function stubSprites() {
           { status: 404 },
         );
       }
-      return new HttpResponse(bytes, {
+      // in pieces, as a body that size arrives over the network
+      let at = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (at >= bytes.length) return controller.close();
+          controller.enqueue(bytes.subarray(at, at + READ_PIECE_BYTES));
+          at += READ_PIECE_BYTES;
+        },
+      });
+      return new HttpResponse(body, {
         headers: { "content-type": "application/octet-stream" },
       });
     }),
+    // a missing path is a 404, which the SDK's `rm` swallows under `force`
     http.delete(`${SPRITES}/:name/fs/delete`, ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
-      const path = new URL(request.url).searchParams.get("path") ?? "";
+      const query = new URL(request.url).searchParams;
+      const path = query.get("path") ?? "";
       wire.calls.push(`rm ${String(params.name)} ${path}`);
-      if (!wire.files.delete(path)) {
+      const inside = [...wire.files.keys()].filter((p) =>
+        p.startsWith(`${path}/`),
+      );
+      if (inside.length > 0 && query.get("recursive") !== "true") {
+        return HttpResponse.json(
+          { error: "directory not empty", code: "ENOTEMPTY", path },
+          { status: 400 },
+        );
+      }
+      const found = wire.files.delete(path) || wire.dirs.delete(path);
+      for (const p of inside) wire.files.delete(p);
+      madeDirs.get(path)?.resolve();
+      if (!found && inside.length === 0) {
         return HttpResponse.json(
           { error: "no such file", code: "ENOENT", path },
           { status: 404 },

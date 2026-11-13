@@ -74,7 +74,9 @@ beforeEach(() => {
     launchWatchMs: 50,
   });
 });
-afterEach(() => {
+afterEach(async () => {
+  // a capped exec's cleanup is not awaited by its caller, so it can land after the test's last request
+  await wire.cleanedUp();
   if (db.$client.open) db.$client.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -1770,9 +1772,29 @@ test("GET removes the files the diff left in the sprite", async () => {
   wire.exec = (argv) =>
     isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
   await getRun(agent.id, run.id);
+  await wire.cleanedUp();
   expect(
-    [...wire.files.keys()].filter((p) => p.startsWith("/tmp/sky-exec-")),
+    [...wire.files.keys(), ...wire.dirs].filter((p) =>
+      p.startsWith("/tmp/sky-exec-"),
+    ),
   ).toEqual([]);
+});
+
+test("GET whose diff wrapper can't stage its output in the sprite is 502 sprite_exec_failed, not a 200 without a diff", async () => {
+  const { agent, run } = await finishedRun();
+  wire.tmpFull = true;
+  wire.exec = (argv) =>
+    isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+  const { status, body } = await getRun(agent.id, run.id);
+  expect(status).toBe(502);
+  expect(body).toMatchObject({ error: { code: "sprite_exec_failed" } });
+  expect(
+    logs.some(
+      (l) =>
+        l.includes(`diff of ${run.id} failed`) &&
+        l.includes("could not stage its output"),
+    ),
+  ).toBe(true);
 });
 
 test("GET whose exec stream cannot be decoded is 502 sprite_exec_failed, with the cause logged", async () => {

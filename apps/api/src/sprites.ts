@@ -1,5 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { APIError, ExecError, type SpritesClient } from "@fly/sprites";
+import {
+  APIError,
+  ExecError,
+  FilesystemError,
+  type SpritesClient,
+} from "@fly/sprites";
 import { type KnownSecrets, redact } from "./redact.js";
 
 /**
@@ -152,14 +157,16 @@ export async function ensureSprite(
 export type ExecOutcome = { exitCode: number; stdout: string; stderr: string };
 
 /**
- * The sprite answered, but the SDK could not read its HTTP exec stream: its frames carry no length,
- * so output an intermediary re-chunks is misread. The sprite is reachable; the exec is not usable.
+ * The sprite answered, but what the exec produced could not be read back from it: the SDK could not
+ * parse its HTTP exec stream (its frames carry no length, so output an intermediary re-chunks is
+ * misread), or `execCapped`'s wrapper could not stage its output, or left files past their bounds.
+ * The sprite is reachable; the exec is not usable.
  */
 export class SpriteExecStreamError extends Error {}
 
 // the plain `Error`s `execFileHTTP` throws for a stream it cannot parse; transport failures are not these
 const STREAM_DECODE =
-  /^(Unsupported HTTP exec frame|Invalid HTTP exec exit frame|HTTP exec response did not include|(stdout|stderr) maxBuffer exceeded)/;
+  /^(Unsupported HTTP exec frame|Invalid HTTP exec exit frame|HTTP exec response did not include)/;
 
 const isStreamDecodeError = (err: unknown): err is Error =>
   err instanceof Error &&
@@ -261,11 +268,82 @@ export async function execLogged(
   return { exitCode, tail };
 }
 
-// $1 the output file, $2 the byte cap, the rest the argv. Stdout goes whole to `<out>.full`, which
-// never crosses the wire: `<out>` keeps its first $2 bytes, `<out>.size` the full byte count, and the
-// argv's own exit status is the script's. Stderr is dropped, as it would share the exec with the exit frame.
-export const CAPPED_EXEC =
-  'out=$1; cap=$2; shift 2; "$@" >"$out.full" 2>/dev/null; rc=$?; wc -c <"$out.full" >"$out.size"; head -c "$cap" "$out.full" >"$out"; rm -f "$out.full"; exit $rc';
+/** `CAPPED_EXEC`'s own exit when it could not make its directory or stage the files in it. */
+export const CAPPED_WRAPPER_FAILED = 125;
+
+// $1 a directory the call owns, which `mkdir` refuses when it already exists; $2 the byte cap; the rest
+// the argv. Stdout goes whole to `full`, which never crosses the wire: `head` keeps its first $2 bytes,
+// `size` the full byte count, and the argv's own exit status is the script's. Nothing reaches stderr,
+// which would share the exec with the exit frame, so the wrapper's own failures exit
+// `CAPPED_WRAPPER_FAILED` instead.
+export const CAPPED_EXEC = [
+  "exec 2>/dev/null",
+  "dir=$1",
+  "cap=$2",
+  "shift 2",
+  `mkdir -m 700 "$dir" || exit ${CAPPED_WRAPPER_FAILED}`,
+  '"$@" >"$dir/full"',
+  "rc=$?",
+  `wc -c <"$dir/full" >"$dir/size" || exit ${CAPPED_WRAPPER_FAILED}`,
+  `head -c "$cap" "$dir/full" >"$dir/head" || exit ${CAPPED_WRAPPER_FAILED}`,
+  'rm -f "$dir/full"',
+  "exit $rc",
+].join("; ");
+
+// a decimal byte count and its newline
+const SIZE_FILE_MAX = 64;
+
+/**
+ * Reads a file in the sprite over the filesystem API, keeping at most `maxBytes` of it: past that it
+ * stops reading and throws `SpriteExecStreamError`. The SDK's `readFile` buffers the whole body, and
+ * any process in the sprite can swap a file for a larger one, or a link to one, before it is read.
+ */
+async function readBounded(
+  client: SpritesClient,
+  name: string,
+  path: string,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<Buffer> {
+  const url = new URL(
+    `${client.baseURL}/v1/sprites/${encodeURIComponent(name)}/fs/read`,
+  );
+  url.searchParams.set("path", path);
+  url.searchParams.set("workingDir", "/");
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${client.token}` },
+    signal,
+  });
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new FilesystemError(
+      `read failed with status ${res.status}`,
+      res.status === 404 ? "ENOENT" : "UNKNOWN",
+      path,
+      "read",
+    );
+  }
+  if (!res.body) return Buffer.alloc(0);
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > maxBytes) {
+        throw new SpriteExecStreamError(
+          `sprite ${name}: ${path} holds more than ${maxBytes} bytes`,
+        );
+      }
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return Buffer.concat(chunks);
+}
 
 export type CappedOutput = {
   exitCode: number;
@@ -277,10 +355,11 @@ export type CappedOutput = {
 };
 
 /**
- * Runs `argv` like `execInSprite`, but its stdout goes to a file in the sprite so nothing but the
- * exit frame crosses the HTTP exec, which misreads output an intermediary re-chunks. What comes back
- * is read over the filesystem API and is never more than `maxBytes`, however large the output.
- * Nothing is read for a nonzero exit.
+ * Runs `argv` like `execInSprite`, but its stdout goes to files in a directory of the call's own in
+ * the sprite, so nothing but the exit frame crosses the HTTP exec, which misreads output an
+ * intermediary re-chunks. What comes back is read over the filesystem API and is never more than
+ * `maxBytes`, however large the output. Nothing is read for a nonzero exit; the wrapper's own failure
+ * throws `SpriteExecStreamError`. The directory is removed on every path, without waiting on it.
  */
 export async function execCapped(
   ops: SpriteOps,
@@ -288,28 +367,32 @@ export async function execCapped(
   argv: [string, ...string[]],
   { maxBytes, ...options }: CallOptions & { cwd?: string; maxBytes: number },
 ): Promise<CappedOutput> {
-  const out = `/tmp/sky-exec-${randomUUID()}`;
-  const fs = () => ops.client.sprite(name).filesystem("/");
-  const cleanup = () =>
-    spriteCall(ops, name, { op: "rm-capped" }, () =>
-      Promise.all([out, `${out}.size`].map((p) => fs().rm(p, { force: true }))),
-    ).catch(() => {});
+  const dir = `/tmp/sky-exec-${randomUUID()}`;
   try {
     const { exitCode } = await execInSprite(
       ops,
       name,
-      ["sh", "-c", CAPPED_EXEC, "sh", out, `${maxBytes}`, ...argv],
+      ["sh", "-c", CAPPED_EXEC, "sh", dir, `${maxBytes}`, ...argv],
       options,
     );
+    if (exitCode === CAPPED_WRAPPER_FAILED) {
+      throw new SpriteExecStreamError(
+        `sprite ${name}: ${options.op} could not stage its output in the sprite`,
+      );
+    }
     if (exitCode !== 0)
       return { exitCode, stdout: "", size: 0, truncated: false };
     const [head, size] = await Promise.all([
-      spriteCall(ops, name, { op: "read-capped", known: options.known }, () =>
-        fs().readFile(out, null),
+      spriteCall(
+        ops,
+        name,
+        { op: "read-capped", known: options.known },
+        (signal) =>
+          readBounded(ops.client, name, `${dir}/head`, maxBytes, signal),
       ),
-      spriteCall(ops, name, { op: "read-size" }, () =>
-        fs().readFile(`${out}.size`, "utf8"),
-      ),
+      spriteCall(ops, name, { op: "read-size" }, (signal) =>
+        readBounded(ops.client, name, `${dir}/size`, SIZE_FILE_MAX, signal),
+      ).then((bytes) => bytes.toString("utf8")),
     ]);
     const total = Number.parseInt(size.trim(), 10);
     if (!Number.isSafeInteger(total) || total < head.length) {
@@ -335,7 +418,14 @@ export async function execCapped(
       truncated: true,
     };
   } finally {
-    await cleanup();
+    // not awaited: on a hung sprite it would hold the answer for another bound, and a failure leaves
+    // only files in the sprite's /tmp
+    void spriteCall(ops, name, { op: "rm-capped" }, () =>
+      ops.client
+        .sprite(name)
+        .filesystem("/")
+        .rm(dir, { recursive: true, force: true }),
+    ).catch(() => {});
   }
 }
 
