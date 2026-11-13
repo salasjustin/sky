@@ -1,15 +1,20 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import {
+  type ChildProcess,
+  spawn as spawnChild,
+  type SpawnOptions as ChildSpawnOptions,
+} from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   constants,
   copyFileSync,
   mkdirSync,
+  realpathSync,
   rmSync,
   statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { dirname, join } from "node:path";
 import type {
   SpawnedProcess,
   SpawnOptions,
@@ -94,15 +99,56 @@ export function hideRunner(
 const errorCode = (error: unknown) =>
   error instanceof Error && "code" in error ? String(error.code) : "failed";
 
-/** Whether `command` is a file in a directory of `path`. */
-function onPath(command: string, path: string | undefined): boolean {
-  return (path ?? "").split(delimiter).some((dir) => {
+/** What the seal reads of a path, following links: `statSync` and `realpathSync.native` unless a test stands in. */
+export type FileLookup = {
+  stat: (path: string) => { uid: number; mode: number };
+  realpath: (path: string) => string;
+};
+
+const HOST_FILES: FileLookup = {
+  stat: (path) => statSync(path),
+  realpath: (path) => realpathSync.native(path),
+};
+
+// fixed, never PATH: the session's PATH starts with `$HOME/.local/bin`, which the repo's commands can
+// write, and whatever answers to `setpriv` there would be handed Claude's env, credential included
+const SETPRIV_PATHS = ["/usr/bin/setpriv", "/bin/setpriv"];
+const SH_PATHS = ["/bin/sh", "/usr/bin/sh"];
+
+const GROUP_OR_OTHER_WRITE = 0o022;
+const onlyRootChanges = (stat: { uid: number; mode: number }) =>
+  stat.uid === 0 && (stat.mode & GROUP_OR_OTHER_WRITE) === 0;
+
+const ancestorsOf = (path: string) => {
+  const dirs: string[] = [];
+  for (let dir = dirname(path); ; dir = dirname(dir)) {
+    dirs.push(dir);
+    if (dirname(dir) === dir) return dirs;
+  }
+};
+
+/**
+ * The first of `paths` that is a regular file only root can change, through every directory above it
+ * and above the file it links to, as that file's own path; undefined when none is.
+ */
+function rootOnlyProgram(
+  paths: readonly string[],
+  files: FileLookup,
+): string | undefined {
+  for (const path of paths)
     try {
-      return dir !== "" && statSync(join(dir, command)).isFile();
-    } catch {
-      return false;
-    }
-  });
+      const real = files.realpath(path);
+      const file = files.stat(real);
+      if ((file.mode & constants.S_IFMT) !== constants.S_IFREG) continue;
+      const chain = new Set([
+        real,
+        ...ancestorsOf(path),
+        ...ancestorsOf(real),
+      ]);
+      if ([...chain].every((at) => onlyRootChanges(files.stat(at))))
+        return real;
+    } catch {}
+  return undefined;
 }
 
 // the directories of the copies of Claude's binary that haven't been deleted yet
@@ -137,16 +183,51 @@ export type Seal = {
 export type SealOptions = {
   /** Where the copy of Claude's binary lives while it runs; the temp directory when absent. */
   dir?: string;
-  /** The env the session's commands resolve `setpriv` in; the runner's when absent. */
-  env?: NodeJS.ProcessEnv;
   /** Steps the runner out of its commands' reach; the real one when absent. */
   hideRunner?: () => string | undefined;
+  /** The host's files; the real ones when absent. */
+  files?: FileLookup;
+  /** Starts `setpriv`; `child_process.spawn` when absent. */
+  spawn?: (
+    command: string,
+    args: readonly string[],
+    options: ChildSpawnOptions,
+  ) => ChildProcess;
 };
 
+type Programs =
+  | { problem: string }
+  | { problem: undefined; setpriv: string; sh: string };
+
+function sealPrograms(
+  platform: NodeJS.Platform,
+  options: SealOptions,
+): Programs {
+  if (platform !== "linux")
+    return {
+      problem: `only Linux can keep a process's environment from the repo's commands, and this is ${platform}`,
+    };
+  const hidden = (options.hideRunner ?? hideRunner)();
+  if (hidden) return { problem: hidden };
+  const files = options.files ?? HOST_FILES;
+  const setpriv = rootOnlyProgram(SETPRIV_PATHS, files);
+  if (!setpriv)
+    return {
+      problem: `no setpriv (util-linux) that only root can change, at ${SETPRIV_PATHS.join(" or ")}: it drops the capabilities that read around a file's mode`,
+    };
+  const sh = rootOnlyProgram(SH_PATHS, files);
+  if (!sh)
+    return {
+      problem: `no sh that only root can change, at ${SH_PATHS.join(" or ")}`,
+    };
+  return { problem: undefined, setpriv, sh };
+}
+
 /**
- * Hides the runner, and returns the seal for the run's Claude process; undefined where there is no
- * `/proc` to hide it from. The runner's own credential stays in its environment, which only it can read
- * now, so call this before the runner starts anything.
+ * Hides the runner, and returns the seal for the run's Claude process, whose `problem` says why it
+ * can't be sealed: off Linux, a runner the kernel won't hide, or no `setpriv` or `sh` only root can
+ * change. The runner's own credential stays in its environment, which only it can read now, so call
+ * this before the runner starts anything.
  *
  * The Claude process is exec'd, through `setpriv`, from a mode 0111 copy of its binary by a process
  * without the capabilities that read around that mode, so it is non-dumpable from its first
@@ -156,18 +237,15 @@ export type SealOptions = {
 export function createSeal(
   platform: NodeJS.Platform = process.platform,
   options: SealOptions = {},
-): Seal | undefined {
-  if (platform !== "linux") return undefined;
-  const { dir = tmpdir(), env = process.env } = options;
-  const problem =
-    (options.hideRunner ?? hideRunner)() ??
-    (onPath("setpriv", env.PATH)
-      ? undefined
-      : "setpriv (util-linux), which drops the capabilities that read around a file's mode, isn't installed");
+): Seal {
+  const { dir = tmpdir() } = options;
+  const spawn: NonNullable<SealOptions["spawn"]> = options.spawn ?? spawnChild;
+  const programs = sealPrograms(platform, options);
   let claude: ChildProcess | undefined;
   return {
-    problem,
+    problem: programs.problem,
     spawn: (spawnOptions) => {
+      if (programs.problem !== undefined) throw new Error(programs.problem);
       const copyDir = join(dir, `sky-claude-${randomUUID()}`);
       // before the copy: a signal can land while it is in flight
       copies.add(copyDir);
@@ -183,11 +261,11 @@ export function createSeal(
         // setpriv's own exec leaves it the sprite's capabilities, which it drops for the next one: the
         // shell, which runs the unreadable binary without them
         claude = spawn(
-          "setpriv",
+          programs.setpriv,
           [
             `--inh-caps=${READ_OVERRIDES}`,
             `--ambient-caps=${READ_OVERRIDES}`,
-            "sh",
+            programs.sh,
             "-c",
             'exec "$0" "$@"',
             binary,

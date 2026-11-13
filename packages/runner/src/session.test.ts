@@ -921,7 +921,10 @@ test("with a GitHub connector in its env, the session is told to publish through
   }
 });
 
-const appendOf = async (checks: string[]) => {
+const appendOf = async (
+  checks: string[],
+  credentialEnv: NodeJS.ProcessEnv = {},
+) => {
   const query = scripted([init, success]);
   await runSession(
     { ...config, checks },
@@ -930,6 +933,7 @@ const appendOf = async (checks: string[]) => {
       post: recorder().post,
       signal: new AbortController().signal,
       awaitDecision: noDecision,
+      credentialEnv,
     },
   );
   return (
@@ -981,9 +985,11 @@ test("a check written as plain `claude -p` is still run with every project crede
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
   // a subscription run, the only kind whose prompt has the `nestedClaude` line: what this reads is
   // the `env` part after its login prefix
-  vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "subscription-token-opaque");
+  vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", undefined);
   try {
-    const append = await appendOf(['claude -p "/acme:review"']);
+    const append = await appendOf(['claude -p "/acme:review"'], {
+      CLAUDE_CODE_OAUTH_TOKEN: "subscription-token-opaque",
+    });
     expect(append).toContain('- claude -p "/acme:review"');
     expect(append).not.toContain("as written");
     const instruction =
@@ -1139,7 +1145,7 @@ describe("the Claude credential of a run", () => {
   /** Runs a session, and at its start runs the SessionStart hook the way Claude Code does. */
   async function sessionSeen(
     runConfig: Config,
-    result: unknown = success,
+    credentialEnv: NodeJS.ProcessEnv,
   ): Promise<Seen> {
     const seen: Partial<Seen> = {};
     const query = scripted([
@@ -1179,17 +1185,23 @@ describe("the Claude credential of a run", () => {
           }),
         );
       }) as unknown as SDKMessage,
-      result,
+      success,
     ]);
     await runSession(runConfig, {
       query,
       post: recorder().post,
       signal: new AbortController().signal,
       awaitDecision: noDecision,
+      credentialEnv,
     });
     return seen as Seen;
   }
 
+  beforeEach(() => {
+    // the runner took the credential out of its own env, and hands it over by `credentialEnv` alone
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", undefined);
+    vi.stubEnv("SKY_CLAUDE_API_KEY", undefined);
+  });
   afterEach(() => vi.unstubAllEnvs());
 
   /** Points the runner's credential files at a directory this test alone writes to, and returns it. */
@@ -1201,11 +1213,12 @@ describe("the Claude credential of a run", () => {
   };
 
   test("a subscription run: the Claude process holds the token and no API key, even when the project has one", async () => {
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
     vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
     vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "project-auth-token-opaque");
-    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
-    const seen = await sessionSeen(config);
+    const seen = await sessionSeen(config, {
+      CLAUDE_CODE_OAUTH_TOKEN: TOKEN,
+      SKY_CLAUDE_API_KEY: SKY_KEY,
+    });
     const env = seen.options.env ?? {};
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(TOKEN);
     expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
@@ -1216,28 +1229,27 @@ describe("the Claude credential of a run", () => {
   });
 
   test("a subscription run: the project's own ANTHROPIC_API_KEY still works for its commands", async () => {
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
     vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
-    const seen = await sessionSeen(config);
+    const seen = await sessionSeen(config, { CLAUDE_CODE_OAUTH_TOKEN: TOKEN });
     expect(seen.commandKey).toBe(PROJECT_KEY);
     // the key rides in a file only this user reads, not in the settings Claude Code is started with
     expect(JSON.stringify(seen.options.settings)).not.toContain(PROJECT_KEY);
   });
 
   test("a subscription run whose project has no key sets nothing up for commands", async () => {
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
     vi.stubEnv("ANTHROPIC_API_KEY", undefined);
-    const seen = await sessionSeen(config);
+    const seen = await sessionSeen(config, { CLAUDE_CODE_OAUTH_TOKEN: TOKEN });
     expect(seen.options.settings).not.toHaveProperty("hooks");
     expect(seen.commandKey).toBe("");
   });
 
   test("an API-key run: the Claude process holds Sky's key alone, with no subscription token", async () => {
-    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
-    // a real token in the runner's env: the run chose the key, so the token must be left out
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
     vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
-    const seen = await sessionSeen({ ...config, claudeAuth: "api-key" });
+    // a real token beside the key: the run chose the key, so the token must be left out
+    const seen = await sessionSeen(
+      { ...config, claudeAuth: "api-key" },
+      { SKY_CLAUDE_API_KEY: SKY_KEY, CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+    );
     const env = seen.options.env ?? {};
     expect(env.ANTHROPIC_API_KEY).toBe(SKY_KEY);
     expect(env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
@@ -1247,22 +1259,26 @@ describe("the Claude credential of a run", () => {
   });
 
   test("an API-key run: Sky's key never reaches the project's commands, which keep the project's own key", async () => {
-    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
     vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
-    const seen = await sessionSeen({ ...config, claudeAuth: "api-key" });
+    const seen = await sessionSeen(
+      { ...config, claudeAuth: "api-key" },
+      { SKY_CLAUDE_API_KEY: SKY_KEY },
+    );
     expect(seen.commandKey).toBe(PROJECT_KEY);
     expect(JSON.stringify(seen.options.settings)).not.toContain(SKY_KEY);
   });
 
   test("an API-key run whose project has no key: its commands see no ANTHROPIC_API_KEY, not Sky's", async () => {
-    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
     vi.stubEnv("ANTHROPIC_API_KEY", undefined);
-    const seen = await sessionSeen({ ...config, claudeAuth: "api-key" });
+    const seen = await sessionSeen(
+      { ...config, claudeAuth: "api-key" },
+      { SKY_CLAUDE_API_KEY: SKY_KEY },
+    );
     expect(seen.options.env?.ANTHROPIC_API_KEY).toBe(SKY_KEY);
     expect(seen.commandKey).toBe("");
   });
 
-  describe("when the runner env and the profile's session env both carry a key, a token and a gateway", () => {
+  describe("when the runner's credential env, the runner env and the profile's session env all carry a key, a token or a gateway", () => {
     const GATEWAY = "https://project-gateway.example";
     const PROFILE = {
       ANTHROPIC_API_KEY: "profile-anthropic-key-opaque",
@@ -1285,9 +1301,7 @@ describe("the Claude credential of a run", () => {
 
     beforeEach(() => {
       vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
-      vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
       vi.stubEnv("ANTHROPIC_BASE_URL", GATEWAY);
-      vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
     });
 
     test.each([
@@ -1296,11 +1310,10 @@ describe("the Claude credential of a run", () => {
     ] as const)(
       "%s: the Claude process holds exactly the chosen credential, sent to no gateway",
       async (_, claudeAuth, chosen) => {
-        const seen = await sessionSeen({
-          ...config,
-          claudeAuth,
-          sessionEnv: PROFILE,
-        });
+        const seen = await sessionSeen(
+          { ...config, claudeAuth, sessionEnv: PROFILE },
+          { CLAUDE_CODE_OAUTH_TOKEN: TOKEN, SKY_CLAUDE_API_KEY: SKY_KEY },
+        );
         const env = seen.options.env;
         expect(credentialsIn(env)).toEqual(chosen);
         const all = JSON.stringify(env);
@@ -1316,11 +1329,10 @@ describe("the Claude credential of a run", () => {
   });
 
   test("a project's gateway and auth token still reach its commands, through the file and not Claude's env", async () => {
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
     vi.stubEnv("ANTHROPIC_API_KEY", undefined);
     vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "project-auth-token-opaque");
     vi.stubEnv("ANTHROPIC_BASE_URL", "https://project-gateway.example");
-    const seen = await sessionSeen(config);
+    const seen = await sessionSeen(config, { CLAUDE_CODE_OAUTH_TOKEN: TOKEN });
     expect(seen.options.env).not.toHaveProperty("ANTHROPIC_BASE_URL");
     expect(seen.options.env).not.toHaveProperty("ANTHROPIC_AUTH_TOKEN");
     expect(seen.commandEnv).toMatchObject({
@@ -1333,15 +1345,13 @@ describe("the Claude credential of a run", () => {
   });
 
   test("the file holding the project's key is removed when the session ends", async () => {
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
     vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
-    const seen = await sessionSeen(config);
+    const seen = await sessionSeen(config, { CLAUDE_CODE_OAUTH_TOKEN: TOKEN });
     expect(seen.scriptPath).toBeDefined();
     expect(existsSync(String(seen.scriptPath))).toBe(false);
   });
 
   test("a run that can't write that file fails rather than start with Sky's key visible to commands", async () => {
-    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
     vi.stubEnv("TMPDIR", join(root, "not-a-directory"));
     writeFileSync(join(root, "not-a-directory"), "");
     const { posted, post } = recorder();
@@ -1353,6 +1363,7 @@ describe("the Claude credential of a run", () => {
         post,
         signal: new AbortController().signal,
         awaitDecision: noDecision,
+        credentialEnv: { SKY_CLAUDE_API_KEY: SKY_KEY },
       },
     );
     expect(code).toBe(1);
@@ -1361,7 +1372,6 @@ describe("the Claude credential of a run", () => {
   });
 
   test("a usage limit, which Claude reports as an error result of subtype success, reaches run.failed as its own text", async () => {
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
     const { posted, post } = recorder();
     const limit = "You've hit your 5-hour limit · resets 10:20am (UTC)";
     const query = scripted([
@@ -1373,6 +1383,7 @@ describe("the Claude credential of a run", () => {
       post,
       signal: new AbortController().signal,
       awaitDecision: noDecision,
+      credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
     });
     expect(code).toBe(1);
     expect(posted.at(-1)).toMatchObject({
@@ -1384,11 +1395,9 @@ describe("the Claude credential of a run", () => {
   describe("the nested claude's login in the prompt", () => {
     const promptOf = async (
       overrides: Partial<typeof config>,
-      runnerEnv: Record<string, string | undefined>,
+      credentialEnv: NodeJS.ProcessEnv,
       during: Step[] = [],
     ) => {
-      for (const [name, value] of Object.entries(runnerEnv))
-        vi.stubEnv(name, value);
       const query = scripted([init, ...during, success]);
       await runSession(
         { ...config, checks: ["claude -p /review"], ...overrides },
@@ -1397,6 +1406,7 @@ describe("the Claude credential of a run", () => {
           post: recorder().post,
           signal: new AbortController().signal,
           awaitDecision: noDecision,
+          credentialEnv,
         },
       );
       const options = query.calls[0]?.options;
@@ -1456,18 +1466,23 @@ describe("the Claude credential of a run", () => {
       );
     });
 
-    test("the file holding the credential exists alone, for this user only, during the run and is gone once it ends", async () => {
+    /** The nested login files in the credential directory while a run of `runConfig` is under way. */
+    const loginFilesDuring = async (
+      runConfig: Config,
+      credentialEnv: NodeJS.ProcessEnv,
+    ) => {
       const dir = isolatedCredentialDir();
       let during: { names: string[]; modes: number[]; values: string[] } = {
         names: [],
         modes: [],
         values: [],
       };
+      let listed = false;
       const query = scripted([
         init,
         async () => {
-          const names = readdirSync(dir).filter((name) =>
-            name.startsWith("sky-nested-claude-run_1-"),
+          const names = (existsSync(dir) ? readdirSync(dir) : []).filter(
+            (name) => name.startsWith("sky-nested-claude-run_1-"),
           );
           const at = (name: string) => join(dir, name);
           during = {
@@ -1475,23 +1490,47 @@ describe("the Claude credential of a run", () => {
             modes: names.map((name) => statSync(at(name)).mode & 0o777),
             values: names.map((name) => readFileSync(at(name), "utf8")),
           };
+          listed = true;
         },
         success,
       ]);
-      vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
-      await runSession(
-        { ...config, claudeAuth: "oauth" },
-        {
-          query,
-          post: recorder().post,
-          signal: new AbortController().signal,
-          awaitDecision: noDecision,
-        },
+      await runSession(runConfig, {
+        query,
+        post: recorder().post,
+        signal: new AbortController().signal,
+        awaitDecision: noDecision,
+        credentialEnv,
+      });
+      // listed mid-run: the run's own cleanup would hide a file from a listing after it
+      expect(listed).toBe(true);
+      return { during, after: existsSync(dir) ? readdirSync(dir) : [] };
+    };
+
+    // the runner can't tell a pool member's token from a subscription's: both arrive as the run's
+    // CLAUDE_CODE_OAUTH_TOKEN
+    test.each([
+      ["a subscription run", TOKEN],
+      ["a pool run", "pool-member-token-opaque"],
+    ])(
+      "%s with checks: the file holding the credential exists alone, for this user only, during the run and is gone once it ends",
+      async (_, token) => {
+        const { during, after } = await loginFilesDuring(
+          { ...config, claudeAuth: "oauth", checks: ["claude -p /review"] },
+          { CLAUDE_CODE_OAUTH_TOKEN: token },
+        );
+        expect(during.names).toHaveLength(1);
+        expect(during.modes).toEqual([0o600]);
+        expect(during.values).toEqual([token]);
+        expect(after).toEqual([]);
+      },
+    );
+
+    test("a subscription run without checks writes no file holding the credential", async () => {
+      const { during } = await loginFilesDuring(
+        { ...config, claudeAuth: "oauth", checks: [] },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
       );
-      expect(during.names).toHaveLength(1);
-      expect(during.modes).toEqual([0o600]);
-      expect(during.values).toEqual([TOKEN]);
-      expect(readdirSync(dir)).toEqual([]);
+      expect(during.names).toEqual([]);
     });
 
     describe("a run that does not finish", () => {
@@ -1509,14 +1548,14 @@ describe("the Claude credential of a run", () => {
           },
           ...tail,
         ]);
-        vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
         const code = await runSession(
-          { ...config, claudeAuth: "oauth" },
+          { ...config, claudeAuth: "oauth", checks: ["claude -p /review"] },
           {
             query,
             post: recorder().post,
             signal: controller.signal,
             awaitDecision: noDecision,
+            credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
           },
         );
         return { code, during, after: readdirSync(dir) };
@@ -1546,7 +1585,6 @@ describe("the Claude credential of a run", () => {
     });
 
     test("no event the run posts holds the credential, though the check's command that reads it does", async () => {
-      vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
       const { posted, post } = recorder();
       // the command the run's prompt gives for a nested claude, as a Bash call in the run would carry it
       const nestedCommand = (options: Options) =>
@@ -1575,6 +1613,7 @@ describe("the Claude credential of a run", () => {
           post,
           signal: new AbortController().signal,
           awaitDecision: noDecision,
+          credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
         },
       );
       const all = JSON.stringify(posted);
@@ -1584,7 +1623,6 @@ describe("the Claude credential of a run", () => {
     });
 
     test("no event an API-key run posts holds Sky's key, though the run's Bash calls reach the events", async () => {
-      vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
       const { posted, post } = recorder();
       const command = "claude -p /review";
       const bashCall =
@@ -1609,6 +1647,7 @@ describe("the Claude credential of a run", () => {
           post,
           signal: new AbortController().signal,
           awaitDecision: noDecision,
+          credentialEnv: { SKY_CLAUDE_API_KEY: SKY_KEY },
         },
       );
       const all = JSON.stringify(posted);
@@ -3707,7 +3746,7 @@ describe("a repo's or sandbox's Claude settings", () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "sky-guard-home-"));
     managed = mkdtempSync(join(tmpdir(), "sky-guard-managed-"));
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", undefined);
   });
   afterEach(() => {
     rmSync(home, { recursive: true, force: true });
@@ -3734,7 +3773,10 @@ describe("a repo's or sandbox's Claude settings", () => {
     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD");
   };
 
-  const run = async (runConfig: Config = config) => {
+  const run = async (
+    runConfig: Config = config,
+    credentialEnv: NodeJS.ProcessEnv = { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+  ) => {
     const query = scripted([init, success]);
     const rec = recorder();
     const warn = vi.fn();
@@ -3744,6 +3786,7 @@ describe("a repo's or sandbox's Claude settings", () => {
       warn,
       signal: new AbortController().signal,
       awaitDecision: noDecision,
+      credentialEnv,
       env: { HOME: home },
       settingsDirs: { userDirs: [join(home, ".claude")], managedDir: managed },
     });
@@ -3774,12 +3817,11 @@ describe("a repo's or sandbox's Claude settings", () => {
   );
 
   test("an apiKeyHelper in the project's settings fails an API-key run the same way, with no other credential tried", async () => {
-    vi.stubEnv("SKY_CLAUDE_API_KEY", "sky-key-opaque");
     commitSettings("settings.json", { apiKeyHelper: VALUE });
-    const { code, query, posted } = await run({
-      ...config,
-      claudeAuth: "api-key",
-    });
+    const { code, query, posted } = await run(
+      { ...config, claudeAuth: "api-key" },
+      { SKY_CLAUDE_API_KEY: "sky-key-opaque" },
+    );
     expect(code).toBe(1);
     expect(query.calls).toHaveLength(0);
     expect(posted).toHaveLength(1);
@@ -3993,16 +4035,11 @@ describe("keeping the run's Claude credential from the repo's processes", () => 
     ]);
   });
 
-  test("Claude is started through the seal's spawn, and through the SDK's own where there is no seal", async () => {
-    const withSeal = scripted([init, success]);
+  test("Claude is started through the seal's spawn", async () => {
+    const query = scripted([init, success]);
     const seal = sealed();
-    await runSession(config, { ...deps(withSeal), seal });
-    expect(withSeal.calls[0]?.options.spawnClaudeCodeProcess).toBe(seal.spawn);
-    const without = scripted([init, success]);
-    await runSession(config, deps(without));
-    expect(without.calls[0]?.options).not.toHaveProperty(
-      "spawnClaudeCodeProcess",
-    );
+    await runSession(config, { ...deps(query), seal });
+    expect(query.calls[0]?.options.spawnClaudeCodeProcess).toBe(seal.spawn);
   });
 
   test("a Claude process the repo's commands could read stops the run when it starts", async () => {

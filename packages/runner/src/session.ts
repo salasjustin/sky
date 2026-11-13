@@ -465,10 +465,10 @@ export async function runSession(
     heartbeatMs?: number;
     /** `BACKGROUND_HOLD_MS` when absent. */
     backgroundHoldMs?: number;
-    /** The env holding the run's Claude credential, which the runner took out of its own; `process.env` when absent. */
-    credentialEnv?: NodeJS.ProcessEnv;
-    /** Keeps the credential out of the repo's processes' reach; none when absent, as in a test run. */
-    seal?: Seal;
+    /** The env holding the run's Claude credential, which the runner took out of its own. */
+    credentialEnv: NodeJS.ProcessEnv;
+    /** Keeps the credential out of the repo's processes' reach; a seal with a problem fails the run before it starts. */
+    seal: Seal;
   },
 ): Promise<0 | 1> {
   const { runId } = config;
@@ -497,7 +497,7 @@ export async function runSession(
   };
 
   // before the runner starts a single command the repo can influence, git's included
-  if (deps.seal?.problem)
+  if (deps.seal.problem)
     return fail(
       `credential_exposed: Sky can't keep its Claude credential from this repo's commands (${deps.seal.problem}); the run did not start.`,
     );
@@ -756,11 +756,13 @@ export async function runSession(
       config.claudeAuth,
       sessionEnvOf(config),
     );
-    nestedLogin = await prepareNestedLogin(
-      config.claudeAuth,
-      deps.credentialEnv ?? process.env,
-      config.runId,
-    );
+    // a check's nested `claude` is the file's only reader, so a run without checks gets none
+    if (config.checks.length > 0)
+      nestedLogin = await prepareNestedLogin(
+        config.claudeAuth,
+        deps.credentialEnv,
+        config.runId,
+      );
     const stream = deps.query({
       prompt: input.messages,
       options: sessionOptions(
@@ -772,16 +774,16 @@ export async function runSession(
         notes,
         mcp.servers,
         commandEnv.hooks,
-        deps.credentialEnv ?? process.env,
-        deps.seal?.spawn,
-        nestedLogin.prefix,
+        deps.credentialEnv,
+        deps.seal.spawn,
+        nestedLogin?.prefix,
       ),
     });
     for await (const message of stream) {
       if (message.type === "system" && message.subtype === "init" && !started) {
         started = true;
         // Claude is past its exec, so what the kernel does with its `/proc` entries is settled
-        const exposed = deps.seal?.check();
+        const exposed = deps.seal.check();
         if (exposed)
           stopSession(`credential_exposed: ${exposed}; the run was stopped.`);
         await post({

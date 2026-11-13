@@ -1,6 +1,6 @@
-import { spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import {
-  chmodSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -100,51 +100,187 @@ describe("hideRunner", () => {
 });
 
 describe("createSeal", () => {
-  const withSetpriv = () => {
-    const bin = join(dir, "bin");
-    mkdirSync(bin);
-    writeFileSync(join(bin, "setpriv"), "#!/bin/sh\n");
-    chmodSync(join(bin, "setpriv"), 0o755);
-    return { PATH: bin };
+  // a host's files as the seal sees them, so no test depends on this machine's: what isn't listed is absent
+  type Entry = { uid: number; mode: number; realpath?: string };
+  const ROOT_DIR: Entry = { uid: 0, mode: 0o040755 };
+  const ROOT_PROGRAM: Entry = { uid: 0, mode: 0o100755 };
+  const SPRITE_USER = 1000;
+  const SANDBOX: Record<string, Entry> = {
+    "/": ROOT_DIR,
+    "/usr": ROOT_DIR,
+    "/usr/bin": ROOT_DIR,
+    "/usr/bin/setpriv": ROOT_PROGRAM,
+    "/usr/bin/dash": ROOT_PROGRAM,
+    // merged /usr: /bin is /usr/bin, and sh is dash
+    "/bin": { ...ROOT_DIR, realpath: "/usr/bin" },
+    "/bin/sh": { ...ROOT_PROGRAM, realpath: "/usr/bin/dash" },
+    "/home": ROOT_DIR,
+    "/home/sprite": { uid: SPRITE_USER, mode: 0o040755 },
+    "/home/sprite/.local": { uid: SPRITE_USER, mode: 0o040755 },
+    "/home/sprite/.local/bin": { uid: SPRITE_USER, mode: 0o040755 },
   };
+  const filesOf = (host: Record<string, Entry | undefined>) => {
+    const at = (path: string) => {
+      const entry = host[path];
+      if (!entry)
+        throw Object.assign(new Error(`ENOENT: ${path}`), { code: "ENOENT" });
+      return entry;
+    };
+    return {
+      stat: (path: string) => at(at(path).realpath ?? path),
+      realpath: (path: string) => at(path).realpath ?? path,
+    };
+  };
+  const sealOn = (
+    host: Record<string, Entry | undefined>,
+    over: Parameters<typeof createSeal>[1] = {},
+  ) =>
+    createSeal("linux", {
+      hideRunner: () => undefined,
+      files: filesOf(host),
+      ...over,
+    });
 
-  test("there is no seal where there is no /proc to hide", () => {
-    expect(createSeal("darwin")).toBeUndefined();
-    expect(createSeal("win32")).toBeUndefined();
-  });
+  test.each(["darwin", "win32"] as const)(
+    "on %s, where the kernel can't hide a process's environment, the seal's problem says so and nothing is spawned",
+    (platform) => {
+      const seal = createSeal(platform);
+      expect(seal.problem).toMatch(
+        new RegExp(`only Linux .* and this is ${platform}`),
+      );
+      expect(() =>
+        seal.spawn({
+          command: process.execPath,
+          args: [],
+          env: {},
+          signal: new AbortController().signal,
+        }),
+      ).toThrow(seal.problem);
+    },
+  );
 
   test("a runner the kernel can't hide is the seal's problem", () => {
-    const seal = createSeal("linux", {
-      env: withSetpriv(),
+    const seal = sealOn(SANDBOX, {
       hideRunner: () => "the runner can't change its effective user (EPERM)",
     });
-    expect(seal?.problem).toBe(
+    expect(seal.problem).toBe(
       "the runner can't change its effective user (EPERM)",
     );
   });
 
-  test("a sandbox without setpriv is the seal's problem", () => {
-    const seal = createSeal("linux", {
-      env: { PATH: join(dir, "empty") },
-      hideRunner: () => undefined,
-    });
-    expect(seal?.problem).toMatch(/setpriv .* isn't installed/);
+  test("a hidden runner with a root-owned setpriv and sh has no problem", () => {
+    expect(sealOn(SANDBOX).problem).toBeUndefined();
   });
 
-  test("a hidden runner with setpriv at hand has no problem", () => {
-    const seal = createSeal("linux", {
-      env: withSetpriv(),
-      hideRunner: () => undefined,
+  test("a sandbox with no setpriv at a fixed path is the seal's problem, whatever its PATH holds", () => {
+    const seal = sealOn({
+      ...SANDBOX,
+      "/usr/bin/setpriv": undefined,
+      "/home/sprite/.local/bin/setpriv": ROOT_PROGRAM,
     });
-    expect(seal?.problem).toBeUndefined();
+    expect(seal.problem).toBe(
+      "no setpriv (util-linux) that only root can change, at /usr/bin/setpriv or /bin/setpriv: it drops the capabilities that read around a file's mode",
+    );
+  });
+
+  const setprivAs = (entry: Entry) => ({ "/usr/bin/setpriv": entry });
+  test.each([
+    [
+      "owned by the sprite's user",
+      setprivAs({ uid: SPRITE_USER, mode: 0o100755 }),
+    ],
+    ["writable by its group", setprivAs({ uid: 0, mode: 0o100775 })],
+    ["writable by anyone", setprivAs({ uid: 0, mode: 0o100757 })],
+    ["that is no regular file", setprivAs({ uid: 0, mode: 0o040755 })],
+    [
+      "in a directory the sprite's user owns",
+      { "/usr/bin": { uid: SPRITE_USER, mode: 0o040755 } },
+    ],
+    [
+      "under a directory anyone can write",
+      { "/usr": { uid: 0, mode: 0o040777 } },
+    ],
+    [
+      "linked to a file in the sprite's user's own bin",
+      {
+        ...setprivAs({
+          ...ROOT_PROGRAM,
+          realpath: "/home/sprite/.local/bin/setpriv",
+        }),
+        "/home/sprite/.local/bin/setpriv": ROOT_PROGRAM,
+      },
+    ],
+  ])("a setpriv %s isn't trusted", (_, change) => {
+    const seal = sealOn({ ...SANDBOX, ...change });
+    expect(seal.problem).toMatch(
+      /^no setpriv \(util-linux\) that only root can change/,
+    );
+  });
+
+  test("a sandbox with no sh only root can change is the seal's problem", () => {
+    const seal = sealOn({
+      ...SANDBOX,
+      "/bin/sh": { uid: SPRITE_USER, mode: 0o100755 },
+      "/usr/bin/sh": undefined,
+    });
+    expect(seal.problem).toBe(
+      "no sh that only root can change, at /bin/sh or /usr/bin/sh",
+    );
+  });
+
+  describe("starting Claude", () => {
+    /** The command and argv the seal starts Claude with, on `host`; nothing is run. */
+    const startedOn = (host: Record<string, Entry | undefined>) => {
+      const started: { command: string; args: readonly string[] }[] = [];
+      const seal = sealOn(host, {
+        dir,
+        spawn: (command, args) => {
+          started.push({ command, args });
+          return Object.assign(new EventEmitter(), {
+            pid: 4242,
+            exitCode: null,
+            signalCode: null,
+          }) as unknown as ChildProcess;
+        },
+      });
+      const claude = join(dir, "claude-binary");
+      writeFileSync(claude, "");
+      seal.spawn({
+        command: claude,
+        args: ["--print"],
+        env: { PATH: "/home/sprite/.local/bin:/usr/bin" },
+        signal: new AbortController().signal,
+      });
+      return started;
+    };
+
+    test("goes through the root-owned setpriv and sh by the files they resolve to, never by name on PATH", () => {
+      const [start] = startedOn(SANDBOX);
+      expect(start?.command).toBe("/usr/bin/setpriv");
+      expect(start?.args.slice(2, 5)).toEqual([
+        "/usr/bin/dash",
+        "-c",
+        'exec "$0" "$@"',
+      ]);
+      expect(start?.args.at(-1)).toBe("--print");
+    });
+
+    test("takes the next fixed path when the first isn't trusted", () => {
+      const [start] = startedOn({
+        ...SANDBOX,
+        "/usr/bin/setpriv": { uid: SPRITE_USER, mode: 0o100755 },
+        "/bin": ROOT_DIR,
+        "/bin/setpriv": ROOT_PROGRAM,
+        "/bin/sh": { uid: 0, mode: 0o100777 },
+        "/usr/bin/sh": ROOT_PROGRAM,
+      });
+      expect(start?.command).toBe("/bin/setpriv");
+      expect(start?.args[2]).toBe("/usr/bin/sh");
+    });
   });
 
   test("before Claude is started, its process can't be vouched for", () => {
-    const seal = createSeal("linux", {
-      env: withSetpriv(),
-      hideRunner: () => undefined,
-    });
-    expect(seal?.check()).toMatch(/not started/);
+    expect(sealOn(SANDBOX).check()).toMatch(/not started/);
   });
 });
 
@@ -165,7 +301,11 @@ const dumpableRespected = (() => {
   }
 })();
 const kernelCanBeAsked =
-  setprivRuns && dumpableRespected && process.getuid?.() !== 0;
+  setprivRuns &&
+  dumpableRespected &&
+  process.getuid?.() !== 0 &&
+  // a host whose setpriv or sh isn't root's alone gets no seal at all
+  createSeal("linux", { hideRunner: () => undefined }).problem === undefined;
 
 // what a command the repo starts does: read its parent's environment, as `cat /proc/$PPID/environ` or
 // `ps auxe` do, and report whether the secret was there to be read
@@ -214,7 +354,6 @@ describe.skipIf(!kernelCanBeAsked)("the kernel's hiding of a process", () => {
 
   test("a sealed child's environment is not, while the project's own values still reach it", async () => {
     const seal = createSeal("linux", { dir, hideRunner: () => undefined });
-    if (!seal) throw new Error("no seal on Linux");
     expect(seal.problem).toBeUndefined();
     const child = seal.spawn({
       command: process.execPath,
@@ -235,7 +374,7 @@ describe.skipIf(!kernelCanBeAsked)("the kernel's hiding of a process", () => {
 
   test("removeSealedCopiesNow deletes a copy of the binary a dying runner would leave behind", async () => {
     const seal = createSeal("linux", { dir, hideRunner: () => undefined });
-    const child = seal?.spawn({
+    const child = seal.spawn({
       command: process.execPath,
       args: ["-e", CHILD],
       env: ENV,
