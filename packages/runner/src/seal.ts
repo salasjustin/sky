@@ -18,7 +18,7 @@ import type {
   SpawnedProcess,
   SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
-import { credentialDir } from "./claude-auth.js";
+import { credentialDir, ownDirectory } from "./claude-auth.js";
 
 // Every command the repo starts runs as the user the runner and Claude run as, and `/proc/<pid>/environ`,
 // `mem` and `fd` of a process are readable by every other process of its user, unless the kernel marks
@@ -223,7 +223,9 @@ function sealPrograms(
  * Hides the runner, and returns the seal for the run's Claude process, whose `problem` says why it
  * can't be sealed: off Linux, a runner the kernel won't hide, or no `setpriv` or `sh` only root can
  * change. The runner's own credential stays in its environment, which only it can read now, so call
- * this before the runner starts anything.
+ * this before the runner starts anything. It writes nothing to disk: the seal's `spawn` is the first
+ * to write to `options.dir`, so `sweepCredentialFiles` may run between the two and delete nothing the seal
+ * needs.
  *
  * The Claude process is exec'd, through `setpriv`, from a mode 0111 copy of its binary by a process
  * without the capabilities that read around that mode, so it is non-dumpable from its first
@@ -252,7 +254,8 @@ export function createSeal(
         rmSync(copyDir, { recursive: true, force: true });
       };
       try {
-        mkdirSync(copyDir, { recursive: true, mode: 0o700 });
+        ownDirectory(dir);
+        mkdirSync(copyDir, { mode: 0o700 });
         const binary = join(copyDir, "claude");
         copyFileSync(spawnOptions.command, binary, constants.COPYFILE_FICLONE);
         chmodSync(binary, 0o111);

@@ -1,10 +1,14 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
+  chmodSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -346,6 +350,62 @@ describe("createSeal", () => {
       start(sealOn(SANDBOX, { dir: copies, spawn: () => claude }));
       expect(readdirSync(copies)).toHaveLength(1);
       claude.emit(event, payload);
+      expect(readdirSync(copies)).toEqual([]);
+    });
+
+    test("a missing directory is created as this user's alone, and the copy lands in it", () => {
+      start(sealOn(SANDBOX, { dir: copies, spawn: () => fakeProcess() }));
+      expect(statSync(copies).mode & 0o777).toBe(0o700);
+      expect(readdirSync(copies)).toEqual([
+        expect.stringMatching(/^sky-claude-/),
+      ]);
+    });
+
+    test("a directory already there looser is held to this user alone before the copy lands in it", () => {
+      mkdirSync(copies);
+      // set outright: a mode passed to mkdir is masked by the umask
+      chmodSync(copies, 0o755);
+      start(sealOn(SANDBOX, { dir: copies, spawn: () => fakeProcess() }));
+      expect(statSync(copies).mode & 0o777).toBe(0o700);
+      expect(readdirSync(copies)).toHaveLength(1);
+    });
+
+    test("a directory that is a symlink is refused, nothing is written where it points, and no copy is left to remove", () => {
+      const elsewhere = join(dir, "elsewhere");
+      mkdirSync(elsewhere);
+      symlinkSync(elsewhere, copies);
+      const started: string[] = [];
+      const seal = sealOn(SANDBOX, {
+        dir: copies,
+        spawn: (command) => {
+          started.push(command);
+          return fakeProcess();
+        },
+      });
+      expect(() => start(seal)).toThrow(
+        `${copies} is not a directory of this user; remove it, and the next run creates its own`,
+      );
+      expect(started).toEqual([]);
+      expect(readdirSync(elsewhere)).toEqual([]);
+      vi.mocked(rmSync).mockClear();
+      removeSealedCopiesNow();
+      expect(rmSync).not.toHaveBeenCalled();
+    });
+
+    test("a directory another user owns is refused, and nothing is written there", () => {
+      mkdirSync(copies);
+      // lstat reports the real owner, so the runner's uid is moved instead
+      const owner = lstatSync(copies).uid;
+      const getuid = vi.spyOn(process, "getuid").mockReturnValue(owner + 1);
+      try {
+        expect(() =>
+          start(sealOn(SANDBOX, { dir: copies, spawn: () => fakeProcess() })),
+        ).toThrow(
+          `${copies} is not a directory of this user; remove it, and the next run creates its own`,
+        );
+      } finally {
+        getuid.mockRestore();
+      }
       expect(readdirSync(copies)).toEqual([]);
     });
 

@@ -22,6 +22,7 @@ import {
   claudeProcessEnv,
   commandEnvScript,
   credentialDir,
+  ownDirectory,
   prepareCommandEnv,
   prepareNestedLogin,
   removeCredentialFilesNow,
@@ -477,5 +478,42 @@ describe("a nested login's link and the directories it is written to", () => {
       expect(statSync(target()).mode & 0o777).toBe(0o700);
       await login.remove();
     });
+  });
+});
+
+// called directly, as the seal's synchronous spawn calls it for the directory of Claude's binary copy
+describe("ownDirectory", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const target = () => join(dir, "owned");
+  const refusal = () =>
+    `${target()} is not a directory of this user; remove it, and the next run creates its own`;
+
+  test("creates a missing directory as this user's alone", () => {
+    ownDirectory(target());
+    expect(lstatSync(target()).isDirectory()).toBe(true);
+    expect(statSync(target()).mode & 0o777).toBe(0o700);
+  });
+
+  test("holds a directory already there looser to this user alone", () => {
+    mkdirSync(target());
+    chmodSync(target(), 0o755);
+    ownDirectory(target());
+    expect(statSync(target()).mode & 0o777).toBe(0o700);
+  });
+
+  test("refuses a symlink, and leaves where it points as it was", () => {
+    const elsewhere = join(dir, "elsewhere");
+    mkdirSync(elsewhere);
+    chmodSync(elsewhere, 0o755);
+    symlinkSync(elsewhere, target());
+    expect(() => ownDirectory(target())).toThrow(refusal());
+    expect(statSync(elsewhere).mode & 0o777).toBe(0o755);
+  });
+
+  test("refuses a directory another user owns", () => {
+    mkdirSync(target());
+    vi.spyOn(process, "getuid").mockReturnValue(lstatSync(target()).uid + 1);
+    expect(() => ownDirectory(target())).toThrow(refusal());
   });
 });

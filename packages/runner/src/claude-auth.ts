@@ -1,15 +1,15 @@
 import { randomUUID } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
+  mkdirSync,
   readdirSync,
   readlinkSync,
   rmSync,
   unlinkSync,
 } from "node:fs";
 import {
-  chmod,
-  lstat,
-  mkdir,
   readlink,
   rename,
   rm,
@@ -243,8 +243,8 @@ export async function prepareNestedLogin(
   const value =
     auth === "oauth" ? runnerEnv.CLAUDE_CODE_OAUTH_TOKEN : undefined;
   if (!value) return { prefix: undefined, remove: async () => {} };
-  await ownDirectory(dir);
-  await ownDirectory(fileDir);
+  ownDirectory(dir);
+  ownDirectory(fileDir);
   const file = join(fileDir, `sky-nested-claude-${runId}-${randomUUID()}`);
   const path = join(dir, `sky-nested-claude-${agentId}`);
   // before the write: a signal can land while it is in flight
@@ -275,17 +275,18 @@ export async function prepareNestedLogin(
 /**
  * Creates `dir` as a 0700 directory of this user, or holds an existing one to that. Refuses a
  * directory another user made first and a symlink standing in for one, so no other user can read or
- * swap what this runner writes there; every process of this user still can.
+ * swap what this runner writes there; every process of this user still can. Synchronous, so the
+ * seal's `spawn` can hold the directory of Claude's binary copy to it too.
  */
-async function ownDirectory(dir: string): Promise<void> {
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const info = await lstat(dir);
+export function ownDirectory(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const info = lstatSync(dir);
   if (!info.isDirectory() || info.uid !== (process.getuid?.() ?? info.uid))
     throw new Error(
       `${dir} is not a directory of this user; remove it, and the next run creates its own`,
     );
   // `mkdir`'s mode is masked by the umask and never applies to a directory already there
-  await chmod(dir, 0o700);
+  chmodSync(dir, 0o700);
 }
 
 /**
@@ -407,7 +408,7 @@ export async function prepareCommandEnv(
 ): Promise<CommandEnv> {
   const script = commandEnvScript(auth, env);
   if (script === undefined) return { hooks: undefined, remove: async () => {} };
-  await ownDirectory(dir);
+  ownDirectory(dir);
   const path = join(dir, `sky-command-env-${randomUUID()}.sh`);
   // before the write: a signal can land while it is in flight
   unremoved.add(path);
