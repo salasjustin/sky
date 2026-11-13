@@ -181,8 +181,9 @@ export function commandEnvScript(
 const RUNNER_DIR = /^sky-runner-(\d+)$/;
 
 /**
- * Where this runner writes its credential files: a directory of `root` named for its pid, which is
- * how `sweepCredentialFiles` tells a dead runner's files from a live one's.
+ * Where this runner writes its credential files and the copy of Claude's binary: a directory of
+ * `root` named for its pid, which is how `sweepCredentialFiles` tells a dead runner's files from a
+ * live one's.
  */
 export const credentialDir = (root: string = tmpdir(), pid = process.pid) =>
   join(root, `sky-runner-${pid}`);
@@ -360,12 +361,12 @@ export function removeCredentialFilesOnExit(): void {
 }
 
 /**
- * Deletes the credential files a runner killed outright (SIGKILL, the OOM killer) left behind, which
- * no exit handler reaches. Runs on one sprite share its tmpdir and pid space, so a directory is swept
- * only when `isAlive` finds no process with its pid; a pid reused by any process keeps its directory
- * until that one ends too. A directory under this runner's own pid is a dead process's and is swept
- * too, so this runs before the runner writes any. Then each nested login link in `nestedLoginDir`
- * whose file is gone is deleted. Never throws.
+ * Deletes the credential files and the copy of Claude's binary a runner killed outright (SIGKILL, the
+ * OOM killer) left behind, which no exit handler reaches. Runs on one sprite share its tmpdir and pid
+ * space, so a directory is swept only when `isAlive` finds no process with its pid; a pid reused by
+ * any process keeps its directory until that one ends too. A directory under this runner's own pid is
+ * a dead process's and is swept too, so this runs before the runner writes any. Then each nested
+ * login link in `nestedLoginDir` whose file is gone is deleted. Never throws.
  */
 export function sweepCredentialFiles(
   isAlive: (pid: number) => boolean,

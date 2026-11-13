@@ -489,8 +489,8 @@ describe("createSeal", () => {
   });
 });
 
-// A runner that ends normally, or dies of an uncaught exception, never reaches the session's own cleanup:
-// the 'exit' listener `main` registers is what takes the copy of Claude's binary with it. The child
+// A runner that dies of an uncaught exception never reaches the session's own cleanup: the 'exit'
+// listener `main` registers is what takes the copy of Claude's binary with it. The child
 // registers it the way `main` does (or leaves it out), starts a seal on a fake spawn, and exits. It is
 // bundled first, because Node alone won't resolve this package's `./x.js` imports to their `.ts` files.
 describe("the copy of Claude's binary when the runner exits", () => {

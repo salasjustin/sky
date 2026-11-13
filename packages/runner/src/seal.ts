@@ -152,7 +152,8 @@ const copies = new Set<string>();
 
 /**
  * Deletes every copy of Claude's binary still on disk, synchronously: for a process about to die by a
- * signal, which never reaches the session's own cleanup. Never throws, so the death goes ahead.
+ * signal, or exiting on an uncaught exception, neither of which reaches the session's own cleanup.
+ * Never throws, so the death goes ahead.
  */
 export function removeSealedCopiesNow(): void {
   for (const dir of copies)
@@ -177,7 +178,10 @@ export type Seal = {
 };
 
 export type SealOptions = {
-  /** Where the copy of Claude's binary lives while it runs; the runner's credential directory when absent. */
+  /**
+   * Where the copy of Claude's binary lives while it runs; the runner's credential directory when
+   * absent.
+   */
   dir?: string;
   /** Steps the runner out of its commands' reach; the real one when absent. */
   hideRunner?: () => string | undefined;
@@ -223,9 +227,8 @@ function sealPrograms(
  * Hides the runner, and returns the seal for the run's Claude process, whose `problem` says why it
  * can't be sealed: off Linux, a runner the kernel won't hide, or no `setpriv` or `sh` only root can
  * change. The runner's own credential stays in its environment, which only it can read now, so call
- * this before the runner starts anything. It writes nothing to disk: the seal's `spawn` is the first
- * to write to `options.dir`, so `sweepCredentialFiles` may run between the two and delete nothing the seal
- * needs.
+ * this before the runner starts anything. It writes nothing to disk until the seal's `spawn`, so
+ * `sweepCredentialFiles` can run in between without deleting anything the seal needs.
  *
  * The Claude process is exec'd, through `setpriv`, from a mode 0111 copy of its binary by a process
  * without the capabilities that read around that mode, so it is non-dumpable from its first

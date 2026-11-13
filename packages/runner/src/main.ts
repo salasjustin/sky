@@ -93,7 +93,8 @@ async function main(): Promise<void> {
   removeCredentialFilesOnExit();
   // the copy of Claude's binary the session started from goes the same way
   process.on("exit", removeSealedCopiesNow);
-  // a runner killed outright (SIGKILL, the OOM killer) left its credential files behind
+  // a runner killed outright (SIGKILL, the OOM killer) left its credential files and its copy of
+  // Claude's binary behind
   sweepCredentialFiles(processAlive);
   // an earlier runner may have left its run's token in Claude Code's credential file, where any later
   // run's commands can read it; removed before this run starts any. A failure is a warning, not the run's
