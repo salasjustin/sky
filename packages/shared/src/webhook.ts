@@ -2,8 +2,11 @@ import { z } from "zod";
 import { EventType } from "./event.js";
 import { EnvironmentId, WebhookId } from "./ids.js";
 
-/** `sky` signs with `Sky-Signature`; `standard` follows https://www.standardwebhooks.com. */
-export const WebhookFormat = z.enum(["sky", "standard"]);
+/**
+ * `sky` signs with `Sky-Signature`; `standard` follows https://www.standardwebhooks.com; `openbot`
+ * signs the way OpenBot webhook routines verify.
+ */
+export const WebhookFormat = z.enum(["sky", "standard", "openbot"]);
 export type WebhookFormat = z.infer<typeof WebhookFormat>;
 
 /** A Standard Webhooks secret: `whsec_` and the base64 of a 24–64 byte key. */
@@ -23,6 +26,19 @@ export const StandardWebhookSecret = z.string().refine(
       "a standard secret is whsec_ followed by the base64 of a 24-64 byte key",
   },
 );
+
+/**
+ * An OpenBot routine's signing secret: a non-empty string of at most 256 characters with no
+ * leading or trailing whitespace, used as raw key bytes, never base64-decoded. Surrounding
+ * whitespace is rejected rather than trimmed, so the stored key is always the one sent.
+ */
+export const OpenBotWebhookSecret = z
+  .string()
+  .min(1, { error: "an openbot secret is a non-empty string" })
+  .max(256, { error: "an openbot secret is at most 256 characters" })
+  .refine((s) => s === s.trim(), {
+    error: "an openbot secret has no leading or trailing whitespace",
+  });
 
 export const Webhook = z.object({
   id: WebhookId,

@@ -3,6 +3,7 @@ import { environments, webhooks } from "@sky/db";
 import {
   EnvironmentId,
   EventType,
+  OpenBotWebhookSecret,
   StandardWebhookSecret,
   Webhook,
   WebhookFormat,
@@ -98,12 +99,28 @@ export function webhookRoutes() {
             "a standard webhook needs a secret: whsec_ followed by the base64 of a 24-64 byte key",
           );
         }
+      } else if (fields.format === "openbot") {
+        if (secret === undefined) {
+          return apiError(
+            c,
+            400,
+            "invalid_body",
+            "an openbot webhook needs a secret: the routine's signing secret, up to 256 characters",
+          );
+        }
+        const parsed = OpenBotWebhookSecret.safeParse(secret);
+        if (!parsed.success) {
+          // the schema's own fixed messages, which never quote the input
+          const message =
+            parsed.error.issues[0]?.message ?? "invalid openbot secret";
+          return apiError(c, 400, "invalid_body", message);
+        }
       } else if (secret !== undefined) {
         return apiError(
           c,
           400,
           "invalid_body",
-          'secret only goes with format "standard"',
+          'secret only goes with format "standard" or "openbot"',
         );
       }
       const environmentIds = fields.environmentIds && [

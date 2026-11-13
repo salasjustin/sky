@@ -134,6 +134,7 @@ sky env delete web --yes        # the same without asking; required off a termin
                                 # refused while a webhook added with --env=web exists; sky webhook delete it first
 sky webhook add https://example.com/hook --events=run.waiting,run.finished   # a Sky-format webhook
 sky webhook add https://example.com/hook --events=run.waiting --format=standard --secret=@secret.txt --env=web
+sky webhook add https://example.com/hook --events=run.waiting --format=openbot --secret=@secret.txt --env=web
 sky webhook list                # id, format, url, event types and environments; secrets are never printed
 sky webhook delete whk_…
 sky key create <name> --role=runs --env=web,api   # admin only: a key limited to those environments; prints the secret once
@@ -446,7 +447,7 @@ Three ways to receive them:
 - **MCP:** `wait_for_events`, above.
 - **Stream:** `GET /v1/stream`, one SSE connection across every agent. Filter with `?types=claude.PostToolUse,run.waiting` and `?agentId=`. After a drop, reconnect with `Last-Event-ID` to receive what you missed. A `: ping` arrives every 15 seconds. When the server restarts, the stream ends with an `event: server.shutdown` frame whose `id` is your resume point and whose `retry: 2000` asks you to reconnect in 2 seconds; `EventSource` does this on its own. `GET /v1/events?after=&wait=` is the same feed as a long poll.
 - **Webhooks:** `POST /v1/webhooks` (or `sky webhook add`) with an `https` URL and the `eventTypes` you want. A failed delivery is retried with backoff, up to 30 attempts, and a `429` holds the webhook until its `Retry-After`. Two optional fields:
-  - `format`: `"sky"` (the default) or `"standard"`, below.
+  - `format`: `"sky"` (the default), `"standard"` or `"openbot"`, below.
   - `environmentIds`: a non-empty array of environment ids. The webhook then receives only events from agents in those environments; an id that doesn't exist is `400 invalid_body`. Left out, it receives every environment's events. An environment a webhook filters on can't be deleted until that webhook is (`409 webhooks_filter`).
 
   `GET /v1/webhooks` returns each webhook's `format` and `environmentIds` when set. A secret is never returned.
@@ -510,6 +511,20 @@ function verify(secret, headers, rawBody, now = Date.now() / 1000) {
   });
 }
 ```
+
+**`openbot` format** signs the way OpenBot webhook routines verify, so a routine's own signing secret works as is. Create it with the `secret` exactly as the routine shows it, up to 256 characters (`whsec_` prefix included if it has one; it is not base64-decoded). A missing or empty secret, a longer one, or one with whitespace at either end is `400 invalid_body`; Sky never trims it, because the trimmed string would be a different key. Sky stores it encrypted and never logs it. `sky webhook add --format=openbot` reads it with `--secret=@file` or `--secret=-` (stdin), never from an argument, and drops only the one newline that ends the file or the input.
+
+```json
+POST /hook
+Content-Type: application/json
+x-openbot-timestamp: 1794070000
+x-openbot-delivery-id: evt_1042_whk_…
+x-openbot-signature: sha256=<hex HMAC-SHA256 of "<x-openbot-timestamp>.<x-openbot-delivery-id>.<body>">
+
+{ "type": "run.waiting", "data": { "id": "evt_1042", "environmentId": "env_…", "…": "the event, as in standard" } }
+```
+
+The HMAC key is the secret's raw UTF-8 bytes. `x-openbot-delivery-id` is `<event id>_<webhook id>`, so each webhook gets its own, and it is the same on every retry of that delivery; `x-openbot-timestamp` and so the signature are fresh on each attempt. `type` is the event type and `data` the same event `standard` carries, so a routine can filter on JSON Pointers into it, such as `/environmentId`.
 
 ## License
 

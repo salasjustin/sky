@@ -371,6 +371,97 @@ test("a runs key's webhook may filter only on its own environments", async () =>
   expect(ok.status).toBe(201);
 });
 
+const openbotHook = (fields: object = {}) =>
+  hook({ format: "openbot", secret: "whsec_not+base64/but-fine", ...fields });
+
+test("a runs key's openbot webhook is visible, deletable and environment-bound only as its owner's, like a sky one", async () => {
+  const envId = readyEnv();
+  const elsewhere = readyEnv();
+  const key = await mintKey([envId]);
+  const other = await mintKey([envId], "other");
+  const create = async (token: string, fields: object = {}) =>
+    (await (
+      await call(token, "POST", "/v1/webhooks", openbotHook(fields))
+    ).json()) as { id: WebhookId };
+  const mine = await create(key.secret);
+  const theirs = await create(other.secret);
+  const admins = await create(admin);
+
+  const listed = (await (
+    await call(key.secret, "GET", "/v1/webhooks")
+  ).json()) as { data: { id: string; format: string }[] };
+  expect(listed.data.map((w) => [w.id, w.format])).toEqual([
+    [mine.id, "openbot"],
+  ]);
+  const realMiss = await call(
+    key.secret,
+    "GET",
+    "/v1/webhooks/whk_0000000000000000000000",
+  );
+  const realBody = await realMiss.json();
+  for (const id of [theirs.id, admins.id]) {
+    const get = await call(key.secret, "GET", `/v1/webhooks/${id}`);
+    expect(get.status).toBe(404);
+    expect(await get.json()).toEqual(realBody);
+    expect(
+      (await call(key.secret, "DELETE", `/v1/webhooks/${id}`)).status,
+    ).toBe(404);
+  }
+
+  const outside = await call(
+    key.secret,
+    "POST",
+    "/v1/webhooks",
+    openbotHook({ environmentIds: [envId, elsewhere] }),
+  );
+  expect(outside.status).toBe(400);
+  expect(await outside.json()).toEqual({
+    error: {
+      code: "invalid_body",
+      message: `no such environment: ${elsewhere}`,
+    },
+  });
+
+  const own = seedAgent(envId, key.id);
+  const foreign = seedAgent(envId, other.id);
+  const adminAgent = seedAgent(envId, null);
+  for (const { runId } of [own, foreign, adminAgent]) {
+    db.transaction((tx) =>
+      recordEvent(tx, runId, "claude.Message", { text: "hi" }),
+    );
+  }
+  expect(deliveredTo(mine.id)).toEqual([own.runId]);
+  expect(deliveredTo(admins.id)).toEqual([
+    own.runId,
+    foreign.runId,
+    adminAgent.runId,
+  ]);
+
+  expect(
+    (await call(key.secret, "DELETE", `/v1/webhooks/${mine.id}`)).status,
+  ).toBe(204);
+  expect(db.select().from(webhooks).all()).toHaveLength(2);
+});
+
+test("revoking a key deletes its openbot webhook and leaves admin's", async () => {
+  const envId = readyEnv();
+  const key = await mintKey([envId]);
+  await call(key.secret, "POST", "/v1/webhooks", openbotHook());
+  const admins = (await (
+    await call(admin, "POST", "/v1/webhooks", openbotHook())
+  ).json()) as { id: WebhookId };
+  expect(db.select().from(webhooks).all()).toHaveLength(2);
+
+  expect((await call(admin, "DELETE", `/v1/keys/${key.id}`)).status).toBe(200);
+  expect(
+    db
+      .select()
+      .from(webhooks)
+      .all()
+      .map((w) => w.id),
+  ).toEqual([admins.id]);
+});
+
 /** The run of each event delivered to the webhook, in event order. */
 const deliveredTo = (id: WebhookId) =>
   db

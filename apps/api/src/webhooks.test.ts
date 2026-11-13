@@ -180,6 +180,70 @@ test("a standard webhook is created with its secret held back: the format comes 
   expect(JSON.stringify(body)).not.toContain(whsec);
 });
 
+test("an openbot webhook takes its secret as is, and hides it", async () => {
+  const openbotSecret = "whsec_not+base64/but-fine";
+  const res = await subscribe({
+    ...hook,
+    format: "openbot",
+    secret: openbotSecret,
+  });
+  expect(res.status).toBe(201);
+  const body = (await res.json()) as { id: string };
+  expect(body).toEqual({
+    id: expect.any(String),
+    ...hook,
+    format: "openbot",
+    createdAt: expect.stringMatching(/Z$/),
+  });
+  expect(JSON.stringify(body)).not.toContain(openbotSecret);
+});
+
+// distinctive, so finding it in a response means the secret was echoed
+const rawSecret = "Zq7openbotRaw";
+
+test.each([
+  [
+    "a leading space",
+    ` ${rawSecret}`,
+    "an openbot secret has no leading or trailing whitespace",
+  ],
+  [
+    "a trailing newline",
+    `${rawSecret}\n`,
+    "an openbot secret has no leading or trailing whitespace",
+  ],
+  [
+    "257 characters",
+    rawSecret.padEnd(257, "x"),
+    "an openbot secret is at most 256 characters",
+  ],
+])(
+  "an openbot secret with %s is 400 invalid_body naming the rule, without the secret",
+  async (_, secret, message) => {
+    const res = await subscribe({ ...hook, format: "openbot", secret });
+    expect(res.status).toBe(400);
+    const text = await res.text();
+    expect(JSON.parse(text)).toEqual({
+      error: { code: "invalid_body", message },
+    });
+    expect(text).not.toContain(rawSecret);
+    expect(db.$client.prepare("select count(*) n from webhooks").get()).toEqual(
+      { n: 0 },
+    );
+  },
+);
+
+test("an openbot webhook without a secret is 400 invalid_body saying it needs one", async () => {
+  const res = await subscribe({ ...hook, format: "openbot" });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toEqual({
+    error: {
+      code: "invalid_body",
+      message: expect.stringMatching(/needs a secret/),
+    },
+  });
+});
+
 test("environmentIds of existing environments are stored and returned, duplicates collapsed", async () => {
   db.$client
     .prepare(
@@ -202,6 +266,8 @@ test.each([
   ],
   ["a secret that is not base64", { format: "standard", secret: "whsec_%%%" }],
   ["an empty secret key", { format: "standard", secret: "whsec_" }],
+  ["an openbot format without a secret", { format: "openbot" }],
+  ["an openbot format with an empty secret", { format: "openbot", secret: "" }],
   ["a secret on a sky webhook", { secret: whsec }],
   ["an unknown format", { format: "svix", secret: whsec }],
   ["an unknown environment", { environmentIds: ["env_missing"] }],

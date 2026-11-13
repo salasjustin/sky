@@ -1,8 +1,12 @@
 import { readFileSync } from "node:fs";
-import { EventType, StandardWebhookSecret } from "@sky/shared";
+import {
+  EventType,
+  OpenBotWebhookSecret,
+  StandardWebhookSecret,
+} from "@sky/shared";
 import type { AgentCommand } from "./agent.js";
 import type { Io } from "./cli.js";
-import { readStdinValue } from "./input.js";
+import { readStdinValue, stripFinalNewline } from "./input.js";
 import { UsageError } from "./output.js";
 import { resolveEnvId } from "./secret.js";
 
@@ -28,6 +32,7 @@ async function readSecret(
   source: string,
   url: string,
   io: Io,
+  format: "standard" | "openbot",
 ): Promise<string> {
   let raw: string;
   let from: string;
@@ -42,7 +47,7 @@ async function readSecret(
     const file = source.slice(1);
     from = `in ${file}`;
     try {
-      raw = readFileSync(file, "utf8");
+      raw = stripFinalNewline(readFileSync(file, "utf8"));
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       throw new UsageError(`cannot read ${file}${code ? ` (${code})` : ""}`);
@@ -54,8 +59,19 @@ async function readSecret(
       true,
     );
   }
+  if (raw.trim() === "") throw new UsageError(`the secret ${from} is empty`);
+  if (format === "openbot") {
+    // refused, never trimmed: the secret is raw key bytes, so a trimmed one is another key;
+    // the issue messages state the rule without quoting the value
+    const parsed = OpenBotWebhookSecret.safeParse(raw);
+    if (!parsed.success) {
+      throw new UsageError(
+        parsed.error.issues.map((issue) => issue.message).join("; "),
+      );
+    }
+    return raw;
+  }
   const secret = raw.trim();
-  if (secret === "") throw new UsageError(`the secret ${from} is empty`);
   if (!StandardWebhookSecret.safeParse(secret).success) {
     throw new UsageError(
       "the secret must be whsec_ followed by the base64 of a 24-64 byte key",
@@ -113,7 +129,7 @@ export const webhook: AgentCommand = {
       const [url, ...extra] = rest;
       if (url === undefined || extra.length > 0) {
         throw new UsageError(
-          "webhook add takes <url> --events=<types,...> [--format=standard --secret=@file|-] [--env=<id|name>,...]",
+          "webhook add takes <url> --events=<types,...> [--format=standard|openbot --secret=@file|-] [--env=<id|name>,...]",
           true,
         );
       }
@@ -130,14 +146,21 @@ export const webhook: AgentCommand = {
         throw new UsageError("--events names no event type", true);
       }
       const format = values.format ?? "sky";
-      if (format !== "sky" && format !== "standard") {
-        throw new UsageError("--format is sky or standard", true);
+      if (format !== "sky" && format !== "standard" && format !== "openbot") {
+        throw new UsageError("--format is sky, standard or openbot", true);
       }
-      if (format === "standard" && values.secret === undefined) {
-        throw new UsageError("--format=standard needs --secret=@file|-", true);
+      const secretFormat = format === "sky" ? undefined : format;
+      if (secretFormat !== undefined && values.secret === undefined) {
+        throw new UsageError(
+          `--format=${secretFormat} needs --secret=@file|-`,
+          true,
+        );
       }
-      if (format === "sky" && values.secret !== undefined) {
-        throw new UsageError("--secret only goes with --format=standard", true);
+      if (secretFormat === undefined && values.secret !== undefined) {
+        throw new UsageError(
+          "--secret only goes with --format=standard or openbot",
+          true,
+        );
       }
       const envRefs = values.env === undefined ? undefined : split(values.env);
       if (envRefs?.length === 0) {
@@ -145,9 +168,9 @@ export const webhook: AgentCommand = {
       }
       return async (api, io, out) => {
         const secret =
-          values.secret === undefined
+          secretFormat === undefined || values.secret === undefined
             ? undefined
-            : await readSecret(values.secret, url, io);
+            : await readSecret(values.secret, url, io, secretFormat);
         let environmentIds: string[] | undefined;
         if (envRefs) {
           environmentIds = [];

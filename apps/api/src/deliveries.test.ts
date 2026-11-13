@@ -18,6 +18,7 @@ import { createApp } from "./app.js";
 import {
   createDispatcher,
   type Dispatcher,
+  openbotSignature,
   retryDelayMs,
   signatureHeader,
 } from "./deliveries.js";
@@ -785,6 +786,46 @@ test("a standard delivery carries the Standard Webhooks headers and body, verifi
   );
 });
 
+/** Every stored value of the tables a webhook secret could leak into, as bytes: blobs as they are, text as UTF-8. */
+function storedBytes(): Buffer[] {
+  const out: Buffer[] = [];
+  for (const table of ["webhooks", "events", "webhook_deliveries"]) {
+    const rows = db.$client.prepare(`select * from ${table}`).all();
+    for (const row of rows as Record<string, unknown>[]) {
+      for (const value of Object.values(row)) {
+        if (Buffer.isBuffer(value)) out.push(value);
+        else if (typeof value === "string") out.push(Buffer.from(value));
+      }
+    }
+  }
+  return out;
+}
+
+function expectNoneStored(...needles: (string | Buffer)[]) {
+  const stored = storedBytes();
+  // the sweep reads the rows it claims to: planting what is stored makes it throw
+  expect(() => expectNoneStoredIn(stored, [subscriberUrl])).toThrow();
+  expect(() => expectNoneStoredIn(stored, ["run.finished"])).toThrow();
+  expectNoneStoredIn(stored, needles);
+}
+
+function expectNoneStoredIn(stored: Buffer[], needles: (string | Buffer)[]) {
+  for (const needle of needles) {
+    const bytes = Buffer.from(needle);
+    for (const value of stored) expect(value.includes(bytes)).toBe(false);
+  }
+}
+
+/** The ciphertext is neither the plaintext nor carries its bytes, and is no shorter than it. */
+function expectSealed(ciphertext: unknown, plaintext: string) {
+  const plain = Buffer.from(plaintext);
+  expect(Buffer.isBuffer(ciphertext)).toBe(true);
+  const sealed = ciphertext as Buffer;
+  expect(sealed.length).toBeGreaterThanOrEqual(plain.length);
+  expect(sealed.includes(plain)).toBe(false);
+  expect(sealed.subarray(0, plain.length).equals(plain)).toBe(false);
+}
+
 test("the secret of a standard webhook is stored sealed and never appears in a GET or a log line", async () => {
   const id = await subscribe(["run.finished"], subscriberUrl, {
     format: "standard",
@@ -812,8 +853,314 @@ test("the secret of a standard webhook is stored sealed and never appears in a G
   const row = db.$client
     .prepare("select * from webhooks where id = ?")
     .get(id) as Record<string, Buffer | string | number | null>;
-  expect(JSON.stringify(row)).not.toContain(secret.slice("whsec_".length));
-  expect(Buffer.isBuffer(row.secret_ciphertext)).toBe(true);
+  expectSealed(row.secret_ciphertext, secret);
+  expectNoneStored(
+    secret,
+    secret.slice("whsec_".length),
+    Buffer.from(secret.slice("whsec_".length), "base64"),
+  );
+});
+
+// an OpenBot secret is used as raw bytes, whsec_ prefix and all
+const openbotSecret = "whsec_not+base64/but-fine";
+
+/** The OpenBot signature header, computed with WebCrypto from the raw secret bytes and "<ts>.<id>.<body>". */
+async function openbotExpected(
+  secret: string,
+  t: string | number,
+  id: string,
+  body: string,
+): Promise<string> {
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await crypto.subtle.sign(
+    "HMAC",
+    cryptoKey,
+    new TextEncoder().encode(`${t}.${id}.${body}`),
+  );
+  return `sha256=${Buffer.from(mac).toString("hex")}`;
+}
+
+test("an openbot delivery matches a fixed signature vector, carries the OpenBot headers and body, and keeps its id across retries", async () => {
+  const webhookId = await subscribe(["run.finished"], subscriberUrl, {
+    format: "openbot",
+    secret: openbotSecret,
+  });
+  const received: Received[] = [];
+  const statuses = [500, 200];
+  const sentAt: number[] = [];
+  server.use(
+    http.post(subscriberUrl, async ({ request }) => {
+      sentAt.push(Math.floor(clock.getTime() / 1000));
+      received.push({ headers: request.headers, body: await request.text() });
+      return new HttpResponse(null, { status: statuses.shift() ?? 599 });
+    }),
+  );
+  const { agentId, envId, runId, token } = runningRun();
+  const posted = await finish(token, runId);
+  const { id: eventId } = (await posted.json()) as { id: number };
+
+  await dispatcher.drain();
+  expect(received).toHaveLength(1);
+  // the retry is not due until the backoff has passed
+  await dispatcher.drain();
+  expect(received).toHaveLength(1);
+  advance(10_000);
+  await dispatcher.drain();
+
+  expect(received).toHaveLength(2);
+  expect(deliveries().map((d) => [d.status, d.attempts])).toEqual([
+    ["delivered", 2],
+  ]);
+  for (const [i, { headers, body }] of received.entries()) {
+    const t = sentAt[i] ?? 0;
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(headers.get("x-openbot-timestamp")).toBe(String(t));
+    const deliveryId = `evt_${eventId}_${webhookId}`;
+    expect(headers.get("x-openbot-delivery-id")).toBe(deliveryId);
+    expect(headers.get("x-openbot-signature")).toBe(
+      await openbotExpected(openbotSecret, t, deliveryId, body),
+    );
+    expect(headers.get("x-openbot-signature")).toMatch(/^sha256=[0-9a-f]{64}$/);
+    for (const name of [
+      "sky-signature",
+      "sky-event-id",
+      "sky-event-type",
+      "webhook-id",
+      "webhook-timestamp",
+      "webhook-signature",
+    ]) {
+      expect(headers.has(name)).toBe(false);
+    }
+    const parsed = JSON.parse(body);
+    expect(Object.keys(parsed)).toEqual(["type", "data"]);
+    expect(parsed).toEqual({
+      type: "run.finished",
+      data: {
+        id: `evt_${eventId}`,
+        agentId,
+        environmentId: envId,
+        runId,
+        ts: expect.stringMatching(/Z$/),
+        type: "run.finished",
+        payload: { summary: "done", usage },
+      },
+    });
+  }
+  expect(sentAt[1]).toBeGreaterThan(sentAt[0] ?? 0);
+  expect(received[1]?.body).toBe(received[0]?.body);
+  expect(received[1]?.headers.get("x-openbot-signature")).not.toBe(
+    received[0]?.headers.get("x-openbot-signature"),
+  );
+});
+
+test("one event to two openbot webhooks goes out under two delivery ids, each signed with its own webhook's secret", async () => {
+  const other = "https://hooks.example.com/other";
+  const otherSecret = "a-different-openbot-secret";
+  const firstId = await subscribe(["run.finished"], subscriberUrl, {
+    format: "openbot",
+    secret: openbotSecret,
+  });
+  const secondId = await subscribe(["run.finished"], other, {
+    format: "openbot",
+    secret: otherSecret,
+  });
+  const first = subscriber([200]);
+  const second = subscriber([200], other);
+  const { runId, token } = runningRun();
+  const posted = await finish(token, runId);
+  const { id: eventId } = (await posted.json()) as { id: number };
+
+  await dispatcher.drain();
+
+  expect(first).toHaveLength(1);
+  expect(second).toHaveLength(1);
+  const deliveries = [
+    { received: first[0], secret: openbotSecret, webhookId: firstId },
+    { received: second[0], secret: otherSecret, webhookId: secondId },
+  ];
+  for (const { received, secret, webhookId } of deliveries) {
+    const headers = received?.headers ?? new Headers();
+    const body = received?.body ?? "";
+    const id = headers.get("x-openbot-delivery-id") ?? "";
+    expect(id).toBe(`evt_${eventId}_${webhookId}`);
+    // header-safe, and no "." to split the signed "<ts>.<id>.<body>" on
+    expect(id).toMatch(/^[0-9A-Za-z_]+$/);
+    expect(headers.get("x-openbot-signature")).toBe(
+      await openbotExpected(
+        secret,
+        headers.get("x-openbot-timestamp") ?? "",
+        id,
+        body,
+      ),
+    );
+    // the event itself, its id included, is the same for every webhook
+    expect(JSON.parse(body).data.id).toBe(`evt_${eventId}`);
+  }
+  expect(first[0]?.headers.get("x-openbot-delivery-id")).not.toBe(
+    second[0]?.headers.get("x-openbot-delivery-id"),
+  );
+});
+
+test("openbotSignature matches a hard-coded vector", () => {
+  // HMAC-SHA256, key "secret", message "1700000000.evt_1.{}", computed independently with openssl
+  expect(openbotSignature("secret", "evt_1", 1700000000, "{}")).toBe(
+    "sha256=26d77ca6a783c304147f4d1df6c77f9055350d43a20070ae3c2fbc598bb3bec4",
+  );
+});
+
+test("the secret of an openbot webhook is stored sealed and never appears in a GET or a log line", async () => {
+  const id = await subscribe(["run.finished"], subscriberUrl, {
+    format: "openbot",
+    secret: openbotSecret,
+  });
+  subscriber([500, 599, 599]);
+  const { runId, token } = runningRun();
+  await finish(token, runId);
+  await dispatcher.drain();
+  expect(logs.length).toBeGreaterThan(0);
+
+  const list = await app.request("/v1/webhooks", { headers: auth });
+  const one = await app.request(`/v1/webhooks/${id}`, { headers: auth });
+  const listed = await list.text();
+  const read = await one.text();
+  for (const text of [listed, read, ...logs]) {
+    expect(text).not.toContain(openbotSecret);
+  }
+  expect(JSON.parse(read)).toMatchObject({ id, format: "openbot" });
+  expect(JSON.parse(read)).not.toHaveProperty("secret");
+  const row = db.$client
+    .prepare("select * from webhooks where id = ?")
+    .get(id) as Record<string, Buffer | string | number | null>;
+  expectSealed(row.secret_ciphertext, openbotSecret);
+  expectNoneStored(openbotSecret);
+});
+
+const nonAsciiSecret = "whsec_pässwörd-秘密-🔑";
+
+test("an openbot secret of multi-byte characters signs as its UTF-8 bytes", async () => {
+  const webhookId = await subscribe(["run.finished"], subscriberUrl, {
+    format: "openbot",
+    secret: nonAsciiSecret,
+  });
+  const received = subscriber([200]);
+  const { runId, token } = runningRun();
+  const posted = await finish(token, runId);
+  const { id: eventId } = (await posted.json()) as { id: number };
+  await dispatcher.drain();
+
+  const [only] = received;
+  const id = `evt_${eventId}_${webhookId}`;
+  expect(only?.headers.get("x-openbot-delivery-id")).toBe(id);
+  expect(only?.headers.get("x-openbot-signature")).toBe(
+    await openbotExpected(
+      nonAsciiSecret,
+      only?.headers.get("x-openbot-timestamp") ?? "",
+      id,
+      only?.body ?? "",
+    ),
+  );
+  expect(deliveries().map((d) => d.status)).toEqual(["delivered"]);
+});
+
+const sealedFormats = [
+  { format: "openbot", plain: openbotSecret },
+  { format: "standard", plain: secret },
+] as const;
+const sendFailures = [
+  "corrupted ciphertext",
+  "wrong encryption key",
+  "network error",
+] as const;
+
+test.each(
+  sealedFormats.flatMap((f) =>
+    sendFailures.map((failure) => ({ ...f, failure })),
+  ),
+)(
+  "a $format webhook's secret stays out of the logs and last_error on a $failure",
+  async ({ format, plain, failure }) => {
+    const id = await subscribe(["run.finished"], subscriberUrl, {
+      format,
+      secret: plain,
+    });
+    const received = subscriber([200]);
+    if (failure === "network error") {
+      server.use(http.post(subscriberUrl, () => HttpResponse.error()));
+    }
+    if (failure === "corrupted ciphertext") {
+      const { c } = db.$client
+        .prepare("select secret_ciphertext as c from webhooks where id = ?")
+        .get(id) as { c: Buffer };
+      const flipped = Buffer.from(c);
+      flipped[0] = (flipped[0] ?? 0) ^ 0xff;
+      db.$client
+        .prepare("update webhooks set secret_ciphertext = ? where id = ?")
+        .run(flipped, id);
+    }
+    if (failure === "wrong encryption key") {
+      await dispatcher.stop();
+      dispatcher = createDispatcher({
+        db,
+        signingKey: config.webhookSigningKey,
+        secretEncryptionKey: Buffer.from(
+          config.secretEncryptionKey.map((b) => b ^ 0xff),
+        ),
+        log: (line) => logs.push(line),
+        now: () => clock,
+        random: () => 0.5,
+      });
+    }
+    const { runId, token } = runningRun();
+    await finish(token, runId);
+    await dispatcher.drain();
+
+    // the failing path ran: one failed attempt, nothing sent
+    expect(received).toHaveLength(0);
+    const [only] = deliveries();
+    expect(only).toMatchObject({
+      status: "pending",
+      attempts: 1,
+      lastStatus: null,
+      lastError:
+        failure === "network error"
+          ? expect.any(String)
+          : "Error: cannot open the webhook's secret",
+    });
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("attempt 1/30 failed");
+    for (const text of [...logs, only?.lastError ?? ""]) {
+      expect(text).not.toContain(plain);
+      expect(text).not.toContain(plain.slice("whsec_".length));
+    }
+    expectNoneStored(plain, plain.slice("whsec_".length));
+  },
+);
+
+test("an openbot webhook with environmentIds receives only events of agents in those environments", async () => {
+  const a = runningRun("a");
+  const b = runningRun("b");
+  await subscribe(["run.finished"], subscriberUrl, {
+    format: "openbot",
+    secret: openbotSecret,
+    environmentIds: [a.envId],
+  });
+  const received = subscriber([200, 200]);
+
+  await finish(b.token, b.runId, "from b");
+  await dispatcher.drain();
+  expect(received).toHaveLength(0);
+
+  await finish(a.token, a.runId, "from a");
+  await dispatcher.drain();
+  expect(received.map((r) => JSON.parse(r.body).data.environmentId)).toEqual([
+    a.envId,
+  ]);
 });
 
 test("a webhook with environmentIds receives only events of agents in those environments", async () => {

@@ -8,9 +8,6 @@ import { apiUrl, runCli } from "./testing.js";
 
 const secret = `whsec_${Buffer.from("0123456789abcdef0123456789abcdef").toString("base64")}`;
 const posts: unknown[] = [];
-beforeEach(() => {
-  posts.length = 0;
-});
 
 const created = {
   id: "whk_1",
@@ -37,10 +34,19 @@ const handlers = [
     HttpResponse.json({ data: [envRow] }),
   ),
   http.post(`${apiUrl}/v1/webhooks`, async ({ request }) => {
-    posts.push(await request.json());
-    return HttpResponse.json(created, { status: 201 });
+    const body = (await request.json()) as { format: string };
+    posts.push(body);
+    return HttpResponse.json(
+      { ...created, format: body.format },
+      { status: 201 },
+    );
   }),
 ];
+// installed for every test, so one that expects nothing sent fails if the CLI does post
+beforeEach(() => {
+  posts.length = 0;
+  server.use(...handlers);
+});
 
 const add = [
   "webhook",
@@ -50,7 +56,6 @@ const add = [
 ];
 
 test("webhook add sends a standard webhook with its secret read from a file and the env name resolved", async () => {
-  server.use(...handlers);
   const file = join(mkdtempSync(join(tmpdir(), "sky-wh-")), "secret");
   writeFileSync(file, `${secret}\n`);
   const r = await runCli([
@@ -76,7 +81,6 @@ test("webhook add sends a standard webhook with its secret read from a file and 
 });
 
 test("--secret=- reads the secret from stdin", async () => {
-  server.use(...handlers);
   const r = await runCli([...add, "--format=standard", "--secret=-"], {
     stdin: { readAll: async () => `${secret}\n` },
   });
@@ -85,7 +89,6 @@ test("--secret=- reads the secret from stdin", async () => {
 });
 
 test("--secret=- on a terminal prompts for the secret without echoing it", async () => {
-  server.use(...handlers);
   const prompts: string[] = [];
   const r = await runCli([...add, "--format=standard", "--secret=-"], {
     stderrIsTTY: true,
@@ -106,6 +109,105 @@ test("--secret=- on a terminal prompts for the secret without echoing it", async
   expect(r.stdout + r.stderr).not.toContain(secret);
 });
 
+test("webhook add sends an openbot webhook with a non-base64 secret, never printing it", async () => {
+  const openbotSecret = "whsec_not+base64/but-fine";
+  const file = join(mkdtempSync(join(tmpdir(), "sky-wh-")), "secret");
+  writeFileSync(file, `${openbotSecret}\n`);
+  const r = await runCli([
+    ...add,
+    "--format=openbot",
+    `--secret=@${file}`,
+    "--env=web",
+  ]);
+  expect(r.code).toBe(0);
+  expect(posts).toEqual([
+    {
+      url: "https://hooks.example.com/x",
+      eventTypes: ["run.waiting"],
+      format: "openbot",
+      secret: openbotSecret,
+      environmentIds: ["env_1"],
+    },
+  ]);
+  expect(r.stdout).toBe(
+    "whk_1 openbot https://hooks.example.com/x run.waiting env_1\n",
+  );
+  expect(r.stdout + r.stderr).not.toContain(openbotSecret);
+});
+
+const sentinel = "OB-7f3q-sentinel";
+type Source = "file" | "stdin";
+const sources: Source[] = ["file", "stdin"];
+
+async function addOpenBot(source: Source, content: string) {
+  if (source === "stdin") {
+    return runCli([...add, "--format=openbot", "--secret=-"], {
+      stdin: { readAll: async () => content },
+    });
+  }
+  const file = join(mkdtempSync(join(tmpdir(), "sky-wh-")), "secret");
+  writeFileSync(file, content);
+  return runCli([...add, "--format=openbot", `--secret=@${file}`]);
+}
+
+const accepted = sources.flatMap((source): [Source, string, string][] => [
+  [source, `${sentinel}\n`, sentinel],
+  [source, `${sentinel}\r\n`, sentinel],
+  [source, `in ${sentinel} side\n`, `in ${sentinel} side`],
+]);
+test.each(accepted)("openbot %s %j sends %j", async (src, raw, sent) => {
+  const r = await addOpenBot(src, raw);
+  expect(r.code).toBe(0);
+  expect(posts).toEqual([
+    expect.objectContaining({ format: "openbot", secret: sent }),
+  ]);
+});
+
+const padded = "an openbot secret has no leading or trailing whitespace";
+const refused: [string, Source, string, string][] = [
+  ...sources.flatMap((source): [string, Source, string, string][] => [
+    ["a leading space", source, ` ${sentinel}\n`, padded],
+    ["a trailing space", source, `${sentinel} \n`, padded],
+    ["two trailing newlines", source, `${sentinel}\n\n`, padded],
+    [
+      "257 characters",
+      source,
+      `${sentinel}${"a".repeat(257 - sentinel.length)}\n`,
+      "an openbot secret is at most 256 characters",
+    ],
+  ]),
+  ["a byte order mark", "file", `\uFEFF${sentinel}\n`, padded],
+];
+test.each(refused)("openbot refuses %s from %s", async (_, src, raw, rule) => {
+  const r = await addOpenBot(src, raw);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain(`sky: ${rule}\n`);
+  expect(r.stdout + r.stderr).not.toContain(sentinel);
+  expect(posts).toEqual([]);
+});
+
+test("an openbot secret given as the argument value is refused without echoing it", async () => {
+  const r = await runCli([...add, "--format=openbot", `--secret=${sentinel}`]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain(
+    "--secret takes @<file> or - (stdin), not the secret itself",
+  );
+  expect(r.stdout + r.stderr).not.toContain(sentinel);
+  expect(posts).toEqual([]);
+});
+
+test.each([
+  ["--format=nope", "--format is sky, standard or openbot"],
+  ["--format=", "--format is sky, standard or openbot"],
+  ["--format=openbot", "--format=openbot needs --secret=@file|-"],
+  ["--secret=-", "--secret only goes with --format=standard or openbot"],
+])("webhook add %s exits 2 with its usage message", async (flag, message) => {
+  const r = await runCli([...add, flag]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toBe(`sky: ${message}\nRun 'sky --help' for usage.\n`);
+  expect(posts).toEqual([]);
+});
+
 test.each([
   ["stderr is not a terminal", { stderrIsTTY: false }],
   ["CI is set", { stderrIsTTY: true, env: { CI: "true" } }],
@@ -120,13 +222,15 @@ test.each([
 });
 
 const blanks = ["", "\n", "  \n"];
-test.each(blanks)("empty stdin %j exits 2 as empty", async (input) => {
-  const r = await runCli([...add, "--format=standard", "--secret=-"], {
+const formats = ["standard", "openbot"];
+const empties = formats.flatMap((f) => blanks.map((input) => [f, input]));
+test.each(empties)("%s stdin %j exits 2 as empty", async (format, input) => {
+  const r = await runCli([...add, `--format=${format}`, "--secret=-"], {
     stdin: { readAll: async () => input },
   });
   expect(r.code).toBe(2);
   expect(r.stderr).toMatch(/the secret from stdin is empty/);
-  expect(r.stderr).not.toMatch(/must be whsec_/);
+  expect(r.stderr).not.toMatch(/must be whsec_|whitespace/);
   expect(posts).toEqual([]);
 });
 
@@ -149,7 +253,6 @@ test("a secret given as the argument value is refused without echoing it", async
 test.each([
   ["a malformed secret", [...add, "--format=standard", "--secret=-"]],
   ["standard without a secret", [...add, "--format=standard"]],
-  ["a secret on a sky webhook", [...add, "--secret=-"]],
   ["no --events", ["webhook", "add", "https://hooks.example.com/x"]],
   [
     "an unknown event type",
@@ -162,7 +265,6 @@ test.each([
 });
 
 test("an unknown --env exits 1 and sends nothing", async () => {
-  server.use(...handlers);
   const r = await runCli([...add, "--env=nope"]);
   expect(r.code).toBe(1);
   expect(posts).toEqual([]);

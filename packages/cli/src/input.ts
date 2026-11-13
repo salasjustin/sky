@@ -27,8 +27,13 @@ export async function readStdinValue(
       `no terminal to prompt on; pipe the ${ask.noun} on stdin`,
     );
   }
-  // `echo value |` and a heredoc both end in one newline that isn't part of the value
-  const value = raw.replace(/\r?\n$/, "");
+  const value = stripFinalNewline(raw);
   if (value === "") throw new UsageError(ask.empty);
   return value;
 }
+
+/**
+ * `echo value |`, a heredoc and an editor-saved file all end in one newline that isn't part of
+ * the value.
+ */
+export const stripFinalNewline = (raw: string) => raw.replace(/\r?\n$/, "");
