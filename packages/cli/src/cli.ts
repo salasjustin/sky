@@ -84,10 +84,12 @@ const help = (io: Io) => `Usage:
       Subscribe an https URL to event types. --format=standard signs
       deliveries as Standard Webhooks and needs the whsec_<base64> secret;
       --format=openbot signs them the way OpenBot webhook routines verify
-      and takes the routine's signing secret as is (any non-empty string).
-      The secret is read from a file or stdin, never argv. --env limits it to events from
-      agents in those environments. On a terminal, --secret=- prompts for
-      the secret without echoing it. Prints the line webhook list prints.
+      and takes the routine's signing secret (up to 256 characters)
+      exactly as written apart from one trailing newline; a secret that
+      begins or ends with spaces is refused. The secret is read from a
+      file or stdin, never argv. --env limits it to events from agents in
+      those environments. On a terminal, --secret=- prompts for the secret
+      without echoing it. Prints the line webhook list prints.
   sky webhook list [options]
       Print "<id> <format> <url> <types> [<env ids>]" per webhook; secrets
       are never printed.
