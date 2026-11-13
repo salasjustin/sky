@@ -6,6 +6,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -1189,6 +1190,14 @@ describe("the Claude credential of a run", () => {
 
   afterEach(() => vi.unstubAllEnvs());
 
+  /** Points the runner's credential files at a directory this test alone writes to, and returns it. */
+  const isolatedCredentialDir = () => {
+    const tmp = join(root, "tmp");
+    mkdirSync(tmp);
+    vi.stubEnv("TMPDIR", tmp);
+    return credentialDir(tmp);
+  };
+
   test("a subscription run: the Claude process holds the token and no API key, even when the project has one", async () => {
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
     vi.stubEnv("ANTHROPIC_API_KEY", PROJECT_KEY);
@@ -1422,17 +1431,131 @@ describe("the Claude credential of a run", () => {
       expect(append).not.toContain("$(<");
     });
 
-    test("the file holding the credential is gone once the run ends", async () => {
-      const dir = credentialDir();
-      mkdirSync(dir, { recursive: true });
-      const logins = () =>
-        readdirSync(dir).filter((n) => n.startsWith("sky-nested-claude-"));
-      const before = logins();
-      await promptOf(
-        { claudeAuth: "api-key" },
-        { SKY_CLAUDE_API_KEY: SKY_KEY },
+    test("the file holding the credential exists alone, for this user only, during the run and is gone once it ends", async () => {
+      const dir = isolatedCredentialDir();
+      let during: { names: string[]; modes: number[]; values: string[] } = {
+        names: [],
+        modes: [],
+        values: [],
+      };
+      const query = scripted([
+        init,
+        async () => {
+          const names = readdirSync(dir).filter((name) =>
+            name.startsWith("sky-nested-claude-run_1-"),
+          );
+          const at = (name: string) => join(dir, name);
+          during = {
+            names,
+            modes: names.map((name) => statSync(at(name)).mode & 0o777),
+            values: names.map((name) => readFileSync(at(name), "utf8")),
+          };
+        },
+        success,
+      ]);
+      vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+      await runSession(
+        { ...config, claudeAuth: "api-key" },
+        {
+          query,
+          post: recorder().post,
+          signal: new AbortController().signal,
+          awaitDecision: noDecision,
+        },
       );
-      expect(logins()).toEqual(before);
+      expect(during.names).toHaveLength(1);
+      expect(during.modes).toEqual([0o600]);
+      expect(during.values).toEqual([SKY_KEY]);
+      expect(readdirSync(dir)).toEqual([]);
+    });
+
+    describe("a run that does not finish", () => {
+      /** Runs an API-key run whose script ends as `tail` says, and lists the credential directory during the run and after it. */
+      const credentialFilesAround = async (
+        tail: unknown[],
+        controller = new AbortController(),
+      ) => {
+        const dir = isolatedCredentialDir();
+        let during: string[] = [];
+        const query = scripted([
+          init,
+          async () => {
+            during = readdirSync(dir);
+          },
+          ...tail,
+        ]);
+        vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+        const code = await runSession(
+          { ...config, claudeAuth: "api-key" },
+          {
+            query,
+            post: recorder().post,
+            signal: controller.signal,
+            awaitDecision: noDecision,
+          },
+        );
+        return { code, during, after: readdirSync(dir) };
+      };
+      const loginsIn = (names: string[]) =>
+        names.filter((name) => name.startsWith("sky-nested-claude-run_1-"));
+
+      test("an SDK that throws leaves no credential file behind", async () => {
+        const { code, during, after } = await credentialFilesAround([
+          new Error("Claude Code process exited with code 1"),
+        ]);
+        expect(code).toBe(1);
+        expect(loginsIn(during)).toHaveLength(1);
+        expect(after).toEqual([]);
+      });
+
+      test("a run aborted by its signal leaves no credential file behind", async () => {
+        const controller = new AbortController();
+        const { code, during, after } = await credentialFilesAround(
+          [async () => controller.abort("SIGTERM"), success],
+          controller,
+        );
+        expect(code).toBe(1);
+        expect(loginsIn(during)).toHaveLength(1);
+        expect(after).toEqual([]);
+      });
+    });
+
+    test("no event the run posts holds the credential, though the check's command that reads it does", async () => {
+      vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+      const { posted, post } = recorder();
+      // the command the run's prompt gives for a nested claude, as a Bash call in the run would carry it
+      const nestedCommand = (options: Options) =>
+        /`(ANTHROPIC_API_KEY="\$\(<[^`]+)`/.exec(
+          (options.systemPrompt as { append?: string }).append ?? "",
+        )?.[1] ?? "";
+      const bashCall =
+        (event: "PreToolUse" | "PostToolUse"): Step =>
+        async (options) => {
+          await fire(options, event, {
+            tool_name: "Bash",
+            tool_input: { command: nestedCommand(options) },
+            tool_response: { stdout: "ok", stderr: "" },
+            tool_use_id: "t1",
+          });
+        };
+      await runSession(
+        { ...config, claudeAuth: "api-key", checks: ["claude -p /review"] },
+        {
+          query: scripted([
+            init,
+            bashCall("PreToolUse"),
+            bashCall("PostToolUse"),
+            success,
+          ]),
+          post,
+          signal: new AbortController().signal,
+          awaitDecision: noDecision,
+        },
+      );
+      const all = JSON.stringify(posted);
+      // the read is live: the command reached the events, naming the file
+      expect(all).toContain("$(<");
+      expect(all).not.toContain(SKY_KEY);
     });
   });
 

@@ -15,21 +15,30 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { type NestedPrefix, prepareNestedLogin } from "./claude-auth.js";
+import {
+  HOST_MANAGED,
+  type NestedLogin,
+  type NestedPrefix,
+  prepareNestedLogin,
+} from "./claude-auth.js";
 import { nestedClaude } from "./session.js";
 
-// the Claude Code binary the Agent SDK ships beside itself, the one a run's nested `claude` is
+// the Claude Code binary the Agent SDK ships beside itself, the one a run's nested `claude` is: the
+// platform package for this arch and libc, glibc or musl, the SDK installed with the optional
+// dependency that matches
 const claudeBinary = (() => {
   const sdk = realpathSync(
     join(import.meta.dirname, "../node_modules/@anthropic-ai/claude-agent-sdk"),
   );
-  const musl = existsSync("/lib/ld-musl-x86_64.so.1") ? "-musl" : "";
-  const path = join(
-    dirname(sdk),
-    `claude-agent-sdk-${process.platform}-${process.arch}${musl}`,
-    "claude",
-  );
-  return existsSync(path) ? path : undefined;
+  return ["", "-musl"]
+    .map((libc) =>
+      join(
+        dirname(sdk),
+        `claude-agent-sdk-${process.platform}-${process.arch}${libc}`,
+        "claude",
+      ),
+    )
+    .find((path) => existsSync(path));
 })();
 
 const SUBSCRIPTION = "subscription-token-0001";
@@ -78,20 +87,26 @@ beforeEach(async () => {
   decoy = await listen();
 });
 afterEach(async () => {
-  api.server.close();
-  decoy.server.close();
+  for (const { server } of [api, decoy]) {
+    server.closeAllConnections();
+    server.close();
+  }
   rmSync(root, { recursive: true, force: true });
 });
 
 /**
  * Runs the prompt's nested command in a shell as a Bash command sees it: the credential variables
- * Claude Code strips are absent, the project's own are set, and its repo holds a settings file that
- * tries to send the session to the decoy. Only the API's address is added, after the command's own
- * prefix, so the test's requests land on the mock. Resolves with the command's output.
+ * Claude Code strips are absent, the project's own (key, auth token, gateway, proxies) are set, and
+ * its repo holds a settings file that tries to send the session to the decoy. Only the API's address
+ * is added, after the command's own `-u` list (host-managed claude takes its endpoint from no other
+ * place), so a leaked project gateway is for the unit test of the command's env to catch, and a
+ * leaked key, auth token or proxy shows here. `hostManaged: false` leaves the mode out, to show the
+ * settings file is live. Resolves with the command's output; a command that outlasts its timeout fails.
  */
 async function runNested(
   login: NestedPrefix | undefined,
   commandEnv: Record<string, string> = {},
+  { hostManaged = true }: { hostManaged?: boolean } = {},
 ): Promise<string> {
   const repo = join(root, "repo");
   mkdirSync(join(repo, ".claude"), { recursive: true });
@@ -106,11 +121,14 @@ async function runNested(
   );
   const home = join(root, "home");
   mkdirSync(home, { recursive: true });
-  const command = nestedClaude(login).replace(
+  const managed = nestedClaude(login);
+  const command = (
+    hostManaged ? managed : managed.replace(` ${HOST_MANAGED}=1`, "")
+  ).replace(
     /claude -p …$/,
     `ANTHROPIC_BASE_URL=${api.url} ${claudeBinary} -p "reply ok" </dev/null`,
   );
-  return await new Promise((resolve) =>
+  return await new Promise((resolve, reject) =>
     execFile(
       "bash",
       ["-c", command],
@@ -120,15 +138,35 @@ async function runNested(
           PATH: process.env.PATH,
           HOME: home,
           ANTHROPIC_API_KEY: "project-api-key",
+          ANTHROPIC_AUTH_TOKEN: "project-auth-token",
           ANTHROPIC_BASE_URL: "http://127.0.0.1:9",
+          HTTP_PROXY: "http://127.0.0.1:9",
+          HTTPS_PROXY: "http://127.0.0.1:9",
+          // the real binary calls no host of its own: no telemetry, no update check
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+          DISABLE_AUTOUPDATER: "1",
           ...commandEnv,
         },
         timeout: 60_000,
       },
-      (_error, stdout, stderr) => resolve(`${stdout}${stderr}`),
+      (error, stdout, stderr) =>
+        error?.killed
+          ? reject(new Error("the nested claude outlasted its timeout"))
+          : resolve(`${stdout}${stderr}`),
     ),
   );
 }
+
+// CI installs the SDK's platform package with the rest, so a missing binary there is an install
+// problem to fail on, not coverage to skip
+test.runIf(process.env.CI && !claudeBinary)(
+  "the Claude Code binary the real-binary tests drive is installed",
+  () => {
+    expect.fail(
+      `no claude-agent-sdk-${process.platform}-${process.arch} package beside the SDK`,
+    );
+  },
+);
 
 describe.skipIf(!claudeBinary)(
   "a nested claude -p in a run (real binary)",
@@ -141,32 +179,38 @@ describe.skipIf(!claudeBinary)(
         root,
       );
       const output = await runNested(login.prefix);
+      // the project's auth token is in the parent env too, and would show here as another bearer
       expect(api.seen[0]).toEqual({
         auth: `Bearer ${SUBSCRIPTION}`,
         key: undefined,
       });
-      expect(output).not.toContain("Not logged in");
       expect(output).not.toContain(SUBSCRIPTION);
     }, 90_000);
 
-    test("logs in with the pool's token on a pool run, and two runs of one sprite keep their own", async () => {
-      const mine = await prepareNestedLogin(
-        "oauth",
-        { CLAUDE_CODE_OAUTH_TOKEN: POOL },
-        "run_pool",
-        root,
-      );
-      const other = await prepareNestedLogin(
-        "oauth",
-        { CLAUDE_CODE_OAUTH_TOKEN: SUBSCRIPTION },
-        "run_other",
-        root,
-      );
+    test("logs in with the pool's token on a pool run, and two runs of one sprite keep their own files", async () => {
+      const prepare = (token: string, runId: string) =>
+        prepareNestedLogin(
+          "oauth",
+          { CLAUDE_CODE_OAUTH_TOKEN: token },
+          runId,
+          root,
+        );
+      const pathOf = (login: NestedLogin) =>
+        /<'([^']+)'/.exec(login.prefix?.assignment ?? "")?.[1] ?? "";
+      const mine = await prepare(POOL, "run_pool");
+      const other = await prepare(SUBSCRIPTION, "run_other");
+      const [minePath, otherPath] = [pathOf(mine), pathOf(other)];
+      expect(minePath).not.toBe(otherPath);
+      expect(minePath).toContain("run_pool");
+      expect(otherPath).toContain("run_other");
       const output = await runNested(mine.prefix);
       expect(api.seen[0]?.auth).toBe(`Bearer ${POOL}`);
-      expect(output).not.toContain("Not logged in");
       expect(output).not.toContain(POOL);
+      await mine.remove();
+      expect(existsSync(minePath)).toBe(false);
+      expect(readFileSync(otherPath, "utf8")).toBe(SUBSCRIPTION);
       await other.remove();
+      expect(existsSync(otherPath)).toBe(false);
     }, 90_000);
 
     test("logs in with Sky's API key on an API-key run, whatever key the project has", async () => {
@@ -178,7 +222,6 @@ describe.skipIf(!claudeBinary)(
       );
       const output = await runNested(login.prefix);
       expect(api.seen[0]).toEqual({ auth: undefined, key: API_KEY });
-      expect(output).not.toContain("Not logged in");
       expect(output).not.toContain(API_KEY);
     }, 90_000);
 
@@ -190,24 +233,43 @@ describe.skipIf(!claudeBinary)(
         join(home, ".claude", ".credentials.json"),
         JSON.stringify({ claudeAiOauth: { accessToken: SUBSCRIPTION } }),
       );
-      const output = await runNested(undefined);
-      expect(output).toContain("Not logged in");
+      await runNested(undefined);
+      // no login means no model request, whatever the binary says about it
       expect(api.seen).toEqual([]);
+      expect(decoy.seen).toEqual([]);
     }, 90_000);
 
-    test("a settings file in the repo cannot send the session or its credential elsewhere", async () => {
-      const login = await prepareNestedLogin(
-        "oauth",
-        { CLAUDE_CODE_OAUTH_TOKEN: SUBSCRIPTION },
-        "run_guard",
-        root,
-      );
-      await runNested(login.prefix);
-      expect(decoy.seen).toEqual([]);
-      expect(api.seen.length).toBeGreaterThan(0);
-      for (const request of api.seen)
-        expect(request.key).not.toBe("settings-file-key");
-    }, 90_000);
+    describe("a settings file in the repo", () => {
+      const settingsKey = "settings-file-key";
+      const oauthLogin = () =>
+        prepareNestedLogin(
+          "oauth",
+          { CLAUDE_CODE_OAUTH_TOKEN: SUBSCRIPTION },
+          "run_guard",
+          root,
+        );
+
+      test("cannot send the session or its credential elsewhere", async () => {
+        const login = await oauthLogin();
+        await runNested(login.prefix);
+        expect(decoy.seen).toEqual([]);
+        expect(api.seen.length).toBeGreaterThan(0);
+        for (const request of api.seen)
+          expect(request).toEqual({
+            auth: `Bearer ${SUBSCRIPTION}`,
+            key: undefined,
+          });
+      }, 90_000);
+
+      test("does send the session to its endpoint, with its key, when the run is not host-managed", async () => {
+        // the control for the test above: the file is read, so the guard is what holds it back
+        const login = await oauthLogin();
+        await runNested(login.prefix, {}, { hostManaged: false });
+        expect(decoy.seen).toContainEqual(
+          expect.objectContaining({ key: settingsKey }),
+        );
+      }, 90_000);
+    });
   },
 );
 
