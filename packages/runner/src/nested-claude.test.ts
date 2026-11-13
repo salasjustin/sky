@@ -230,22 +230,22 @@ describe.skipIf(!claudeBinary)(
       const output = await runNested(login.prefix, {
         SKY_CLAUDE_API_KEY: API_KEY,
       });
-      expect(output).toContain("Not logged in");
+      expect(output).toMatch(/not logged in/i);
       expect(output).not.toContain(API_KEY);
       expect(api.seen).toEqual([]);
       expect(decoy.seen).toEqual([]);
     }, 90_000);
 
-    test("the stored login is not what a host-managed claude reads, which is why the prefix carries one", async () => {
-      // the failure this guards: no credential in the command's env and none readable there
+    test("a host-managed claude does not read a login stored in its home: it reports not logged in and makes no model request", async () => {
       const home = join(root, "home");
       mkdirSync(join(home, ".claude"), { recursive: true });
       writeFileSync(
         join(home, ".claude", ".credentials.json"),
         JSON.stringify({ claudeAiOauth: { accessToken: SUBSCRIPTION } }),
       );
-      await runNested(undefined);
-      // no login means no model request, whatever the binary says about it
+      const output = await runNested(undefined);
+      // the message shows the binary ran to its login check, so empty `seen` is not a crash
+      expect(output).toMatch(/not logged in/i);
       expect(api.seen).toEqual([]);
       expect(decoy.seen).toEqual([]);
     }, 90_000);
