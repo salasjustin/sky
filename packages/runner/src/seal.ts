@@ -93,7 +93,7 @@ export function hideRunner(
   }
   return syscalls.hidden()
     ? undefined
-    : "the kernel still lets the runner's commands read its environment (fs.suid_dumpable is not 0?)";
+    : "the kernel still lets the runner's commands read its environment (is fs.suid_dumpable 1?)";
 }
 
 const errorCode = (error: unknown) =>

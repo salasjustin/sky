@@ -48,7 +48,8 @@ function suidDumpable(): string | undefined {
 /**
  * Why this machine can't be asked what the kernel does with a sealed process, or undefined when it can:
  * Linux, a user that isn't root (root's capabilities read any file), a `setpriv` and `sh` only root can
- * change, `fs.suid_dumpable` at 0 (so a non-dumpable process's `/proc` entries are root's), and a temp
+ * change, `fs.suid_dumpable` at 0 or 2 (either way a non-dumpable process's `/proc` entries are root's;
+ * only 1 leaves them to its user), and a temp
  * directory that executes what is written to it.
  */
 function kernelGapOf(): string | undefined {
@@ -60,8 +61,8 @@ function kernelGapOf(): string | undefined {
   if (problem) return `the seal has a problem here: ${problem}`;
   if (!setprivRuns()) return `no setpriv at ${SETPRIV_PATHS.join(" or ")} runs`;
   const dumpable = suidDumpable();
-  if (dumpable !== "0")
-    return `fs.suid_dumpable is ${dumpable ?? "unreadable"}, not 0`;
+  if (dumpable !== "0" && dumpable !== "2")
+    return `fs.suid_dumpable is ${dumpable ?? "unreadable"}, not 0 or 2`;
   if (!tmpdirExecutes()) return `files in ${tmpdir()} can't be executed`;
   return undefined;
 }
