@@ -1,74 +1,79 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+const LOGIN = "claudeAiOauth";
+
 /**
- * The entries already in the credential file, or none when it is missing or not a JSON object.
- * Any other read error throws: `writeClaudeCredentials` would otherwise rename over a file it could
- * not read and drop every entry in it.
+ * The entries in the credential file, or undefined when it is missing or not a JSON object: a file
+ * this can't parse is left as it is. Any other read error throws, so a path that can't be read is
+ * never replaced.
  */
-async function readExisting(path: string): Promise<Record<string, unknown>> {
+async function readExisting(
+  path: string,
+): Promise<Record<string, unknown> | undefined> {
   const text = await readFile(path, "utf8").catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   });
-  if (text === null) return {};
+  if (text === null) return undefined;
   try {
     const parsed: unknown = JSON.parse(text);
     return parsed !== null &&
       typeof parsed === "object" &&
       !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
-      : {};
+      : undefined;
   } catch {
-    return {};
+    return undefined;
   }
 }
 
 /**
- * Claude Code removes `CLAUDE_CODE_OAUTH_TOKEN` from the env of the commands it runs, so a nested
- * `claude -p` (the Kru checks) finds no login there. It does read the credential file in its config
- * dir, so the runner writes the same subscription token there, readable by this user only. The
- * entry carries no refresh token and no expiry: the token is a long-lived one from `claude setup-token`.
- *
- * Only `claudeAiOauth` is replaced. Other entries, such as a `designOauth` credential from an
- * interactive `/design-login` on the sprite, are kept so a run does not sign them out.
- *
- * Every agent on a sprite shares this file, so it is never rewritten in place: a runner or a nested
- * `claude` reading it mid-write could find it empty or half-written, and a runner would then drop the
- * other entries. The new content goes to a 0600 temp file that is renamed over it, which also
- * replaces a symlink at that path with a regular file.
+ * The login a runner stored for a nested `claude`: a long-lived `claude setup-token` token, so no
+ * refresh token and no expiry. An interactive `claude` login always has both.
  */
-export async function writeClaudeCredentials(
+function isSkyLogin(entry: unknown): boolean {
+  if (entry === null || typeof entry !== "object") return false;
+  const { refreshToken, expiresAt } = entry as Record<string, unknown>;
+  return refreshToken === null && expiresAt === null;
+}
+
+/**
+ * Removes the run's subscription token an earlier runner stored in Claude Code's credential file,
+ * where every later run's commands could read it; resolves to whether there was one. The runner's
+ * `claude` processes run host-managed, which ignores a stored login, so nothing here writes one.
+ *
+ * Only that entry goes. A login a person made interactively and every other entry, such as a
+ * `designOauth` credential from `/design-login`, are kept; a file with nothing left is deleted.
+ * Every agent on a sprite shares this file, so it is never rewritten in place, where a `claude`
+ * reading it mid-write could find it half-written: the rest goes to a 0600 temp file that is
+ * renamed over it.
+ */
+export async function removeSkyLogin(
   env: NodeJS.ProcessEnv,
   home: string = homedir(),
-): Promise<string> {
-  const token = env.CLAUDE_CODE_OAUTH_TOKEN;
-  if (!token) throw new Error("CLAUDE_CODE_OAUTH_TOKEN is not set");
+): Promise<boolean> {
   const dir = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
   const path = join(dir, ".credentials.json");
-  await mkdir(dir, { recursive: true, mode: 0o700 });
   const existing = await readExisting(path);
+  if (!existing || !isSkyLogin(existing[LOGIN])) return false;
+  const rest = Object.entries(existing).filter(([key]) => key !== LOGIN);
+  if (rest.length === 0) {
+    await rm(path, { force: true });
+    return true;
+  }
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await writeFile(
-      temp,
-      JSON.stringify({
-        ...existing,
-        claudeAiOauth: {
-          accessToken: token,
-          refreshToken: null,
-          expiresAt: null,
-          scopes: ["user:inference"],
-        },
-      }),
-      { mode: 0o600, flag: "wx" },
-    );
+    await writeFile(temp, JSON.stringify(Object.fromEntries(rest)), {
+      mode: 0o600,
+      flag: "wx",
+    });
     await rename(temp, path);
   } catch (error) {
     await rm(temp, { force: true });
     throw error;
   }
-  return path;
+  return true;
 }

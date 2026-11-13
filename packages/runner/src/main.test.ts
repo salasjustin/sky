@@ -31,7 +31,7 @@ beforeAll(() => {
   execFileSync("pnpm", ["run", "--silent", "build"], { cwd: pkg });
 }, 30_000);
 
-// the runner writes Claude Code's credential file; keep it out of the real home
+// the runner rewrites Claude Code's credential file; keep it out of the real home
 const CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), "runner-claude-"));
 afterAll(() => rmSync(CLAUDE_CONFIG_DIR, { recursive: true, force: true }));
 // no sprite API here, whatever host the tests run on: the runner would otherwise hold a real sprite
@@ -71,6 +71,25 @@ const preload = (host: keyof typeof PRELOADS) => {
   writeFileSync(path, PRELOADS[host]);
   return path;
 };
+// the seal the preloads stand in for is Linux's: elsewhere the runner fails every run as
+// credential_exposed before the worktree, and `unprivileged` needs `process.geteuid`, which
+// Windows lacks. A test whose outcome depends on how the seal turns out runs only here
+const sealHost =
+  process.platform === "linux" && typeof process.geteuid === "function";
+
+/**
+ * A stand-in command at `<dir>/<name>` that prints `stdout` and exits `code`, appending its
+ * arguments and env to the file it returns.
+ */
+function recorder(dir: string, name: string, stdout: string, code: number) {
+  const path = join(dir, name);
+  writeFileSync(
+    path,
+    `#!/bin/sh\n{ echo "argv: $*"; env; } >> '${path}.seen'\nprintf '%s' '${stdout}'\nexit ${code}\n`,
+  );
+  chmodSync(path, 0o755);
+  return `${path}.seen`;
+}
 
 const servers: Server[] = [];
 afterEach(() => {
@@ -253,69 +272,26 @@ describe("a stray runner.mjs started in a run's shell, which inherits PROMPT_FIL
   }, 20_000);
 });
 
-test("a failed run posts run.failed to the API with the agent token, exits 1, and leaves nothing running", async () => {
-  const received: { auth?: string; body: unknown }[] = [];
-  const api = createServer((req, res) => {
-    let body = "";
-    req.on("data", (d) => (body += d));
-    req.on("end", () => {
-      received.push({
-        auth: req.headers.authorization,
-        body: JSON.parse(body),
+test.skipIf(!sealHost)(
+  "a failed run posts run.failed to the API with the agent token, exits 1, and leaves nothing running",
+  async () => {
+    const received: { auth?: string; body: unknown }[] = [];
+    const api = createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        received.push({
+          auth: req.headers.authorization,
+          body: JSON.parse(body),
+        });
+        res.writeHead(204).end();
       });
-      res.writeHead(204).end();
     });
-  });
-  api.listen(0, "127.0.0.1");
-  await once(api, "listening");
-  const { port } = api.address() as AddressInfo;
-  try {
-    const { code, stdout } = await runBundle({
-      AGENT_ID: "agt_1",
-      RUN_ID: "run_1",
-      PROMPT: "do it",
-      API_BASE_URL: `http://127.0.0.1:${port}`,
-      AGENT_TOKEN: "agent-secret",
-      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
-      REPO_DIR: "/nonexistent/repo",
-      WORKTREES_DIR: "/nonexistent/worktrees",
-    });
-    expect(code).toBe(1);
-    expect(stdout).toBe("");
-    expect(received).toEqual([
-      {
-        auth: "Bearer agent-secret",
-        body: {
-          runId: "run_1",
-          type: "run.failed",
-          payload: { error: expect.stringMatching(/worktree setup failed/) },
-        },
-      },
-    ]);
-  } finally {
-    api.closeAllConnections();
-    api.close();
-  }
-  // an idle keep-alive socket or a live child would hold the process open: runBundle then never
-  // resolves and the timeout fails the test, with no wall-clock threshold to tune
-}, 20_000);
-
-test("a host whose runner can't change its effective user fails the run as credential_exposed, before any worktree work", async () => {
-  const received: { body: unknown }[] = [];
-  const api = createServer((req, res) => {
-    let body = "";
-    req.on("data", (d) => (body += d));
-    req.on("end", () => {
-      received.push({ body: JSON.parse(body) });
-      res.writeHead(204).end();
-    });
-  });
-  api.listen(0, "127.0.0.1");
-  await once(api, "listening");
-  const { port } = api.address() as AddressInfo;
-  try {
-    const { code } = await runBundle(
-      {
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    const { port } = api.address() as AddressInfo;
+    try {
+      const { code, stdout } = await runBundle({
         AGENT_ID: "agt_1",
         RUN_ID: "run_1",
         PROMPT: "do it",
@@ -324,30 +300,81 @@ test("a host whose runner can't change its effective user fails the run as crede
         CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
         REPO_DIR: "/nonexistent/repo",
         WORKTREES_DIR: "/nonexistent/worktrees",
-      },
-      undefined,
-      "unprivileged",
-    );
-    expect(code).toBe(1);
-    expect(received).toEqual([
-      {
-        body: {
-          runId: "run_1",
-          type: "run.failed",
-          payload: {
-            error: expect.stringMatching(
-              /^credential_exposed: .*can't change its effective user \(EPERM\).*the run did not start\.$/,
-            ),
+      });
+      expect(code).toBe(1);
+      expect(stdout).toBe("");
+      expect(received).toEqual([
+        {
+          auth: "Bearer agent-secret",
+          body: {
+            runId: "run_1",
+            type: "run.failed",
+            payload: { error: expect.stringMatching(/worktree setup failed/) },
           },
         },
-      },
-    ]);
-    expect(JSON.stringify(received)).not.toContain("oauth-secret");
-  } finally {
-    api.closeAllConnections();
-    api.close();
-  }
-}, 20_000);
+      ]);
+    } finally {
+      api.closeAllConnections();
+      api.close();
+    }
+    // an idle keep-alive socket or a live child would hold the process open: runBundle then never
+    // resolves and the timeout fails the test, with no wall-clock threshold to tune
+  },
+  20_000,
+);
+
+test.skipIf(!sealHost)(
+  "a host whose runner can't change its effective user fails the run as credential_exposed, before any worktree work",
+  async () => {
+    const received: { body: unknown }[] = [];
+    const api = createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        received.push({ body: JSON.parse(body) });
+        res.writeHead(204).end();
+      });
+    });
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    const { port } = api.address() as AddressInfo;
+    try {
+      const { code } = await runBundle(
+        {
+          AGENT_ID: "agt_1",
+          RUN_ID: "run_1",
+          PROMPT: "do it",
+          API_BASE_URL: `http://127.0.0.1:${port}`,
+          AGENT_TOKEN: "agent-secret",
+          CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+          REPO_DIR: "/nonexistent/repo",
+          WORKTREES_DIR: "/nonexistent/worktrees",
+        },
+        undefined,
+        "unprivileged",
+      );
+      expect(code).toBe(1);
+      expect(received).toEqual([
+        {
+          body: {
+            runId: "run_1",
+            type: "run.failed",
+            payload: {
+              error: expect.stringMatching(
+                /^credential_exposed: .*can't change its effective user \(EPERM\).*the run did not start\.$/,
+              ),
+            },
+          },
+        },
+      ]);
+      expect(JSON.stringify(received)).not.toContain("oauth-secret");
+    } finally {
+      api.closeAllConnections();
+      api.close();
+    }
+  },
+  20_000,
+);
 
 test("the runner holds the sprite through the Tasks API at SKY_SPRITE_API_SOCKET", async () => {
   const sockets = mkdtempSync(join(tmpdir(), "runner-main-sprite-"));
@@ -626,3 +653,122 @@ test.skipIf(!linux)(
   },
   20_000,
 );
+
+describe("the Claude login stored in Claude Code's credential file", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "runner-main-login-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const credentials = () => join(dir, ".credentials.json");
+  const run = async (credential: Record<string, string>) => {
+    const { base } = await apiAndGateway();
+    recorder(dir, "claude", "[]", 0);
+    return runBundle({
+      AGENT_ID: "agt_1",
+      RUN_ID: "run_1",
+      PROMPT: "do it",
+      API_BASE_URL: base,
+      AGENT_TOKEN: "agent-secret",
+      ...credential,
+      REPO_DIR: "/nonexistent/repo",
+      WORKTREES_DIR: "/nonexistent/worktrees",
+      CLAUDE_CONFIG_DIR: dir,
+      SKY_CLAUDE: join(dir, "claude"),
+      TMPDIR: dir,
+    });
+  };
+
+  test("a subscription run stores none", async () => {
+    const { code, stderr } = await run({
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+    });
+    expect(code).toBe(1);
+    // the setup that once stored it ran
+    expect(stderr).toMatch(/runner: plugin refresh done/);
+    expect(existsSync(credentials())).toBe(false);
+  }, 20_000);
+
+  test("one an earlier runner stored is removed when a run starts, an API-key run's too, and the other entries stay", async () => {
+    writeFileSync(
+      credentials(),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "oauth-secret",
+          refreshToken: null,
+          expiresAt: null,
+          scopes: ["user:inference"],
+        },
+        designOauth: { accessToken: "design", refreshToken: "refresh" },
+      }),
+      { mode: 0o600 },
+    );
+    const { code, stderr } = await run({
+      SKY_CLAUDE_AUTH: "api-key",
+      SKY_CLAUDE_API_KEY: "key-secret",
+    });
+    expect(code).toBe(1);
+    expect(JSON.parse(readFileSync(credentials(), "utf8"))).toEqual({
+      designOauth: { accessToken: "design", refreshToken: "refresh" },
+    });
+    expect(stderr).toMatch(/runner: removed the Claude login a runner stored/);
+  }, 20_000);
+});
+
+// the git commands run only once the seal holds, which the preloads stand in for on Linux alone
+describe.skipIf(!sealHost)("the runner's own commands", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "runner-main-children-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test.each([
+    ["a subscription run", { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret" }],
+    [
+      "an API-key run",
+      { SKY_CLAUDE_AUTH: "api-key", SKY_CLAUDE_API_KEY: "key-secret" },
+    ],
+  ])(
+    "on %s, its git and the plugin refresh's claude never get the Claude credential",
+    async (_, credential) => {
+      const { base } = await apiAndGateway();
+      const bin = join(dir, "bin");
+      mkdirSync(bin);
+      // failing, so worktree setup ends the run at its first git command
+      const git = recorder(bin, "git", "", 1);
+      const claude = recorder(bin, "claude", "[]", 0);
+      const { code, stderr } = await runBundle({
+        AGENT_ID: "agt_1",
+        RUN_ID: "run_1",
+        PROMPT: "do it",
+        API_BASE_URL: base,
+        AGENT_TOKEN: "agent-secret",
+        ...credential,
+        // a directory git can start in
+        REPO_DIR: dir,
+        WORKTREES_DIR: join(dir, "worktrees"),
+        PATH: `${bin}:${join(HOST, "bin")}:${process.env.PATH ?? ""}`,
+        SKY_CLAUDE: join(bin, "claude"),
+        TMPDIR: dir,
+      });
+      expect(code).toBe(1);
+      expect(stderr).toMatch(/runner: plugins refreshed/);
+      const seen = {
+        git: readFileSync(git, "utf8"),
+        claude: readFileSync(claude, "utf8"),
+      };
+      expect(seen.git).toMatch(/^argv: worktree prune$/m);
+      expect(seen.claude).toMatch(/^argv: plugin list --json$/m);
+      for (const env of Object.values(seen)) {
+        // the run's own env reached the command, so what's missing was taken out
+        expect(env).toMatch(/^RUN_ID=run_1$/m);
+        expect(env).not.toMatch(
+          /^(CLAUDE_CODE_OAUTH_TOKEN|SKY_CLAUDE_API_KEY)=/m,
+        );
+        expect(env).not.toMatch(/oauth-secret|key-secret/);
+      }
+    },
+    20_000,
+  );
+});

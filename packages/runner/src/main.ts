@@ -7,7 +7,7 @@ import {
   withdrawCredential,
 } from "./claude-auth.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
-import { writeClaudeCredentials } from "./credentials.js";
+import { removeSkyLogin } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
 import { holdSprite, spriteApiFrom } from "./keepalive.js";
 import { refreshPlugins } from "./plugins.js";
@@ -93,6 +93,18 @@ async function main(): Promise<void> {
   removeCredentialFilesOnExit();
   // a runner killed outright (SIGKILL, the OOM killer) left its credential files behind
   sweepCredentialFiles(processAlive);
+  // an earlier runner may have left its run's token in Claude Code's credential file, where any later
+  // run's commands can read it; gone before this run starts one. A failure is a warning, not the run's
+  try {
+    if (await removeSkyLogin(process.env))
+      warn(
+        "runner: removed the Claude login a runner stored in Claude Code's credential file",
+      );
+  } catch (error) {
+    warn(
+      `runner: a stored Claude login may remain: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 
   // the first SIGTERM/SIGINT/SIGHUP aborts the session and lets the run report and commit; a second one
   // kills what the session left running and then the runner, at once
@@ -142,10 +154,7 @@ async function main(): Promise<void> {
   await step("sprite hold", () => hold.ready);
   // a stop while the hold was landing skips setup; the session reports it as run.failed
   if (!controller.signal.aborted)
-    await setUpSession(controller.signal, config.claudeAuth, {
-      ...process.env,
-      ...credentialEnv,
-    });
+    await setUpSession(controller.signal);
   warn("runner: session starting");
   try {
     process.exitCode = await runSession(config, {
@@ -169,28 +178,15 @@ async function main(): Promise<void> {
   else stopListening();
 }
 
-async function setUpSession(
-  signal: AbortSignal,
-  claudeAuth: Config["claudeAuth"],
-  /** `process.env` with the run's Claude credential back in it. */
-  env: NodeJS.ProcessEnv,
-): Promise<void> {
-  // the stored login for a `claude` run without host-managed mode; the checks' nested `claude` is logged in
-  // by `prepareNestedLogin` instead. A failure costs neither the checks nor the run.
-  // An API-key run writes nothing: the file is shared by every agent on the sprite and holds a subscription
-  if (claudeAuth === "oauth") {
-    await step("claude credentials", () =>
-      writeClaudeCredentials(env).catch((error: unknown) =>
-        warn(
-          `runner: nested claude login not set up: ${error instanceof Error ? error.message : String(error)}`,
-        ),
-      ),
-    );
-  }
+async function setUpSession(signal: AbortSignal): Promise<void> {
   // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
   await step("store sync", () => syncStoreQuietly("pull", process.env, warn));
-  // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails the run
-  await step("plugin refresh", () => refreshPlugins({ env, warn, signal }));
+  // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails
+  // the run. The marketplaces need no Claude login, and these `claude` processes are neither sealed nor
+  // pinned, so they get the env with the credential taken out
+  await step("plugin refresh", () =>
+    refreshPlugins({ env: process.env, warn, signal }),
+  );
 }
 
 const io = {
