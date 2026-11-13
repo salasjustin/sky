@@ -1,6 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -10,13 +11,16 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
   type CommandEnv,
   claudeProcessEnv,
   commandEnvScript,
+  credentialDir,
   prepareCommandEnv,
-  removeCommandEnvNow,
+  removeCredentialFilesNow,
+  sweepCredentialFiles,
   withdrawCredential,
 } from "./claude-auth.js";
 
@@ -232,11 +236,11 @@ test("once the script is removed, sourcing Claude Code's env file still succeeds
   expect(command()).toBe("unset unset");
 });
 
-test("removeCommandEnvNow deletes a script still on disk before it returns, and a later remove still resolves", async () => {
+test("removeCredentialFilesNow deletes a script still on disk before it returns, and a later remove still resolves", async () => {
   const env = await prepareCommandEnv("oauth", PROJECT, dir);
   const [path = ""] = scriptIn(dir);
   expect(existsSync(path)).toBe(true);
-  removeCommandEnvNow();
+  removeCredentialFilesNow();
   expect(existsSync(path)).toBe(false);
   await expect(env.remove()).resolves.toBeUndefined();
 });
@@ -281,4 +285,67 @@ describe("withdrawCredential", () => {
       CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
     });
   });
+});
+
+// the module as Node itself loads it, types stripped, so a child process can die with it loaded
+const CLAUDE_AUTH = join(import.meta.dirname, "claude-auth.ts");
+const CLAUDE_AUTH_URL = pathToFileURL(CLAUDE_AUTH).href;
+
+test.each([
+  ["an uncaught exception", "setImmediate(() => { throw boom; });"],
+  ["an unhandled rejection", "Promise.reject(boom);"],
+])(
+  "the credential files are removed when the process dies of %s",
+  (_, death) => {
+    const script = [
+      `import * as auth from ${JSON.stringify(CLAUDE_AUTH_URL)};`,
+      "auth.removeCredentialFilesOnExit();",
+      "const dir = process.env.DIR;",
+      'const login = { CLAUDE_CODE_OAUTH_TOKEN: "token" };',
+      'await auth.prepareNestedLogin("oauth", login, "run_1", dir);',
+      'const project = { ANTHROPIC_API_KEY: "project-key" };',
+      'await auth.prepareCommandEnv("oauth", project, dir);',
+      'process.stdout.write("written");',
+      'const boom = new Error("boom");',
+      death,
+    ].join("\n");
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--disable-warning=ExperimentalWarning",
+        "--input-type=module",
+        "-e",
+        script,
+      ],
+      { env: { PATH: process.env.PATH, DIR: dir }, encoding: "utf8" },
+    );
+    expect(child.stdout).toBe("written");
+    expect(child.stderr).toContain("boom");
+    expect(child.status).toBe(1);
+    expect(readdirSync(dir)).toEqual([]);
+  },
+);
+
+test("the sweep removes a dead runner's credential files and leaves a live runner's", () => {
+  const [dead, live, self] = [101, 102, 103];
+  for (const pid of [dead, live, self]) {
+    const runner = credentialDir(dir, pid);
+    mkdirSync(runner);
+    writeFileSync(join(runner, "sky-nested-claude-run_1"), "");
+  }
+  writeFileSync(join(dir, "sky-runner-notes"), "");
+  // this runner's own pid is alive, and its directory still a dead process's
+  sweepCredentialFiles((pid) => pid === live || pid === self, dir, self);
+  expect(readdirSync(dir).sort()).toEqual([
+    "sky-runner-102",
+    "sky-runner-notes",
+  ]);
+  expect(readdirSync(credentialDir(dir, live))).toEqual([
+    "sky-nested-claude-run_1",
+  ]);
+});
+
+test("the sweep of a missing directory does nothing and never throws", () => {
+  const absent = join(dir, "absent");
+  expect(() => sweepCredentialFiles(() => false, absent)).not.toThrow();
 });

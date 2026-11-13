@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { rmSync } from "node:fs";
+import { readdirSync, rmSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -163,6 +163,67 @@ export function commandEnvScript(
   return lines.length > 0 ? `${lines.join("\n")}\n` : undefined;
 }
 
+const RUNNER_DIR = /^sky-runner-(\d+)$/;
+
+/**
+ * Where this runner writes its credential files: a directory of `root` named for its pid, which is
+ * how `sweepCredentialFiles` tells a dead runner's files from a live one's.
+ */
+export const credentialDir = (root: string = tmpdir(), pid = process.pid) =>
+  join(root, `sky-runner-${pid}`);
+
+/**
+ * The shell assignment that logs a check's nested `claude` in: it sets `variable` from the credential
+ * file as the command runs, ahead of `env`, so the value is in that command's environment alone.
+ */
+export type NestedPrefix = {
+  variable: "CLAUDE_CODE_OAUTH_TOKEN";
+  assignment: string;
+};
+
+export type NestedLogin = {
+  /** Undefined on an API-key run. */
+  prefix: NestedPrefix | undefined;
+  /** Deletes the file holding the credential. */
+  remove: () => Promise<void>;
+};
+
+/**
+ * Host-managed mode makes Claude Code ignore a stored login, and Claude Code removes
+ * `CLAUDE_CODE_OAUTH_TOKEN` from the env of the commands it runs, so a nested `claude -p` finds its
+ * credential in neither place. A subscription or pool run's token goes in a 0600 file named for the
+ * run; every process of the sprite's user can still read it while it exists. `prefix` has the shell
+ * read it into the nested command's environment, the one place Claude Code takes the credential in
+ * host-managed mode, and it always wins over a value of that name already in the command's env. The
+ * value never reaches the prompt, any program's argv, Claude's env or its env file.
+ *
+ * An API-key run gets no file and no prefix: every process of the sprite's user could read Sky's key
+ * from that file.
+ */
+export async function prepareNestedLogin(
+  auth: ClaudeAuth,
+  runnerEnv: NodeJS.ProcessEnv,
+  runId: string,
+  dir: string = credentialDir(),
+): Promise<NestedLogin> {
+  const value =
+    auth === "oauth" ? runnerEnv.CLAUDE_CODE_OAUTH_TOKEN : undefined;
+  if (!value) return { prefix: undefined, remove: async () => {} };
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, `sky-nested-claude-${runId}-${randomUUID()}`);
+  unremoved.add(path);
+  await writeFile(path, value, { mode: 0o600, flag: "wx" });
+  const variable = "CLAUDE_CODE_OAUTH_TOKEN";
+  return {
+    // quoted, so the value is never split or globbed
+    prefix: { variable, assignment: `${variable}="$(<${shellQuote(path)})"` },
+    remove: () => {
+      unremoved.delete(path);
+      return rm(path, { force: true });
+    },
+  };
+}
+
 type Settings = Exclude<Options["settings"], string | undefined>;
 
 export type CommandEnv = {
@@ -172,14 +233,16 @@ export type CommandEnv = {
   remove: () => Promise<void>;
 };
 
-// every script `prepareCommandEnv` wrote that its `remove` hasn't deleted yet
+// every credential file `prepareCommandEnv` and `prepareNestedLogin` wrote that its `remove` hasn't
+// deleted yet
 const unremoved = new Set<string>();
 
 /**
- * Deletes every command-env script still on disk, synchronously: for a process about to die by a
- * signal, which never reaches the session's own `remove`. Never throws, so the death goes ahead.
+ * Deletes every command-env script and nested login file still on disk, synchronously: for a process
+ * about to die by a signal or an uncaught exception, neither of which reaches the session's own
+ * `remove`. Never throws, so the death goes ahead.
  */
-export function removeCommandEnvNow(): void {
+export function removeCredentialFilesNow(): void {
   for (const path of unremoved)
     try {
       rmSync(path, { force: true });
@@ -188,15 +251,50 @@ export function removeCommandEnvNow(): void {
 }
 
 /**
+ * Runs `removeCredentialFilesNow` on 'exit', which Node also fires for an uncaught exception or
+ * unhandled rejection; death by a signal fires none, so that path calls it itself.
+ */
+export function removeCredentialFilesOnExit(): void {
+  process.on("exit", removeCredentialFilesNow);
+}
+
+/**
+ * Deletes the credential files a runner killed outright (SIGKILL, the OOM killer) left behind, which
+ * no exit handler reaches. Runs on one sprite share its tmpdir and pid space, so a directory is swept
+ * only when `isAlive` finds no process with its pid; a pid reused by any process keeps its directory
+ * until that one ends too. A directory under this runner's own pid is a dead process's and is swept
+ * too, so this runs before the runner writes any. Never throws.
+ */
+export function sweepCredentialFiles(
+  isAlive: (pid: number) => boolean,
+  root: string = tmpdir(),
+  self = process.pid,
+): void {
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const pid = Number(RUNNER_DIR.exec(name)?.[1]);
+    if (!pid || (pid !== self && isAlive(pid))) continue;
+    try {
+      rmSync(join(root, name), { recursive: true, force: true });
+    } catch {}
+  }
+}
+
+/**
  * Writes `commandEnvScript` to a file only this user reads, and the SessionStart hook that appends
  * to `$CLAUDE_ENV_FILE` a line sourcing that file while it exists. The values live in that file
  * alone, never in argv, Claude's env or Claude Code's env file; once `remove` or
- * `removeCommandEnvNow` deletes it, the line sources nothing and still succeeds.
+ * `removeCredentialFilesNow` deletes it, the line sources nothing and still succeeds.
  */
 export async function prepareCommandEnv(
   auth: ClaudeAuth,
   env: NodeJS.ProcessEnv,
-  dir: string = tmpdir(),
+  dir: string = credentialDir(),
 ): Promise<CommandEnv> {
   const script = commandEnvScript(auth, env);
   if (script === undefined) return { hooks: undefined, remove: async () => {} };

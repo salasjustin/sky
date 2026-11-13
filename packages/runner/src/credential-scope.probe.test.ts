@@ -358,6 +358,7 @@ async function runCase(c: Case): Promise<Findings> {
     commandEnv.hooks,
     credentialEnv,
     seal?.spawn,
+    undefined,
   );
   const settings = { ...(built.settings as object) };
   if (!c.pinned)

@@ -131,7 +131,7 @@ const StatusInput = z
       .boolean()
       .optional()
       .describe(
-        `With agentId: also return the branch's diff, cut at ${DIFF_LIMIT} chars.`,
+        `With agentId: also return the branch's diff. A long diff is cut to whole lines within ${DIFF_LIMIT} chars, ending in a note that gives the full diff's size and where to read it.`,
       ),
   })
   .refine((i) => (i.agentId === undefined) !== (i.envId === undefined), {
@@ -149,13 +149,27 @@ const StatusInput = z
 const RunList = z.object({ data: z.array(z.object({ id: RunId })) });
 const RunDetail = z.looseObject({
   diff: z.string().nullish(),
+  // both present only when the API cut the diff; diffSize is the full diff's bytes
+  diffTruncated: z.literal(true).optional(),
+  diffSize: z.number().int().nonnegative().optional(),
   compareUrl: z.string().nullish(),
 });
 
-const clip = (diff?: string | null, compareUrl?: string | null) =>
-  !diff || diff.length <= DIFF_LIMIT
-    ? diff
-    : `${diff.slice(0, DIFF_LIMIT)}\n[diff truncated: ${DIFF_LIMIT} of ${diff.length} chars shown; full diff at ${compareUrl ?? "the agent's branch"}]`;
+type RunDetail = z.infer<typeof RunDetail>;
+
+/** The diff cut to DIFF_LIMIT chars at the last whole line, with a note giving the full size and where to read it. */
+const clip = ({ diff, diffTruncated, diffSize, compareUrl }: RunDetail) => {
+  if (!diff || (diff.length <= DIFF_LIMIT && !diffTruncated)) return diff;
+  // a single line longer than the limit is cut mid-line
+  const end = diff.lastIndexOf("\n", DIFF_LIMIT - 1) + 1 || DIFF_LIMIT;
+  const shown = diff.slice(0, end);
+  const where = compareUrl ?? "the agent's branch";
+  const note =
+    diffTruncated && diffSize !== undefined
+      ? `[diff truncated: ${shown.length} chars shown; full diff is ${diffSize} bytes at ${where}]`
+      : `[diff truncated: ${shown.length} of ${diff.length} chars shown; full diff at ${where}]`;
+  return `${shown}${shown.endsWith("\n") ? "" : "\n"}${note}`;
+};
 
 const WaitForEventsInput = z.strictObject({
   after: EventCursor.optional().describe(
@@ -219,7 +233,7 @@ function buildServer(call: Call) {
     return { ok: true, value: newest.id };
   };
 
-  /** runId's run, else the newest one re-read singly, since the list omits the diff and pending request; the diff goes out only with includeDiff. */
+  /** runId's run, else the newest one re-read singly, since the list omits the diff; the diff goes out only with includeDiff. */
   const runOf = async (
     agentId: AgentId,
     runId: RunId | undefined,
@@ -234,10 +248,8 @@ function buildServer(call: Call) {
     const detail = RunDetail.safeParse(run.value);
     if (!detail.success)
       return failure(200, "unexpected_response", z.prettifyError(detail.error));
-    const { diff, ...rest } = detail.data;
-    return text(
-      includeDiff ? { ...rest, diff: clip(diff, rest.compareUrl) } : rest,
-    );
+    const { diff, diffTruncated, diffSize, ...rest } = detail.data;
+    return text(includeDiff ? { ...rest, diff: clip(detail.data) } : rest);
   };
 
   const server = new McpServer({ name: "sky", version: "0.0.0" });
@@ -323,7 +335,7 @@ function buildServer(call: Call) {
     "status",
     {
       description:
-        "With agentId: a run (runId, or the newest) with its rollup, compareUrl and any pending request; its diff only with includeDiff. With envId: the environment, e.g. to poll provisioning.",
+        "With agentId: a run (runId, or the newest) with its rollup, compareUrl and any pending request; its diff only with includeDiff, possibly cut, with a note giving the full size and where to read it. With envId: the environment, e.g. to poll provisioning.",
       inputSchema: StatusInput,
       annotations: { readOnlyHint: true },
     },
