@@ -151,7 +151,8 @@ async function setUpSession(
   signal: AbortSignal,
   claudeAuth: Config["claudeAuth"],
 ): Promise<void> {
-  // so a nested `claude -p` in the sandbox is logged in; a failure costs the Kru checks, not the run.
+  // the stored login for a `claude` run without host-managed mode; the checks' nested `claude` is logged in
+  // by `prepareNestedLogin` instead. A failure costs neither the checks nor the run.
   // An API-key run writes nothing: the file is shared by every agent on the sprite and holds a subscription
   if (claudeAuth === "oauth") {
     await step("claude credentials", () =>

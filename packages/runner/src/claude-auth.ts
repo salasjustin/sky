@@ -143,6 +143,54 @@ export function commandEnvScript(
   return lines.length > 0 ? `${lines.join("\n")}\n` : undefined;
 }
 
+export type NestedLogin = {
+  /**
+   * The `env` argument that logs a check's nested `claude` in with the run's credential, read from the
+   * file when the command runs; undefined when the run has no credential to give it.
+   */
+  assignment: string | undefined;
+  /** Deletes the file holding the credential. */
+  remove: () => Promise<void>;
+};
+
+/**
+ * Host-managed mode makes Claude Code ignore a stored login, and Claude Code removes
+ * `CLAUDE_CODE_OAUTH_TOKEN` from the env of the commands it runs, so a nested `claude -p` finds its
+ * credential in neither place. The run's credential (the chosen subscription token, or Sky's API key on
+ * an API-key run, read from `runnerEnv` like `claudeProcessEnv`) goes in a file only this user reads,
+ * named for the run so agents sharing a sprite never share a login; `assignment` reads it into the
+ * nested process's env alone, the one place Claude Code takes the credential in host-managed mode.
+ * The value never reaches the prompt, argv, Claude's env or its env file.
+ */
+export async function prepareNestedLogin(
+  auth: ClaudeAuth,
+  runnerEnv: NodeJS.ProcessEnv,
+  runId: string,
+  dir: string = tmpdir(),
+): Promise<NestedLogin> {
+  const value =
+    auth === "api-key"
+      ? runnerEnv.SKY_CLAUDE_API_KEY
+      : runnerEnv.CLAUDE_CODE_OAUTH_TOKEN;
+  if (!value) return { assignment: undefined, remove: async () => {} };
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, `sky-nested-claude-${runId}-${randomUUID()}`);
+  unremoved.add(path);
+  await writeFile(path, value, { mode: 0o600, flag: "wx" });
+  const read = `$(<${shellQuote(path)})`;
+  return {
+    // a subscription token already in the env wins, as it did before the file
+    assignment:
+      auth === "api-key"
+        ? `ANTHROPIC_API_KEY=${read}`
+        : `CLAUDE_CODE_OAUTH_TOKEN=\${CLAUDE_CODE_OAUTH_TOKEN:-${read}}`,
+    remove: () => {
+      unremoved.delete(path);
+      return rm(path, { force: true });
+    },
+  };
+}
+
 type Settings = Exclude<Options["settings"], string | undefined>;
 
 export type CommandEnv = {

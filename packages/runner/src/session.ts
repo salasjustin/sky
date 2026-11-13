@@ -28,8 +28,10 @@ import {
   type CommandEnv,
   claudeProcessEnv,
   HOST_MANAGED,
+  type NestedLogin,
   PROJECT_VARIABLES,
   prepareCommandEnv,
+  prepareNestedLogin,
 } from "./claude-auth.js";
 import type { Config } from "./config.js";
 import { type PostEvent, RunEndedError } from "./events.js";
@@ -177,6 +179,8 @@ function sessionOptions(
   mcpServers: Record<string, SessionMcpServer>,
   /** The SessionStart hook that gives the session's commands back what `claudeProcessEnv` drops; see `prepareCommandEnv`. */
   commandEnvHooks: CommandEnv["hooks"],
+  /** See `prepareNestedLogin`. */
+  nestedLogin: string | undefined,
 ): Options {
   return {
     cwd,
@@ -198,7 +202,7 @@ function sessionOptions(
       append: [
         ...(process.env[CONNECTOR_ENV] ? [publishInstructions()] : []),
         ...(config.checks.length > 0
-          ? [checkInstructions(config.checks, config.claudeAuth)]
+          ? [checkInstructions(config.checks, config.claudeAuth, nestedLogin)]
           : []),
         ...(notes.length > 0
           ? [[NOTES_HEADING, ...notes.map((note) => `- ${note}`)].join("\n")]
@@ -239,26 +243,28 @@ const NOTES_HEADING =
 
 // a check's nested `claude` runs without the project's key, auth token, gateway, provider switches and
 // proxies (`PROJECT_VARIABLES`), which commands get back from the command-env file: they would outrank
-// the subscription login, or send its token to the project's gateway. It is host-managed like the
-// session, whatever a command set
+// the run's login, or send its credential to the project's gateway. It is host-managed like the
+// session, whatever a command set, and so takes the run's own credential from `prepareNestedLogin`
 const UNSET_PROJECT = PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ");
-const NESTED_CLAUDE = `env ${UNSET_PROJECT} ${HOST_MANAGED}=1 claude -p …`;
+export const nestedClaude = (login: string | undefined) =>
+  `env ${UNSET_PROJECT} ${HOST_MANAGED}=1 ${login ? `${login} ` : ""}claude -p …`;
 
 /**
  * The env's base profile lists what to run before finishing. A command that calls `claude` runs as
- * a nested headless session, which the runner has logged in with the subscription (an API-key run
- * has none); the prompt has each run as `NESTED_CLAUDE` whatever the profile wrote.
+ * a nested headless session on the run's own credential; the prompt has each run as `nestedClaude`
+ * whatever the profile wrote.
  */
 const checkInstructions = (
   checks: string[],
   claudeAuth: Config["claudeAuth"],
+  login: string | undefined,
 ) =>
   [
     "Before you finish, run these checks on your change, in order, from the repo root. Plugin skills can't be invoked through the Skill tool, so run any `claude -p` command through Bash:",
     ...checks.map((check) => `- ${check}`),
-    `Run each command that calls \`claude\` with the project's Anthropic key, auth token, base URL and provider switches unset, as \`${NESTED_CLAUDE}\`, even where the check leaves that prefix out.`,
-    claudeAuth === "oauth"
-      ? "A nested `claude` session is already logged in with the sandbox's subscription. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run."
+    `Run each command that calls \`claude\` with the project's Anthropic key, auth token, base URL and provider switches unset, as \`${nestedClaude(login)}\`, even where the check leaves that prefix out.`,
+    login
+      ? `A nested \`claude\` session run that way is logged in with this run's ${claudeAuth === "oauth" ? "subscription" : "API key"}. Never set or use another credential for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`
       : "A nested `claude` session is not logged in on this run, so a check that calls `claude` can't run: report it as not run. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.",
   ].join("\n");
 
@@ -719,11 +725,17 @@ export async function runSession(
   let holdTimer: NodeJS.Timeout | undefined;
   const endHold = () => clearTimeout(holdTimer);
   let commandEnv: CommandEnv | undefined;
+  let nestedLogin: NestedLogin | undefined;
   try {
     // inside the try: an API-key run that can't hide Sky's key from its commands must not start
     commandEnv = await prepareCommandEnv(
       config.claudeAuth,
       sessionEnvOf(config),
+    );
+    nestedLogin = await prepareNestedLogin(
+      config.claudeAuth,
+      process.env,
+      config.runId,
     );
     const stream = deps.query({
       prompt: input.messages,
@@ -736,6 +748,7 @@ export async function runSession(
         notes,
         mcp.servers,
         commandEnv.hooks,
+        nestedLogin.assignment,
       ),
     });
     for await (const message of stream) {
@@ -805,6 +818,7 @@ export async function runSession(
     input.close();
     heartbeat.stop();
     await commandEnv?.remove().catch(() => {});
+    await nestedLogin?.remove().catch(() => {});
   }
 
   let commitError: string | undefined;

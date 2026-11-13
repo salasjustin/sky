@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -1359,21 +1360,69 @@ describe("the Claude credential of a run", () => {
     });
   });
 
-  test("an API-key run tells the agent its nested claude isn't logged in", async () => {
-    vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
-    const query = scripted([init, success]);
-    await runSession(
-      { ...config, claudeAuth: "api-key", checks: ["claude -p /review"] },
-      {
-        query,
-        post: recorder().post,
-        signal: new AbortController().signal,
-        awaitDecision: noDecision,
-      },
-    );
-    const append = JSON.stringify(query.calls[0]?.options.systemPrompt);
-    expect(append).toContain("is not logged in on this run");
-    expect(append).not.toContain("already logged in");
+  describe("the nested claude's login in the prompt", () => {
+    const promptOf = async (
+      overrides: Partial<typeof config>,
+      runnerEnv: Record<string, string | undefined>,
+    ) => {
+      for (const [name, value] of Object.entries(runnerEnv))
+        vi.stubEnv(name, value);
+      const query = scripted([init, success]);
+      await runSession(
+        { ...config, checks: ["claude -p /review"], ...overrides },
+        {
+          query,
+          post: recorder().post,
+          signal: new AbortController().signal,
+          awaitDecision: noDecision,
+        },
+      );
+      return JSON.stringify(query.calls[0]?.options.systemPrompt);
+    };
+
+    test("an API-key run's nested claude is logged in with Sky's key, which the prompt never holds", async () => {
+      const append = await promptOf(
+        { claudeAuth: "api-key" },
+        { SKY_CLAUDE_API_KEY: SKY_KEY },
+      );
+      expect(append).toContain("ANTHROPIC_API_KEY=$(<");
+      expect(append).toContain("logged in with this run's API key");
+      expect(append).not.toContain("is not logged in");
+      expect(append).not.toContain(SKY_KEY);
+    });
+
+    test("a subscription run's nested claude is logged in with its token, which the prompt never holds", async () => {
+      const append = await promptOf(
+        { claudeAuth: "oauth" },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      );
+      expect(append).toContain("CLAUDE_CODE_OAUTH_TOKEN=${");
+      expect(append).toContain("logged in with this run's subscription");
+      expect(append).not.toContain(TOKEN);
+    });
+
+    test("a run with no credential tells the agent its nested claude isn't logged in", async () => {
+      const append = await promptOf(
+        { claudeAuth: "api-key" },
+        { SKY_CLAUDE_API_KEY: undefined },
+      );
+      expect(append).toContain("is not logged in on this run");
+      expect(append).not.toContain("$(<");
+    });
+
+    test("the file holding the credential is gone once the run ends", async () => {
+      const before = readdirSync(tmpdir()).filter((n) =>
+        n.startsWith("sky-nested-claude-run_"),
+      );
+      await promptOf(
+        { claudeAuth: "api-key" },
+        { SKY_CLAUDE_API_KEY: SKY_KEY },
+      );
+      const after = readdirSync(tmpdir()).filter((n) =>
+        n.startsWith("sky-nested-claude-run_"),
+      );
+      expect(after).toEqual(before);
+    });
   });
 });
 
