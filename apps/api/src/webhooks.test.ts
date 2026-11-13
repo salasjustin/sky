@@ -180,7 +180,7 @@ test("a standard webhook is created with its secret held back: the format comes 
   expect(JSON.stringify(body)).not.toContain(whsec);
 });
 
-test("an openbot webhook takes any non-empty secret as is, and hides it", async () => {
+test("an openbot webhook takes its secret as is, and hides it", async () => {
   const openbotSecret = "whsec_not+base64/but-fine";
   const res = await subscribe({
     ...hook,
@@ -196,6 +196,52 @@ test("an openbot webhook takes any non-empty secret as is, and hides it", async 
     createdAt: expect.stringMatching(/Z$/),
   });
   expect(JSON.stringify(body)).not.toContain(openbotSecret);
+});
+
+// distinctive, so finding it in a response means the secret was echoed
+const rawSecret = "Zq7openbotRaw";
+
+test.each([
+  [
+    "a leading space",
+    ` ${rawSecret}`,
+    "an openbot secret has no leading or trailing whitespace",
+  ],
+  [
+    "a trailing newline",
+    `${rawSecret}\n`,
+    "an openbot secret has no leading or trailing whitespace",
+  ],
+  [
+    "257 characters",
+    rawSecret.padEnd(257, "x"),
+    "an openbot secret is at most 256 characters",
+  ],
+])(
+  "an openbot secret with %s is 400 invalid_body naming the rule, without the secret",
+  async (_, secret, message) => {
+    const res = await subscribe({ ...hook, format: "openbot", secret });
+    expect(res.status).toBe(400);
+    const text = await res.text();
+    expect(JSON.parse(text)).toEqual({
+      error: { code: "invalid_body", message },
+    });
+    expect(text).not.toContain(rawSecret);
+    expect(db.$client.prepare("select count(*) n from webhooks").get()).toEqual(
+      { n: 0 },
+    );
+  },
+);
+
+test("an openbot webhook without a secret is 400 invalid_body saying it needs one", async () => {
+  const res = await subscribe({ ...hook, format: "openbot" });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toEqual({
+    error: {
+      code: "invalid_body",
+      message: expect.stringMatching(/needs a secret/),
+    },
+  });
 });
 
 test("environmentIds of existing environments are stored and returned, duplicates collapsed", async () => {

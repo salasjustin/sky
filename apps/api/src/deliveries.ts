@@ -222,13 +222,21 @@ export function createDispatcher({
     }
     if (row.format === "openbot") {
       const body = JSON.stringify({ type: presented.type, data: presented });
+      // one id per (event, webhook), as OpenBot may dedupe ids across routines; event and
+      // webhook ids are [0-9A-Za-z_], so it is header-safe with no "." to split "<ts>.<id>.<body>" on
+      const deliveryId = `${id}_${row.webhookId}`;
       return {
         body,
         headers: {
           "Content-Type": "application/json",
           "x-openbot-timestamp": String(t),
-          "x-openbot-delivery-id": id,
-          "x-openbot-signature": openbotSignature(openSecret(row), id, t, body),
+          "x-openbot-delivery-id": deliveryId,
+          "x-openbot-signature": openbotSignature(
+            openSecret(row),
+            deliveryId,
+            t,
+            body,
+          ),
         },
       };
     }

@@ -100,13 +100,20 @@ export function webhookRoutes() {
           );
         }
       } else if (fields.format === "openbot") {
-        if (!OpenBotWebhookSecret.safeParse(secret).success) {
+        if (secret === undefined) {
           return apiError(
             c,
             400,
             "invalid_body",
-            "an openbot webhook needs a secret: a non-empty string",
+            "an openbot webhook needs a secret",
           );
+        }
+        const parsed = OpenBotWebhookSecret.safeParse(secret);
+        if (!parsed.success) {
+          // the schema's own fixed messages, which never quote the input
+          const message =
+            parsed.error.issues[0]?.message ?? "invalid openbot secret";
+          return apiError(c, 400, "invalid_body", message);
         }
       } else if (secret !== undefined) {
         return apiError(

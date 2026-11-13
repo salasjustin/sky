@@ -820,8 +820,30 @@ test("the secret of a standard webhook is stored sealed and never appears in a G
 // an OpenBot secret is used as raw bytes, whsec_ prefix and all
 const openbotSecret = "whsec_not+base64/but-fine";
 
+/** The OpenBot signature header, computed with WebCrypto from the raw secret bytes and "<ts>.<id>.<body>". */
+async function openbotExpected(
+  secret: string,
+  t: string | number,
+  id: string,
+  body: string,
+): Promise<string> {
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await crypto.subtle.sign(
+    "HMAC",
+    cryptoKey,
+    new TextEncoder().encode(`${t}.${id}.${body}`),
+  );
+  return `sha256=${Buffer.from(mac).toString("hex")}`;
+}
+
 test("an openbot delivery matches a fixed signature vector, carries the OpenBot headers and body, and keeps its id across retries", async () => {
-  await subscribe(["run.finished"], subscriberUrl, {
+  const webhookId = await subscribe(["run.finished"], subscriberUrl, {
     format: "openbot",
     secret: openbotSecret,
   });
@@ -848,22 +870,10 @@ test("an openbot delivery matches a fixed signature vector, carries the OpenBot 
     const t = sentAt[i] ?? 0;
     expect(headers.get("content-type")).toBe("application/json");
     expect(headers.get("x-openbot-timestamp")).toBe(String(t));
-    expect(headers.get("x-openbot-delivery-id")).toBe(`evt_${eventId}`);
-    // computed here with WebCrypto, from the raw secret bytes and "<ts>.<id>.<body>"
-    const cryptoKey = await crypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(openbotSecret),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"],
-    );
-    const mac = await crypto.subtle.sign(
-      "HMAC",
-      cryptoKey,
-      new TextEncoder().encode(`${t}.evt_${eventId}.${body}`),
-    );
+    const deliveryId = `evt_${eventId}_${webhookId}`;
+    expect(headers.get("x-openbot-delivery-id")).toBe(deliveryId);
     expect(headers.get("x-openbot-signature")).toBe(
-      `sha256=${Buffer.from(mac).toString("hex")}`,
+      await openbotExpected(openbotSecret, t, deliveryId, body),
     );
     expect(headers.get("x-openbot-signature")).toMatch(/^sha256=[0-9a-f]{64}$/);
     for (const name of ["sky-signature", "webhook-id", "webhook-signature"]) {
@@ -888,6 +898,54 @@ test("an openbot delivery matches a fixed signature vector, carries the OpenBot 
   expect(received[1]?.body).toBe(received[0]?.body);
   expect(received[1]?.headers.get("x-openbot-signature")).not.toBe(
     received[0]?.headers.get("x-openbot-signature"),
+  );
+});
+
+test("one event to two openbot webhooks goes out under two delivery ids, each signed with its own webhook's secret", async () => {
+  const other = "https://hooks.example.com/other";
+  const otherSecret = "a-different-openbot-secret";
+  const firstId = await subscribe(["run.finished"], subscriberUrl, {
+    format: "openbot",
+    secret: openbotSecret,
+  });
+  const secondId = await subscribe(["run.finished"], other, {
+    format: "openbot",
+    secret: otherSecret,
+  });
+  const first = subscriber([200]);
+  const second = subscriber([200], other);
+  const { runId, token } = runningRun();
+  const posted = await finish(token, runId);
+  const { id: eventId } = (await posted.json()) as { id: number };
+
+  await dispatcher.drain();
+
+  expect(first).toHaveLength(1);
+  expect(second).toHaveLength(1);
+  const deliveries = [
+    { received: first[0], secret: openbotSecret, webhookId: firstId },
+    { received: second[0], secret: otherSecret, webhookId: secondId },
+  ];
+  for (const { received, secret, webhookId } of deliveries) {
+    const headers = received?.headers ?? new Headers();
+    const body = received?.body ?? "";
+    const id = headers.get("x-openbot-delivery-id") ?? "";
+    expect(id).toBe(`evt_${eventId}_${webhookId}`);
+    // header-safe, and no "." to split the signed "<ts>.<id>.<body>" on
+    expect(id).toMatch(/^[0-9A-Za-z_]+$/);
+    expect(headers.get("x-openbot-signature")).toBe(
+      await openbotExpected(
+        secret,
+        headers.get("x-openbot-timestamp") ?? "",
+        id,
+        body,
+      ),
+    );
+    // the event itself, its id included, is the same for every webhook
+    expect(JSON.parse(body).data.id).toBe(`evt_${eventId}`);
+  }
+  expect(first[0]?.headers.get("x-openbot-delivery-id")).not.toBe(
+    second[0]?.headers.get("x-openbot-delivery-id"),
   );
 });
 
