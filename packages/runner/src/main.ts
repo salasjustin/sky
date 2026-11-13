@@ -1,6 +1,6 @@
 import { appendFileSync } from "node:fs";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { removeCommandEnvNow } from "./claude-auth.js";
+import { removeCommandEnvNow, withdrawCredential } from "./claude-auth.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { writeClaudeCredentials } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
@@ -11,6 +11,7 @@ import { endSessionProcesses } from "./reap.js";
 import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
 import { claimRunLog } from "./runlog.js";
+import { createSeal, removeSealedCopiesNow } from "./seal.js";
 import { runSession } from "./session.js";
 import { storeSyncMain, syncStoreQuietly } from "./store.js";
 import { branchCheckMain } from "./sync.js";
@@ -64,6 +65,11 @@ async function main(): Promise<void> {
     );
     return;
   }
+  // before the runner starts a command of any kind: its credential is taken out of the env its git and
+  // `claude` commands inherit, and the runner is put out of its commands' reach, so the repo's hooks and
+  // config, which those run, find nothing; only the session's Claude process gets the credential back
+  const credentialEnv = withdrawCredential(process.env);
+  const seal = createSeal();
   const claim = process.env.PROMPT_FILE
     ? claimRunLog(process.env.PROMPT_FILE)
     : undefined;
@@ -94,6 +100,7 @@ async function main(): Promise<void> {
     release();
     // the session's `finally` never runs on this path, and the file may hold the project's key
     removeCommandEnvNow();
+    removeSealedCopiesNow();
     process.kill(process.pid, signal);
   };
   let dying = false;
@@ -125,7 +132,10 @@ async function main(): Promise<void> {
   await step("sprite hold", () => hold.ready);
   // a stop while the hold was landing skips setup; the session reports it as run.failed
   if (!controller.signal.aborted)
-    await setUpSession(controller.signal, config.claudeAuth);
+    await setUpSession(controller.signal, config.claudeAuth, {
+      ...process.env,
+      ...credentialEnv,
+    });
   warn("runner: session starting");
   try {
     process.exitCode = await runSession(config, {
@@ -134,6 +144,8 @@ async function main(): Promise<void> {
       awaitDecision: createDecisionWaiter(config),
       signal: controller.signal,
       warn,
+      credentialEnv,
+      seal,
     });
   } finally {
     // the run is over, whatever way: nothing it started may keep its memory on a sprite other runs share
@@ -150,12 +162,14 @@ async function main(): Promise<void> {
 async function setUpSession(
   signal: AbortSignal,
   claudeAuth: Config["claudeAuth"],
+  /** `process.env` with the run's Claude credential back in it. */
+  env: NodeJS.ProcessEnv,
 ): Promise<void> {
   // so a nested `claude -p` in the sandbox is logged in; a failure costs the Kru checks, not the run.
   // An API-key run writes nothing: the file is shared by every agent on the sprite and holds a subscription
   if (claudeAuth === "oauth") {
     await step("claude credentials", () =>
-      writeClaudeCredentials(process.env).catch((error: unknown) =>
+      writeClaudeCredentials(env).catch((error: unknown) =>
         warn(
           `runner: nested claude login not set up: ${error instanceof Error ? error.message : String(error)}`,
         ),
@@ -165,9 +179,7 @@ async function setUpSession(
   // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
   await step("store sync", () => syncStoreQuietly("pull", process.env, warn));
   // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails the run
-  await step("plugin refresh", () =>
-    refreshPlugins({ env: process.env, warn, signal }),
-  );
+  await step("plugin refresh", () => refreshPlugins({ env, warn, signal }));
 }
 
 const io = {

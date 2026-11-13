@@ -119,6 +119,26 @@ export function claudeProcessEnv(
   return out;
 }
 
+// what the API launches the runner with to hand the session its credential: the subscription token, or
+// Sky's API key under a name of its own
+const CREDENTIAL_VARIABLES = ["SKY_CLAUDE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+/**
+ * Takes the run's Claude credential out of `env` and returns it, so the runner's own children, such as
+ * the git commands that run a repo's hooks and config, never inherit it. Only the session's Claude
+ * process gets it back, through `claudeProcessEnv`'s `runnerEnv`.
+ */
+export function withdrawCredential(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const held: NodeJS.ProcessEnv = {};
+  for (const name of CREDENTIAL_VARIABLES) {
+    const value = env[name];
+    if (value === undefined) continue;
+    held[name] = value;
+    delete env[name];
+  }
+  return held;
+}
+
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
 /**

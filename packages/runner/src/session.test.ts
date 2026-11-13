@@ -25,8 +25,13 @@ import { PROJECT_VARIABLES } from "./claude-auth.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
 import { createDecisionWaiter } from "./requests.js";
+import type { Seal } from "./seal.js";
 import { type QueryFn, sessionGitIdentity } from "./session.js";
-import { defaultSettingsDirs, settingsRedirects } from "./settings-guard.js";
+import {
+  defaultSettingsDirs,
+  PINNED_SETTINGS,
+  settingsRedirects,
+} from "./settings-guard.js";
 import { hermeticRunSession as runSession } from "./testing/hermetic-run.js";
 
 const git = (cwd: string, ...args: string[]) =>
@@ -759,7 +764,7 @@ test("the session turns Claude Code's commit and pull request attribution off", 
     signal: new AbortController().signal,
     awaitDecision: noDecision,
   });
-  expect(query.calls[0]?.options.settings).toEqual({
+  expect(query.calls[0]?.options.settings).toMatchObject({
     attribution: { commit: "", pr: "" },
   });
 });
@@ -3629,5 +3634,178 @@ describe("a repo's or sandbox's Claude settings", () => {
     ])
       expect(env).not.toHaveProperty(name);
     expect(JSON.stringify(env)).not.toContain(VALUE);
+  });
+});
+
+describe("keeping the run's Claude credential from the repo's processes", () => {
+  const TOKEN = "oauth-token-opaque-value";
+  const SKY_KEY = "sky-api-key-opaque-value";
+  const NO_SPAWN: Seal["spawn"] = () => {
+    throw new Error("a test's query never spawns");
+  };
+  const sealed = (over: Partial<Seal> = {}): Seal => ({
+    problem: undefined,
+    spawn: NO_SPAWN,
+    check: () => undefined,
+    ...over,
+  });
+  const deps = (query: QueryFn, posted = recorder()) => ({
+    query,
+    post: posted.post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+
+  beforeEach(() => {
+    // neither credential is in the runner's own env: the runner took it out, and hands it over by `credentialEnv`
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", undefined);
+    vi.stubEnv("SKY_CLAUDE_API_KEY", undefined);
+    vi.stubEnv("ANTHROPIC_API_KEY", undefined);
+  });
+
+  test("a seal that can't hide the runner fails the run before the worktree or Claude exist", async () => {
+    const query = scripted([init, success]);
+    const posted = recorder();
+    const code = await runSession(config, {
+      ...deps(query, posted),
+      credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      seal: sealed({ problem: "setpriv isn't installed" }),
+    });
+    expect(code).toBe(1);
+    expect(query.calls).toHaveLength(0);
+    expect(existsSync(config.worktreesDir)).toBe(false);
+    expect(posted.posted).toEqual([
+      {
+        runId: "run_1",
+        type: "run.failed",
+        payload: {
+          error:
+            "credential_exposed: Sky can't keep its Claude credential from this repo's commands (setpriv isn't installed); the run did not start.",
+        },
+      },
+    ]);
+  });
+
+  test("Claude is started through the seal's spawn, and through the SDK's own where there is no seal", async () => {
+    const withSeal = scripted([init, success]);
+    const seal = sealed();
+    await runSession(config, { ...deps(withSeal), seal });
+    expect(withSeal.calls[0]?.options.spawnClaudeCodeProcess).toBe(seal.spawn);
+    const without = scripted([init, success]);
+    await runSession(config, deps(without));
+    expect(without.calls[0]?.options).not.toHaveProperty(
+      "spawnClaudeCodeProcess",
+    );
+  });
+
+  test("a Claude process the repo's commands could read stops the run when it starts", async () => {
+    const query = scripted([init, success]);
+    const posted = recorder();
+    const code = await runSession(config, {
+      ...deps(query, posted),
+      seal: sealed({
+        check: () => "the kernel lets the repo's commands read it",
+      }),
+    });
+    expect(code).toBe(1);
+    expect(posted.posted.at(-1)).toMatchObject({
+      type: "run.failed",
+      payload: {
+        error:
+          "credential_exposed: the kernel lets the repo's commands read it; the run was stopped.",
+      },
+    });
+    expect(posted.posted.map((event) => event.type)).not.toContain(
+      "run.finished",
+    );
+  });
+
+  test("a seal that vouches for Claude leaves the run as it was", async () => {
+    const posted = recorder();
+    const code = await runSession(config, {
+      ...deps(scripted([init, success]), posted),
+      seal: sealed(),
+    });
+    expect(code).toBe(0);
+    expect(posted.posted.at(-1)).toMatchObject({ type: "run.finished" });
+  });
+
+  test.each([
+    ["a subscription run", "oauth", { CLAUDE_CODE_OAUTH_TOKEN: TOKEN }],
+    ["an API-key run", "api-key", { SKY_CLAUDE_API_KEY: SKY_KEY }],
+  ] as const)(
+    "%s: the Claude process gets the credential the runner took out of its own env",
+    async (_, claudeAuth, credentialEnv) => {
+      const query = scripted([init, success]);
+      await runSession(
+        { ...config, claudeAuth },
+        { ...deps(query), credentialEnv },
+      );
+      const env = query.calls[0]?.options.env ?? {};
+      if (claudeAuth === "oauth") {
+        expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(TOKEN);
+        expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
+      } else {
+        expect(env.ANTHROPIC_API_KEY).toBe(SKY_KEY);
+        expect(env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+      }
+      expect(env).not.toHaveProperty("SKY_CLAUDE_API_KEY");
+    },
+  );
+
+  test.each([["oauth"], ["api-key"]] as const)(
+    "%s: every credential helper is pinned empty at the flag level, above the project, project-local and user files",
+    async (claudeAuth) => {
+      const query = scripted([init, success]);
+      await runSession({ ...config, claudeAuth }, deps(query));
+      const settings = query.calls[0]?.options.settings;
+      expect(settings).toMatchObject(PINNED_SETTINGS);
+      expect(Object.keys(PINNED_SETTINGS).sort()).toEqual([
+        "apiKeyHelper",
+        "awsAuthRefresh",
+        "awsCredentialExport",
+        "gcpAuthRefresh",
+        "otelHeadersHelper",
+        "processWrapper",
+        "proxyAuthHelper",
+      ]);
+      for (const value of Object.values(PINNED_SETTINGS))
+        expect(value).toBe("");
+    },
+  );
+
+  test("the pins ride beside the project's own command-env hook, which keeps its place", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "project-key-opaque");
+    const query = scripted([init, success]);
+    await runSession(config, deps(query));
+    const settings = query.calls[0]?.options.settings;
+    expect(settings).toMatchObject({
+      ...PINNED_SETTINGS,
+      attribution: { commit: "", pr: "" },
+    });
+    expect(settings).toHaveProperty("hooks.SessionStart");
+  });
+
+  test("neither credential reaches an event or an error", async () => {
+    const posted = recorder();
+    await runSession(config, {
+      ...deps(scripted([init, success]), posted),
+      credentialEnv: {
+        CLAUDE_CODE_OAUTH_TOKEN: TOKEN,
+        SKY_CLAUDE_API_KEY: SKY_KEY,
+      },
+      seal: sealed({
+        check: () => "the kernel lets the repo's commands read it",
+      }),
+    });
+    await runSession(config, {
+      ...deps(scripted([init, success]), posted),
+      credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      seal: sealed({ problem: "setpriv isn't installed" }),
+    });
+    const events = JSON.stringify(posted.posted);
+    expect(events).toContain("credential_exposed");
+    expect(events).not.toContain(TOKEN);
+    expect(events).not.toContain(SKY_KEY);
   });
 });

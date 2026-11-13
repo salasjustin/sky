@@ -10,13 +10,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
   type CommandEnv,
   claudeProcessEnv,
   commandEnvScript,
   prepareCommandEnv,
   removeCommandEnvNow,
+  withdrawCredential,
 } from "./claude-auth.js";
 
 let dir: string;
@@ -244,4 +245,40 @@ test("with nothing to say there is no hook and nothing to remove", async () => {
   const env = await prepareCommandEnv("oauth", { PATH: "/bin" }, dir);
   expect(env.hooks).toBeUndefined();
   await expect(env.remove()).resolves.toBeUndefined();
+});
+
+describe("withdrawCredential", () => {
+  test("takes the subscription token and Sky's key out of the env, returns them, and leaves the project's own values", () => {
+    const env: NodeJS.ProcessEnv = {
+      PATH: "/bin",
+      CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+      SKY_CLAUDE_API_KEY: "sky-key",
+      SKY_CLAUDE_AUTH: "api-key",
+      ANTHROPIC_API_KEY: "project-key",
+      NPM_TOKEN: "npm-secret",
+    };
+    const held = withdrawCredential(env);
+    expect(held).toEqual({
+      CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+      SKY_CLAUDE_API_KEY: "sky-key",
+    });
+    expect(env).toEqual({
+      PATH: "/bin",
+      SKY_CLAUDE_AUTH: "api-key",
+      ANTHROPIC_API_KEY: "project-key",
+      NPM_TOKEN: "npm-secret",
+    });
+  });
+
+  test("an env with neither holds nothing, and what it hands back still chooses the Claude process's credential", () => {
+    const env: NodeJS.ProcessEnv = { PATH: "/bin" };
+    expect(withdrawCredential(env)).toEqual({});
+    const withdrawn: NodeJS.ProcessEnv = {
+      CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+    };
+    const held = withdrawCredential(withdrawn);
+    expect(claudeProcessEnv({ PATH: "/bin" }, "oauth", held)).toMatchObject({
+      CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+    });
+  });
 });
