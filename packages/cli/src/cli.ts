@@ -86,7 +86,7 @@ const help = (io: Io) => `Usage:
       --format=openbot signs them the way OpenBot webhook routines verify
       and takes the routine's signing secret (up to 256 characters)
       exactly as written apart from one trailing newline; a secret that
-      begins or ends with spaces is refused. The secret is read from a
+      begins or ends with whitespace is refused. The secret is read from a
       file or stdin, never argv. --env limits it to events from agents in
       those environments. On a terminal, --secret=- prompts for the secret
       without echoing it. Prints the line webhook list prints.

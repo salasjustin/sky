@@ -512,7 +512,7 @@ function verify(secret, headers, rawBody, now = Date.now() / 1000) {
 }
 ```
 
-**`openbot` format** signs the way OpenBot webhook routines verify, so a routine's own signing secret works as is. Create it with the `secret` exactly as the routine shows it, up to 256 characters (`whsec_` prefix included if it has one; it is not base64-decoded). A missing or empty secret, a longer one, or one with spaces or a newline at either end is `400 invalid_body`; Sky never trims it, because the trimmed string would be a different key. Sky stores it encrypted and never returns or logs it. `sky webhook add --format=openbot` reads it with `--secret=@file` or `--secret=-` (stdin), never from an argument, and drops only the one newline that ends the file or the input. Retries, `environmentIds` and event types work as for `standard`.
+**`openbot` format** signs the way OpenBot webhook routines verify, so a routine's own signing secret works as is. Create it with the `secret` exactly as the routine shows it, up to 256 characters (`whsec_` prefix included if it has one; it is not base64-decoded). A missing or empty secret, a longer one, or one with whitespace at either end is `400 invalid_body`; Sky never trims it, because the trimmed string would be a different key. Sky stores it encrypted and never logs it. `sky webhook add --format=openbot` reads it with `--secret=@file` or `--secret=-` (stdin), never from an argument, and drops only the one newline that ends the file or the input.
 
 ```json
 POST /hook
@@ -524,7 +524,7 @@ x-openbot-signature: sha256=<hex HMAC-SHA256 of "<x-openbot-timestamp>.<x-openbo
 { "type": "run.waiting", "data": { "id": "evt_1042", "environmentId": "env_…", "…": "the event, as in standard" } }
 ```
 
-The HMAC key is the secret's raw UTF-8 bytes. `x-openbot-delivery-id` is the event's id followed by the webhook's id, so each webhook gets its own, and it is the same on every retry of that delivery; `x-openbot-timestamp` and so the signature are fresh on each attempt. `type` is the event type and `data` the same event `standard` carries, so a routine can filter on JSON Pointers into it, such as `/environmentId`.
+The HMAC key is the secret's raw UTF-8 bytes. `x-openbot-delivery-id` is `<event id>_<webhook id>`, so each webhook gets its own, and it is the same on every retry of that delivery; `x-openbot-timestamp` and so the signature are fresh on each attempt. `type` is the event type and `data` the same event `standard` carries, so a routine can filter on JSON Pointers into it, such as `/environmentId`.
 
 ## License
 

@@ -105,7 +105,7 @@ export function webhookRoutes() {
             c,
             400,
             "invalid_body",
-            "an openbot webhook needs a secret",
+            "an openbot webhook needs a secret: the routine's signing secret, up to 256 characters",
           );
         }
         const parsed = OpenBotWebhookSecret.safeParse(secret);
