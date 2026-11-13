@@ -546,6 +546,86 @@ test("status with includeDiff returns the diff, cut at 20 000 chars with a point
   expect(diff).toContain(compareUrl);
 });
 
+test("status with includeDiff on a diff the API cut gives the full size in bytes, not the fields", async () => {
+  const compareUrl = "https://github.com/acme/web/compare/abc...claude/agt_1";
+  route("get", "/v1/agents/agt_1/runs/run_1", 200, {
+    id: "run_1",
+    diff: "+a\n".repeat(100_000),
+    diffTruncated: true,
+    diffSize: 2_000_000,
+    compareUrl,
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "status",
+    arguments: { agentId: "agt_1", runId: "run_1", includeDiff: true },
+  });
+
+  const out = textOf(result);
+  expect(out.diff).toMatch(
+    /\[diff truncated: \d+ chars shown; full diff is 2000000 bytes at https:\/\/github\.com\/acme\/web\/compare\/abc\.\.\.claude\/agt_1\]$/,
+  );
+  expect(out).not.toHaveProperty("diffTruncated");
+  expect(out).not.toHaveProperty("diffSize");
+});
+
+test("status with includeDiff on an uncut diff over the limit counts its chars", async () => {
+  route("get", "/v1/agents/agt_1/runs/run_1", 200, {
+    id: "run_1",
+    diff: "+a\n".repeat(10_000),
+    compareUrl: null,
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "status",
+    arguments: { agentId: "agt_1", runId: "run_1", includeDiff: true },
+  });
+
+  expect(textOf(result).diff).toMatch(
+    /\[diff truncated: \d+ of 30000 chars shown; full diff at the agent's branch\]$/,
+  );
+});
+
+test("status with includeDiff cuts the diff on a line boundary", async () => {
+  const line = `+${"x".repeat(6_000)}\n`;
+  route("get", "/v1/agents/agt_1/runs/run_1", 200, {
+    id: "run_1",
+    diff: line.repeat(4),
+    compareUrl: null,
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "status",
+    arguments: { agentId: "agt_1", runId: "run_1", includeDiff: true },
+  });
+
+  const { diff } = textOf(result);
+  const [shown] = diff.split("[diff truncated");
+  expect(shown).toBe(line.repeat(3));
+  expect(diff).toContain(`[diff truncated: ${line.length * 3} of`);
+});
+
+test("status without includeDiff omits the diff and its cut state", async () => {
+  route("get", "/v1/agents/agt_1/runs/run_1", 200, {
+    id: "run_1",
+    diff: "+a\n",
+    diffTruncated: true,
+    diffSize: 2_000_000,
+    compareUrl: null,
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "status",
+    arguments: { agentId: "agt_1", runId: "run_1", includeDiff: false },
+  });
+
+  expect(textOf(result)).toEqual({ id: "run_1", compareUrl: null });
+});
+
 test("status with includeDiff returns a short diff whole", async () => {
   route("get", "/v1/agents/agt_1/runs/run_1", 200, {
     id: "run_1",

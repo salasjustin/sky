@@ -18,7 +18,7 @@ import { eq } from "drizzle-orm";
 import { HttpResponse, http, ws } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import { DIFF } from "./agents.js";
+import { DIFF, DIFF_MAX_BYTES } from "./agents.js";
 import { createApp } from "./app.js";
 import { BASE_ENV_NAMES } from "./base-profile.js";
 import { boot } from "./boot.js";
@@ -74,7 +74,9 @@ beforeEach(() => {
     launchWatchMs: 50,
   });
 });
-afterEach(() => {
+afterEach(async () => {
+  // a capped exec's cleanup is not awaited by its caller, so it can land after the test's last request
+  await wire.cleanedUp();
   if (db.$client.open) db.$client.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -1486,6 +1488,8 @@ test("the diff script exits 3 with nothing on stdout or stderr for a branch that
 });
 
 const patch = "diff --git a/x b/x\n+fixed\n";
+// the diff's file reads and removals follow its exec, so the exec is the last `exec` call
+const lastExec = () => wire.calls.findLast((c) => c.startsWith("exec "));
 /** The run-detail diff exec: `sh -c <script> sh <base> <branch>`. */
 const isDiff = (argv: string[]) =>
   argv[0] === "sh" && argv[2]?.includes("git diff") === true;
@@ -1513,7 +1517,7 @@ test("GET of an ended run returns its branch and its diff against the env's base
     compareUrl: null,
     secretNames: [],
   });
-  expect(wire.calls.at(-1)).toMatch(
+  expect(lastExec()).toMatch(
     new RegExp(
       `^exec ${spriteNameFor(envId)} /workspace/repo sh -c .* sh origin/HEAD claude/${agent.id}$`,
     ),
@@ -1709,6 +1713,164 @@ test("GET of a run whose diff fails in git is still a 200 with no diff, and logs
   expect(logs).toContain(
     `diff of ${run.id} (agent ${agent.id}) exited 128; answered without one`,
   );
+});
+
+test("GET of a run with a large diff returns all of it, however the exec stream is re-chunked", async () => {
+  const { agent, run } = await finishedRun();
+  const large = "+tttttttttttttttttttttttttttttttt\n".repeat(20_000);
+  expect(large.length).toBeLessThan(DIFF_MAX_BYTES);
+  wire.execChunkBytes = 1024;
+  wire.exec = (argv) =>
+    isDiff(argv) ? { exitCode: 0, stdout: large } : { exitCode: 0 };
+  const { status, body } = await getRun(agent.id, run.id);
+  expect(status).toBe(200);
+  expect(body.diff).toBe(large);
+  expect(body).not.toHaveProperty("diffTruncated");
+});
+
+test("GET of a run whose diff is over the cap returns it cut to whole lines, flagged, with its full size", async () => {
+  const { agent, run } = await finishedRun();
+  const line = `+${"x".repeat(78)}\n`;
+  const huge = line.repeat(Math.ceil((DIFF_MAX_BYTES * 3) / line.length));
+  wire.exec = (argv) =>
+    isDiff(argv) ? { exitCode: 0, stdout: huge } : { exitCode: 0 };
+  const { status, body } = await getRun(agent.id, run.id);
+  expect(status).toBe(200);
+  expect(body).toMatchObject({ diffTruncated: true, diffSize: huge.length });
+  const diff = body.diff as string;
+  expect(diff.length).toBeLessThanOrEqual(DIFF_MAX_BYTES);
+  expect(diff.length).toBeGreaterThan(DIFF_MAX_BYTES - line.length);
+  expect(diff.endsWith("\n")).toBe(true);
+  expect(huge.startsWith(diff)).toBe(true);
+});
+
+test("GET of a run whose diff is exactly the cap is not truncated", async () => {
+  const { agent, run } = await finishedRun();
+  const exact = "x".repeat(DIFF_MAX_BYTES);
+  wire.exec = (argv) =>
+    isDiff(argv) ? { exitCode: 0, stdout: exact } : { exitCode: 0 };
+  const { body } = await getRun(agent.id, run.id);
+  expect(body.diff).toBe(exact);
+  expect(body).not.toHaveProperty("diffTruncated");
+});
+
+test("GET of a truncated diff redacts a secret the cut would have split", async () => {
+  const { agent, run } = await finishedRun();
+  const key = "sk-proj-0123456789abcdefABCDEF";
+  const filler = "+x\n".repeat(Math.floor((DIFF_MAX_BYTES - 20) / 3));
+  wire.exec = (argv) =>
+    isDiff(argv)
+      ? { exitCode: 0, stdout: `${filler}+API_KEY=${key}\n${filler}` }
+      : { exitCode: 0 };
+  const { body } = await getRun(agent.id, run.id);
+  expect(body.diffTruncated).toBe(true);
+  expect(body.diff).not.toContain("sk-proj");
+  // the cut lands inside the key's line and goes back to the filler's last newline; a kept 13-character
+  // stub of the key would be under redact's pattern floor and would show
+  expect(body.diff).toBe(filler);
+});
+
+test("GET of a truncated diff redacts a credential, an env secret and the run's agent token held wholly in its kept part", async () => {
+  const { agent, run, envId, token } = await finishedRun();
+  const stored = "plain-env-secret-value-42";
+  expect(
+    (await putSecret(envId, "DB_PASSWORD", { value: stored })).status,
+  ).toBe(200);
+  const key = "sk-proj-0123456789abcdefABCDEF";
+  expect(token).not.toBe("");
+  const lead = `+API_KEY=${key}\n+DB_PASSWORD=${stored}\n+AGENT_TOKEN=${token}\n+PORT=8080\n`;
+  const filler = "+x\n".repeat(Math.ceil(DIFF_MAX_BYTES / 3));
+  wire.exec = (argv) =>
+    isDiff(argv)
+      ? { exitCode: 0, stdout: `${lead}${filler}` }
+      : { exitCode: 0 };
+  const { body } = await getRun(agent.id, run.id);
+  expect(body.diffTruncated).toBe(true);
+  const diff = body.diff as string;
+  expect(
+    diff.startsWith(
+      "+API_KEY=[redacted]\n+DB_PASSWORD=[redacted]\n+AGENT_TOKEN=[redacted]\n+PORT=8080\n",
+    ),
+  ).toBe(true);
+  for (const secret of [key, stored, token]) {
+    expect(diff).not.toContain(secret);
+  }
+});
+
+test.each([
+  { name: "non-numeric", size: "lots\n" },
+  { name: "smaller than the diff's head", size: "2\n" },
+])(
+  "GET whose diff's size file is $name is 502 sprite_exec_failed, not a 200 without a diff",
+  async ({ size }) => {
+    const { agent, run } = await finishedRun();
+    wire.exec = (argv) =>
+      isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+    // a process in the sprite rewrites the size file between the exec and the read
+    wire.afterExec = () => {
+      for (const path of [...wire.files.keys()]) {
+        if (path.endsWith("/size")) {
+          wire.files.set(path, new TextEncoder().encode(size));
+        }
+      }
+    };
+    const { status, body } = await getRun(agent.id, run.id);
+    expect(status).toBe(502);
+    expect(body).toMatchObject({ error: { code: "sprite_exec_failed" } });
+    expect(
+      logs.some(
+        (l) =>
+          l.includes(`diff of ${run.id} failed`) &&
+          l.includes("unreadable size file"),
+      ),
+    ).toBe(true);
+  },
+);
+
+test("GET removes the files the diff left in the sprite", async () => {
+  const { agent, run } = await finishedRun();
+  wire.exec = (argv) =>
+    isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+  await getRun(agent.id, run.id);
+  await wire.cleanedUp();
+  expect(
+    [...wire.files.keys(), ...wire.dirs].filter((p) =>
+      p.startsWith("/tmp/sky-exec-"),
+    ),
+  ).toEqual([]);
+});
+
+test("GET whose diff wrapper can't stage its output in the sprite is 502 sprite_exec_failed, not a 200 without a diff", async () => {
+  const { agent, run } = await finishedRun();
+  wire.tmpFull = true;
+  wire.exec = (argv) =>
+    isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+  const { status, body } = await getRun(agent.id, run.id);
+  expect(status).toBe(502);
+  expect(body).toMatchObject({ error: { code: "sprite_exec_failed" } });
+  expect(
+    logs.some(
+      (l) =>
+        l.includes(`diff of ${run.id} failed`) &&
+        l.includes("could not stage its output"),
+    ),
+  ).toBe(true);
+});
+
+test("GET whose exec stream cannot be decoded is 502 sprite_exec_failed, with the cause logged", async () => {
+  const { agent, run } = await finishedRun();
+  // the exit frame split in two, which the SDK rejects: the sprite answered, so it is not unreachable
+  wire.execChunkBytes = 1;
+  const { status, body } = await getRun(agent.id, run.id);
+  expect(status).toBe(502);
+  expect(body).toMatchObject({ error: { code: "sprite_exec_failed" } });
+  expect(
+    logs.some(
+      (l) =>
+        l.includes(`diff of ${run.id} failed`) &&
+        l.includes("HTTP exec exit frame"),
+    ),
+  ).toBe(true);
 });
 
 test("GET while the sprite is unreachable gets 502", async () => {
@@ -3365,9 +3527,7 @@ test("GET of a follow-up run shows its own summary and the cumulative branch dif
     diff: patch,
   });
   // against the base branch, not run 1's end: the diff spans every run on the branch
-  expect(wire.calls.at(-1)).toMatch(
-    new RegExp(` sh origin/HEAD claude/${agent.id}$`),
-  );
+  expect(lastExec()).toMatch(new RegExp(` sh origin/HEAD claude/${agent.id}$`));
   expect((await getRun(agent.id, first.id)).body.summary).toBe("done");
 });
 
@@ -4437,7 +4597,7 @@ test("an ended run's diff on a remote branch is against the start point the runn
   const { status, body } = await getRun(agent.id, run.id);
   expect(status).toBe(200);
   expect(body.diff).toBe(patch);
-  expect(wire.calls.at(-1)).toMatch(
+  expect(lastExec()).toMatch(
     new RegExp(` sh refs/sky/starts/${agent.id} claude/${agent.id}$`),
   );
 });
