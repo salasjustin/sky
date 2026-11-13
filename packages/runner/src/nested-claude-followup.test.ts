@@ -8,6 +8,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -29,20 +30,29 @@ import { nestedClaude } from "./session.js";
 // the Claude Code binary the Agent SDK ships beside itself, the one a run's nested `claude` is: the
 // platform package for this arch and libc, glibc or musl, the SDK installed with the optional
 // dependency that matches
-const claudeBinary = (() => {
-  const sdk = realpathSync(
-    join(import.meta.dirname, "../node_modules/@anthropic-ai/claude-agent-sdk"),
-  );
-  return ["", "-musl"]
-    .map((libc) =>
+// undefined when the SDK or its platform package isn't installed, so the tests that need no binary
+// still run
+const claudeBinary = (): string | undefined => {
+  try {
+    const sdk = realpathSync(
       join(
-        dirname(sdk),
-        `claude-agent-sdk-${process.platform}-${process.arch}${libc}`,
-        "claude",
+        import.meta.dirname,
+        "../node_modules/@anthropic-ai/claude-agent-sdk",
       ),
-    )
-    .find((path) => existsSync(path));
-})();
+    );
+    return ["", "-musl"]
+      .map((libc) =>
+        join(
+          dirname(sdk),
+          `claude-agent-sdk-${process.platform}-${process.arch}${libc}`,
+          "claude",
+        ),
+      )
+      .find((path) => existsSync(path));
+  } catch {
+    return undefined;
+  }
+};
 
 const SUBSCRIPTION = "subscription-token-0001";
 const POOL = "pool-subscription-token-0002";
@@ -133,7 +143,7 @@ async function runNested(
     hostManaged ? managed : managed.replace(` ${HOST_MANAGED}=1`, "")
   ).replace(
     /claude -p …$/,
-    `ANTHROPIC_BASE_URL=${api.url} ${claudeBinary} -p "reply ok" </dev/null`,
+    `ANTHROPIC_BASE_URL=${api.url} ${claudeBinary()} -p "reply ok" </dev/null`,
   );
   return await new Promise((resolve, reject) =>
     execFile(
@@ -167,7 +177,18 @@ async function runNested(
 const pathOf = (login: NestedLogin) =>
   /<'([^']+)'/.exec(login.prefix?.assignment ?? "")?.[1] ?? "";
 
-describe.skipIf(!claudeBinary)(
+// CI installs the SDK's platform package with the rest, so a missing binary there is an install
+// problem to fail on, not coverage to skip
+test.runIf(process.env.CI && !claudeBinary())(
+  "the Claude Code binary the real-binary tests drive is installed",
+  () => {
+    expect.fail(
+      `no claude-agent-sdk-${process.platform}-${process.arch} package beside the SDK`,
+    );
+  },
+);
+
+describe.skipIf(!claudeBinary())(
   "a follow-up run of an agent (real binary)",
   () => {
     test("finds a live credential at the path the first run named, holding its own run's token", async () => {
@@ -184,7 +205,8 @@ describe.skipIf(!claudeBinary)(
       const first = await prepare(SUBSCRIPTION, "run_first");
       const named = pathOf(first);
       await first.remove();
-      expect(existsSync(named)).toBe(false);
+      // the link, which `existsSync` would follow to the file that is gone
+      expect(readdirSync(links)).toEqual([]);
       // a pool run that moved to another subscription
       const followUp = await prepare(POOL, "run_follow");
       expect(pathOf(followUp)).toBe(named);
@@ -193,7 +215,6 @@ describe.skipIf(!claudeBinary)(
       expect(api.seen[0]).toEqual({ auth: `Bearer ${POOL}`, key: undefined });
       expect(output).not.toContain(POOL);
       await followUp.remove();
-      expect(existsSync(named)).toBe(false);
       expect(readdirSync(links)).toEqual([]);
     }, 90_000);
   },
@@ -216,6 +237,18 @@ describe("the nested login of an agent across runs", () => {
     await early.remove();
     expect(readFileSync(pathOf(late), "utf8")).toBe(POOL);
     await late.remove();
+    expect(readdirSync(join(root, "links"))).toEqual([]);
+  });
+
+  test("a run's end deletes its link and its file", async () => {
+    const login = await prepare(SUBSCRIPTION, "run_end", "agt_1");
+    expect(readdirSync(join(root, "links"))).toEqual([
+      "sky-nested-claude-agt_1",
+    ]);
+    expect(readdirSync(join(root, "runner"))).toHaveLength(1);
+    await login.remove();
+    expect(readdirSync(join(root, "links"))).toEqual([]);
+    expect(readdirSync(join(root, "runner"))).toEqual([]);
   });
 
   test("two agents' files stay apart", async () => {
@@ -225,9 +258,12 @@ describe("the nested login of an agent across runs", () => {
     expect(readFileSync(pathOf(a), "utf8")).toBe(SUBSCRIPTION);
     expect(readFileSync(pathOf(b), "utf8")).toBe(POOL);
     await a.remove();
-    expect(existsSync(pathOf(a))).toBe(false);
+    expect(readdirSync(join(root, "links"))).toEqual([
+      "sky-nested-claude-agt_b",
+    ]);
     expect(readFileSync(pathOf(b), "utf8")).toBe(POOL);
     await b.remove();
+    expect(readdirSync(join(root, "links"))).toEqual([]);
   });
 
   test("the directory of the links is for this user alone", async () => {
@@ -236,28 +272,42 @@ describe("the nested login of an agent across runs", () => {
     await login.remove();
   });
 
-  test("a hard-killed runner's link is swept, and a live runner's is not", async () => {
-    const dead = await prepareNestedLogin(
-      "oauth",
-      { CLAUDE_CODE_OAUTH_TOKEN: SUBSCRIPTION },
-      "run_dead",
-      nestedLoginDir(root),
-      "agt_dead",
-      credentialDir(root, 4001),
-    );
-    const live = await prepareNestedLogin(
-      "oauth",
-      { CLAUDE_CODE_OAUTH_TOKEN: POOL },
-      "run_live",
-      nestedLoginDir(root),
-      "agt_live",
-      credentialDir(root, 4002),
-    );
-    sweepCredentialFiles((pid) => pid === 4002, root, 1);
-    expect(existsSync(pathOf(dead))).toBe(false);
-    expect(readFileSync(pathOf(live), "utf8")).toBe(POOL);
-    expect(readdirSync(credentialDir(root, 4002))).toHaveLength(1);
-    expect(existsSync(credentialDir(root, 4001))).toBe(false);
-    await live.remove();
+  describe("the sweep of links whose runner was hard-killed", () => {
+    const links = () => nestedLoginDir(root);
+    const prepareFor = (pid: number, agent: string, token: string) =>
+      prepareNestedLogin(
+        "oauth",
+        { CLAUDE_CODE_OAUTH_TOKEN: token },
+        `run_${agent}`,
+        links(),
+        `agt_${agent}`,
+        credentialDir(root, pid),
+      );
+
+    test("a hard-killed runner's link is swept, and a live runner's is not", async () => {
+      await prepareFor(4001, "dead", SUBSCRIPTION);
+      const live = await prepareFor(4002, "live", POOL);
+      // listed, not followed: the dead runner's link dangles once its directory goes
+      expect(readdirSync(links()).sort()).toEqual([
+        "sky-nested-claude-agt_dead",
+        "sky-nested-claude-agt_live",
+      ]);
+      sweepCredentialFiles((pid) => pid === 4002, root, 1);
+      expect(readdirSync(links())).toEqual(["sky-nested-claude-agt_live"]);
+      expect(readFileSync(pathOf(live), "utf8")).toBe(POOL);
+      expect(readdirSync(credentialDir(root, 4002))).toHaveLength(1);
+      expect(existsSync(credentialDir(root, 4001))).toBe(false);
+      await live.remove();
+    });
+
+    test("a dangling link that is not a nested login's is kept, and a staged leftover is swept", async () => {
+      await prepareFor(4001, "dead", SUBSCRIPTION);
+      // a staged link is named like an agent's, so one left by a runner killed before the rename matches
+      const staged = "sky-nested-claude-0b9f7d52.staged";
+      symlinkSync(join(root, "nowhere"), join(links(), staged));
+      symlinkSync(join(root, "nowhere"), join(links(), "notes"));
+      sweepCredentialFiles(() => false, root, 1);
+      expect(readdirSync(links())).toEqual(["notes"]);
+    });
   });
 });

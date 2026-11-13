@@ -182,6 +182,8 @@ describe.skipIf(!claudeBinary)(
         { CLAUDE_CODE_OAUTH_TOKEN: SUBSCRIPTION },
         "run_a",
         root,
+        "run_a",
+        join(root, "files"),
       );
       const output = await runNested(login.prefix);
       // the project's auth token is in the parent env too, and would show here as another bearer
@@ -199,6 +201,8 @@ describe.skipIf(!claudeBinary)(
           { CLAUDE_CODE_OAUTH_TOKEN: token },
           runId,
           root,
+          runId,
+          join(root, "files"),
         );
       const pathOf = (login: NestedLogin) =>
         /<'([^']+)'/.exec(login.prefix?.assignment ?? "")?.[1] ?? "";
@@ -258,6 +262,8 @@ describe.skipIf(!claudeBinary)(
           { CLAUDE_CODE_OAUTH_TOKEN: SUBSCRIPTION },
           "run_guard",
           root,
+          "run_guard",
+          join(root, "files"),
         );
 
       test("cannot send the session or its credential elsewhere", async () => {
@@ -286,21 +292,27 @@ describe.skipIf(!claudeBinary)(
 
 describe("the nested login file", () => {
   test("holds the credential for this user alone and is gone once removed", async () => {
+    const [links, files] = [join(root, "links"), join(root, "files")];
     const login = await prepareNestedLogin(
       "oauth",
       { CLAUDE_CODE_OAUTH_TOKEN: SUBSCRIPTION },
       "run_file",
-      root,
+      links,
+      "agt_file",
+      files,
     );
-    const [name] = readdirSync(root);
-    const path = join(root, name ?? "");
+    const [name] = readdirSync(files);
+    const path = join(files, name ?? "");
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(readFileSync(path, "utf8")).toBe(SUBSCRIPTION);
-    // the command the agent runs names the file, never the credential
+    // the command the agent runs names the agent's link, never the credential
     expect(nestedClaude(login.prefix)).not.toContain(SUBSCRIPTION);
-    expect(nestedClaude(login.prefix)).toContain(path);
+    expect(nestedClaude(login.prefix)).toContain(
+      join(links, "sky-nested-claude-agt_file"),
+    );
     await login.remove();
-    expect(existsSync(path)).toBe(false);
+    expect(readdirSync(files)).toEqual([]);
+    expect(readdirSync(links)).toEqual([]);
   });
 
   test("a run with no credential to give gets no file and no assignment", async () => {

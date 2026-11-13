@@ -25,6 +25,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import {
   credentialDir,
+  nestedLoginDir,
   PROJECT_VARIABLES,
   prepareNestedLogin,
 } from "./claude-auth.js";
@@ -45,6 +46,10 @@ beforeEach(() => {
   // a sandbox host exports its own connector, which would send every run here through a refresh
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
   root = mkdtempSync(join(tmpdir(), "runner-session-"));
+  // a run's credential files and nested login link go under the machine's tmpdir, which parallel
+  // workers share: keep them in this test's own
+  mkdirSync(join(root, "os-tmp"));
+  vi.stubEnv("TMPDIR", join(root, "os-tmp"));
   const origin = join(root, "origin");
   execFileSync("git", ["init", "-q", "-b", "main", origin]);
   writeFileSync(join(origin, "README"), "hi\n");
@@ -1517,17 +1522,20 @@ describe("the Claude credential of a run", () => {
     });
 
     describe("a run that does not finish", () => {
-      /** Runs a subscription run whose script ends as `tail` says, and lists the credential directory during the run and after it. */
+      /** Runs a subscription run whose script ends as `tail` says, and lists the credential and nested login link directories during the run and after it. */
       const credentialFilesAround = async (
         tail: unknown[],
         controller = new AbortController(),
       ) => {
         const dir = isolatedCredentialDir();
+        const links = nestedLoginDir(join(root, "tmp"));
         let during: string[] = [];
+        let linksDuring: string[] = [];
         const query = scripted([
           init,
           async () => {
             during = readdirSync(dir);
+            linksDuring = readdirSync(links);
           },
           ...tail,
         ]);
@@ -1541,29 +1549,41 @@ describe("the Claude credential of a run", () => {
             awaitDecision: noDecision,
           },
         );
-        return { code, during, after: readdirSync(dir) };
+        return {
+          code,
+          during,
+          after: readdirSync(dir),
+          linksDuring,
+          linksAfter: readdirSync(links),
+        };
       };
       const loginsIn = (names: string[]) =>
         names.filter((name) => name.startsWith("sky-nested-claude-run_1-"));
 
       test("an SDK that throws leaves no credential file behind", async () => {
-        const { code, during, after } = await credentialFilesAround([
-          new Error("Claude Code process exited with code 1"),
-        ]);
+        const { code, during, after, linksDuring, linksAfter } =
+          await credentialFilesAround([
+            new Error("Claude Code process exited with code 1"),
+          ]);
         expect(code).toBe(1);
         expect(loginsIn(during)).toHaveLength(1);
         expect(after).toEqual([]);
+        expect(linksDuring).toEqual(["sky-nested-claude-agt_1"]);
+        expect(linksAfter).toEqual([]);
       });
 
       test("a run aborted by its signal leaves no credential file behind", async () => {
         const controller = new AbortController();
-        const { code, during, after } = await credentialFilesAround(
-          [async () => controller.abort("SIGTERM"), success],
-          controller,
-        );
+        const { code, during, after, linksDuring, linksAfter } =
+          await credentialFilesAround(
+            [async () => controller.abort("SIGTERM"), success],
+            controller,
+          );
         expect(code).toBe(1);
         expect(loginsIn(during)).toHaveLength(1);
         expect(after).toEqual([]);
+        expect(linksDuring).toEqual(["sky-nested-claude-agt_1"]);
+        expect(linksAfter).toEqual([]);
       });
     });
 

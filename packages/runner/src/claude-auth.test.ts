@@ -268,11 +268,11 @@ test.each([
     const script = [
       `import * as auth from ${JSON.stringify(CLAUDE_AUTH_URL)};`,
       "auth.removeCredentialFilesOnExit();",
-      "const dir = process.env.DIR;",
+      "const { LINKS, FILES } = process.env;",
       'const login = { CLAUDE_CODE_OAUTH_TOKEN: "token" };',
-      'await auth.prepareNestedLogin("oauth", login, "run_1", dir);',
+      'await auth.prepareNestedLogin("oauth", login, "run_1", LINKS, "agt_1", FILES);',
       'const project = { ANTHROPIC_API_KEY: "project-key" };',
-      'await auth.prepareCommandEnv("oauth", project, dir);',
+      'await auth.prepareCommandEnv("oauth", project, FILES);',
       'process.stdout.write("written");',
       'const boom = new Error("boom");',
       death,
@@ -285,12 +285,20 @@ test.each([
         "-e",
         script,
       ],
-      { env: { PATH: process.env.PATH, DIR: dir }, encoding: "utf8" },
+      {
+        env: {
+          PATH: process.env.PATH,
+          LINKS: join(dir, "links"),
+          FILES: join(dir, "files"),
+        },
+        encoding: "utf8",
+      },
     );
     expect(child.stdout).toBe("written");
     expect(child.stderr).toContain("boom");
     expect(child.status).toBe(1);
-    expect(readdirSync(dir)).toEqual([]);
+    expect(readdirSync(join(dir, "links"))).toEqual([]);
+    expect(readdirSync(join(dir, "files"))).toEqual([]);
   },
 );
 
