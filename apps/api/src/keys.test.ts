@@ -403,9 +403,9 @@ test("a runs key's openbot webhook is visible, deletable and environment-bound o
     const get = await call(key.secret, "GET", `/v1/webhooks/${id}`);
     expect(get.status).toBe(404);
     expect(await get.json()).toEqual(realBody);
-    expect((await call(key.secret, "DELETE", `/v1/webhooks/${id}`)).status).toBe(
-      404,
-    );
+    expect(
+      (await call(key.secret, "DELETE", `/v1/webhooks/${id}`)).status,
+    ).toBe(404);
   }
 
   const outside = await call(
@@ -453,9 +453,13 @@ test("revoking a key deletes its openbot webhook and leaves admin's", async () =
   expect(db.select().from(webhooks).all()).toHaveLength(2);
 
   expect((await call(admin, "DELETE", `/v1/keys/${key.id}`)).status).toBe(200);
-  expect(db.select().from(webhooks).all().map((w) => w.id)).toEqual([
-    admins.id,
-  ]);
+  expect(
+    db
+      .select()
+      .from(webhooks)
+      .all()
+      .map((w) => w.id),
+  ).toEqual([admins.id]);
 });
 
 /** The run of each event delivered to the webhook, in event order. */

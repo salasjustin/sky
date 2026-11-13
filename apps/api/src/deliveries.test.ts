@@ -1079,67 +1079,68 @@ const sendFailures = [
 ] as const;
 
 test.each(
-  sealedFormats.flatMap((f) => sendFailures.map((failure) => ({ ...f, failure }))),
-)("a $format webhook's secret stays out of the logs and last_error on a $failure", async ({
-  format,
-  plain,
-  failure,
-}) => {
-  const id = await subscribe(["run.finished"], subscriberUrl, {
-    format,
-    secret: plain,
-  });
-  const received = subscriber([200]);
-  if (failure === "network error") {
-    server.use(http.post(subscriberUrl, () => HttpResponse.error()));
-  }
-  if (failure === "corrupted ciphertext") {
-    const { c } = db.$client
-      .prepare("select secret_ciphertext as c from webhooks where id = ?")
-      .get(id) as { c: Buffer };
-    const flipped = Buffer.from(c);
-    flipped[0] = (flipped[0] ?? 0) ^ 0xff;
-    db.$client
-      .prepare("update webhooks set secret_ciphertext = ? where id = ?")
-      .run(flipped, id);
-  }
-  if (failure === "wrong encryption key") {
-    await dispatcher.stop();
-    dispatcher = createDispatcher({
-      db,
-      signingKey: config.webhookSigningKey,
-      secretEncryptionKey: Buffer.from(
-        config.secretEncryptionKey.map((b) => b ^ 0xff),
-      ),
-      log: (line) => logs.push(line),
-      now: () => clock,
-      random: () => 0.5,
+  sealedFormats.flatMap((f) =>
+    sendFailures.map((failure) => ({ ...f, failure })),
+  ),
+)(
+  "a $format webhook's secret stays out of the logs and last_error on a $failure",
+  async ({ format, plain, failure }) => {
+    const id = await subscribe(["run.finished"], subscriberUrl, {
+      format,
+      secret: plain,
     });
-  }
-  const { runId, token } = runningRun();
-  await finish(token, runId);
-  await dispatcher.drain();
+    const received = subscriber([200]);
+    if (failure === "network error") {
+      server.use(http.post(subscriberUrl, () => HttpResponse.error()));
+    }
+    if (failure === "corrupted ciphertext") {
+      const { c } = db.$client
+        .prepare("select secret_ciphertext as c from webhooks where id = ?")
+        .get(id) as { c: Buffer };
+      const flipped = Buffer.from(c);
+      flipped[0] = (flipped[0] ?? 0) ^ 0xff;
+      db.$client
+        .prepare("update webhooks set secret_ciphertext = ? where id = ?")
+        .run(flipped, id);
+    }
+    if (failure === "wrong encryption key") {
+      await dispatcher.stop();
+      dispatcher = createDispatcher({
+        db,
+        signingKey: config.webhookSigningKey,
+        secretEncryptionKey: Buffer.from(
+          config.secretEncryptionKey.map((b) => b ^ 0xff),
+        ),
+        log: (line) => logs.push(line),
+        now: () => clock,
+        random: () => 0.5,
+      });
+    }
+    const { runId, token } = runningRun();
+    await finish(token, runId);
+    await dispatcher.drain();
 
-  // the failing path ran: one failed attempt, nothing sent
-  expect(received).toHaveLength(0);
-  const [only] = deliveries();
-  expect(only).toMatchObject({
-    status: "pending",
-    attempts: 1,
-    lastStatus: null,
-    lastError:
-      failure === "network error"
-        ? expect.any(String)
-        : "Error: cannot open the webhook's secret",
-  });
-  expect(logs).toHaveLength(1);
-  expect(logs[0]).toContain("attempt 1/30 failed");
-  for (const text of [...logs, only?.lastError ?? ""]) {
-    expect(text).not.toContain(plain);
-    expect(text).not.toContain(plain.slice("whsec_".length));
-  }
-  expectNoneStored(plain, plain.slice("whsec_".length));
-});
+    // the failing path ran: one failed attempt, nothing sent
+    expect(received).toHaveLength(0);
+    const [only] = deliveries();
+    expect(only).toMatchObject({
+      status: "pending",
+      attempts: 1,
+      lastStatus: null,
+      lastError:
+        failure === "network error"
+          ? expect.any(String)
+          : "Error: cannot open the webhook's secret",
+    });
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("attempt 1/30 failed");
+    for (const text of [...logs, only?.lastError ?? ""]) {
+      expect(text).not.toContain(plain);
+      expect(text).not.toContain(plain.slice("whsec_".length));
+    }
+    expectNoneStored(plain, plain.slice("whsec_".length));
+  },
+);
 
 test("an openbot webhook with environmentIds receives only events of agents in those environments", async () => {
   const a = runningRun("a");

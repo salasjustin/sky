@@ -63,14 +63,12 @@ test.each([
   expect(StandardWebhookSecret.safeParse(secret).success).toBe(ok);
 });
 
-test.each([
-  "s",
-  `whsec_${key(32)}`,
-  "clé-secrète-🔑",
-  "a".repeat(256),
-])("openbot secret %s is accepted as sent", (secret) => {
-  expect(OpenBotWebhookSecret.parse(secret)).toBe(secret);
-});
+test.each(["s", `whsec_${key(32)}`, "clé-secrète-🔑", "a".repeat(256)])(
+  "openbot secret %s is accepted as sent",
+  (secret) => {
+    expect(OpenBotWebhookSecret.parse(secret)).toBe(secret);
+  },
+);
 
 const empty = "an openbot secret is a non-empty string";
 const padded = "an openbot secret has no leading or trailing whitespace";
