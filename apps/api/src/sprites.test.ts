@@ -1,8 +1,22 @@
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { APIError, FilesystemError, SpritesClient } from "@fly/sprites";
-import { expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { KnownSecrets } from "./redact.js";
 import {
   CAPPED_EXEC,
+  CAPPED_WRAPPER_FAILED,
   execCapped,
   execInSprite,
   SpriteExecStreamError,
@@ -113,12 +127,13 @@ test("a hung exec is cut at its bound: the request is aborted and the call rejec
   wire.sprites.add("sky-a");
   wire.hangs = (call) => call.includes("git clone");
   const { ops, logged } = opsWith();
-  const started = Date.now();
+  // the server would hold the call for ten minutes: only the client's abort can settle it
+  wire.hangMs = 10 * 60_000;
   const err = await execInSprite(ops, "sky-a", ["git", "clone", "x"], {
     op: "clone",
     timeoutMs: 50,
   }).catch((e: unknown) => e);
-  expect(Date.now() - started).toBeLessThan(2_000);
+  await wire.hangsSettled();
   expect((err as Error).message).toBe(
     "sprite sky-a: clone timed out after 50 ms",
   );
@@ -181,7 +196,7 @@ test("a capped exec of large output re-chunked on the wire returns the first byt
   await wire.cleanedUp();
 });
 
-test("a capped exec of output within the cap returns all of it untruncated, and a nonzero exit reads nothing", async () => {
+test("a capped exec of output within the cap returns all of it untruncated", async () => {
   const wire = stubSprites();
   wire.sprites.add("sky-a");
   const { ops } = opsWith();
@@ -192,16 +207,202 @@ test("a capped exec of output within the cap returns all of it untruncated, and 
       maxBytes: 1000,
     }),
   ).toEqual({ exitCode: 0, stdout: "small\n", size: 6, truncated: false });
-  wire.calls.length = 0;
-  wire.exec = () => ({ exitCode: 3 });
+  await wire.cleanedUp();
+});
+
+test("a capped exec that exits nonzero returns no output and reads nothing, though the argv wrote some, and removes its directory", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  const { ops } = opsWith();
+  wire.exec = () => ({ exitCode: 3, stdout: "partial\n" });
   expect(
     await execCapped(ops, "sky-a", ["git", "diff"], {
       op: "diff",
       maxBytes: 1000,
     }),
-  ).toMatchObject({ exitCode: 3, stdout: "" });
-  expect(wire.calls.some((c) => c.startsWith("read "))).toBe(false);
+  ).toEqual({ exitCode: 3, stdout: "", size: 0, truncated: false });
+  expect(wire.calls.filter((c) => c.startsWith("read "))).toEqual([]);
   await wire.cleanedUp();
+  expect(wire.calls).toContain(`rm sky-a ${cappedDirs(wire)[0]}`);
+  expect(leftovers(wire)).toEqual([]);
+});
+
+// cap 10 throughout; each row's `stdout` is what the argv printed
+test.each([
+  {
+    name: "exactly the cap is whole and untruncated",
+    stdout: "aaaa\nbbbb\n",
+    expected: { stdout: "aaaa\nbbbb\n", size: 10, truncated: false },
+  },
+  {
+    name: "one byte over the cap with its cut on a newline keeps every line before it",
+    stdout: "aaaa\nbbbb\nc",
+    expected: { stdout: "aaaa\nbbbb\n", size: 11, truncated: true },
+  },
+  {
+    name: "one byte over the cap with its cut mid-line is cut back to the line before",
+    stdout: "aaaa\nbbbbbb",
+    expected: { stdout: "aaaa\n", size: 11, truncated: true },
+  },
+  {
+    name: "one byte over the cap with no newline in what is kept returns nothing",
+    stdout: "abcdefghijk",
+    expected: { stdout: "", size: 11, truncated: true },
+  },
+])("a capped exec of output $name", async ({ stdout, expected }) => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  wire.exec = () => ({ exitCode: 0, stdout });
+  const { ops } = opsWith();
+  expect(
+    await execCapped(ops, "sky-a", ["git", "diff"], {
+      op: "diff",
+      maxBytes: 10,
+    }),
+  ).toEqual({ exitCode: 0, ...expected });
+  await wire.cleanedUp();
+});
+
+// the cap and `size` count bytes: "é" is 2 and "😀" is 4, though each is under 3 UTF-16 units
+test.each([
+  {
+    name: "an é split by the cap is cut back to the line before it",
+    stdout: "é\né\né\n",
+    maxBytes: 4,
+    expected: { stdout: "é\n", size: 9, truncated: true },
+  },
+  {
+    name: "an emoji split by the cap with no line before it returns nothing",
+    stdout: "😀😀\n😀😀\n",
+    maxBytes: 6,
+    expected: { stdout: "", size: 18, truncated: true },
+  },
+  {
+    name: "multibyte output under the cap round-trips, sized in bytes",
+    stdout: "é😀\n",
+    maxBytes: 100,
+    expected: { stdout: "é😀\n", size: 7, truncated: false },
+  },
+])("a capped exec of $name", async ({ stdout, maxBytes, expected }) => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  wire.exec = () => ({ exitCode: 0, stdout });
+  const { ops } = opsWith();
+  const out = await execCapped(ops, "sky-a", ["git", "diff"], {
+    op: "diff",
+    maxBytes,
+  });
+  expect(out).toEqual({ exitCode: 0, ...expected });
+  expect(out.stdout).not.toContain("�");
+  await wire.cleanedUp();
+});
+
+/** Overwrites the size file a capped exec left, as a process in the sprite could before it is read. */
+const leaveSize = (wire: SpritesWire, text: string) => {
+  wire.afterExec = () => {
+    for (const path of [...wire.files.keys()]) {
+      if (path.endsWith("/size")) wire.files.set(path, enc.encode(text));
+    }
+  };
+};
+const enc = new TextEncoder();
+
+test.each([
+  { name: "non-numeric", size: "lots\n" },
+  { name: "empty", size: "" },
+  { name: "negative", size: "-5\n" },
+  { name: "smaller than the head it describes", size: "2\n" },
+])("a capped exec whose size file is $name rejects as an unusable exec and removes its directory", async ({
+  size,
+}) => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  wire.exec = () => ({ exitCode: 0, stdout: "+x\n" });
+  leaveSize(wire, size);
+  const { ops } = opsWith();
+  const err = await execCapped(ops, "sky-a", ["git", "diff"], {
+    op: "diff",
+    maxBytes: 1000,
+  }).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(SpriteExecStreamError);
+  expect((err as Error).message).toBe(
+    "sprite sky-a: diff left an unreadable size file",
+  );
+  await wire.cleanedUp();
+  expect(leftovers(wire)).toEqual([]);
+});
+
+test("a capped exec reads a size file padded with spaces, as BSD wc writes it", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-a");
+  wire.exec = () => ({ exitCode: 0, stdout: "+x\n" });
+  leaveSize(wire, "       3\n");
+  const { ops } = opsWith();
+  expect(
+    await execCapped(ops, "sky-a", ["git", "diff"], {
+      op: "diff",
+      maxBytes: 1000,
+    }),
+  ).toEqual({ exitCode: 0, stdout: "+x\n", size: 3, truncated: false });
+  await wire.cleanedUp();
+});
+
+// the script itself, which the stub only mimics
+describe.skipIf(process.platform === "win32")("CAPPED_EXEC under sh", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "sky-capped-exec-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const run = (cap: number, argv: string[], dir = join(root, "out")) =>
+    spawnSync("sh", ["-c", CAPPED_EXEC, "sh", dir, `${cap}`, ...argv], {
+      encoding: "utf8",
+    });
+  const read = (file: string) => readFileSync(join(root, "out", file));
+
+  test("keeps the first cap bytes of stdout and its full byte count", () => {
+    const res = run(4, ["printf", "%s", "abcdefghij\n"]);
+    expect(res.status).toBe(0);
+    expect(read("head").toString()).toBe("abcd");
+    // BSD wc pads its count with spaces
+    expect(read("size").toString().trim()).toBe("11");
+  });
+
+  test("passes the argv's exit status through, its output still staged", () => {
+    const res = run(100, ["sh", "-c", "printf partial; exit 7"]);
+    expect(res.status).toBe(7);
+    expect(read("head").toString()).toBe("partial");
+    expect(read("size").toString().trim()).toBe("7");
+  });
+
+  test("lets nothing reach stderr, the argv's own included, or stdout", () => {
+    const res = run(100, ["sh", "-c", "echo oops >&2; echo out"]);
+    expect(res.status).toBe(0);
+    expect(res.stderr).toBe("");
+    expect(res.stdout).toBe("");
+    expect(read("head").toString()).toBe("out\n");
+  });
+
+  test("leaves only head and size in its private directory", () => {
+    run(2, ["printf", "%s", "abcdef"]);
+    expect(readdirSync(join(root, "out")).sort()).toEqual(["head", "size"]);
+    expect(statSync(join(root, "out")).mode & 0o777).toBe(0o700);
+  });
+
+  test("exits CAPPED_WRAPPER_FAILED, silently and without running the argv, for a directory that already exists", () => {
+    const dir = join(root, "out");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "keep"), "mine");
+    const ran = join(root, "ran");
+    const res = run(100, ["sh", "-c", 'echo hi >"$0"', ran]);
+    expect(res.status).toBe(CAPPED_WRAPPER_FAILED);
+    expect(res.stderr).toBe("");
+    expect(existsSync(ran)).toBe(false);
+    expect(readdirSync(dir)).toEqual(["keep"]);
+  });
 });
 
 /** What capped execs left under the sprite's /tmp: files and directories. */

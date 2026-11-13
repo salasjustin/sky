@@ -1765,6 +1765,65 @@ test("GET of a truncated diff redacts a secret the cut would have split", async 
   const { body } = await getRun(agent.id, run.id);
   expect(body.diffTruncated).toBe(true);
   expect(body.diff).not.toContain("sk-proj");
+  // the cut lands inside the key's line and goes back to the filler's last newline; were the key's
+  // 13-character stub kept, it is under redact's pattern floor and would show
+  expect(body.diff).toBe(filler);
+});
+
+test("GET of a truncated diff redacts a credential, an env secret and the run's agent token held wholly in its kept part", async () => {
+  const { agent, run, envId, token } = await finishedRun();
+  const stored = "plain-env-secret-value-42";
+  expect(
+    (await putSecret(envId, "DB_PASSWORD", { value: stored })).status,
+  ).toBe(200);
+  const key = "sk-proj-0123456789abcdefABCDEF";
+  expect(token).not.toBe("");
+  const lead = `+API_KEY=${key}\n+DB_PASSWORD=${stored}\n+AGENT_TOKEN=${token}\n+PORT=8080\n`;
+  const filler = "+x\n".repeat(Math.ceil(DIFF_MAX_BYTES / 3));
+  wire.exec = (argv) =>
+    isDiff(argv)
+      ? { exitCode: 0, stdout: `${lead}${filler}` }
+      : { exitCode: 0 };
+  const { body } = await getRun(agent.id, run.id);
+  expect(body.diffTruncated).toBe(true);
+  const diff = body.diff as string;
+  expect(
+    diff.startsWith(
+      "+API_KEY=[redacted]\n+DB_PASSWORD=[redacted]\n+AGENT_TOKEN=[redacted]\n+PORT=8080\n",
+    ),
+  ).toBe(true);
+  for (const secret of [key, stored, token]) {
+    expect(diff).not.toContain(secret);
+  }
+});
+
+test.each([
+  { name: "non-numeric", size: "lots\n" },
+  { name: "smaller than the diff's head", size: "2\n" },
+])("GET whose diff's size file is $name is 502 sprite_exec_failed, not a 200 without a diff", async ({
+  size,
+}) => {
+  const { agent, run } = await finishedRun();
+  wire.exec = (argv) =>
+    isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+  // a process in the sprite rewrites the size file between the exec and the read
+  wire.afterExec = () => {
+    for (const path of [...wire.files.keys()]) {
+      if (path.endsWith("/size")) {
+        wire.files.set(path, new TextEncoder().encode(size));
+      }
+    }
+  };
+  const { status, body } = await getRun(agent.id, run.id);
+  expect(status).toBe(502);
+  expect(body).toMatchObject({ error: { code: "sprite_exec_failed" } });
+  expect(
+    logs.some(
+      (l) =>
+        l.includes(`diff of ${run.id} failed`) &&
+        l.includes("unreadable size file"),
+    ),
+  ).toBe(true);
 });
 
 test("GET removes the files the diff left in the sprite", async () => {
