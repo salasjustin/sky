@@ -312,25 +312,26 @@ test.each([
   { name: "empty", size: "" },
   { name: "negative", size: "-5\n" },
   { name: "smaller than the head it describes", size: "2\n" },
-])("a capped exec whose size file is $name rejects as an unusable exec and removes its directory", async ({
-  size,
-}) => {
-  const wire = stubSprites();
-  wire.sprites.add("sky-a");
-  wire.exec = () => ({ exitCode: 0, stdout: "+x\n" });
-  leaveSize(wire, size);
-  const { ops } = opsWith();
-  const err = await execCapped(ops, "sky-a", ["git", "diff"], {
-    op: "diff",
-    maxBytes: 1000,
-  }).catch((e: unknown) => e);
-  expect(err).toBeInstanceOf(SpriteExecStreamError);
-  expect((err as Error).message).toBe(
-    "sprite sky-a: diff left an unreadable size file",
-  );
-  await wire.cleanedUp();
-  expect(leftovers(wire)).toEqual([]);
-});
+])(
+  "a capped exec whose size file is $name rejects as an unusable exec and removes its directory",
+  async ({ size }) => {
+    const wire = stubSprites();
+    wire.sprites.add("sky-a");
+    wire.exec = () => ({ exitCode: 0, stdout: "+x\n" });
+    leaveSize(wire, size);
+    const { ops } = opsWith();
+    const err = await execCapped(ops, "sky-a", ["git", "diff"], {
+      op: "diff",
+      maxBytes: 1000,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SpriteExecStreamError);
+    expect((err as Error).message).toBe(
+      "sprite sky-a: diff left an unreadable size file",
+    );
+    await wire.cleanedUp();
+    expect(leftovers(wire)).toEqual([]);
+  },
+);
 
 test("a capped exec reads a size file padded with spaces, as BSD wc writes it", async () => {
   const wire = stubSprites();

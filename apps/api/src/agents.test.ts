@@ -1800,31 +1800,32 @@ test("GET of a truncated diff redacts a credential, an env secret and the run's 
 test.each([
   { name: "non-numeric", size: "lots\n" },
   { name: "smaller than the diff's head", size: "2\n" },
-])("GET whose diff's size file is $name is 502 sprite_exec_failed, not a 200 without a diff", async ({
-  size,
-}) => {
-  const { agent, run } = await finishedRun();
-  wire.exec = (argv) =>
-    isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
-  // a process in the sprite rewrites the size file between the exec and the read
-  wire.afterExec = () => {
-    for (const path of [...wire.files.keys()]) {
-      if (path.endsWith("/size")) {
-        wire.files.set(path, new TextEncoder().encode(size));
+])(
+  "GET whose diff's size file is $name is 502 sprite_exec_failed, not a 200 without a diff",
+  async ({ size }) => {
+    const { agent, run } = await finishedRun();
+    wire.exec = (argv) =>
+      isDiff(argv) ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+    // a process in the sprite rewrites the size file between the exec and the read
+    wire.afterExec = () => {
+      for (const path of [...wire.files.keys()]) {
+        if (path.endsWith("/size")) {
+          wire.files.set(path, new TextEncoder().encode(size));
+        }
       }
-    }
-  };
-  const { status, body } = await getRun(agent.id, run.id);
-  expect(status).toBe(502);
-  expect(body).toMatchObject({ error: { code: "sprite_exec_failed" } });
-  expect(
-    logs.some(
-      (l) =>
-        l.includes(`diff of ${run.id} failed`) &&
-        l.includes("unreadable size file"),
-    ),
-  ).toBe(true);
-});
+    };
+    const { status, body } = await getRun(agent.id, run.id);
+    expect(status).toBe(502);
+    expect(body).toMatchObject({ error: { code: "sprite_exec_failed" } });
+    expect(
+      logs.some(
+        (l) =>
+          l.includes(`diff of ${run.id} failed`) &&
+          l.includes("unreadable size file"),
+      ),
+    ).toBe(true);
+  },
+);
 
 test("GET removes the files the diff left in the sprite", async () => {
   const { agent, run } = await finishedRun();

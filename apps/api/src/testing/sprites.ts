@@ -2,11 +2,7 @@ import { createHash } from "node:crypto";
 import { HttpResponse, http, ws } from "msw";
 import { server } from "../../../../test/msw.js";
 import type { Config } from "../config.js";
-import {
-  CAPPED_EXEC,
-  CAPPED_WRAPPER_FAILED,
-  LOGGED_EXEC,
-} from "../sprites.js";
+import { CAPPED_EXEC, CAPPED_WRAPPER_FAILED, LOGGED_EXEC } from "../sprites.js";
 
 export const spritesToken = "sprites-test-token";
 const SPRITES = "https://api.sprites.dev/v1/sprites";
