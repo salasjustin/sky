@@ -974,14 +974,15 @@ test("with a connector and checks, the publish instructions come first, then the
 
 test("a check written as plain `claude -p` is still run with every project credential, gateway and provider switch unset", async () => {
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
-  // no run credential, so no login prefix: what this reads is the `env` part alone
-  vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", undefined);
+  // a subscription run, the only kind given this line: what this reads is the `env` part after the
+  // login prefix
+  vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "subscription-token-opaque");
   try {
     const append = await appendOf(['claude -p "/acme:review"']);
     expect(append).toContain('- claude -p "/acme:review"');
     expect(append).not.toContain("as written");
     const instruction =
-      /`(env (?:-u \S+ )+(?:\S+=\S+ )*)claude -p …`, even where/;
+      /`CLAUDE_CODE_OAUTH_TOKEN="\$\(<\S+\)" (env (?:-u \S+ )+(?:\S+=\S+ )*)claude -p …`, even where/;
     const prefix = instruction.exec(append)?.[1] ?? "";
     for (const name of [
       "ANTHROPIC_API_KEY",
