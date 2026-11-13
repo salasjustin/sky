@@ -1,5 +1,9 @@
 import { expect, test } from "vitest";
-import { StandardWebhookSecret, Webhook } from "./webhook.js";
+import {
+  OpenBotWebhookSecret,
+  StandardWebhookSecret,
+  Webhook,
+} from "./webhook.js";
 
 const hook = {
   id: "whk_1",
@@ -57,4 +61,31 @@ test.each([
   [`whsec_${Buffer.alloc(32, 250).toString("base64url")}=`, false],
 ])("secret %s is valid: %s", (secret, ok) => {
   expect(StandardWebhookSecret.safeParse(secret).success).toBe(ok);
+});
+
+test.each([
+  "s",
+  `whsec_${key(32)}`,
+  "clé-secrète-🔑",
+  "a".repeat(256),
+])("openbot secret %s is accepted as sent", (secret) => {
+  expect(OpenBotWebhookSecret.parse(secret)).toBe(secret);
+});
+
+const empty = "an openbot secret is a non-empty string";
+const padded = "an openbot secret has no leading or trailing whitespace";
+const long = "an openbot secret is at most 256 characters";
+
+test.each([
+  ["", empty],
+  [" s", padded],
+  ["s ", padded],
+  ["s\n", padded],
+  ["s\r\n", padded],
+  ["\uFEFFs", padded],
+  ["a".repeat(257), long],
+])("openbot secret %j is rejected: %s", (secret, message) => {
+  const result = OpenBotWebhookSecret.safeParse(secret);
+  expect(result.success).toBe(false);
+  expect(result.error?.issues.map((i) => i.message)).toEqual([message]);
 });

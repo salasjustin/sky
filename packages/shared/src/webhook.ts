@@ -27,8 +27,18 @@ export const StandardWebhookSecret = z.string().refine(
   },
 );
 
-/** An OpenBot routine's signing secret: any non-empty string, used as raw key bytes, never base64-decoded. */
-export const OpenBotWebhookSecret = z.string().min(1);
+/**
+ * An OpenBot routine's signing secret: a non-empty string of at most 256 characters with no
+ * leading or trailing whitespace, used as raw key bytes, never base64-decoded. Surrounding
+ * whitespace is rejected rather than trimmed, so the stored key is always the one sent.
+ */
+export const OpenBotWebhookSecret = z
+  .string()
+  .min(1, { error: "an openbot secret is a non-empty string" })
+  .max(256, { error: "an openbot secret is at most 256 characters" })
+  .refine((s) => s === s.trim(), {
+    error: "an openbot secret has no leading or trailing whitespace",
+  });
 
 export const Webhook = z.object({
   id: WebhookId,
