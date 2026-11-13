@@ -16,6 +16,22 @@ export const REDIRECT_SETTINGS = [
   "forceLoginGatewayUrl",
 ];
 
+// the settings keys that name a command Claude Code runs to fetch a credential or a header, or to wrap
+// its own processes, which a settings file the guard has already passed can gain mid-run: Claude Code
+// reloads settings files as they change, and a project-local file created mid-session loads too. The
+// session pins each to empty at the flag level, which outranks the project, project-local and user
+// files; probed against the bundled binary, an `otelHeadersHelper` runs with Claude's own env, credential
+// included, and a mid-run `apiKeyHelper` ends an OAuth run with "Not logged in"
+export const PINNED_SETTINGS = {
+  apiKeyHelper: "",
+  proxyAuthHelper: "",
+  awsAuthRefresh: "",
+  awsCredentialExport: "",
+  gcpAuthRefresh: "",
+  otelHeadersHelper: "",
+  processWrapper: "",
+} as const;
+
 // the session's redirect variables, plus two only a settings `env` entry is refused for: one moving
 // Claude Code's own config, and with it the credential it reads, and one switching off the
 // host-managed mode the runner sets

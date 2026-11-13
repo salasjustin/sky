@@ -1,7 +1,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -29,12 +31,96 @@ beforeAll(() => {
   execFileSync("pnpm", ["run", "--silent", "build"], { cwd: pkg });
 }, 30_000);
 
-// the runner writes Claude Code's credential file; keep it out of the real home
+// the runner removes a stored login from Claude Code's credential file; keep it out of the real home
 const CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), "runner-claude-"));
 afterAll(() => rmSync(CLAUDE_CONFIG_DIR, { recursive: true, force: true }));
 // no sprite API here, whatever host the tests run on: the runner would otherwise hold a real sprite
 // when run inside one, and retry a missing socket for 30 seconds when run outside
 const NO_SPRITE_SOCKET = join(CLAUDE_CONFIG_DIR, "absent.sock");
+
+// The runner refuses to start Claude where it can't keep the credential from the repo's commands, which
+// depends on the host: Linux, privileges its user may lack (a CI runner can't change its effective user),
+// and a `setpriv` and `sh` at fixed paths that only root can change. These bundle runs stand in for the
+// host so a test's outcome doesn't depend on it: a preload gives the platform, the effective user, the
+// fixed files and the kernel's answer about `/proc` as a capable sandbox has them. `unprivileged` is the
+// host whose runner can't change its user.
+const HOST = join(CLAUDE_CONFIG_DIR, "host");
+mkdirSync(HOST, { recursive: true });
+// the files the seal reads (seal.ts: SETPRIV_PATHS, SH_PATHS), as a root-owned sandbox has them
+const FIXED_FILES = [
+  "/usr/bin/setpriv",
+  "/bin/setpriv",
+  "/bin/sh",
+  "/usr/bin/sh",
+];
+const FIXED_DIRS = ["/", "/usr", "/usr/bin", "/bin"];
+const STAND_IN_PLATFORM = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+Object.defineProperty(process, "platform", { value: "linux" });
+if (!process.geteuid) process.geteuid = () => 1000;
+const FILES = new Set(${JSON.stringify(FIXED_FILES)});
+const DIRS = new Set(${JSON.stringify(FIXED_DIRS)});
+const realStatSync = fs.statSync;
+const realRealpathSync = fs.realpathSync;
+const rootOwned = (mode) => ({
+  uid: 0,
+  mode,
+  isFile: () => (mode & 0o170000) === 0o100000,
+  isDirectory: () => (mode & 0o170000) === 0o040000,
+});
+fs.statSync = (path, ...rest) => {
+  const at = String(path);
+  if (FILES.has(at)) return rootOwned(0o100755);
+  if (DIRS.has(at)) return rootOwned(0o040755);
+  if (at.endsWith("/environ")) {
+    // another user's, as the kernel shows a non-dumpable process's; a host without /proc has none to stat
+    let stat = {};
+    try { stat = realStatSync(path, ...rest); } catch {}
+    return { ...stat, uid: process.geteuid() + 1 };
+  }
+  return realStatSync(path, ...rest);
+};
+fs.realpathSync = Object.assign(
+  (path, ...rest) => (FILES.has(String(path)) ? String(path) : realRealpathSync(path, ...rest)),
+  {
+    native: (path, ...rest) =>
+      FILES.has(String(path)) ? String(path) : realRealpathSync.native(path, ...rest),
+  },
+);
+syncBuiltinESMExports();
+`;
+const PRELOADS = {
+  capable: `${STAND_IN_PLATFORM}
+process.seteuid = () => {};
+`,
+  unprivileged: `${STAND_IN_PLATFORM}
+// stepping to another user is refused; stepping back to one's own is always allowed
+const own = process.geteuid();
+process.seteuid = (uid) => {
+  if (uid !== own) throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+};
+`,
+};
+const preload = (host: keyof typeof PRELOADS) => {
+  const path = join(HOST, `${host}.mjs`);
+  writeFileSync(path, PRELOADS[host]);
+  return path;
+};
+
+/**
+ * A stand-in command at `<dir>/<name>` that prints `stdout` and exits `code`, appending its
+ * arguments and env to the file it returns.
+ */
+function recorder(dir: string, name: string, stdout: string, code: number) {
+  const path = join(dir, name);
+  writeFileSync(
+    path,
+    `#!/bin/sh\n{ echo "argv: $*"; env; } >> '${path}.seen'\nprintf '%s' '${stdout}'\nexit ${code}\n`,
+  );
+  chmodSync(path, 0o755);
+  return `${path}.seen`;
+}
 
 const servers: Server[] = [];
 afterEach(() => {
@@ -45,10 +131,14 @@ afterEach(() => {
 });
 
 /** Runs the bundle as the launcher does: the run's id as its argument. `args` replaces that. */
-async function runBundle(env: Record<string, string>, args?: string[]) {
+async function runBundle(
+  env: Record<string, string>,
+  args?: string[],
+  host: keyof typeof PRELOADS = "capable",
+) {
   const child = spawn(
     process.execPath,
-    [bundle, ...(args ?? [env.RUN_ID ?? ""])],
+    ["--import", preload(host), bundle, ...(args ?? [env.RUN_ID ?? ""])],
     {
       env: {
         PATH: process.env.PATH ?? "",
@@ -260,6 +350,55 @@ test("a failed run posts run.failed to the API with the agent token, exits 1, an
   // resolves and the timeout fails the test, with no wall-clock threshold to tune
 }, 20_000);
 
+test("a host whose runner can't change its effective user fails the run as credential_exposed, before any worktree work", async () => {
+  const received: { body: unknown }[] = [];
+  const api = createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      received.push({ body: JSON.parse(body) });
+      res.writeHead(204).end();
+    });
+  });
+  api.listen(0, "127.0.0.1");
+  await once(api, "listening");
+  const { port } = api.address() as AddressInfo;
+  try {
+    const { code } = await runBundle(
+      {
+        AGENT_ID: "agt_1",
+        RUN_ID: "run_1",
+        PROMPT: "do it",
+        API_BASE_URL: `http://127.0.0.1:${port}`,
+        AGENT_TOKEN: "agent-secret",
+        CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+        REPO_DIR: "/nonexistent/repo",
+        WORKTREES_DIR: "/nonexistent/worktrees",
+      },
+      undefined,
+      "unprivileged",
+    );
+    expect(code).toBe(1);
+    expect(received).toEqual([
+      {
+        body: {
+          runId: "run_1",
+          type: "run.failed",
+          payload: {
+            error: expect.stringMatching(
+              /^credential_exposed: .*can't change its effective user \(EPERM\).*the run did not start\.$/,
+            ),
+          },
+        },
+      },
+    ]);
+    expect(JSON.stringify(received)).not.toContain("oauth-secret");
+  } finally {
+    api.closeAllConnections();
+    api.close();
+  }
+}, 20_000);
+
 test("the runner holds the sprite through the Tasks API at SKY_SPRITE_API_SOCKET", async () => {
   const sockets = mkdtempSync(join(tmpdir(), "runner-main-sprite-"));
   const tasks: string[] = [];
@@ -314,23 +453,27 @@ test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies
   if (!api) throw new Error("no server");
   await once(api, "listening");
   const { port } = api.address() as AddressInfo;
-  const child = spawn(process.execPath, [bundle, "run_1"], {
-    env: {
-      PATH: process.env.PATH ?? "",
-      CLAUDE_CONFIG_DIR,
-      SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
-      AGENT_ID: "agt_1",
-      RUN_ID: "run_1",
-      PROMPT: "do it",
-      API_BASE_URL: `http://127.0.0.1:${port}`,
-      AGENT_TOKEN: "agent-secret",
-      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
-      REPO_DIR: "/nonexistent/repo",
-      WORKTREES_DIR: "/nonexistent/worktrees",
-      PROMPT_FILE: join(runs, "run_1.prompt"),
+  const child = spawn(
+    process.execPath,
+    ["--import", preload("capable"), bundle, "run_1"],
+    {
+      env: {
+        PATH: process.env.PATH ?? "",
+        CLAUDE_CONFIG_DIR,
+        SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
+        AGENT_ID: "agt_1",
+        RUN_ID: "run_1",
+        PROMPT: "do it",
+        API_BASE_URL: `http://127.0.0.1:${port}`,
+        AGENT_TOKEN: "agent-secret",
+        CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+        REPO_DIR: "/nonexistent/repo",
+        WORKTREES_DIR: "/nonexistent/worktrees",
+        PROMPT_FILE: join(runs, "run_1.prompt"),
+      },
+      stdio: "ignore",
     },
-    stdio: "ignore",
-  });
+  );
   try {
     const exited = once(child, "exit");
     // the runner is mid-post of run.failed, the API holding its answer
@@ -467,6 +610,7 @@ const alive = (pid: number) => {
   }
 };
 
+// the reap scans `/proc`, which only Linux has
 const linux = existsSync("/proc/self/stat");
 
 test.skipIf(!linux)(
@@ -510,16 +654,23 @@ test.skipIf(!linux)(
     const { port } = api.address() as AddressInfo;
     try {
       const server = await leftover("run_reap2", dir, true);
-      const child = spawn(process.execPath, [bundle, "run_reap2"], {
-        env: {
-          PATH: process.env.PATH ?? "",
-          CLAUDE_CONFIG_DIR,
-          SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
-          ...runEnv(`http://127.0.0.1:${port}`, join(dir, "run_reap2.prompt")),
-          RUN_ID: "run_reap2",
+      const child = spawn(
+        process.execPath,
+        ["--import", preload("capable"), bundle, "run_reap2"],
+        {
+          env: {
+            PATH: process.env.PATH ?? "",
+            CLAUDE_CONFIG_DIR,
+            SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
+            ...runEnv(
+              `http://127.0.0.1:${port}`,
+              join(dir, "run_reap2.prompt"),
+            ),
+            RUN_ID: "run_reap2",
+          },
+          stdio: "ignore",
         },
-        stdio: "ignore",
-      });
+      );
       const exited = once(child, "exit");
       // the first stop, while the runner is mid-post of run.failed
       await until(() => respond !== undefined);
@@ -537,3 +688,123 @@ test.skipIf(!linux)(
   },
   20_000,
 );
+
+describe("the Claude login stored in Claude Code's credential file", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "runner-main-login-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const credentials = () => join(dir, ".credentials.json");
+  const run = async (credential: Record<string, string>) => {
+    const { base } = await apiAndGateway();
+    recorder(dir, "claude", "[]", 0);
+    return runBundle({
+      AGENT_ID: "agt_1",
+      RUN_ID: "run_1",
+      PROMPT: "do it",
+      API_BASE_URL: base,
+      AGENT_TOKEN: "agent-secret",
+      ...credential,
+      REPO_DIR: "/nonexistent/repo",
+      WORKTREES_DIR: "/nonexistent/worktrees",
+      CLAUDE_CONFIG_DIR: dir,
+      SKY_CLAUDE: join(dir, "claude"),
+      TMPDIR: dir,
+    });
+  };
+
+  test("a subscription run stores none", async () => {
+    const { code, stderr } = await run({
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+    });
+    expect(code).toBe(1);
+    // session setup ran, so the missing file isn't a run that ended before it
+    expect(stderr).toMatch(/runner: plugin refresh done/);
+    expect(existsSync(credentials())).toBe(false);
+  }, 20_000);
+
+  test("one an earlier runner stored is removed when a run starts, an API-key run's too, and the other entries stay", async () => {
+    writeFileSync(
+      credentials(),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "oauth-secret",
+          refreshToken: null,
+          expiresAt: null,
+          scopes: ["user:inference"],
+        },
+        designOauth: { accessToken: "design", refreshToken: "refresh" },
+      }),
+      { mode: 0o600 },
+    );
+    const { code, stderr } = await run({
+      SKY_CLAUDE_AUTH: "api-key",
+      SKY_CLAUDE_API_KEY: "key-secret",
+    });
+    expect(code).toBe(1);
+    expect(JSON.parse(readFileSync(credentials(), "utf8"))).toEqual({
+      designOauth: { accessToken: "design", refreshToken: "refresh" },
+    });
+    expect(stderr).toMatch(
+      /runner: removed the Claude login an earlier runner stored/,
+    );
+  }, 20_000);
+});
+
+describe("the runner's own commands", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "runner-main-children-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test.each([
+    ["a subscription run", { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret" }],
+    [
+      "an API-key run",
+      { SKY_CLAUDE_AUTH: "api-key", SKY_CLAUDE_API_KEY: "key-secret" },
+    ],
+  ])(
+    "on %s, its git and the plugin refresh's claude never get the Claude credential",
+    async (_, credential) => {
+      const { base } = await apiAndGateway();
+      const bin = join(dir, "bin");
+      mkdirSync(bin);
+      // failing, so worktree setup ends the run at its first git command
+      const git = recorder(bin, "git", "", 1);
+      const claude = recorder(bin, "claude", "[]", 0);
+      const { code, stderr } = await runBundle({
+        AGENT_ID: "agt_1",
+        RUN_ID: "run_1",
+        PROMPT: "do it",
+        API_BASE_URL: base,
+        AGENT_TOKEN: "agent-secret",
+        ...credential,
+        // a directory git can start in
+        REPO_DIR: dir,
+        WORKTREES_DIR: join(dir, "worktrees"),
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        SKY_CLAUDE: join(bin, "claude"),
+        TMPDIR: dir,
+      });
+      expect(code).toBe(1);
+      expect(stderr).toMatch(/runner: plugins refreshed/);
+      const seen = {
+        git: readFileSync(git, "utf8"),
+        claude: readFileSync(claude, "utf8"),
+      };
+      expect(seen.git).toMatch(/^argv: worktree prune$/m);
+      expect(seen.claude).toMatch(/^argv: plugin list --json$/m);
+      for (const env of Object.values(seen)) {
+        // the run's own env reached the command, so what's missing was taken out
+        expect(env).toMatch(/^RUN_ID=run_1$/m);
+        expect(env).not.toMatch(
+          /^(CLAUDE_CODE_OAUTH_TOKEN|SKY_CLAUDE_API_KEY)=/m,
+        );
+        expect(env).not.toMatch(/oauth-secret|key-secret/);
+      }
+    },
+    20_000,
+  );
+});

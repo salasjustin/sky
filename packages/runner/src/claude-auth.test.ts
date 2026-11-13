@@ -22,10 +22,12 @@ import {
   claudeProcessEnv,
   commandEnvScript,
   credentialDir,
+  ownDirectory,
   prepareCommandEnv,
   prepareNestedLogin,
   removeCredentialFilesNow,
   sweepCredentialFiles,
+  withdrawCredential,
 } from "./claude-auth.js";
 
 let dir: string;
@@ -255,6 +257,42 @@ test("with nothing to say there is no hook and nothing to remove", async () => {
   await expect(env.remove()).resolves.toBeUndefined();
 });
 
+describe("withdrawCredential", () => {
+  test("takes the subscription token and Sky's key out of the env, returns them, and leaves the project's own values", () => {
+    const env: NodeJS.ProcessEnv = {
+      PATH: "/bin",
+      CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+      SKY_CLAUDE_API_KEY: "sky-key",
+      SKY_CLAUDE_AUTH: "api-key",
+      ANTHROPIC_API_KEY: "project-key",
+      NPM_TOKEN: "npm-secret",
+    };
+    const held = withdrawCredential(env);
+    expect(held).toEqual({
+      CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+      SKY_CLAUDE_API_KEY: "sky-key",
+    });
+    expect(env).toEqual({
+      PATH: "/bin",
+      SKY_CLAUDE_AUTH: "api-key",
+      ANTHROPIC_API_KEY: "project-key",
+      NPM_TOKEN: "npm-secret",
+    });
+  });
+
+  test("an env with neither holds nothing, and what it hands back still chooses the Claude process's credential", () => {
+    const env: NodeJS.ProcessEnv = { PATH: "/bin" };
+    expect(withdrawCredential(env)).toEqual({});
+    const withdrawn: NodeJS.ProcessEnv = {
+      CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+    };
+    const held = withdrawCredential(withdrawn);
+    expect(claudeProcessEnv({ PATH: "/bin" }, "oauth", held)).toMatchObject({
+      CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
+    });
+  });
+});
+
 // the module as Node itself loads it, types stripped, so a child process can die with it loaded
 const CLAUDE_AUTH = join(import.meta.dirname, "claude-auth.ts");
 const CLAUDE_AUTH_URL = pathToFileURL(CLAUDE_AUTH).href;
@@ -440,5 +478,42 @@ describe("a nested login's link and the directories it is written to", () => {
       expect(statSync(target()).mode & 0o777).toBe(0o700);
       await login.remove();
     });
+  });
+});
+
+// called directly, as the seal's synchronous spawn calls it for the directory of Claude's binary copy
+describe("ownDirectory", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const target = () => join(dir, "owned");
+  const refusal = () =>
+    `${target()} is not a directory of this user; remove it, and the next run creates its own`;
+
+  test("creates a missing directory as this user's alone", () => {
+    ownDirectory(target());
+    expect(lstatSync(target()).isDirectory()).toBe(true);
+    expect(statSync(target()).mode & 0o777).toBe(0o700);
+  });
+
+  test("holds a directory already there looser to this user alone", () => {
+    mkdirSync(target());
+    chmodSync(target(), 0o755);
+    ownDirectory(target());
+    expect(statSync(target()).mode & 0o777).toBe(0o700);
+  });
+
+  test("refuses a symlink, and leaves where it points as it was", () => {
+    const elsewhere = join(dir, "elsewhere");
+    mkdirSync(elsewhere);
+    chmodSync(elsewhere, 0o755);
+    symlinkSync(elsewhere, target());
+    expect(() => ownDirectory(target())).toThrow(refusal());
+    expect(statSync(elsewhere).mode & 0o777).toBe(0o755);
+  });
+
+  test("refuses a directory another user owns", () => {
+    mkdirSync(target());
+    vi.spyOn(process, "getuid").mockReturnValue(lstatSync(target()).uid + 1);
+    expect(() => ownDirectory(target())).toThrow(refusal());
   });
 });

@@ -7,7 +7,6 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
-  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -234,6 +233,8 @@ describe("the nested login of an agent across runs", () => {
   test("a run's end leaves a later run's link alone", async () => {
     const early = await prepare(SUBSCRIPTION, "run_early", "agt_1");
     const late = await prepare(POOL, "run_late", "agt_1");
+    // the path the first run named is the one the later run's prompt names
+    expect(pathOf(late)).toBe(pathOf(early));
     await early.remove();
     expect(readFileSync(pathOf(late), "utf8")).toBe(POOL);
     await late.remove();
@@ -264,12 +265,6 @@ describe("the nested login of an agent across runs", () => {
     expect(readFileSync(pathOf(b), "utf8")).toBe(POOL);
     await b.remove();
     expect(readdirSync(join(root, "links"))).toEqual([]);
-  });
-
-  test("the directory of the links is for this user alone", async () => {
-    const login = await prepare(SUBSCRIPTION, "run_mode", "agt_1");
-    expect(statSync(join(root, "links")).mode & 0o777).toBe(0o700);
-    await login.remove();
   });
 
   describe("the sweep of links whose runner was hard-killed", () => {

@@ -47,8 +47,10 @@ import {
 import { policyOutcome } from "./policy.js";
 import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
+import type { Seal } from "./seal.js";
 import {
   defaultSettingsDirs,
+  PINNED_SETTINGS,
   type SettingsDirs,
   settingsRedirects,
 } from "./settings-guard.js";
@@ -168,8 +170,8 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
   : never;
 
-/** Every Agent SDK option a run passes is assembled here. */
-function sessionOptions(
+/** Every Agent SDK option a run passes is assembled here; exported for the credential-scope probe. */
+export function sessionOptions(
   config: Config,
   cwd: string,
   abortController: AbortController,
@@ -180,6 +182,10 @@ function sessionOptions(
   mcpServers: Record<string, SessionMcpServer>,
   /** The SessionStart hook that gives the session's commands back what `claudeProcessEnv` drops; see `prepareCommandEnv`. */
   commandEnvHooks: CommandEnv["hooks"],
+  /** Where the run's Claude credential is read from. */
+  runnerEnv: NodeJS.ProcessEnv,
+  /** How the Claude process is started; the SDK's own spawn when absent. */
+  spawn: Seal["spawn"] | undefined,
   /** See `prepareNestedLogin`. */
   nestedLogin: NestedPrefix | undefined,
 ): Options {
@@ -191,10 +197,13 @@ function sessionOptions(
     // secrets to the session's commands. The Claude process itself gets exactly the run's credential,
     // sent to the Anthropic API: `claudeProcessEnv` drops the project's API key, auth token, base URL
     // and provider switches, and the commands get those from `commandEnvHooks` instead
-    env: claudeProcessEnv(sessionEnvOf(config), config.claudeAuth, process.env),
-    // Claude Code's own commit trailer and pull request footer are off, for hosting that rejects them
+    env: claudeProcessEnv(sessionEnvOf(config), config.claudeAuth, runnerEnv),
+    ...(spawn && { spawnClaudeCodeProcess: spawn }),
+    // Claude Code's own commit trailer and pull request footer are off, for hosting that rejects them;
+    // the credential helpers are pinned to none above every settings file, the ones written mid-run included
     settings: {
       attribution: { commit: "", pr: "" },
+      ...PINNED_SETTINGS,
       ...(commandEnvHooks && { hooks: commandEnvHooks }),
     },
     systemPrompt: {
@@ -457,6 +466,10 @@ export async function runSession(
     heartbeatMs?: number;
     /** `BACKGROUND_HOLD_MS` when absent. */
     backgroundHoldMs?: number;
+    /** The env holding the run's Claude credential, which the runner took out of its own. */
+    credentialEnv: NodeJS.ProcessEnv;
+    /** Keeps the credential out of the repo's processes' reach; a seal with a problem fails the run before it starts. */
+    seal: Seal;
   },
 ): Promise<0 | 1> {
   const { runId } = config;
@@ -483,6 +496,12 @@ export async function runSession(
     });
     return 1 as const;
   };
+
+  // before the runner starts a single command the repo can influence, git's included
+  if (deps.seal.problem)
+    return fail(
+      `credential_exposed: Sky can't keep its Claude credential from this repo's commands (${deps.seal.problem}); the run did not start.`,
+    );
 
   let cwd: string;
   let notes: string[];
@@ -738,13 +757,15 @@ export async function runSession(
       config.claudeAuth,
       sessionEnvOf(config),
     );
-    nestedLogin = await prepareNestedLogin(
-      config.claudeAuth,
-      process.env,
-      config.runId,
-      undefined,
-      config.agentId,
-    );
+    // a check's nested `claude` is the file's only reader, so a run without checks gets none
+    if (config.checks.length > 0)
+      nestedLogin = await prepareNestedLogin(
+        config.claudeAuth,
+        deps.credentialEnv,
+        config.runId,
+        undefined,
+        config.agentId,
+      );
     const stream = deps.query({
       prompt: input.messages,
       options: sessionOptions(
@@ -756,12 +777,18 @@ export async function runSession(
         notes,
         mcp.servers,
         commandEnv.hooks,
-        nestedLogin.prefix,
+        deps.credentialEnv,
+        deps.seal.spawn,
+        nestedLogin?.prefix,
       ),
     });
     for await (const message of stream) {
       if (message.type === "system" && message.subtype === "init" && !started) {
         started = true;
+        // Claude is past its exec, so what the kernel does with its `/proc` entries is settled
+        const exposed = deps.seal.check();
+        if (exposed)
+          stopSession(`credential_exposed: ${exposed}; the run was stopped.`);
         await post({
           type: "run.started",
           payload: { sessionId: message.session_id },

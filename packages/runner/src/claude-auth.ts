@@ -1,21 +1,15 @@
 import { randomUUID } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
+  mkdirSync,
   readdirSync,
   readlinkSync,
   rmSync,
   unlinkSync,
 } from "node:fs";
-import {
-  chmod,
-  lstat,
-  mkdir,
-  readlink,
-  rename,
-  rm,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
@@ -134,6 +128,26 @@ export function claudeProcessEnv(
   return out;
 }
 
+// what the API launches the runner with to hand the session its credential: the subscription token, or
+// Sky's API key under a name of its own
+const CREDENTIAL_VARIABLES = ["SKY_CLAUDE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+/**
+ * Takes the run's Claude credential out of `env` and returns it, so the runner's own children, such as
+ * the git commands that run a repo's hooks and config, never inherit it. Only the session's Claude
+ * process gets it back, through `claudeProcessEnv`'s `runnerEnv`.
+ */
+export function withdrawCredential(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const held: NodeJS.ProcessEnv = {};
+  for (const name of CREDENTIAL_VARIABLES) {
+    const value = env[name];
+    if (value === undefined) continue;
+    held[name] = value;
+    delete env[name];
+  }
+  return held;
+}
+
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
 /**
@@ -161,8 +175,9 @@ export function commandEnvScript(
 const RUNNER_DIR = /^sky-runner-(\d+)$/;
 
 /**
- * Where this runner writes its credential files: a directory of `root` named for its pid, which is
- * how `sweepCredentialFiles` tells a dead runner's files from a live one's.
+ * Where this runner writes its credential files and the copy of Claude's binary: a directory of
+ * `root` named for its pid, which is how `sweepCredentialFiles` tells a dead runner's files from a
+ * live one's.
  */
 export const credentialDir = (root: string = tmpdir(), pid = process.pid) =>
   join(root, `sky-runner-${pid}`);
@@ -223,8 +238,8 @@ export async function prepareNestedLogin(
   const value =
     auth === "oauth" ? runnerEnv.CLAUDE_CODE_OAUTH_TOKEN : undefined;
   if (!value) return { prefix: undefined, remove: async () => {} };
-  await ownDirectory(dir);
-  await ownDirectory(fileDir);
+  ownDirectory(dir);
+  ownDirectory(fileDir);
   const file = join(fileDir, `sky-nested-claude-${runId}-${randomUUID()}`);
   const path = join(dir, `sky-nested-claude-${agentId}`);
   // before the write: a signal can land while it is in flight
@@ -255,17 +270,18 @@ export async function prepareNestedLogin(
 /**
  * Creates `dir` as a 0700 directory of this user, or holds an existing one to that. Refuses a
  * directory another user made first and a symlink standing in for one, so no other user can read or
- * swap what this runner writes there; every process of this user still can.
+ * swap what this runner writes there; every process of this user still can. Synchronous, so the
+ * seal's `spawn` can hold the directory of Claude's binary copy to it too.
  */
-async function ownDirectory(dir: string): Promise<void> {
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const info = await lstat(dir);
+export function ownDirectory(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const info = lstatSync(dir);
   if (!info.isDirectory() || info.uid !== (process.getuid?.() ?? info.uid))
     throw new Error(
       `${dir} is not a directory of this user; remove it, and the next run creates its own`,
     );
   // `mkdir`'s mode is masked by the umask and never applies to a directory already there
-  await chmod(dir, 0o700);
+  chmodSync(dir, 0o700);
 }
 
 /**
@@ -339,12 +355,12 @@ export function removeCredentialFilesOnExit(): void {
 }
 
 /**
- * Deletes the credential files a runner killed outright (SIGKILL, the OOM killer) left behind, which
- * no exit handler reaches. Runs on one sprite share its tmpdir and pid space, so a directory is swept
- * only when `isAlive` finds no process with its pid; a pid reused by any process keeps its directory
- * until that one ends too. A directory under this runner's own pid is a dead process's and is swept
- * too, so this runs before the runner writes any. Then each nested login link in `nestedLoginDir`
- * whose file is gone is deleted. Never throws.
+ * Deletes the credential files and the copy of Claude's binary a runner killed outright (SIGKILL, the
+ * OOM killer) left behind, which no exit handler reaches. Runs on one sprite share its tmpdir and pid
+ * space, so a directory is swept only when `isAlive` finds no process with its pid; a pid reused by
+ * any process keeps its directory until that one ends too. A directory under this runner's own pid is
+ * a dead process's and is swept too, so this runs before the runner writes any. Then each nested
+ * login link in `nestedLoginDir` whose file is gone is deleted. Never throws.
  */
 export function sweepCredentialFiles(
   isAlive: (pid: number) => boolean,
@@ -387,7 +403,7 @@ export async function prepareCommandEnv(
 ): Promise<CommandEnv> {
   const script = commandEnvScript(auth, env);
   if (script === undefined) return { hooks: undefined, remove: async () => {} };
-  await ownDirectory(dir);
+  ownDirectory(dir);
   const path = join(dir, `sky-command-env-${randomUUID()}.sh`);
   // before the write: a signal can land while it is in flight
   unremoved.add(path);
