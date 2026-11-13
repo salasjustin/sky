@@ -13,7 +13,8 @@ const runPathOf = (promptFile: string) => promptFile.replace(/\.prompt$/, "");
 export const logPathOf = (promptFile: string) => `${runPathOf(promptFile)}.log`;
 const lockPathOf = (promptFile: string) => `${runPathOf(promptFile)}.lock`;
 
-const alive = (pid: number) => {
+/** Whether a process with this pid exists, whoever's it is. */
+export const processAlive = (pid: number) => {
   try {
     process.kill(pid, 0);
     return true;
@@ -67,7 +68,7 @@ export function claimRunLog(
       }
       const content = readLock(lock);
       const holder = /^\d+$/.test(content) ? Number(content) : undefined;
-      if (holder !== undefined && holder !== pid && alive(holder)) {
+      if (holder !== undefined && holder !== pid && processAlive(holder)) {
         return {
           ok: false,
           reason: `another runner (pid ${holder}) already runs this run`,

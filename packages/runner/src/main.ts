@@ -1,6 +1,10 @@
 import { appendFileSync } from "node:fs";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { removeCommandEnvNow } from "./claude-auth.js";
+import {
+  removeCredentialFilesNow,
+  removeCredentialFilesOnExit,
+  sweepCredentialFiles,
+} from "./claude-auth.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { writeClaudeCredentials } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
@@ -10,7 +14,7 @@ import { publishMain } from "./publish.js";
 import { endSessionProcesses } from "./reap.js";
 import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
-import { claimRunLog } from "./runlog.js";
+import { claimRunLog, processAlive } from "./runlog.js";
 import { runSession } from "./session.js";
 import { storeSyncMain, syncStoreQuietly } from "./store.js";
 import { branchCheckMain } from "./sync.js";
@@ -78,6 +82,10 @@ async function main(): Promise<void> {
     // behind is only ever from a process killed outright (SIGKILL, a crash of Node itself)
     process.on("exit", release);
   }
+  // the session's `finally` never runs for an uncaught exception, which still fires 'exit'
+  removeCredentialFilesOnExit();
+  // a runner killed outright (SIGKILL, the OOM killer) left its credential files behind
+  sweepCredentialFiles(processAlive);
 
   // the first SIGTERM/SIGINT/SIGHUP aborts the session and lets the run report and commit; a second one
   // kills what the session left running and then the runner, at once
@@ -92,8 +100,9 @@ async function main(): Promise<void> {
   const dieBy = (signal: NodeJS.Signals) => {
     stopListening();
     release();
-    // the session's `finally` never runs on this path, and the file may hold the project's key
-    removeCommandEnvNow();
+    // the session's `finally` never runs on this path, and its files may hold the project's key or
+    // the run's own credential
+    removeCredentialFilesNow();
     process.kill(process.pid, signal);
   };
   let dying = false;

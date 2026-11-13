@@ -22,11 +22,19 @@ import { RUNNER_TEXT_MAX, type RunnerEventPost } from "@sky/shared";
 import { delay, HttpResponse, http } from "msw";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import { PROJECT_VARIABLES } from "./claude-auth.js";
+import {
+  credentialDir,
+  PROJECT_VARIABLES,
+  prepareNestedLogin,
+} from "./claude-auth.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
 import { createDecisionWaiter } from "./requests.js";
-import { type QueryFn, sessionGitIdentity } from "./session.js";
+import {
+  nestedClaude,
+  type QueryFn,
+  sessionGitIdentity,
+} from "./session.js";
 import { defaultSettingsDirs, settingsRedirects } from "./settings-guard.js";
 import { hermeticRunSession as runSession } from "./testing/hermetic-run.js";
 
@@ -969,6 +977,8 @@ test("with a connector and checks, the publish instructions come first, then the
 
 test("a check written as plain `claude -p` is still run with every project credential, gateway and provider switch unset", async () => {
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
+  // no run credential, so no login prefix: what this reads is the `env` part alone
+  vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", undefined);
   try {
     const append = await appendOf(['claude -p "/acme:review"']);
     expect(append).toContain('- claude -p "/acme:review"');
@@ -1377,7 +1387,9 @@ describe("the Claude credential of a run", () => {
           awaitDecision: noDecision,
         },
       );
-      return JSON.stringify(query.calls[0]?.options.systemPrompt);
+      const options = query.calls[0]?.options;
+      const prompt = options?.systemPrompt as { append?: string } | undefined;
+      return prompt?.append ?? "";
     };
 
     test("an API-key run's nested claude is logged in with Sky's key, which the prompt never holds", async () => {
@@ -1385,7 +1397,7 @@ describe("the Claude credential of a run", () => {
         { claudeAuth: "api-key" },
         { SKY_CLAUDE_API_KEY: SKY_KEY },
       );
-      expect(append).toContain("ANTHROPIC_API_KEY=$(<");
+      expect(append).toContain('`ANTHROPIC_API_KEY="$(<');
       expect(append).toContain("logged in with this run's API key");
       expect(append).not.toContain("is not logged in");
       expect(append).not.toContain(SKY_KEY);
@@ -1396,7 +1408,7 @@ describe("the Claude credential of a run", () => {
         { claudeAuth: "oauth" },
         { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
       );
-      expect(append).toContain("CLAUDE_CODE_OAUTH_TOKEN=${");
+      expect(append).toContain('`CLAUDE_CODE_OAUTH_TOKEN="$(<');
       expect(append).toContain("logged in with this run's subscription");
       expect(append).not.toContain(TOKEN);
     });
@@ -1411,18 +1423,81 @@ describe("the Claude credential of a run", () => {
     });
 
     test("the file holding the credential is gone once the run ends", async () => {
-      const before = readdirSync(tmpdir()).filter((n) =>
-        n.startsWith("sky-nested-claude-run_"),
-      );
+      const dir = credentialDir();
+      mkdirSync(dir, { recursive: true });
+      const logins = () =>
+        readdirSync(dir).filter((n) => n.startsWith("sky-nested-claude-"));
+      const before = logins();
       await promptOf(
         { claudeAuth: "api-key" },
         { SKY_CLAUDE_API_KEY: SKY_KEY },
       );
-      const after = readdirSync(tmpdir()).filter((n) =>
-        n.startsWith("sky-nested-claude-run_"),
-      );
-      expect(after).toEqual(before);
+      expect(logins()).toEqual(before);
     });
+  });
+
+  describe("a check's nested claude command", () => {
+    const PROJECT_ENV = Object.fromEntries(
+      PROJECT_VARIABLES.map((name) => [name, `project-value-${name}`]),
+    );
+    const loginOf = (auth: Config["claudeAuth"]) =>
+      prepareNestedLogin(
+        auth,
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN, SKY_CLAUDE_API_KEY: SKY_KEY },
+        "run_1",
+        join(root, "logins"),
+      );
+    /** Runs the command in bash as a Bash command would, with `program` in place of `claude -p …`. */
+    const run = (
+      command: string,
+      program: string,
+      env: Record<string, string> = {},
+    ) =>
+      execFileSync("bash", ["-c", command.replace(/claude -p …$/, program)], {
+        env: { PATH: process.env.PATH, ...env },
+        encoding: "utf8",
+      });
+
+    test("the credential is assigned by the shell ahead of env, so neither the command nor env's argv holds it", async () => {
+      const { prefix } = await loginOf("oauth");
+      const command = nestedClaude(prefix);
+      expect(command).toMatch(
+        /^CLAUDE_CODE_OAUTH_TOKEN="\$\(<'[^']+'\)" env -u /,
+      );
+      expect(command).not.toContain(TOKEN);
+      // a shell function shadowing `env` gets exactly the arguments the real one would be run with
+      const argv = run(
+        `env() { printf '%s\\n' "$@"; }; ${command}`,
+        "claude -p check",
+      );
+      expect(argv).toContain("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1\n");
+      expect(argv).not.toContain(TOKEN);
+    });
+
+    test("a subscription token already in the command's env does not win over the run's own", async () => {
+      const { prefix } = await loginOf("oauth");
+      const command = nestedClaude(prefix);
+      const env = { CLAUDE_CODE_OAUTH_TOKEN: "command-env-token" };
+      const seen = run(command, "printenv CLAUDE_CODE_OAUTH_TOKEN", env);
+      expect(seen).toBe(`${TOKEN}\n`);
+    });
+
+    test.each([
+      ["api-key", "ANTHROPIC_API_KEY", SKY_KEY],
+      ["oauth", "CLAUDE_CODE_OAUTH_TOKEN", TOKEN],
+    ] as const)(
+      "on an %s run the nested claude gets the run's %s, never the project's ANTHROPIC_API_KEY, and no other project variable",
+      async (auth, variable, value) => {
+        const { prefix } = await loginOf(auth);
+        const seen = run(nestedClaude(prefix), "printenv", PROJECT_ENV);
+        expect(seen).toMatch(new RegExp(`^${variable}=${value}$`, "m"));
+        expect(seen).toMatch(/^CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1$/m);
+        expect(seen).not.toContain("project-value-");
+        for (const name of PROJECT_VARIABLES)
+          if (name !== variable)
+            expect(seen).not.toMatch(new RegExp(`^${name}=`, "m"));
+      },
+    );
   });
 });
 

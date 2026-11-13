@@ -15,7 +15,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { prepareNestedLogin } from "./claude-auth.js";
+import { type NestedPrefix, prepareNestedLogin } from "./claude-auth.js";
 import { nestedClaude } from "./session.js";
 
 // the Claude Code binary the Agent SDK ships beside itself, the one a run's nested `claude` is
@@ -90,7 +90,7 @@ afterEach(async () => {
  * prefix, so the test's requests land on the mock. Resolves with the command's output.
  */
 async function runNested(
-  login: string | undefined,
+  login: NestedPrefix | undefined,
   commandEnv: Record<string, string> = {},
 ): Promise<string> {
   const repo = join(root, "repo");
@@ -140,7 +140,7 @@ describe.skipIf(!claudeBinary)(
         "run_a",
         root,
       );
-      const output = await runNested(login.assignment);
+      const output = await runNested(login.prefix);
       expect(api.seen[0]).toEqual({
         auth: `Bearer ${SUBSCRIPTION}`,
         key: undefined,
@@ -162,7 +162,7 @@ describe.skipIf(!claudeBinary)(
         "run_other",
         root,
       );
-      const output = await runNested(mine.assignment);
+      const output = await runNested(mine.prefix);
       expect(api.seen[0]?.auth).toBe(`Bearer ${POOL}`);
       expect(output).not.toContain("Not logged in");
       expect(output).not.toContain(POOL);
@@ -176,7 +176,7 @@ describe.skipIf(!claudeBinary)(
         "run_key",
         root,
       );
-      const output = await runNested(login.assignment);
+      const output = await runNested(login.prefix);
       expect(api.seen[0]).toEqual({ auth: undefined, key: API_KEY });
       expect(output).not.toContain("Not logged in");
       expect(output).not.toContain(API_KEY);
@@ -202,7 +202,7 @@ describe.skipIf(!claudeBinary)(
         "run_guard",
         root,
       );
-      await runNested(login.assignment);
+      await runNested(login.prefix);
       expect(decoy.seen).toEqual([]);
       expect(api.seen.length).toBeGreaterThan(0);
       for (const request of api.seen)
@@ -224,15 +224,15 @@ describe("the nested login file", () => {
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(readFileSync(path, "utf8")).toBe(SUBSCRIPTION);
     // the command the agent runs names the file, never the credential
-    expect(nestedClaude(login.assignment)).not.toContain(SUBSCRIPTION);
-    expect(nestedClaude(login.assignment)).toContain(path);
+    expect(nestedClaude(login.prefix)).not.toContain(SUBSCRIPTION);
+    expect(nestedClaude(login.prefix)).toContain(path);
     await login.remove();
     expect(existsSync(path)).toBe(false);
   });
 
   test("a run with no credential to give gets no file and no assignment", async () => {
     const login = await prepareNestedLogin("api-key", {}, "run_none", root);
-    expect(login.assignment).toBeUndefined();
+    expect(login.prefix).toBeUndefined();
     expect(readdirSync(root)).toEqual([]);
   });
 });
