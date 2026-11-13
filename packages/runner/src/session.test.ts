@@ -974,8 +974,8 @@ test("with a connector and checks, the publish instructions come first, then the
 
 test("a check written as plain `claude -p` is still run with every project credential, gateway and provider switch unset", async () => {
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
-  // a subscription run, the only kind given this line: what this reads is the `env` part after the
-  // login prefix
+  // a subscription run, the only kind whose prompt has the `nestedClaude` line: what this reads is
+  // the `env` part after its login prefix
   vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "subscription-token-opaque");
   try {
     const append = await appendOf(['claude -p "/acme:review"']);
