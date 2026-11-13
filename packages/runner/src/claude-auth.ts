@@ -162,7 +162,7 @@ export type NestedPrefix = {
 };
 
 export type NestedLogin = {
-  /** Undefined when the run gives a nested `claude` no credential: an API-key run, or a run with no token. */
+  /** Undefined on an API-key run. */
   prefix: NestedPrefix | undefined;
   /** Deletes the file holding the credential. */
   remove: () => Promise<void>;

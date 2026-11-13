@@ -203,7 +203,7 @@ function sessionOptions(
       append: [
         ...(process.env[CONNECTOR_ENV] ? [publishInstructions()] : []),
         ...(config.checks.length > 0
-          ? [checkInstructions(config.checks, config.claudeAuth, nestedLogin)]
+          ? [checkInstructions(config.checks, nestedLogin)]
           : []),
         ...(notes.length > 0
           ? [[NOTES_HEADING, ...notes.map((note) => `- ${note}`)].join("\n")]
@@ -245,33 +245,35 @@ const NOTES_HEADING =
 // a check's nested `claude` runs without the project's key, auth token, gateway, provider switches and
 // proxies (`PROJECT_VARIABLES`), which commands get back from the command-env file: they would outrank
 // the run's login, or send its credential to the project's gateway. It is host-managed like the
-// session, whatever a command set, and so takes the run's own credential from `prepareNestedLogin`'s
-// prefix: a shell assignment ahead of `env`, so the value is never an argument of `env`. That name
-// is left off the `-u` list, since `-u` would unset the prefix's value; the prefix replaces the
-// project's value of it
+// session, whatever a command set. A subscription or pool run's token comes from
+// `prepareNestedLogin`'s prefix: a shell assignment ahead of `env`, so the value is never an argument
+// of `env`. An API-key run has no prefix, and the prompt has its `claude` checks reported as not run
 export const nestedClaude = (login: NestedPrefix | undefined) => {
-  const unset = PROJECT_VARIABLES.filter((name) => name !== login?.variable);
   const prefix = login ? `${login.assignment} ` : "";
-  return `${prefix}env ${unset.map((name) => `-u ${name}`).join(" ")} ${HOST_MANAGED}=1 claude -p …`;
+  return `${prefix}env ${PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ")} ${HOST_MANAGED}=1 claude -p …`;
 };
 
 /**
- * The env's base profile lists what to run before finishing. A command that calls `claude` runs as
- * a nested headless session on the run's own credential; the prompt has each run as `nestedClaude`
- * whatever the profile wrote.
+ * The env's base profile lists what to run before finishing. On a subscription or pool run, a command
+ * that calls `claude` runs as a nested headless session on the run's token, and the prompt has each
+ * run as `nestedClaude` whatever the profile wrote. An API-key run has no login to give it, so the
+ * prompt has those checks reported as not run.
  */
 const checkInstructions = (
   checks: string[],
-  claudeAuth: Config["claudeAuth"],
   login: NestedPrefix | undefined,
 ) =>
   [
     "Before you finish, run these checks on your change, in order, from the repo root. Plugin skills can't be invoked through the Skill tool, so run any `claude -p` command through Bash:",
     ...checks.map((check) => `- ${check}`),
-    `Run each command that calls \`claude\` with the project's Anthropic key, auth token, base URL and provider switches unset, as \`${nestedClaude(login)}\`, even where the check leaves that prefix out.`,
-    login
-      ? `A nested \`claude\` session run that way is logged in with this run's subscription: the command reads it from the file it names, which is expected, so run the command as given. Leave that file to the command: never read, print, copy or edit it yourself, never set or use another credential for the nested session, and never print or read any other credential file or token. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`
-      : `A nested \`claude\` session is not logged in on this run${claudeAuth === "api-key" ? " (Sky's API key isn't handed to nested sessions)" : ""}, so a check that calls \`claude\` can't run: report it as not run${claudeAuth === "api-key" ? ", with that reason" : ""}. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
+    ...(login
+      ? [
+          `Run each command that calls \`claude\` with the project's Anthropic key, auth token, base URL and provider switches unset, as \`${nestedClaude(login)}\`, even where the check leaves that prefix out.`,
+          `A nested \`claude\` session run that way is logged in with this run's subscription: the command reads it from the file it names, which is expected, so run the command as given. Leave that file to the command: never read, print, copy or edit it yourself, never set or use another credential for the nested session, and never print or read any other credential file or token. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
+        ]
+      : [
+          `A nested \`claude\` session is not logged in on this run, because Sky's API key isn't handed to nested sessions. Don't run a check that calls \`claude\`: report it as not run, with that reason. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
+        ]),
   ].join("\n");
 
 /**

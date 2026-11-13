@@ -1397,16 +1397,22 @@ describe("the Claude credential of a run", () => {
       return prompt?.append ?? "";
     };
 
-    test("an API-key run's nested claude gets no login: its checks are reported as not run, and the prompt never holds Sky's key", async () => {
+    test("an API-key run's nested claude gets no login: its checks are not run but reported as not run, and the prompt never holds Sky's key", async () => {
       const dir = isolatedCredentialDir();
       const append = await promptOf(
         { claudeAuth: "api-key" },
         { SKY_CLAUDE_API_KEY: SKY_KEY },
       );
       expect(append).toContain(
-        "is not logged in on this run (Sky's API key isn't handed to nested sessions)",
+        "is not logged in on this run, because Sky's API key isn't handed to nested sessions",
       );
-      expect(append).toContain("report it as not run, with that reason");
+      expect(append).toContain(
+        "Don't run a check that calls `claude`: report it as not run, with that reason.",
+      );
+      expect(append).toContain("Never set or use an API key for it");
+      // no line tells the agent to run the check as the nested command
+      expect(append).not.toContain("Run each command that calls `claude`");
+      expect(append).not.toContain("env -u");
       expect(append).not.toContain("$(<");
       expect(append).not.toContain("logged in with this run's");
       expect(append).not.toContain(SKY_KEY);
@@ -1423,6 +1429,16 @@ describe("the Claude credential of a run", () => {
       expect(append).toContain('`CLAUDE_CODE_OAUTH_TOKEN="$(<');
       expect(append).toContain("logged in with this run's subscription");
       expect(append).not.toContain(TOKEN);
+    });
+
+    test("a subscription run's prompt has each check that calls claude run as the nested command", async () => {
+      const append = await promptOf(
+        { claudeAuth: "oauth" },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      );
+      expect(append).toMatch(
+        /Run each command that calls `claude` .*, as `CLAUDE_CODE_OAUTH_TOKEN="\$\(<'[^']+'\)" env -u ANTHROPIC_API_KEY -u .* CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 claude -p …`, even where the check leaves that prefix out\./,
+      );
     });
 
     test("a run with no credential tells the agent its nested claude isn't logged in", async () => {
