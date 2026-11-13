@@ -157,12 +157,12 @@ export const credentialDir = (root: string = tmpdir(), pid = process.pid) =>
  * file as the command runs, ahead of `env`, so the value is in that command's environment alone.
  */
 export type NestedPrefix = {
-  variable: "ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN";
+  variable: "CLAUDE_CODE_OAUTH_TOKEN";
   assignment: string;
 };
 
 export type NestedLogin = {
-  /** Undefined when the run has no credential to give a nested `claude`. */
+  /** Undefined when the run gives a nested `claude` no credential: an API-key run, or a run with no token. */
   prefix: NestedPrefix | undefined;
   /** Deletes the file holding the credential. */
   remove: () => Promise<void>;
@@ -171,12 +171,14 @@ export type NestedLogin = {
 /**
  * Host-managed mode makes Claude Code ignore a stored login, and Claude Code removes
  * `CLAUDE_CODE_OAUTH_TOKEN` from the env of the commands it runs, so a nested `claude -p` finds its
- * credential in neither place. The run's credential (the chosen subscription token, or Sky's API key on
- * an API-key run, read from `runnerEnv` like `claudeProcessEnv`) goes in a 0600 file named for the run;
- * every process of the sprite's user can still read it while it exists. `prefix` has the shell read it
- * into the nested command's environment, the one place Claude Code takes the credential in
+ * credential in neither place. A subscription or pool run's token goes in a 0600 file named for the
+ * run; every process of the sprite's user can still read it while it exists. `prefix` has the shell
+ * read it into the nested command's environment, the one place Claude Code takes the credential in
  * host-managed mode, and it always wins over a value of that name already in the command's env. The
  * value never reaches the prompt, any program's argv, Claude's env or its env file.
+ *
+ * An API-key run gets no file and no prefix: Sky's key must stay out of reach of the repo's
+ * processes, and a file the sprite's user can read does not do that.
  */
 export async function prepareNestedLogin(
   auth: ClaudeAuth,
@@ -185,16 +187,13 @@ export async function prepareNestedLogin(
   dir: string = credentialDir(),
 ): Promise<NestedLogin> {
   const value =
-    auth === "api-key"
-      ? runnerEnv.SKY_CLAUDE_API_KEY
-      : runnerEnv.CLAUDE_CODE_OAUTH_TOKEN;
+    auth === "oauth" ? runnerEnv.CLAUDE_CODE_OAUTH_TOKEN : undefined;
   if (!value) return { prefix: undefined, remove: async () => {} };
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `sky-nested-claude-${runId}-${randomUUID()}`);
   unremoved.add(path);
   await writeFile(path, value, { mode: 0o600, flag: "wx" });
-  const variable =
-    auth === "api-key" ? "ANTHROPIC_API_KEY" : "CLAUDE_CODE_OAUTH_TOKEN";
+  const variable = "CLAUDE_CODE_OAUTH_TOKEN";
   return {
     // quoted, so the value is never split or globbed
     prefix: { variable, assignment: `${variable}="$(<${shellQuote(path)})"` },

@@ -48,7 +48,7 @@ const API_KEY = "sky-api-key-0003";
 type Seen = { auth: string | undefined; key: string | undefined };
 
 /** An Anthropic API that refuses every request and records what each model request was signed with. */
-async function listen(): Promise<{
+async function listen(status = 401): Promise<{
   server: Server;
   url: string;
   seen: Seen[];
@@ -62,11 +62,15 @@ async function listen(): Promise<{
         key: req.headers["x-api-key"] as string | undefined,
       });
     req.resume();
-    res.writeHead(401, { "content-type": "application/json" });
+    res.writeHead(status, { "content-type": "application/json" });
     res.end(
       JSON.stringify({
         type: "error",
-        error: { type: "authentication_error", message: "refused" },
+        error: {
+          type:
+            status === 401 ? "authentication_error" : "invalid_request_error",
+          message: "refused",
+        },
       }),
     );
   });
@@ -84,7 +88,8 @@ let decoy: Awaited<ReturnType<typeof listen>>;
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), "nested-claude-"));
   api = await listen();
-  decoy = await listen();
+  // a 400, which Claude Code does not retry for minutes as it does a refused key
+  decoy = await listen(400);
 });
 afterEach(async () => {
   for (const { server } of [api, decoy]) {
@@ -213,16 +218,22 @@ describe.skipIf(!claudeBinary)(
       expect(existsSync(otherPath)).toBe(false);
     }, 90_000);
 
-    test("logs in with Sky's API key on an API-key run, whatever key the project has", async () => {
+    test("an API-key run's nested claude has no login and makes no model request, whatever key the project has", async () => {
       const login = await prepareNestedLogin(
         "api-key",
         { SKY_CLAUDE_API_KEY: API_KEY },
         "run_key",
         root,
       );
-      const output = await runNested(login.prefix);
-      expect(api.seen[0]).toEqual({ auth: undefined, key: API_KEY });
+      expect(login.prefix).toBeUndefined();
+      expect(readdirSync(root)).toEqual([]);
+      const output = await runNested(login.prefix, {
+        SKY_CLAUDE_API_KEY: API_KEY,
+      });
+      expect(output).toContain("Not logged in");
       expect(output).not.toContain(API_KEY);
+      expect(api.seen).toEqual([]);
+      expect(decoy.seen).toEqual([]);
     }, 90_000);
 
     test("the stored login is not what a host-managed claude reads, which is why the prefix carries one", async () => {

@@ -31,11 +31,7 @@ import {
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
 import { createDecisionWaiter } from "./requests.js";
-import {
-  nestedClaude,
-  type QueryFn,
-  sessionGitIdentity,
-} from "./session.js";
+import { nestedClaude, type QueryFn, sessionGitIdentity } from "./session.js";
 import { defaultSettingsDirs, settingsRedirects } from "./settings-guard.js";
 import { hermeticRunSession as runSession } from "./testing/hermetic-run.js";
 
@@ -1401,15 +1397,22 @@ describe("the Claude credential of a run", () => {
       return prompt?.append ?? "";
     };
 
-    test("an API-key run's nested claude is logged in with Sky's key, which the prompt never holds", async () => {
+    test("an API-key run's nested claude gets no login: its checks are reported as not run, and the prompt never holds Sky's key", async () => {
+      const dir = isolatedCredentialDir();
       const append = await promptOf(
         { claudeAuth: "api-key" },
         { SKY_CLAUDE_API_KEY: SKY_KEY },
       );
-      expect(append).toContain('`ANTHROPIC_API_KEY="$(<');
-      expect(append).toContain("logged in with this run's API key");
-      expect(append).not.toContain("is not logged in");
+      expect(append).toContain(
+        "is not logged in on this run (Sky's API key isn't handed to nested sessions)",
+      );
+      expect(append).toContain("report it as not run, with that reason");
+      expect(append).not.toContain("$(<");
+      expect(append).not.toContain("logged in with this run's");
       expect(append).not.toContain(SKY_KEY);
+      expect(
+        readdirSync(dir).filter((n) => n.startsWith("sky-nested")),
+      ).toEqual([]);
     });
 
     test("a subscription run's nested claude is logged in with its token, which the prompt never holds", async () => {
@@ -1453,9 +1456,9 @@ describe("the Claude credential of a run", () => {
         },
         success,
       ]);
-      vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+      vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
       await runSession(
-        { ...config, claudeAuth: "api-key" },
+        { ...config, claudeAuth: "oauth" },
         {
           query,
           post: recorder().post,
@@ -1465,12 +1468,12 @@ describe("the Claude credential of a run", () => {
       );
       expect(during.names).toHaveLength(1);
       expect(during.modes).toEqual([0o600]);
-      expect(during.values).toEqual([SKY_KEY]);
+      expect(during.values).toEqual([TOKEN]);
       expect(readdirSync(dir)).toEqual([]);
     });
 
     describe("a run that does not finish", () => {
-      /** Runs an API-key run whose script ends as `tail` says, and lists the credential directory during the run and after it. */
+      /** Runs a subscription run whose script ends as `tail` says, and lists the credential directory during the run and after it. */
       const credentialFilesAround = async (
         tail: unknown[],
         controller = new AbortController(),
@@ -1484,9 +1487,9 @@ describe("the Claude credential of a run", () => {
           },
           ...tail,
         ]);
-        vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+        vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
         const code = await runSession(
-          { ...config, claudeAuth: "api-key" },
+          { ...config, claudeAuth: "oauth" },
           {
             query,
             post: recorder().post,
@@ -1521,11 +1524,11 @@ describe("the Claude credential of a run", () => {
     });
 
     test("no event the run posts holds the credential, though the check's command that reads it does", async () => {
-      vi.stubEnv("SKY_CLAUDE_API_KEY", SKY_KEY);
+      vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN);
       const { posted, post } = recorder();
       // the command the run's prompt gives for a nested claude, as a Bash call in the run would carry it
       const nestedCommand = (options: Options) =>
-        /`(ANTHROPIC_API_KEY="\$\(<[^`]+)`/.exec(
+        /`(CLAUDE_CODE_OAUTH_TOKEN="\$\(<[^`]+)`/.exec(
           (options.systemPrompt as { append?: string }).append ?? "",
         )?.[1] ?? "";
       const bashCall =
@@ -1539,7 +1542,7 @@ describe("the Claude credential of a run", () => {
           });
         };
       await runSession(
-        { ...config, claudeAuth: "api-key", checks: ["claude -p /review"] },
+        { ...config, claudeAuth: "oauth", checks: ["claude -p /review"] },
         {
           query: scripted([
             init,
@@ -1555,7 +1558,7 @@ describe("the Claude credential of a run", () => {
       const all = JSON.stringify(posted);
       // the read is live: the command reached the events, naming the file
       expect(all).toContain("$(<");
-      expect(all).not.toContain(SKY_KEY);
+      expect(all).not.toContain(TOKEN);
     });
   });
 
@@ -1605,22 +1608,29 @@ describe("the Claude credential of a run", () => {
       expect(seen).toBe(`${TOKEN}\n`);
     });
 
-    test.each([
-      ["api-key", "ANTHROPIC_API_KEY", SKY_KEY],
-      ["oauth", "CLAUDE_CODE_OAUTH_TOKEN", TOKEN],
-    ] as const)(
-      "on an %s run the nested claude gets the run's %s, never the project's ANTHROPIC_API_KEY, and no other project variable",
-      async (auth, variable, value) => {
-        const { prefix } = await loginOf(auth);
-        const seen = run(nestedClaude(prefix), "printenv", PROJECT_ENV);
-        expect(seen).toMatch(new RegExp(`^${variable}=${value}$`, "m"));
-        expect(seen).toMatch(/^CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1$/m);
-        expect(seen).not.toContain("project-value-");
-        for (const name of PROJECT_VARIABLES)
-          if (name !== variable)
-            expect(seen).not.toMatch(new RegExp(`^${name}=`, "m"));
-      },
-    );
+    test("on a subscription run the nested claude gets the run's token, never the project's ANTHROPIC_API_KEY, and no other project variable", async () => {
+      const { prefix } = await loginOf("oauth");
+      const seen = run(nestedClaude(prefix), "printenv", PROJECT_ENV);
+      expect(seen).toMatch(
+        new RegExp(`^CLAUDE_CODE_OAUTH_TOKEN=${TOKEN}$`, "m"),
+      );
+      expect(seen).toMatch(/^CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1$/m);
+      expect(seen).not.toContain("project-value-");
+      for (const name of PROJECT_VARIABLES)
+        expect(seen).not.toMatch(new RegExp(`^${name}=`, "m"));
+    });
+
+    test("on an API-key run there is no prefix, and the nested claude gets none of Sky's or the project's credentials", async () => {
+      const { prefix } = await loginOf("api-key");
+      expect(prefix).toBeUndefined();
+      const seen = run(nestedClaude(prefix), "printenv", {
+        ...PROJECT_ENV,
+        SKY_CLAUDE_API_KEY: SKY_KEY,
+      });
+      expect(seen).toMatch(/^CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1$/m);
+      expect(seen).not.toContain("project-value-");
+      expect(seen).not.toMatch(/^ANTHROPIC_API_KEY=/m);
+    });
   });
 });
 

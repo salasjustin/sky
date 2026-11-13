@@ -270,8 +270,8 @@ const checkInstructions = (
     ...checks.map((check) => `- ${check}`),
     `Run each command that calls \`claude\` with the project's Anthropic key, auth token, base URL and provider switches unset, as \`${nestedClaude(login)}\`, even where the check leaves that prefix out.`,
     login
-      ? `A nested \`claude\` session run that way is logged in with this run's ${claudeAuth === "oauth" ? "subscription" : "API key"}: the command reads it from the file it names, which is expected, so run the command as given. Leave that file to the command: never read, print, copy or edit it yourself, never set or use another credential for the nested session, and never print or read any other credential file or token. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`
-      : "A nested `claude` session is not logged in on this run, so a check that calls `claude` can't run: report it as not run. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.",
+      ? `A nested \`claude\` session run that way is logged in with this run's subscription: the command reads it from the file it names, which is expected, so run the command as given. Leave that file to the command: never read, print, copy or edit it yourself, never set or use another credential for the nested session, and never print or read any other credential file or token. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`
+      : `A nested \`claude\` session is not logged in on this run${claudeAuth === "api-key" ? " (Sky's API key isn't handed to nested sessions)" : ""}, so a check that calls \`claude\` can't run: report it as not run${claudeAuth === "api-key" ? ", with that reason" : ""}. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
   ].join("\n");
 
 /**
