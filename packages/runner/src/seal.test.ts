@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   chmodSync,
@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildSync } from "esbuild";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { credentialDir, sweepCredentialFiles } from "./claude-auth.js";
 import {
@@ -34,6 +35,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "sky-seal-"));
 });
 afterEach(() => {
+  vi.unstubAllEnvs();
   removeSealedCopiesNow();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -410,16 +412,14 @@ describe("createSeal", () => {
     });
 
     test("by default it lands in the runner's credential directory, where a dead runner's sweep finds it", () => {
-      const seal = sealOn(SANDBOX, { spawn: () => fakeProcess() });
-      start(seal);
-      try {
-        expect(readdirSync(credentialDir())).toEqual([
-          expect.stringMatching(/^sky-claude-/),
-        ]);
-      } finally {
-        removeSealedCopiesNow();
-        rmSync(credentialDir(), { recursive: true, force: true });
-      }
+      // the OS temp directory is TMPDIR where it is set, so the default directory is under this test's own
+      const osTmp = join(dir, "os-tmp");
+      mkdirSync(osTmp);
+      vi.stubEnv("TMPDIR", osTmp);
+      start(sealOn(SANDBOX, { spawn: () => fakeProcess() }));
+      expect(readdirSync(credentialDir(osTmp))).toEqual([
+        expect.stringMatching(/^sky-claude-/),
+      ]);
     });
 
     test("a copy a killed runner left in its credential directory is swept with the directory", () => {
@@ -428,6 +428,15 @@ describe("createSeal", () => {
       expect(readdirSync(runner)).toHaveLength(1);
       sweepCredentialFiles(() => false, copies, process.pid);
       expect(readdirSync(copies)).toEqual([]);
+    });
+
+    test("a copy a live runner is still running from is left alone by another runner's sweep", () => {
+      const runner = credentialDir(copies, 4242);
+      start(sealOn(SANDBOX, { dir: runner, spawn: () => fakeProcess() }));
+      const [copy] = readdirSync(runner);
+      // the sweeping runner is another pid, and 4242 is alive
+      sweepCredentialFiles((pid) => pid === 4242, copies, 1);
+      expect(readdirSync(runner)).toEqual([copy]);
     });
 
     test("removeSealedCopiesNow goes on to the next copy when one can't be removed, and never throws", () => {
@@ -477,6 +486,76 @@ describe("createSeal", () => {
         "the kernel lets the repo's commands read Claude's environment",
       );
     });
+  });
+});
+
+// A runner that ends normally, or dies of an uncaught exception, never reaches the session's own cleanup:
+// the 'exit' listener `main` registers is what takes the copy of Claude's binary with it. The child
+// registers it the way `main` does (or leaves it out), starts a seal on a fake spawn, and exits. It is
+// bundled first, because Node alone won't resolve this package's `./x.js` imports to their `.ts` files.
+describe("the copy of Claude's binary when the runner exits", () => {
+  const CHILD_SCRIPT = (registerListener: boolean) => `
+    import { EventEmitter } from "node:events";
+    import { readdirSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    import { createSeal, removeSealedCopiesNow } from "./seal.js";
+    ${registerListener ? 'process.on("exit", removeSealedCopiesNow);' : ""}
+    const { SEAL_DIR, BINARY } = process.env;
+    const rootOnly = { stat: () => ({ uid: 0, mode: 0o100755 }), realpath: (path) => path };
+    const claude = Object.assign(new EventEmitter(), { pid: 1, exitCode: null, signalCode: null });
+    const seal = createSeal("linux", {
+      dir: SEAL_DIR,
+      hideRunner: () => undefined,
+      files: rootOnly,
+      spawn: () => claude,
+    });
+    writeFileSync(BINARY, "");
+    seal.spawn({ command: BINARY, args: [], env: {}, signal: new AbortController().signal });
+    process.stdout.write(String(readdirSync(SEAL_DIR).length));
+    process.exit(0);
+  `;
+
+  const runChild = (registerListener: boolean) => {
+    const script = join(dir, "child.mjs");
+    buildSync({
+      stdin: {
+        contents: CHILD_SCRIPT(registerListener),
+        resolveDir: import.meta.dirname,
+        loader: "js",
+      },
+      bundle: true,
+      platform: "node",
+      format: "esm",
+      outfile: script,
+      logLevel: "silent",
+    });
+    const sealDir = join(dir, "copies");
+    const child = spawnSync(process.execPath, [script], {
+      env: {
+        PATH: process.env.PATH,
+        SEAL_DIR: sealDir,
+        BINARY: join(dir, "claude-binary"),
+      },
+      encoding: "utf8",
+    });
+    return { child, sealDir };
+  };
+
+  test("is deleted by the exit listener when the runner ends with Claude still running", () => {
+    const { child, sealDir } = runChild(true);
+    // the copy was on disk before the exit
+    expect(child.stdout).toBe("1");
+    expect(child.status).toBe(0);
+    expect(readdirSync(sealDir)).toEqual([]);
+  });
+
+  test("is left on disk when no listener removes it, so the removal above is the listener's", () => {
+    const { child, sealDir } = runChild(false);
+    expect(child.stdout).toBe("1");
+    expect(child.status).toBe(0);
+    expect(readdirSync(sealDir)).toEqual([
+      expect.stringMatching(/^sky-claude-/),
+    ]);
   });
 });
 

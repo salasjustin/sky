@@ -1569,6 +1569,31 @@ describe("the Claude credential of a run", () => {
       expect(during.names).toEqual([]);
     });
 
+    // the runner took its credential out of its own env at start; whatever is in that env now is not the run's
+    const RUNNER_ENV_TOKEN = "runner-env-token-opaque";
+
+    test("the nested login's file holds the handed-over token, never the one in the runner's own env", async () => {
+      vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", RUNNER_ENV_TOKEN);
+      const { during } = await loginFilesDuring(
+        { ...config, claudeAuth: "oauth", checks: ["claude -p /review"] },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      );
+      expect(during.values).toEqual([TOKEN]);
+    });
+
+    test("a run handed no token gets no nested login file and no prefix, whatever the runner's own env holds", async () => {
+      vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", RUNNER_ENV_TOKEN);
+      const { during } = await loginFilesDuring(
+        { ...config, claudeAuth: "oauth", checks: ["claude -p /review"] },
+        {},
+      );
+      expect(during.names).toEqual([]);
+      const append = await promptOf({ claudeAuth: "oauth" }, {});
+      expect(append).toContain("is not logged in on this run");
+      expect(append).not.toContain("$(<");
+      expect(append).not.toContain(RUNNER_ENV_TOKEN);
+    });
+
     describe("a run that does not finish", () => {
       /** Runs a subscription run whose script ends as `tail` says, and lists the credential and nested login link directories during the run and after it. */
       const credentialFilesAround = async (
