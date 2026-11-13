@@ -259,10 +259,7 @@ export const nestedClaude = (login: NestedPrefix | undefined) => {
  * run as `nestedClaude` whatever the profile wrote. An API-key run has no login to give it, so the
  * prompt has those checks reported as not run.
  */
-const checkInstructions = (
-  checks: string[],
-  login: NestedPrefix | undefined,
-) =>
+const checkInstructions = (checks: string[], login: NestedPrefix | undefined) =>
   [
     "Before you finish, run these checks on your change, in order, from the repo root. Plugin skills can't be invoked through the Skill tool, so run any `claude -p` command through Bash:",
     ...checks.map((check) => `- ${check}`),
