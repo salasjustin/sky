@@ -18,6 +18,7 @@ import { createApp } from "./app.js";
 import {
   createDispatcher,
   type Dispatcher,
+  openbotSignature,
   retryDelayMs,
   signatureHeader,
 } from "./deliveries.js";
@@ -814,6 +815,135 @@ test("the secret of a standard webhook is stored sealed and never appears in a G
     .get(id) as Record<string, Buffer | string | number | null>;
   expect(JSON.stringify(row)).not.toContain(secret.slice("whsec_".length));
   expect(Buffer.isBuffer(row.secret_ciphertext)).toBe(true);
+});
+
+// an OpenBot secret is used as raw bytes, whsec_ prefix and all
+const openbotSecret = "whsec_not+base64/but-fine";
+
+test("an openbot delivery matches a fixed signature vector, carries the OpenBot headers and body, and keeps its id across retries", async () => {
+  await subscribe(["run.finished"], subscriberUrl, {
+    format: "openbot",
+    secret: openbotSecret,
+  });
+  const received: Received[] = [];
+  const statuses = [500, 200];
+  const sentAt: number[] = [];
+  server.use(
+    http.post(subscriberUrl, async ({ request }) => {
+      sentAt.push(Math.floor(clock.getTime() / 1000));
+      received.push({ headers: request.headers, body: await request.text() });
+      return new HttpResponse(null, { status: statuses.shift() ?? 599 });
+    }),
+  );
+  const { agentId, envId, runId, token } = runningRun();
+  const posted = await finish(token, runId);
+  const { id: eventId } = (await posted.json()) as { id: number };
+
+  await dispatcher.drain();
+  advance(10_000);
+  await dispatcher.drain();
+
+  expect(received).toHaveLength(2);
+  for (const [i, { headers, body }] of received.entries()) {
+    const t = sentAt[i] ?? 0;
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(headers.get("x-openbot-timestamp")).toBe(String(t));
+    expect(headers.get("x-openbot-delivery-id")).toBe(`evt_${eventId}`);
+    // computed here with WebCrypto, from the raw secret bytes and "<ts>.<id>.<body>"
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(openbotSecret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const mac = await crypto.subtle.sign(
+      "HMAC",
+      cryptoKey,
+      new TextEncoder().encode(`${t}.evt_${eventId}.${body}`),
+    );
+    expect(headers.get("x-openbot-signature")).toBe(
+      `sha256=${Buffer.from(mac).toString("hex")}`,
+    );
+    expect(headers.get("x-openbot-signature")).toMatch(/^sha256=[0-9a-f]{64}$/);
+    for (const name of ["sky-signature", "webhook-id", "webhook-signature"]) {
+      expect(headers.has(name)).toBe(false);
+    }
+    const parsed = JSON.parse(body);
+    expect(Object.keys(parsed)).toEqual(["type", "data"]);
+    expect(parsed).toEqual({
+      type: "run.finished",
+      data: {
+        id: `evt_${eventId}`,
+        agentId,
+        environmentId: envId,
+        runId,
+        ts: expect.stringMatching(/Z$/),
+        type: "run.finished",
+        payload: { summary: "done", usage },
+      },
+    });
+  }
+  expect(sentAt[1]).toBeGreaterThan(sentAt[0] ?? 0);
+  expect(received[1]?.body).toBe(received[0]?.body);
+  expect(received[1]?.headers.get("x-openbot-signature")).not.toBe(
+    received[0]?.headers.get("x-openbot-signature"),
+  );
+});
+
+test("openbotSignature matches a hard-coded vector", () => {
+  // HMAC-SHA256, key "secret", message "1700000000.evt_1.{}", computed independently with openssl
+  expect(openbotSignature("secret", "evt_1", 1700000000, "{}")).toBe(
+    "sha256=26d77ca6a783c304147f4d1df6c77f9055350d43a20070ae3c2fbc598bb3bec4",
+  );
+});
+
+test("the secret of an openbot webhook is stored sealed and never appears in a GET or a log line", async () => {
+  const id = await subscribe(["run.finished"], subscriberUrl, {
+    format: "openbot",
+    secret: openbotSecret,
+  });
+  subscriber([500, 599, 599]);
+  const { runId, token } = runningRun();
+  await finish(token, runId);
+  await dispatcher.drain();
+  expect(logs.length).toBeGreaterThan(0);
+
+  const list = await app.request("/v1/webhooks", { headers: auth });
+  const one = await app.request(`/v1/webhooks/${id}`, { headers: auth });
+  const listed = await list.text();
+  const read = await one.text();
+  for (const text of [listed, read, ...logs]) {
+    expect(text).not.toContain(openbotSecret);
+  }
+  expect(JSON.parse(read)).toMatchObject({ id, format: "openbot" });
+  expect(JSON.parse(read)).not.toHaveProperty("secret");
+  const row = db.$client
+    .prepare("select * from webhooks where id = ?")
+    .get(id) as Record<string, Buffer | string | number | null>;
+  expect(JSON.stringify(row)).not.toContain(openbotSecret);
+  expect(Buffer.isBuffer(row.secret_ciphertext)).toBe(true);
+});
+
+test("an openbot webhook with environmentIds receives only events of agents in those environments", async () => {
+  const a = runningRun("a");
+  const b = runningRun("b");
+  await subscribe(["run.finished"], subscriberUrl, {
+    format: "openbot",
+    secret: openbotSecret,
+    environmentIds: [a.envId],
+  });
+  const received = subscriber([200, 200]);
+
+  await finish(b.token, b.runId, "from b");
+  await dispatcher.drain();
+  expect(received).toHaveLength(0);
+
+  await finish(a.token, a.runId, "from a");
+  await dispatcher.drain();
+  expect(received.map((r) => JSON.parse(r.body).data.environmentId)).toEqual([
+    a.envId,
+  ]);
 });
 
 test("a webhook with environmentIds receives only events of agents in those environments", async () => {

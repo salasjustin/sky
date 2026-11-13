@@ -1,0 +1,1256 @@
+{
+  "version": "6",
+  "dialect": "sqlite",
+  "id": "5811251c-7d4d-4327-af69-7ab51b567c4a",
+  "prevId": "c6c97f5f-9b3f-4b97-851b-a661d08af6ce",
+  "tables": {
+    "agents": {
+      "name": "agents",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "env_id": {
+          "name": "env_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "branch": {
+          "name": "branch",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+        },
+        "archived_at": {
+          "name": "archived_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "remote_branch": {
+          "name": "remote_branch",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "owner_key_id": {
+          "name": "owner_key_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "agents_env_id": {
+          "name": "agents_env_id",
+          "columns": ["env_id"],
+          "isUnique": false
+        },
+        "agents_owner_key_id": {
+          "name": "agents_owner_key_id",
+          "columns": ["owner_key_id"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "agents_env_id_environments_id_fk": {
+          "name": "agents_env_id_environments_id_fk",
+          "tableFrom": "agents",
+          "tableTo": "environments",
+          "columnsFrom": ["env_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "agents_owner_key_id_api_keys_id_fk": {
+          "name": "agents_owner_key_id_api_keys_id_fk",
+          "tableFrom": "agents",
+          "tableTo": "api_keys",
+          "columnsFrom": ["owner_key_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "agents_status": {
+          "name": "agents_status",
+          "value": "\"status\" in ('idle', 'running', 'waiting')"
+        },
+        "agents_branch": {
+          "name": "agents_branch",
+          "value": "\"branch\" = 'claude/' || \"id\""
+        },
+        "agents_created_at": {
+          "name": "agents_created_at",
+          "value": "\"created_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        }
+      }
+    },
+    "api_keys": {
+      "name": "api_keys",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "key_hash": {
+          "name": "key_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "role": {
+          "name": "role",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "environment_ids": {
+          "name": "environment_ids",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_used_at": {
+          "name": "last_used_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "api_keys_key_hash": {
+          "name": "api_keys_key_hash",
+          "columns": ["key_hash"],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "api_keys_role": {
+          "name": "api_keys_role",
+          "value": "\"role\" in ('admin', 'runs')"
+        },
+        "api_keys_environment_ids": {
+          "name": "api_keys_environment_ids",
+          "value": "json_type(\"environment_ids\") = 'array'"
+        },
+        "api_keys_created_at": {
+          "name": "api_keys_created_at",
+          "value": "\"created_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        },
+        "api_keys_revoked_at": {
+          "name": "api_keys_revoked_at",
+          "value": "\"revoked_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        },
+        "api_keys_last_used_at": {
+          "name": "api_keys_last_used_at",
+          "value": "\"last_used_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        }
+      }
+    },
+    "claude_limits": {
+      "name": "claude_limits",
+      "columns": {
+        "credential": {
+          "name": "credential",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "limited_until": {
+          "name": "limited_until",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "claude_limits_limited_until": {
+          "name": "claude_limits_limited_until",
+          "value": "\"limited_until\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        },
+        "claude_limits_created_at": {
+          "name": "claude_limits_created_at",
+          "value": "\"created_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        }
+      }
+    },
+    "claude_usage": {
+      "name": "claude_usage",
+      "columns": {
+        "credential": {
+          "name": "credential",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "five_hour_utilization": {
+          "name": "five_hour_utilization",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "five_hour_resets_at": {
+          "name": "five_hour_resets_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "seven_day_utilization": {
+          "name": "seven_day_utilization",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "seven_day_resets_at": {
+          "name": "seven_day_resets_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "probed_at": {
+          "name": "probed_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "claude_usage_probed_at": {
+          "name": "claude_usage_probed_at",
+          "value": "\"probed_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        }
+      }
+    },
+    "environments": {
+      "name": "environments",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "repo": {
+          "name": "repo",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "setup": {
+          "name": "setup",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "base": {
+          "name": "base",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "sprite_name": {
+          "name": "sprite_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "checkpoint_id": {
+          "name": "checkpoint_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "concurrency": {
+          "name": "concurrency",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 3
+        },
+        "approval_policy": {
+          "name": "approval_policy",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'[]'"
+        },
+        "auto_approve": {
+          "name": "auto_approve",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'{\"defaults\":true,\"commands\":[]}'"
+        },
+        "claude_credential": {
+          "name": "claude_credential",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "claude_pool": {
+          "name": "claude_pool",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "claude_fallback": {
+          "name": "claude_fallback",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'api-key'"
+        },
+        "failure_step": {
+          "name": "failure_step",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "failure_stderr": {
+          "name": "failure_stderr",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+        }
+      },
+      "indexes": {
+        "environments_name": {
+          "name": "environments_name",
+          "columns": ["name"],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "environments_status": {
+          "name": "environments_status",
+          "value": "\"status\" in ('provisioning', 'ready', 'failed')"
+        },
+        "environments_concurrency": {
+          "name": "environments_concurrency",
+          "value": "\"concurrency\" > 0"
+        },
+        "environments_approval_policy": {
+          "name": "environments_approval_policy",
+          "value": "json_type(\"approval_policy\") = 'array'"
+        },
+        "environments_auto_approve": {
+          "name": "environments_auto_approve",
+          "value": "json_type(\"auto_approve\") = 'object'"
+        },
+        "environments_failure_step": {
+          "name": "environments_failure_step",
+          "value": "\"failure_step\" in ('create', 'clone', 'setup', 'checkpoint')"
+        },
+        "environments_failure_stderr": {
+          "name": "environments_failure_stderr",
+          "value": "length(\"failure_stderr\") <= 4000"
+        },
+        "environments_created_at": {
+          "name": "environments_created_at",
+          "value": "\"created_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        }
+      }
+    },
+    "events": {
+      "name": "events",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "run_id": {
+          "name": "run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ts": {
+          "name": "ts",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "type": {
+          "name": "type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "payload": {
+          "name": "payload",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "events_run_id_id": {
+          "name": "events_run_id_id",
+          "columns": ["run_id", "id"],
+          "isUnique": false
+        },
+        "events_claude_ts": {
+          "name": "events_claude_ts",
+          "columns": ["ts"],
+          "isUnique": false,
+          "where": "\"type\" glob 'claude.*'"
+        },
+        "events_heartbeat_ts": {
+          "name": "events_heartbeat_ts",
+          "columns": ["ts"],
+          "isUnique": false,
+          "where": "\"type\" = 'runner.heartbeat'"
+        }
+      },
+      "foreignKeys": {
+        "events_run_id_runs_id_fk": {
+          "name": "events_run_id_runs_id_fk",
+          "tableFrom": "events",
+          "tableTo": "runs",
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "events_type": {
+          "name": "events_type",
+          "value": "\"type\" in ('run.started', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped', 'run.resumed',\n        'run.probed', 'runner.warning', 'runner.heartbeat',\n        'claude.PreToolUse', 'claude.PostToolUse', 'claude.PostToolUseFailure', 'claude.SubagentStart', 'claude.SubagentStop',\n        'claude.TaskCreated', 'claude.TaskCompleted', 'claude.Notification', 'claude.PreCompact', 'claude.FileChanged', 'claude.Message')"
+        },
+        "events_ts": {
+          "name": "events_ts",
+          "value": "\"ts\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        },
+        "events_payload": {
+          "name": "events_payload",
+          "value": "json_type(\"payload\") = 'object'"
+        }
+      }
+    },
+    "run_env_vars": {
+      "name": "run_env_vars",
+      "columns": {
+        "run_id": {
+          "name": "run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ciphertext": {
+          "name": "ciphertext",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "nonce": {
+          "name": "nonce",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "key_version": {
+          "name": "key_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+        }
+      },
+      "indexes": {
+        "run_env_vars_expires_at": {
+          "name": "run_env_vars_expires_at",
+          "columns": ["expires_at"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "run_env_vars_run_id_runs_id_fk": {
+          "name": "run_env_vars_run_id_runs_id_fk",
+          "tableFrom": "run_env_vars",
+          "tableTo": "runs",
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "run_env_vars_run_id_name_pk": {
+          "columns": ["run_id", "name"],
+          "name": "run_env_vars_run_id_name_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "run_env_vars_name": {
+          "name": "run_env_vars_name",
+          "value": "\"name\" glob '[A-Za-z_]*' and \"name\" not glob '*[^A-Za-z0-9_]*'"
+        },
+        "run_env_vars_key_version": {
+          "name": "run_env_vars_key_version",
+          "value": "\"key_version\" > 0"
+        },
+        "run_env_vars_expires_at": {
+          "name": "run_env_vars_expires_at",
+          "value": "\"expires_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        },
+        "run_env_vars_created_at": {
+          "name": "run_env_vars_created_at",
+          "value": "\"created_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        }
+      }
+    },
+    "run_requests": {
+      "name": "run_requests",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "run_id": {
+          "name": "run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "request": {
+          "name": "request",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "decision": {
+          "name": "decision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "decided_at": {
+          "name": "decided_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+        }
+      },
+      "indexes": {
+        "run_requests_run_id_decided_at": {
+          "name": "run_requests_run_id_decided_at",
+          "columns": ["run_id", "decided_at"],
+          "isUnique": false
+        },
+        "run_requests_run_id_open": {
+          "name": "run_requests_run_id_open",
+          "columns": ["run_id"],
+          "isUnique": true,
+          "where": "\"decided_at\" is null"
+        }
+      },
+      "foreignKeys": {
+        "run_requests_run_id_runs_id_fk": {
+          "name": "run_requests_run_id_runs_id_fk",
+          "tableFrom": "run_requests",
+          "tableTo": "runs",
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "run_requests_kind": {
+          "name": "run_requests_kind",
+          "value": "\"kind\" in ('question', 'approval')"
+        },
+        "run_requests_request": {
+          "name": "run_requests_request",
+          "value": "json_valid(\"request\") and json_type(\"request\") = 'object'\n        and json_extract(\"request\", '$.kind') = \"kind\"\n        and json_extract(\"request\", '$.requestId') = \"id\""
+        },
+        "run_requests_decision": {
+          "name": "run_requests_decision",
+          "value": "json_valid(\"decision\") and json_type(\"decision\") = 'object'\n        and json_extract(\"decision\", '$.requestId') = \"id\""
+        },
+        "run_requests_decided": {
+          "name": "run_requests_decided",
+          "value": "(\"decision\" is null) = (\"decided_at\" is null)"
+        },
+        "run_requests_decided_at": {
+          "name": "run_requests_decided_at",
+          "value": "\"decided_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        },
+        "run_requests_created_at": {
+          "name": "run_requests_created_at",
+          "value": "\"created_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        }
+      }
+    },
+    "runs": {
+      "name": "runs",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "agent_id": {
+          "name": "agent_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "summary": {
+          "name": "summary",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "input_tokens": {
+          "name": "input_tokens",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "output_tokens": {
+          "name": "output_tokens",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "cost_usd": {
+          "name": "cost_usd",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "turns": {
+          "name": "turns",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "duration_ms": {
+          "name": "duration_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "rollup": {
+          "name": "rollup",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "secret_names": {
+          "name": "secret_names",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "claude_credential": {
+          "name": "claude_credential",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "retry_of": {
+          "name": "retry_of",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+        }
+      },
+      "indexes": {
+        "runs_agent_id": {
+          "name": "runs_agent_id",
+          "columns": ["agent_id"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "runs_agent_id_agents_id_fk": {
+          "name": "runs_agent_id_agents_id_fk",
+          "tableFrom": "runs",
+          "tableTo": "agents",
+          "columnsFrom": ["agent_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "runs_status": {
+          "name": "runs_status",
+          "value": "\"status\" in ('starting', 'running', 'waiting', 'finished', 'failed', 'stopped')"
+        },
+        "runs_usage": {
+          "name": "runs_usage",
+          "value": "(\"input_tokens\" is null and \"output_tokens\" is null and \"cost_usd\" is null and \"turns\" is null and \"duration_ms\" is null)\n        or (\"input_tokens\" >= 0 and \"output_tokens\" >= 0 and \"cost_usd\" >= 0 and \"turns\" >= 0 and \"duration_ms\" >= 0)"
+        },
+        "runs_created_at": {
+          "name": "runs_created_at",
+          "value": "\"created_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        }
+      }
+    },
+    "secrets": {
+      "name": "secrets",
+      "columns": {
+        "env_id": {
+          "name": "env_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "connector": {
+          "name": "connector",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ciphertext": {
+          "name": "ciphertext",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "nonce": {
+          "name": "nonce",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "key_version": {
+          "name": "key_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "secrets_env_id_environments_id_fk": {
+          "name": "secrets_env_id_environments_id_fk",
+          "tableFrom": "secrets",
+          "tableTo": "environments",
+          "columnsFrom": ["env_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "secrets_env_id_name_pk": {
+          "columns": ["env_id", "name"],
+          "name": "secrets_env_id_name_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "secrets_name": {
+          "name": "secrets_name",
+          "value": "\"name\" glob '[A-Za-z_]*' and \"name\" not glob '*[^A-Za-z0-9_]*'"
+        },
+        "secrets_kind": {
+          "name": "secrets_kind",
+          "value": "\"kind\" in ('value', 'connector')"
+        },
+        "secrets_shape": {
+          "name": "secrets_shape",
+          "value": "(\"kind\" = 'value' and \"connector\" is null\n          and \"ciphertext\" is not null and \"nonce\" is not null and \"key_version\" is not null)\n        or (\"kind\" = 'connector' and \"connector\" is not null and \"connector\" <> ''\n          and \"ciphertext\" is null and \"nonce\" is null and \"key_version\" is null)"
+        },
+        "secrets_key_version": {
+          "name": "secrets_key_version",
+          "value": "\"key_version\" > 0"
+        }
+      }
+    },
+    "webhook_deliveries": {
+      "name": "webhook_deliveries",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "webhook_id": {
+          "name": "webhook_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "event_id": {
+          "name": "event_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "next_attempt_at": {
+          "name": "next_attempt_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "last_status": {
+          "name": "last_status",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_error": {
+          "name": "last_error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+        }
+      },
+      "indexes": {
+        "webhook_deliveries_webhook_id_event_id": {
+          "name": "webhook_deliveries_webhook_id_event_id",
+          "columns": ["webhook_id", "event_id"],
+          "isUnique": true
+        },
+        "webhook_deliveries_event_id": {
+          "name": "webhook_deliveries_event_id",
+          "columns": ["event_id"],
+          "isUnique": false
+        },
+        "webhook_deliveries_status_next_attempt_at": {
+          "name": "webhook_deliveries_status_next_attempt_at",
+          "columns": ["status", "next_attempt_at"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "webhook_deliveries_webhook_id_webhooks_id_fk": {
+          "name": "webhook_deliveries_webhook_id_webhooks_id_fk",
+          "tableFrom": "webhook_deliveries",
+          "tableTo": "webhooks",
+          "columnsFrom": ["webhook_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "webhook_deliveries_event_id_events_id_fk": {
+          "name": "webhook_deliveries_event_id_events_id_fk",
+          "tableFrom": "webhook_deliveries",
+          "tableTo": "events",
+          "columnsFrom": ["event_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "webhook_deliveries_status": {
+          "name": "webhook_deliveries_status",
+          "value": "\"status\" in ('pending', 'delivered', 'failed')"
+        },
+        "webhook_deliveries_attempts": {
+          "name": "webhook_deliveries_attempts",
+          "value": "\"attempts\" >= 0"
+        },
+        "webhook_deliveries_next_attempt_at": {
+          "name": "webhook_deliveries_next_attempt_at",
+          "value": "\"next_attempt_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        },
+        "webhook_deliveries_last_status": {
+          "name": "webhook_deliveries_last_status",
+          "value": "\"last_status\" between 100 and 599"
+        },
+        "webhook_deliveries_last_error": {
+          "name": "webhook_deliveries_last_error",
+          "value": "length(\"last_error\") <= 1000"
+        },
+        "webhook_deliveries_created_at": {
+          "name": "webhook_deliveries_created_at",
+          "value": "\"created_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        }
+      }
+    },
+    "webhooks": {
+      "name": "webhooks",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "url": {
+          "name": "url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "event_types": {
+          "name": "event_types",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "format": {
+          "name": "format",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'sky'"
+        },
+        "secret_ciphertext": {
+          "name": "secret_ciphertext",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "secret_nonce": {
+          "name": "secret_nonce",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "secret_key_version": {
+          "name": "secret_key_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "environment_ids": {
+          "name": "environment_ids",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+        },
+        "owner_key_id": {
+          "name": "owner_key_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "webhooks_owner_key_id_api_keys_id_fk": {
+          "name": "webhooks_owner_key_id_api_keys_id_fk",
+          "tableFrom": "webhooks",
+          "tableTo": "api_keys",
+          "columnsFrom": ["owner_key_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "webhooks_event_types": {
+          "name": "webhooks_event_types",
+          "value": "json_type(\"event_types\") = 'array' and json_array_length(\"event_types\") > 0"
+        },
+        "webhooks_format": {
+          "name": "webhooks_format",
+          "value": "\"format\" in ('sky', 'standard', 'openbot')"
+        },
+        "webhooks_created_at": {
+          "name": "webhooks_created_at",
+          "value": "\"created_at\" glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'"
+        }
+      }
+    }
+  },
+  "views": {},
+  "enums": {},
+  "_meta": {
+    "schemas": {},
+    "tables": {},
+    "columns": {}
+  },
+  "internal": {
+    "indexes": {}
+  }
+}

@@ -106,6 +106,48 @@ test("--secret=- on a terminal prompts for the secret without echoing it", async
   expect(r.stdout + r.stderr).not.toContain(secret);
 });
 
+test("webhook add sends an openbot webhook with a non-base64 secret as is, never printing it", async () => {
+  server.use(...handlers);
+  const openbotSecret = "whsec_not+base64/but-fine";
+  const file = join(mkdtempSync(join(tmpdir(), "sky-wh-")), "secret");
+  writeFileSync(file, `${openbotSecret}\n`);
+  const r = await runCli([
+    ...add,
+    "--format=openbot",
+    `--secret=@${file}`,
+    "--env=web",
+  ]);
+  expect(r.code).toBe(0);
+  expect(posts).toEqual([
+    {
+      url: "https://hooks.example.com/x",
+      eventTypes: ["run.waiting"],
+      format: "openbot",
+      secret: openbotSecret,
+      environmentIds: ["env_1"],
+    },
+  ]);
+  expect(r.stdout + r.stderr).not.toContain(openbotSecret);
+});
+
+test("an openbot secret on stdin is read, and an argv one is refused", async () => {
+  server.use(...handlers);
+  const ok = await runCli([...add, "--format=openbot", "--secret=-"], {
+    stdin: { readAll: async () => "plain-secret\n" },
+  });
+  expect(ok.code).toBe(0);
+  expect(posts[0]).toMatchObject({ secret: "plain-secret" });
+  const bad = await runCli([...add, "--format=openbot", "--secret=plain"]);
+  expect(bad.code).toBe(2);
+  expect(bad.stderr + bad.stdout).not.toContain("plain");
+});
+
+test("openbot without a secret exits 2", async () => {
+  const r = await runCli([...add, "--format=openbot"]);
+  expect(r.code).toBe(2);
+  expect(posts).toEqual([]);
+});
+
 test.each([
   ["stderr is not a terminal", { stderrIsTTY: false }],
   ["CI is set", { stderrIsTTY: true, env: { CI: "true" } }],

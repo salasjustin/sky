@@ -8,7 +8,13 @@ import {
   webhookDeliveries,
   webhooks,
 } from "@sky/db";
-import type { AgentId, EnvironmentId, Event, EventType } from "@sky/shared";
+import type {
+  AgentId,
+  EnvironmentId,
+  Event,
+  EventType,
+  WebhookFormat,
+} from "@sky/shared";
 import { and, asc, eq, isNull, lt, lte, ne } from "drizzle-orm";
 import { open, type Sealed, webhookSecretAad } from "./crypto.js";
 import { presentEvent } from "./run-events.js";
@@ -47,6 +53,22 @@ export function standardSignature(
 ): string {
   const v1 = createHmac("sha256", key).update(`${id}.${t}.${body}`).digest();
   return `v1,${v1.toString("base64")}`;
+}
+
+/**
+ * The `x-openbot-signature` header of an OpenBot delivery: `sha256=<hex>` of HMAC-SHA256 keyed
+ * with the secret's raw UTF-8 bytes (not base64-decoded) over `<timestamp>.<delivery id>.<body>`.
+ */
+export function openbotSignature(
+  secret: string,
+  id: string,
+  t: number,
+  body: string,
+): string {
+  const hex = createHmac("sha256", secret)
+    .update(`${t}.${id}.${body}`)
+    .digest("hex");
+  return `sha256=${hex}`;
 }
 
 /** The key bytes of a `whsec_<base64>` secret. */
@@ -156,7 +178,7 @@ export function createDispatcher({
 }: {
   db: Db;
   signingKey: string;
-  /** opens the sealed secrets of `standard` webhooks */
+  /** opens the sealed secrets of `standard` and `openbot` webhooks */
   secretEncryptionKey: Buffer;
   log: (line: string) => void;
   now?: () => Date;
@@ -172,14 +194,14 @@ export function createDispatcher({
     webhookId: (typeof webhookDeliveries.$inferSelect)["webhookId"];
     attempts: number;
     url: string;
-    format: "sky" | "standard";
+    format: WebhookFormat;
     secret: Sealed | null;
     agentId: AgentId;
     environmentId: EnvironmentId;
     event: typeof events.$inferSelect;
   };
 
-  /** The body and headers of one attempt; a `standard` delivery's timestamp and signature are per attempt, its id and body are not. */
+  /** The body and headers of one attempt; a `standard` or `openbot` delivery's timestamp and signature are per attempt, its id and body are not. */
   function buildRequest(
     row: Due,
     id: string,
@@ -195,6 +217,18 @@ export function createDispatcher({
           "Sky-Event-Id": id,
           "Sky-Event-Type": presented.type,
           "Sky-Signature": signatureHeader(signingKey, body, t),
+        },
+      };
+    }
+    if (row.format === "openbot") {
+      const body = JSON.stringify({ type: presented.type, data: presented });
+      return {
+        body,
+        headers: {
+          "Content-Type": "application/json",
+          "x-openbot-timestamp": String(t),
+          "x-openbot-delivery-id": id,
+          "x-openbot-signature": openbotSignature(openSecret(row), id, t, body),
         },
       };
     }

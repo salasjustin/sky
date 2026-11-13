@@ -80,10 +80,12 @@ const help = (io: Io) => `Usage:
       pool environments that may use it. Values are never printed. Needs
       the admin key.
   sky webhook add <url> --events=<types,...> [options]
-      [--format=standard --secret=@file|-] [--env=<id|name>,...]
+      [--format=standard|openbot --secret=@file|-] [--env=<id|name>,...]
       Subscribe an https URL to event types. --format=standard signs
-      deliveries as Standard Webhooks and needs the whsec_<base64> secret,
-      read from a file or stdin, never argv. --env limits it to events from
+      deliveries as Standard Webhooks and needs the whsec_<base64> secret;
+      --format=openbot signs them the way OpenBot webhook routines verify
+      and takes the routine's signing secret as is (any non-empty string).
+      The secret is read from a file or stdin, never argv. --env limits it to events from
       agents in those environments. On a terminal, --secret=- prompts for
       the secret without echoing it. Prints the line webhook list prints.
   sky webhook list [options]

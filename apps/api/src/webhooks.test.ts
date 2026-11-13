@@ -180,6 +180,24 @@ test("a standard webhook is created with its secret held back: the format comes 
   expect(JSON.stringify(body)).not.toContain(whsec);
 });
 
+test("an openbot webhook takes any non-empty secret as is, and hides it", async () => {
+  const openbotSecret = "whsec_not+base64/but-fine";
+  const res = await subscribe({
+    ...hook,
+    format: "openbot",
+    secret: openbotSecret,
+  });
+  expect(res.status).toBe(201);
+  const body = (await res.json()) as { id: string };
+  expect(body).toEqual({
+    id: expect.any(String),
+    ...hook,
+    format: "openbot",
+    createdAt: expect.stringMatching(/Z$/),
+  });
+  expect(JSON.stringify(body)).not.toContain(openbotSecret);
+});
+
 test("environmentIds of existing environments are stored and returned, duplicates collapsed", async () => {
   db.$client
     .prepare(
@@ -202,6 +220,8 @@ test.each([
   ],
   ["a secret that is not base64", { format: "standard", secret: "whsec_%%%" }],
   ["an empty secret key", { format: "standard", secret: "whsec_" }],
+  ["an openbot format without a secret", { format: "openbot" }],
+  ["an openbot format with an empty secret", { format: "openbot", secret: "" }],
   ["a secret on a sky webhook", { secret: whsec }],
   ["an unknown format", { format: "svix", secret: whsec }],
   ["an unknown environment", { environmentIds: ["env_missing"] }],

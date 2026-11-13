@@ -28,6 +28,7 @@ async function readSecret(
   source: string,
   url: string,
   io: Io,
+  format: "standard" | "openbot",
 ): Promise<string> {
   let raw: string;
   let from: string;
@@ -56,7 +57,11 @@ async function readSecret(
   }
   const secret = raw.trim();
   if (secret === "") throw new UsageError(`the secret ${from} is empty`);
-  if (!StandardWebhookSecret.safeParse(secret).success) {
+  // an OpenBot secret is any non-empty string, used as raw bytes
+  if (
+    format === "standard" &&
+    !StandardWebhookSecret.safeParse(secret).success
+  ) {
     throw new UsageError(
       "the secret must be whsec_ followed by the base64 of a 24-64 byte key",
     );
@@ -113,7 +118,7 @@ export const webhook: AgentCommand = {
       const [url, ...extra] = rest;
       if (url === undefined || extra.length > 0) {
         throw new UsageError(
-          "webhook add takes <url> --events=<types,...> [--format=standard --secret=@file|-] [--env=<id|name>,...]",
+          "webhook add takes <url> --events=<types,...> [--format=standard|openbot --secret=@file|-] [--env=<id|name>,...]",
           true,
         );
       }
@@ -130,14 +135,17 @@ export const webhook: AgentCommand = {
         throw new UsageError("--events names no event type", true);
       }
       const format = values.format ?? "sky";
-      if (format !== "sky" && format !== "standard") {
-        throw new UsageError("--format is sky or standard", true);
+      if (format !== "sky" && format !== "standard" && format !== "openbot") {
+        throw new UsageError("--format is sky, standard or openbot", true);
       }
-      if (format === "standard" && values.secret === undefined) {
-        throw new UsageError("--format=standard needs --secret=@file|-", true);
+      if (format !== "sky" && values.secret === undefined) {
+        throw new UsageError(`--format=${format} needs --secret=@file|-`, true);
       }
       if (format === "sky" && values.secret !== undefined) {
-        throw new UsageError("--secret only goes with --format=standard", true);
+        throw new UsageError(
+          "--secret only goes with --format=standard or openbot",
+          true,
+        );
       }
       const envRefs = values.env === undefined ? undefined : split(values.env);
       if (envRefs?.length === 0) {
@@ -147,7 +155,12 @@ export const webhook: AgentCommand = {
         const secret =
           values.secret === undefined
             ? undefined
-            : await readSecret(values.secret, url, io);
+            : await readSecret(
+                values.secret,
+                url,
+                io,
+                format === "openbot" ? "openbot" : "standard",
+              );
         let environmentIds: string[] | undefined;
         if (envRefs) {
           environmentIds = [];
