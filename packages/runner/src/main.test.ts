@@ -588,9 +588,13 @@ async function leftover(runId: string, dir: string, stubborn = false) {
   const script = `const fs = require("node:fs"); process.on("SIGTERM", () => ${onTerm}); fs.writeFileSync("${join(dir, "ready")}", ""); setInterval(() => {}, 1000)`;
   const shell = spawn(
     "sh",
-    ["-c", `node -e '${script}' >/dev/null 2>&1 </dev/null & echo $!`],
+    ["-c", `"$NODE" -e '${script}' >/dev/null 2>&1 </dev/null & echo $!`],
     {
-      env: { PATH: process.env.PATH ?? "", RUN_ID: runId },
+      env: {
+        PATH: process.env.PATH ?? "",
+        NODE: process.execPath,
+        RUN_ID: runId,
+      },
       stdio: ["ignore", "pipe", "ignore"],
     },
   );

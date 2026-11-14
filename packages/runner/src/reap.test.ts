@@ -43,9 +43,9 @@ async function orphan(
 ): Promise<number> {
   const shell = spawn(
     "sh",
-    ["-c", `node -e '${script}' >/dev/null 2>&1 </dev/null & echo $!`],
+    ["-c", `"$NODE" -e '${script}' >/dev/null 2>&1 </dev/null & echo $!`],
     {
-      env: { PATH: process.env.PATH ?? "", ...env },
+      env: { PATH: process.env.PATH ?? "", NODE: process.execPath, ...env },
       stdio: ["ignore", "pipe", "ignore"],
     },
   );
@@ -71,9 +71,9 @@ async function runnerWithChild(
 ): Promise<{ runner: number; worker: number }> {
   const runner = spawn(
     "sh",
-    ["-c", `node -e '${SLEEP}' >/dev/null 2>&1 </dev/null & echo $!; wait`],
+    ["-c", `"$NODE" -e '${SLEEP}' >/dev/null 2>&1 </dev/null & echo $!; wait`],
     {
-      env: { PATH: process.env.PATH ?? "", ...env },
+      env: { PATH: process.env.PATH ?? "", NODE: process.execPath, ...env },
       stdio: ["ignore", "pipe", "ignore"],
     },
   );
