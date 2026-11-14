@@ -15,6 +15,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spriteTaskNameFor } from "@sky/shared";
 import {
   afterAll,
   afterEach,
@@ -205,9 +206,15 @@ test("missing env is a usage error: exit 2, one line on stderr, nothing on stdou
   expect(stderr).not.toMatch(/secret/);
 });
 
+/**
+ * A run id no other process on the machine carries: every runner that gets past its checks ends by
+ * reaping each process carrying its `RUN_ID`, so a fixed id would kill the same test's runner in another checkout.
+ */
+const newRunId = () => `run_${randomUUID().replaceAll("-", "")}`;
+
 const runEnv = (api: string, promptFile: string) => ({
   AGENT_ID: "agt_1",
-  RUN_ID: "run_1",
+  RUN_ID: newRunId(),
   PROMPT: "do it",
   PROMPT_FILE: promptFile,
   API_BASE_URL: api,
@@ -320,10 +327,11 @@ test("a failed run posts run.failed to the API with the agent token, exits 1, an
   api.listen(0, "127.0.0.1");
   await once(api, "listening");
   const { port } = api.address() as AddressInfo;
+  const runId = newRunId();
   try {
     const { code, stdout } = await runBundle({
       AGENT_ID: "agt_1",
-      RUN_ID: "run_1",
+      RUN_ID: runId,
       PROMPT: "do it",
       API_BASE_URL: `http://127.0.0.1:${port}`,
       AGENT_TOKEN: "agent-secret",
@@ -337,7 +345,7 @@ test("a failed run posts run.failed to the API with the agent token, exits 1, an
       {
         auth: "Bearer agent-secret",
         body: {
-          runId: "run_1",
+          runId,
           type: "run.failed",
           payload: { error: expect.stringMatching(/worktree setup failed/) },
         },
@@ -364,11 +372,12 @@ test("a host whose runner can't change its effective user fails the run as crede
   api.listen(0, "127.0.0.1");
   await once(api, "listening");
   const { port } = api.address() as AddressInfo;
+  const runId = newRunId();
   try {
     const { code } = await runBundle(
       {
         AGENT_ID: "agt_1",
-        RUN_ID: "run_1",
+        RUN_ID: runId,
         PROMPT: "do it",
         API_BASE_URL: `http://127.0.0.1:${port}`,
         AGENT_TOKEN: "agent-secret",
@@ -383,7 +392,7 @@ test("a host whose runner can't change its effective user fails the run as crede
     expect(received).toEqual([
       {
         body: {
-          runId: "run_1",
+          runId,
           type: "run.failed",
           payload: {
             error: expect.stringMatching(
@@ -422,16 +431,20 @@ test("the runner holds the sprite through the Tasks API at SKY_SPRITE_API_SOCKET
   api.listen(0, "127.0.0.1");
   await once(api, "listening");
   const { port } = api.address() as AddressInfo;
+  const env = runEnv(
+    `http://127.0.0.1:${port}`,
+    join(sockets, "run_1.prompt"),
+  );
   try {
     const { code } = await runBundle({
-      ...runEnv(`http://127.0.0.1:${port}`, join(sockets, "run_1.prompt")),
+      ...env,
       SKY_SPRITE_API_SOCKET: socketPath,
     });
     expect(code).toBe(1);
   } finally {
     rmSync(sockets, { recursive: true, force: true });
   }
-  const task = "/v1/tasks/sky-run-37ddff8ee13f1e57937fd048";
+  const task = `/v1/tasks/${spriteTaskNameFor(env.RUN_ID)}`;
   expect(tasks).toEqual([`PUT sprite ${task}`, `DELETE sprite ${task}`]);
 }, 20_000);
 
@@ -454,16 +467,17 @@ test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies
   if (!api) throw new Error("no server");
   await once(api, "listening");
   const { port } = api.address() as AddressInfo;
+  const runId = newRunId();
   const child = spawn(
     process.execPath,
-    ["--import", preload("capable"), bundle, "run_1"],
+    ["--import", preload("capable"), bundle, runId],
     {
       env: {
         PATH: process.env.PATH ?? "",
         CLAUDE_CONFIG_DIR,
         SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
         AGENT_ID: "agt_1",
-        RUN_ID: "run_1",
+        RUN_ID: runId,
         PROMPT: "do it",
         API_BASE_URL: `http://127.0.0.1:${port}`,
         AGENT_TOKEN: "agent-secret",
@@ -514,7 +528,7 @@ async function apiAndGateway() {
 
 const storeRunEnv = (base: string, storeHome: string) => ({
   AGENT_ID: "agt_1",
-  RUN_ID: "run_1",
+  RUN_ID: newRunId(),
   PROMPT: "do it",
   API_BASE_URL: base,
   AGENT_TOKEN: "agent-secret",
@@ -620,8 +634,7 @@ test.skipIf(!linux)(
     const dir = mkdtempSync(join(tmpdir(), "runner-main-reap-"));
     const { seen, base } = await apiAndGateway();
     try {
-      // an id of its own: the reap matches every process on the machine carrying it
-      const runId = `run_reap1${randomUUID().replaceAll("-", "")}`;
+      const runId = newRunId();
       const server = await leftover(runId, dir);
       const { code, stderr } = await runBundle({
         ...runEnv(base, join(dir, "run_reap1.prompt")),
@@ -656,7 +669,7 @@ test.skipIf(!linux)(
     await once(api, "listening");
     const { port } = api.address() as AddressInfo;
     try {
-      const runId = `run_reap2${randomUUID().replaceAll("-", "")}`;
+      const runId = newRunId();
       const server = await leftover(runId, dir, true);
       const child = spawn(
         process.execPath,
@@ -705,7 +718,7 @@ describe("the Claude login stored in Claude Code's credential file", () => {
     recorder(dir, "claude", "[]", 0);
     return runBundle({
       AGENT_ID: "agt_1",
-      RUN_ID: "run_1",
+      RUN_ID: newRunId(),
       PROMPT: "do it",
       API_BASE_URL: base,
       AGENT_TOKEN: "agent-secret",
@@ -778,9 +791,10 @@ describe("the runner's own commands", () => {
       // failing, so worktree setup ends the run at its first git command
       const git = recorder(bin, "git", "", 1);
       const claude = recorder(bin, "claude", "[]", 0);
+      const runId = newRunId();
       const { code, stderr } = await runBundle({
         AGENT_ID: "agt_1",
-        RUN_ID: "run_1",
+        RUN_ID: runId,
         PROMPT: "do it",
         API_BASE_URL: base,
         AGENT_TOKEN: "agent-secret",
@@ -802,7 +816,7 @@ describe("the runner's own commands", () => {
       expect(seen.claude).toMatch(/^argv: plugin list --json$/m);
       for (const env of Object.values(seen)) {
         // the run's own env reached the command, so what's missing was taken out
-        expect(env).toMatch(/^RUN_ID=run_1$/m);
+        expect(env).toMatch(new RegExp(`^RUN_ID=${runId}$`, "m"));
         expect(env).not.toMatch(
           /^(CLAUDE_CODE_OAUTH_TOKEN|SKY_CLAUDE_API_KEY)=/m,
         );
