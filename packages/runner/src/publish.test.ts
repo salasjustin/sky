@@ -1,7 +1,6 @@
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
-  existsSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -12,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { HttpResponse, http } from "msw";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import {
   GatewayError,
@@ -93,6 +92,12 @@ const amend = (message: string) =>
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "runner-publish-"));
+  // every git here, the runner's included, inherits process.env: the host's global and system
+  // config (signing, hooks, templates, merge.ff) and its attributes file must not reach it
+  vi.stubEnv("GIT_CONFIG_GLOBAL", "/dev/null");
+  vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+  vi.stubEnv("HOME", root);
+  vi.stubEnv("XDG_CONFIG_HOME", join(root, ".config"));
   const origin = join(root, "origin");
   work = join(root, "repo");
   execFileSync("git", ["init", "-q", "-b", "main", origin]);
@@ -120,7 +125,10 @@ beforeEach(() => {
   git(work, "checkout", "-qb", "claude/agt_1");
   baseSha = git(work, "rev-parse", "HEAD");
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(root, { recursive: true, force: true });
+});
 
 type Pull = { number: number; html_url: string; head: string; base: string };
 
@@ -1563,7 +1571,7 @@ const WORKFLOW_CHANGES = [
 ];
 
 test.each(WORKFLOW_CHANGES)(
-  "$name is published with the branch's other files, and nothing is held back",
+  "$name is published with the branch's other files",
   async ({ change, sent, deleted }) => {
     baseWithWorkflows();
     const gh = fakeGitHub();
@@ -1571,20 +1579,10 @@ test.each(WORKFLOW_CHANGES)(
     change();
     const tip = commit("Add a and change workflows");
 
-    const result = await run();
+    await run();
 
     expect(sentPaths(gh)).toEqual(["a.txt", ...sent].sort());
     expect(deletedPaths(gh)).toEqual(deleted);
-    expect(result).not.toHaveProperty("held");
-    expect(
-      existsSync(
-        join(
-          git(work, "rev-parse", "--absolute-git-dir"),
-          "sky",
-          "held-workflows.patch",
-        ),
-      ),
-    ).toBe(false);
     // the local branch is as it was
     expect(git(work, "rev-parse", "HEAD")).toBe(tip);
     expect(git(work, "status", "--porcelain")).toBe("");
@@ -1974,6 +1972,27 @@ test("a branch with a workflow change, re-published after the base moves, force-
   });
   expect(sentPaths(gh)).toEqual([`${WORKFLOWS}/ci.yml`, "a.txt"]);
   expect(gh.commits.map((c) => c.parents)).toEqual([[newBase]]);
+});
+
+test("a GitHub head on the base with this branch's tree plus a workflow file it lacks is someone else's, not resumed from", async () => {
+  baseWithWorkflows();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  // base + a.txt + new.yml: it equals the branch's tree only once workflow files are left out of
+  // both, and it is in no reflog here
+  const theirs = pmPush({
+    "a.txt": "first\n",
+    [`${WORKFLOWS}/new.yml`]: "name: new\n",
+  });
+  const gh = fakeGitHub({
+    ref: "their_head",
+    commitTrees: { their_head: theirs.tree },
+  });
+
+  await expect(run()).rejects.toThrow(
+    "claude/agt_1 on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten, so nothing was sent",
+  );
+  expectNothingSent(gh);
 });
 
 test("a GitHub head that is someone else's, neither this branch's history nor the base's, is refused before anything is sent", async () => {
@@ -2430,20 +2449,81 @@ test("the files named are every workflow path the sent commits change: an edit, 
   );
 });
 
-test("a refused ref update on a branch that changes no workflow stays GitHub's own error", async () => {
-  baseWithWorkflows();
-  fakeGitHub();
-  answer("post", `${REPO}/git/refs`, 404, "Not Found");
-  writeFileSync(join(work, "a.txt"), "first\n");
-  commit("Add a");
+test.each(REFUSALS)(
+  "a $status on creating a ref for a branch that adds the first workflow file to a base with none names it",
+  async ({ status, message }) => {
+    const gh = fakeGitHub();
+    mkdirSync(join(work, WORKFLOWS), { recursive: true });
+    writeFileSync(join(work, WORKFLOWS, "ci.yml"), "name: ci\n");
+    commit("Add CI");
+    answer("post", `${REPO}/git/refs`, status, message);
 
-  const error = await run().catch((e: unknown) => e);
+    const error = await run().catch((e: unknown) => e);
 
-  expect(error).toBeInstanceOf(GatewayError);
-  expect((error as Error).message).toBe(
-    "GitHub gateway: POST /repos/acme/widgets/git/refs returned 404: Not Found",
-  );
-});
+    expect(error).toBeInstanceOf(PublishError);
+    expect((error as Error).message).toBe(
+      blocked(
+        `GitHub gateway: POST /repos/acme/widgets/git/refs returned ${status}: ${message}`,
+      ),
+    );
+    expect(gh.commits).toHaveLength(1);
+  },
+);
+
+const EDIT_B = () => writeFileSync(join(work, "b.txt"), "second\n");
+
+// the same three ref writes as above, for branches whose commits change no workflow
+const REF_WRITES = [
+  {
+    site: "ref create",
+    setup: async () => {
+      baseWithWorkflows();
+      fakeGitHub();
+      writeFileSync(join(work, "a.txt"), "first\n");
+      commit("Add a");
+    },
+    method: "post" as const,
+    url: `${REPO}/git/refs`,
+    where: "POST /repos/acme/widgets/git/refs",
+  },
+  {
+    site: "fast-forward",
+    setup: async () => {
+      await fastForwardWithWorkflows(EDIT_B);
+    },
+    method: "patch" as const,
+    url: REF_PATCH,
+    where: "PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1",
+  },
+  {
+    site: "forced update",
+    setup: async () => {
+      await rewriteWithWorkflows(EDIT_B);
+    },
+    method: "patch" as const,
+    url: REF_PATCH,
+    where: "PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1",
+  },
+];
+
+test.each(
+  REF_WRITES.flatMap((write) =>
+    REFUSALS.map((refusal) => ({ ...write, ...refusal })),
+  ),
+)(
+  "a $status on a $site for a branch that changes no workflow stays GitHub's own error",
+  async ({ setup, method, url, where, status, message }) => {
+    await setup();
+    answer(method, url, status, message);
+
+    const error = await run().catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(GatewayError);
+    expect((error as Error).message).toBe(
+      `GitHub gateway: ${where} returned ${status}: ${message}`,
+    );
+  },
+);
 
 const objectWriteSetups = [
   {
@@ -2469,7 +2549,6 @@ test.each(objectWriteSetups)(
     const error = await run().catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(GatewayError);
-    expect((error as Error).message).not.toMatch(/workflow_files_blocked/);
     expect((error as Error).message).toBe(
       "GitHub gateway: POST /repos/acme/widgets/git/blobs returned 404: Not Found",
     );
@@ -2490,7 +2569,6 @@ test.each(objectWriteSetups)(
     const error = await run().catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(GatewayError);
-    expect((error as Error).message).not.toMatch(/workflow_files_blocked/);
     expect((error as Error).message).toBe(
       "GitHub gateway: POST /repos/acme/widgets/git/commits returned 403: Resource not accessible by integration",
     );
@@ -2512,30 +2590,44 @@ test("the primary rate limit on a ref update that changes workflows is reported 
   expect((error as Error).message).toMatch(/hit GitHub's rate limit/);
 });
 
-test.each<{ how: string; message: string; headers: Record<string, string> }>([
+test.each<{
+  how: string;
+  status: number;
+  message: string;
+  headers: Record<string, string>;
+}>([
   {
     how: "a retry-after past what is waited out",
+    status: 403,
     message: "Forbidden",
     headers: { "retry-after": "120" },
   },
   {
     how: "its message alone",
+    status: 403,
     message:
       "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
     headers: {},
   },
+  {
+    // a 429 is a rate limit whatever its headers; the retry-after is past the wait, so none is waited
+    how: "a 429 with a retry-after past what is waited out",
+    status: 429,
+    message: "Too Many Requests",
+    headers: { "retry-after": "120" },
+  },
 ])(
   "the secondary rate limit, known by $how, on a ref update that changes workflows stays GitHub's own error",
-  async ({ message, headers }) => {
+  async ({ status, message, headers }) => {
     await rewriteWithWorkflows();
-    answer("patch", REF_PATCH, 403, message, headers);
+    answer("patch", REF_PATCH, status, message, headers);
 
     const error = await run().catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(GatewayError);
     expect((error as GatewayError).rateLimited).toBe(true);
     expect((error as Error).message).toBe(
-      `GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 403: ${message}`,
+      `GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned ${status}: ${message}`,
     );
   },
 );
