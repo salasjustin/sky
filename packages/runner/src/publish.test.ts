@@ -2371,7 +2371,7 @@ const rewriteWithWorkflows = async (change = EDIT_CI) => {
 };
 
 const blocked = (gatewayError: string, files = `${WORKFLOWS}/ci.yml`) =>
-  `workflow_files_blocked: GitHub refused to update claude/agt_1 to commits that change ${files}, and that update needs the \`workflow\` scope, which Sky's GitHub connection may lack; give the connection the \`workflow\` scope, then publish again (${gatewayError})`;
+  `workflow_files_blocked: GitHub refused to update claude/agt_1 to commits that change ${files}, and that update needs the \`workflow\` scope, which Sky's GitHub connector may lack; give the connector the \`workflow\` scope, then publish again (${gatewayError})`;
 
 const REFUSALS = [
   { status: 404, message: "Not Found" },

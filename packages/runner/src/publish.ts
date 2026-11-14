@@ -861,7 +861,7 @@ export async function publish(options: {
       ).catch((): string[] => []);
       if (files.length === 0) throw error;
       throw new PublishError(
-        `workflow_files_blocked: GitHub refused to update ${remoteBranch} to commits that change ${files.join(", ")}, and that update needs the \`workflow\` scope, which Sky's GitHub connection may lack; give the connection the \`workflow\` scope, then publish again (${error.message})`,
+        `workflow_files_blocked: GitHub refused to update ${remoteBranch} to commits that change ${files.join(", ")}, and that update needs the \`workflow\` scope, which Sky's GitHub connector may lack; give the connector the \`workflow\` scope, then publish again (${error.message})`,
       );
     });
 
