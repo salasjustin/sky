@@ -20,6 +20,7 @@ import {
   HELD_PATCH_BEGIN,
   HELD_PATCH_END,
   PUBLISH_USAGE,
+  PublishError,
   publish,
   publishMain,
   stripAttribution,
@@ -2664,4 +2665,132 @@ test("a continued branch with its own workflow changes merges an unchanged base 
   expect(gh.refWrites).toEqual([
     { method: "PATCH", body: { sha: "commit1", force: false } },
   ]);
+});
+
+const refuseTrees = (status: number) =>
+  server.use(
+    http.post(`${REPO}/git/trees`, () =>
+      HttpResponse.json({ message: "Not Found" }, { status }),
+    ),
+  );
+
+test("a trees 404 on commits that change workflow files names the files instead of the bare 404", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  refuseTrees(404);
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(
+    join(work, ".github/workflows/ci.yml"),
+    "name: ci\non: [push, pull_request]\n",
+  );
+  commit("Add a and touch CI");
+  const noticed: string[][] = [];
+
+  const error = await run({
+    onWorkflowChanges: (files) => noticed.push(files),
+  }).catch((e: unknown) => e as Error);
+
+  expect(error).toBeInstanceOf(PublishError);
+  expect((error as Error).message).toContain(
+    "workflow_files_blocked: these commits change .github/workflows/ (.github/workflows/ci.yml)",
+  );
+  expect((error as Error).message).toContain("can't write workflow files");
+  expect(noticed).toEqual([[".github/workflows/ci.yml"]]);
+});
+
+test("a 403 on a git data write is named the same way, but a rate limit is not", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  refuseTrees(403);
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+  commit("Add a and new workflow");
+
+  await expect(run()).rejects.toThrow(/^workflow_files_blocked: /);
+
+  server.use(
+    http.post(`${REPO}/git/trees`, () =>
+      HttpResponse.json(
+        { message: "rate limited" },
+        {
+          status: 403,
+          headers: {
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+          },
+        },
+      ),
+    ),
+  );
+  await expect(run()).rejects.toThrow(/rate limit/);
+});
+
+test("a trees 404 on commits without workflow changes reports as before", async () => {
+  fakeGitHub();
+  refuseTrees(404);
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const noticed: string[][] = [];
+
+  const error = await run({
+    onWorkflowChanges: (files) => noticed.push(files),
+  }).catch((e: unknown) => e as Error);
+
+  expect(error).toBeInstanceOf(GatewayError);
+  expect((error as Error).message).toBe(
+    "GitHub gateway: POST /repos/acme/widgets/git/trees returned 404: Not Found",
+  );
+  expect(noticed).toEqual([]);
+});
+
+test("workflow changes are detected across several commits: add, modify, delete and rename", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  refuseTrees(404);
+  writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+  commit("Add new.yml");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: ci2\n");
+  commit("Edit ci.yml");
+  rmSync(join(work, ".github/workflows/new.yml"));
+  commit("Drop new.yml");
+  git(work, "mv", ".github/workflows/old.yml", ".github/workflows/renamed.yml");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Rename old.yml");
+  const noticed: string[][] = [];
+
+  const error = await run({
+    onWorkflowChanges: (files) => noticed.push(files),
+  }).catch((e: unknown) => e as Error);
+
+  expect(noticed).toEqual([
+    [
+      ".github/workflows/ci.yml",
+      ".github/workflows/new.yml",
+      ".github/workflows/old.yml",
+      ".github/workflows/renamed.yml",
+    ],
+  ]);
+  expect((error as Error).message).toContain(
+    "(.github/workflows/ci.yml, .github/workflows/new.yml, .github/workflows/old.yml, .github/workflows/renamed.yml)",
+  );
+});
+
+test("the command says up front that the commits change workflow files, and never prints a token", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  refuseTrees(404);
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: ci2\n");
+  commit("Touch CI");
+
+  const { status, stderr } = await publishMainWith(["--title", "T"], {
+    GITHUB_TOKEN: "ghp_secret_token_value",
+  });
+
+  expect(status).toBe(1);
+  expect(stderr).toContain(
+    "sky publish: these commits change .github/workflows/ (.github/workflows/ci.yml); Sky's GitHub connection can't write workflow files.",
+  );
+  expect(stderr).toContain("sky publish: workflow_files_blocked: ");
+  expect(stderr).not.toContain("ghp_secret_token_value");
 });

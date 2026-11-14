@@ -21,6 +21,8 @@ export class GatewayError extends Error {
   constructor(
     message: string,
     readonly status?: number,
+    /** True for GitHub's rate limit, which also answers 403. */
+    readonly rateLimited = false,
   ) {
     super(message);
   }
@@ -54,6 +56,39 @@ export const WORKFLOWS_DIR = ".github/workflows";
 export const HELD_PATCH_BEGIN =
   "----- held-back workflow changes (git apply) -----";
 export const HELD_PATCH_END = "----- end of held-back workflow changes -----";
+
+/** Each path under `.github/workflows/` that any of `commits` adds, changes, deletes or renames (both ends of a rename), against its first parent. */
+async function workflowFilesChanged(
+  cwd: string,
+  commits: string[],
+): Promise<string[]> {
+  const found = new Set<string>();
+  for (const sha of commits) {
+    const out = await git(
+      cwd,
+      "diff-tree",
+      "-r",
+      "-z",
+      "--name-status",
+      "-M",
+      "--no-commit-id",
+      "--root",
+      sha,
+    );
+    const fields = out.split("\0").filter(Boolean);
+    for (let i = 0; i < fields.length; ) {
+      const count = /^[RC]/.test(fields[i] ?? "") ? 2 : 1;
+      for (const path of fields.slice(i + 1, i + 1 + count)) {
+        if (path.startsWith(`${WORKFLOWS_DIR}/`)) found.add(path);
+      }
+      i += 1 + count;
+    }
+  }
+  return [...found].sort();
+}
+
+const BLOCKED_ADVICE =
+  "Sky's GitHub connection can't write workflow files. Publish the rest without them (move the workflow change to its own commit and drop it from this branch), and have the PM commit the workflow change.";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await run("git", args, {
@@ -385,6 +420,7 @@ export function gateway(options: {
           throw new GatewayError(
             `GitHub gateway: ${where} hit GitHub's rate limit, which resets at ${new Date(resetAt * 1000).toISOString()} (in ${Math.ceil(waitS / 60)} min); try again then`,
             response.status,
+            true,
           );
         }
         await response.body?.cancel();
@@ -634,6 +670,8 @@ export async function publish(options: {
   defaultBranch?: string;
   /** Replaces the author and committer of each commit sent; their dates stay. */
   identity?: { author: PersonName; committer: PersonName };
+  /** Called before anything is sent when the commits change `.github/workflows/`, with those paths. */
+  onWorkflowChanges?: (files: string[]) => void;
 }): Promise<PublishResult> {
   // git takes a pathspec (`-- .github/workflows`, `ls-files`'s implicit one) relative to the
   // directory it runs in, while `<rev>:<path>` is from the top, so every call runs from the top
@@ -786,6 +824,24 @@ export async function publish(options: {
       `the changes on ${localBranch} are already on ${base} on GitHub, so there is nothing left to publish`,
     );
   }
+  const workflowFiles = await workflowFilesChanged(cwd, commits);
+  if (workflowFiles.length > 0) options.onWorkflowChanges?.(workflowFiles);
+  // a write GitHub refuses with 404 or 403 while the commits change workflow files reads, bare, as lost
+  // repo access: the missing `workflow` scope is the likely cause, so it is named
+  const send = <T>(method: string, path: string, body?: unknown) =>
+    call<T>(method, path, body).catch((error: unknown) => {
+      if (
+        workflowFiles.length > 0 &&
+        error instanceof GatewayError &&
+        !error.rateLimited &&
+        (error.status === 404 || error.status === 403)
+      ) {
+        throw new PublishError(
+          `workflow_files_blocked: these commits change ${WORKFLOWS_DIR}/ (${workflowFiles.join(", ")}), and ${BLOCKED_ADVICE} (${error.message})`,
+        );
+      }
+      throw error;
+    });
   const refPath = `heads/${remoteBranch.split("/").map(encodeURIComponent).join("/")}`;
   const notFastForward = `${remoteBranch} on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten`;
   const treeOf = async (sha: string) =>
@@ -1096,7 +1152,7 @@ export async function publish(options: {
     if (found) return found;
     const content = await gitBytes(cwd, "cat-file", "blob", sha);
     return (
-      await call<{ sha: string }>("POST", "/git/blobs", {
+      await send<{ sha: string }>("POST", "/git/blobs", {
         content: content.toString("base64"),
         encoding: "base64",
       })
@@ -1139,7 +1195,7 @@ export async function publish(options: {
     // an empty commit keeps its parent's tree; GitHub refuses a tree request with no entries
     if (entries.length > 0) {
       tree = (
-        await call<{ sha: string }>("POST", "/git/trees", {
+        await send<{ sha: string }>("POST", "/git/trees", {
           base_tree: tree,
           tree: entries,
         })
@@ -1147,7 +1203,7 @@ export async function publish(options: {
     }
     const local = await readCommit(cwd, sha, options.identity);
     parent = (
-      await call<{ sha: string }>("POST", "/git/commits", {
+      await send<{ sha: string }>("POST", "/git/commits", {
         message: local.message,
         tree,
         parents: [parent, ...merged],
@@ -1163,7 +1219,7 @@ export async function publish(options: {
   }
 
   if (remote === null) {
-    await call("POST", "/git/refs", {
+    await send("POST", "/git/refs", {
       ref: `refs/heads/${remoteBranch}`,
       sha: parent,
     });
@@ -1179,9 +1235,9 @@ export async function publish(options: {
         `${remoteBranch} moved on GitHub to ${now.object.sha} while this publish ran; nothing was overwritten, publish again`,
       );
     }
-    await call("PATCH", `/git/refs/${refPath}`, { sha: parent, force: true });
+    await send("PATCH", `/git/refs/${refPath}`, { sha: parent, force: true });
   } else if (remote !== parent) {
-    await call("PATCH", `/git/refs/${refPath}`, {
+    await send("PATCH", `/git/refs/${refPath}`, {
       sha: parent,
       force: false,
     }).catch((error: unknown) => {
@@ -1330,6 +1386,10 @@ export async function publishMain(
       ...(values.branch !== undefined && { branch: values.branch }),
       defaultBranch: env[BRANCH_ENV] || undefined,
       identity: configuredIdentity(env),
+      onWorkflowChanges: (files) =>
+        io.stderr(
+          `sky publish: these commits change ${WORKFLOWS_DIR}/ (${files.join(", ")}); ${BLOCKED_ADVICE}\n`,
+        ),
     });
     io.stderr(
       result.created
