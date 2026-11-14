@@ -5,18 +5,22 @@ import {
   spawnSync,
 } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import type {
   HookEvent,
@@ -36,13 +40,16 @@ import {
 } from "./claude-auth.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
+import { STAGE_MAX_BYTES } from "./outside-reads.js";
 import { repoLockPath } from "./repo-lock.js";
 import { createDecisionWaiter } from "./requests.js";
 import type { Seal } from "./seal.js";
 import {
   nestedClaude,
   type QueryFn,
+  removeScratchNow,
   repoLockWaitS,
+  scratchDirOf,
   sessionGitIdentity,
 } from "./session.js";
 import {
@@ -4339,5 +4346,1098 @@ describe("keeping the run's Claude credential from the repo's processes", () => 
     expect(events).toContain("credential_exposed");
     expect(events).not.toContain(TOKEN);
     expect(events).not.toContain(SKY_KEY);
+  });
+});
+
+describe("the run's scratch directory and reads outside the worktree", () => {
+  const TOKEN = "subscription-token-scratch";
+  /** An env that gates the read tools: its approval policy has a person decide an outside read. */
+  const gated = (extra: Partial<Config> = {}): Config => ({
+    ...config,
+    approvalPolicy: ["Read", "Grep", "Glob"],
+    ...extra,
+  });
+  const readOf = (file_path: string, extra: object = {}) => ({
+    tool_name: "Read",
+    tool_input: { file_path },
+    tool_use_id: "t1",
+    ...extra,
+  });
+  /** The path the one `Read` approval in `sent` asked about. */
+  const waitingSummary = (sent: RunnerEventPost[]) =>
+    sent.find((e) => e.type === "run.waiting")?.payload;
+
+  test("the session may read the scratch directory, and a check's nested log written there is read with no approval", async () => {
+    const { sent, deps } = api();
+    let scratch = "";
+    let realScratch = "";
+    let answers: unknown[] = [];
+    let seen: Options | undefined;
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        seen = options;
+        scratch = options.additionalDirectories?.[0] ?? "";
+        realScratch = realpathSync(scratch);
+        const log = join(scratch, "reflect.log");
+        writeFileSync(log, "nested result\n");
+        answers = await fire(options, "PreToolUse", readOf(log));
+      },
+      success,
+    ]);
+    const code = await runSession(
+      { ...config, checks: ["claude -p /check"] },
+      { ...deps, query, credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN } },
+    );
+    expect(code).toBe(0);
+    expect(answers).toEqual([{ continue: true }]);
+    expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+    // the run's own directory of the runner's temp area, which the run's end removes
+    expect(scratch).toContain(`scratch-${config.runId}`);
+    // real paths on both sides: the temp directory can sit behind a link (macOS /var -> /private/var)
+    expect(realScratch.startsWith(`${realpathSync(tmpdir())}/`)).toBe(true);
+    expect(existsSync(scratch)).toBe(false);
+    const prompt = JSON.stringify(seen?.systemPrompt);
+    expect(prompt).toContain(`> ${scratch}/<name>.log`);
+  });
+
+  test("the nested login file is never in the scratch directory, and reading it is declined at once with a runner.warning, asking no one", async () => {
+    const { sent, polls, deps } = api(decided({ decision: "approve" }));
+    let inside: string[] = [];
+    let loginPath = "";
+    let loginContents = "";
+    let realLogin = "";
+    let answers: unknown[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        const scratch = options.additionalDirectories?.[0] ?? "";
+        inside = readdirSync(scratch, { recursive: true }).map(String);
+        const parent = join(scratch, "..");
+        loginPath = join(
+          parent,
+          readdirSync(parent).find((n) => n.startsWith("sky-nested-claude-")) ??
+            "",
+        );
+        loginContents = readFileSync(loginPath, "utf8");
+        realLogin = realpathSync(loginPath);
+        answers = await fire(options, "PreToolUse", readOf(loginPath));
+      },
+      success,
+    ]);
+    await runSession(
+      { ...config, checks: ["claude -p /check"] },
+      { ...deps, query, credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN } },
+    );
+    expect(loginPath).toMatch(/sky-nested-claude-run_1-/);
+    expect(inside).toEqual([]);
+    expect(loginContents).toBe(TOKEN);
+    expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+    expect(polls).toEqual([]);
+    expect(answers).toEqual([
+      {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "it is in a runner's credential directory.",
+        },
+      },
+    ]);
+    const warning = sent.find((e) => e.type === "runner.warning");
+    expect(warning?.payload).toEqual({
+      message: `Read of ${realLogin} was declined: it is in a runner's credential directory.`,
+    });
+  });
+
+  test("a Read outside the worktree creates an approval request, and approving it reads a copy from the scratch directory", async () => {
+    const outside = join(root, "elsewhere.log");
+    writeFileSync(outside, "outside contents\n");
+    const { sent, deps } = api(decided({ decision: "approve" }));
+    let answers: unknown[] = [];
+    let scratch = "";
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        scratch = options.additionalDirectories?.[0] ?? "";
+        answers = await fire(options, "PreToolUse", readOf(outside));
+      },
+      success,
+    ]);
+    await runSession(gated(), { ...deps, query });
+    expect(waitingSummary(sent)).toMatchObject({
+      request: {
+        kind: "approval",
+        toolName: "Read",
+        toolSummary: realpathSync(outside),
+      },
+    });
+    const [answer] = answers as {
+      hookSpecificOutput: {
+        permissionDecision: string;
+        updatedInput: { file_path: string };
+      };
+    }[];
+    expect(answer?.hookSpecificOutput.permissionDecision).toBe("allow");
+    const copy = answer?.hookSpecificOutput.updatedInput.file_path ?? "";
+    expect(copy.startsWith(`${scratch}/`)).toBe(true);
+    expect(copy.endsWith("/elsewhere.log")).toBe(true);
+    // the run ended, so the copy went with the scratch directory
+    expect(existsSync(copy)).toBe(false);
+    expect(sent.map((e) => e.type)).not.toContain("runner.warning");
+  });
+
+  test("an approved copy holds the file's contents while the run is live", async () => {
+    const outside = join(root, "elsewhere.log");
+    writeFileSync(outside, "outside contents\n");
+    const { deps } = api(decided({ decision: "approve" }));
+    let contents = "";
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        const [answer] = (await fire(
+          options,
+          "PreToolUse",
+          readOf(outside),
+        )) as unknown as {
+          hookSpecificOutput: { updatedInput: { file_path: string } };
+        }[];
+        contents = readFileSync(
+          answer?.hookSpecificOutput.updatedInput.file_path ?? "",
+          "utf8",
+        );
+      },
+      success,
+    ]);
+    await runSession(gated(), { ...deps, query });
+    expect(contents).toBe("outside contents\n");
+  });
+
+  test("a denied Read outside the worktree is declined with the person's reason and a runner.warning naming the path", async () => {
+    const outside = join(root, "elsewhere.log");
+    writeFileSync(outside, "outside contents\n");
+    const { sent, deps } = api(
+      decided({ decision: "deny", reason: "not that file" }),
+    );
+    let answers: unknown[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        answers = await fire(options, "PreToolUse", readOf(outside));
+      },
+      success,
+    ]);
+    await runSession(gated(), { ...deps, query });
+    expect(answers).toEqual([
+      {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "not that file",
+        },
+      },
+    ]);
+    const warning = sent.find((e) => e.type === "runner.warning");
+    expect(warning?.payload).toEqual({
+      message: `Read of ${realpathSync(outside)} was declined: not that file`,
+    });
+  });
+
+  test("a denied Read leaves no approved copy in the scratch directory", async () => {
+    const outside = join(root, "elsewhere.log");
+    writeFileSync(outside, "outside contents\n");
+    const { deps } = api(decided({ decision: "deny" }));
+    let answers: unknown[] = [];
+    let held: string[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        answers = await fire(options, "PreToolUse", readOf(outside));
+        held = readdirSync(options.additionalDirectories?.[0] ?? "");
+      },
+      success,
+    ]);
+    await runSession(gated(), { ...deps, query });
+    expect(answers).toMatchObject([
+      { hookSpecificOutput: { permissionDecision: "deny" } },
+    ]);
+    expect(held).toEqual([]);
+  });
+
+  test("a run aborted while a Read waits for its answer stops the call and leaves no approved copy", async () => {
+    const outside = join(root, "elsewhere.log");
+    writeFileSync(outside, "outside contents\n");
+    const controller = new AbortController();
+    const { sent, deps } = api();
+    let answers: unknown[] = [];
+    let held: string[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        answers = await fire(options, "PreToolUse", readOf(outside));
+        held = readdirSync(options.additionalDirectories?.[0] ?? "");
+      },
+      success,
+    ]);
+    await runSession(gated(), {
+      ...deps,
+      query,
+      signal: controller.signal,
+      // the abort lands while the request is open
+      awaitDecision: async (_requestId, signal) => {
+        controller.abort("SIGTERM");
+        throw signal.reason;
+      },
+    });
+    expect(sent.map((e) => e.type)).toContain("run.waiting");
+    expect(answers).toMatchObject([
+      {
+        continue: false,
+        hookSpecificOutput: { permissionDecision: "deny" },
+      },
+    ]);
+    expect(held).toEqual([]);
+  });
+
+  describe("a run that does not finish removes its scratch directory and the approved copies in it", () => {
+    /** Approves a Read so a copy is live in the scratch directory, then ends the script as `tail` says. */
+    const scratchAround = async (
+      tail: unknown[],
+      controller = new AbortController(),
+    ) => {
+      const outside = join(root, "elsewhere.log");
+      writeFileSync(outside, "outside contents\n");
+      const { deps } = api(decided({ decision: "approve" }));
+      let scratch = "";
+      let copy = "";
+      let liveCopy = false;
+      const query = scripted([
+        init,
+        async (options: Options) => {
+          scratch = options.additionalDirectories?.[0] ?? "";
+          const [answer] = (await fire(
+            options,
+            "PreToolUse",
+            readOf(outside),
+          )) as unknown as {
+            hookSpecificOutput: { updatedInput: { file_path: string } };
+          }[];
+          copy = answer?.hookSpecificOutput.updatedInput.file_path ?? "";
+          liveCopy = existsSync(copy);
+        },
+        ...tail,
+      ]);
+      const code = await runSession(config, {
+        ...deps,
+        query,
+        signal: controller.signal,
+      });
+      return { code, scratch, copy, liveCopy };
+    };
+
+    test("an SDK that throws", async () => {
+      const { code, scratch, copy, liveCopy } = await scratchAround([
+        new Error("Claude Code process exited with code 1"),
+      ]);
+      expect(code).toBe(1);
+      expect(liveCopy).toBe(true);
+      expect(scratch).not.toBe("");
+      expect(existsSync(scratch)).toBe(false);
+      expect(existsSync(copy)).toBe(false);
+    });
+
+    test("a run aborted by its signal", async () => {
+      const controller = new AbortController();
+      const { code, scratch, copy, liveCopy } = await scratchAround(
+        [async () => controller.abort("SIGTERM"), success],
+        controller,
+      );
+      expect(code).toBe(1);
+      expect(liveCopy).toBe(true);
+      expect(scratch).not.toBe("");
+      expect(existsSync(scratch)).toBe(false);
+      expect(existsSync(copy)).toBe(false);
+    });
+  });
+
+  test("a Read of the nested login file, Claude Code's login or account file, or a /proc file is declined with a runner.warning naming it, asking no one", async () => {
+    const configDir = join(root, "claude-config");
+    const home = join(root, "home");
+    mkdirSync(configDir);
+    mkdirSync(home);
+    mkdirSync(join(root, "managed"));
+    writeFileSync(join(configDir, ".credentials.json"), '{"t":"x"}');
+    writeFileSync(join(home, ".claude.json"), "{}");
+    const { sent, deps } = api(decided({ decision: "approve" }));
+    const paths: string[] = [];
+    const answers: unknown[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        const parent = join(options.additionalDirectories?.[0] ?? "", "..");
+        const login = readdirSync(parent).find((n) =>
+          n.startsWith("sky-nested-claude-"),
+        );
+        paths.push(
+          realpathSync(join(parent, login ?? "")),
+          realpathSync(join(configDir, ".credentials.json")),
+          realpathSync(join(home, ".claude.json")),
+        );
+        if (existsSync("/proc/self/status"))
+          paths.push(realpathSync("/proc/self/status"));
+        for (const path of paths)
+          answers.push(...(await fire(options, "PreToolUse", readOf(path))));
+      },
+      success,
+    ]);
+    await runSession(
+      { ...config, checks: ["claude -p /check"] },
+      {
+        ...deps,
+        query,
+        env: { HOME: home },
+        settingsDirs: {
+          userDirs: [configDir],
+          managedDir: join(root, "managed"),
+        },
+        credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      },
+    );
+    expect(answers).toHaveLength(paths.length);
+    for (const answer of answers)
+      expect(answer).toMatchObject({
+        continue: true,
+        hookSpecificOutput: { permissionDecision: "deny" },
+      });
+    const warnings = sent
+      .filter((e) => e.type === "runner.warning")
+      .map((e) => (e.payload as { message: string }).message)
+      .filter((message) => message.startsWith("Read of "));
+    expect(warnings).toHaveLength(paths.length);
+    for (const [i, path] of paths.entries())
+      expect(warnings[i]).toContain(`Read of ${path} was declined:`);
+    expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+  });
+
+  test("a Read of `~/…` is taken from the session env's HOME, and asks", async () => {
+    const home = join(root, "home");
+    mkdirSync(home);
+    writeFileSync(join(home, "notes.txt"), "home notes\n");
+    const { sent, deps } = api(decided({ decision: "deny" }));
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        await fire(options, "PreToolUse", readOf("~/notes.txt"));
+      },
+      success,
+    ]);
+    await runSession(gated({ sessionEnv: { HOME: home } }), { ...deps, query });
+    expect(waitingSummary(sent)).toMatchObject({
+      request: {
+        kind: "approval",
+        toolName: "Read",
+        toolSummary: realpathSync(join(home, "notes.txt")),
+      },
+    });
+  });
+
+  test("an approved Glob whose pattern climbs out is pointed at the copy of its literal prefix, with the rest of its pattern", async () => {
+    const outside = join(root, "elsewhere");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "a.txt"), "a\n");
+    const { sent, deps } = api(decided({ decision: "approve" }));
+    let answers: unknown[] = [];
+    let scratch = "";
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        scratch = options.additionalDirectories?.[0] ?? "";
+        answers = await fire(options, "PreToolUse", {
+          tool_name: "Glob",
+          tool_input: { pattern: `${outside}/**/*.txt` },
+          tool_use_id: "t1",
+        });
+      },
+      success,
+    ]);
+    await runSession(gated(), { ...deps, query });
+    expect(waitingSummary(sent)).toMatchObject({
+      request: { toolName: "Glob", toolSummary: realpathSync(outside) },
+    });
+    const [answer] = answers as {
+      hookSpecificOutput: {
+        permissionDecision: string;
+        updatedInput: { path: string; pattern: string };
+      };
+    }[];
+    expect(answer?.hookSpecificOutput.permissionDecision).toBe("allow");
+    expect(answer?.hookSpecificOutput.updatedInput.pattern).toBe("**/*.txt");
+    const copy = answer?.hookSpecificOutput.updatedInput.path ?? "";
+    expect(copy.startsWith(`${scratch}/`)).toBe(true);
+    expect(copy.endsWith("/elsewhere")).toBe(true);
+  });
+
+  test("the check instructions name the scratch directory, forbid no temp directory, and say reads elsewhere ask", async () => {
+    let prompt = "";
+    let scratch = "";
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        scratch = options.additionalDirectories?.[0] ?? "";
+        prompt = (options.systemPrompt as { append: string }).append;
+      },
+      success,
+    ]);
+    const { deps } = api();
+    await runSession(
+      { ...config, checks: ["claude -p /check"] },
+      { ...deps, query, credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN } },
+    );
+    expect(scratch).not.toBe("");
+    expect(prompt).toContain(`> ${scratch}/<name>.log`);
+    // the scratch directory is itself under the temp directory
+    expect(prompt).not.toMatch(/never to \/tmp/);
+    expect(prompt).not.toContain("nothing outside it and the repo");
+    expect(prompt).toContain(
+      "a read anywhere else may wait for a person's approval, and a read of a credential file or a system directory is declined.",
+    );
+  });
+
+  test("a Grep or Glob of an outside directory, and a link in the worktree that points out, are held too", async () => {
+    const outside = join(root, "elsewhere");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "a.txt"), "a\n");
+    const { sent, deps } = api(
+      decided({ decision: "deny" }),
+      decided({ decision: "deny" }),
+      decided({ decision: "deny" }),
+    );
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        const cwd = options.cwd ?? "";
+        symlinkSync(outside, join(cwd, "link"));
+        await fire(options, "PreToolUse", {
+          tool_name: "Grep",
+          tool_input: { pattern: "a", path: outside },
+          tool_use_id: "t1",
+        });
+        await fire(options, "PreToolUse", {
+          tool_name: "Glob",
+          tool_input: { pattern: "*", path: "../../elsewhere" },
+          tool_use_id: "t2",
+          cwd,
+        });
+        await fire(options, "PreToolUse", readOf(join(cwd, "link", "a.txt")));
+      },
+      success,
+    ]);
+    await runSession(gated(), { ...deps, query });
+    const warnings = sent
+      .filter((e) => e.type === "runner.warning")
+      .map((e) => (e.payload as { message: string }).message);
+    expect(warnings).toHaveLength(3);
+    for (const message of warnings)
+      expect(message).toContain(realpathSync(outside));
+  });
+
+  describe("which outside reads ask a person", () => {
+    const updatedPath = (answers: unknown[]) =>
+      (
+        answers[0] as {
+          hookSpecificOutput?: { updatedInput?: { file_path?: string } };
+        }
+      ).hookSpecificOutput?.updatedInput?.file_path ?? "";
+
+    /** Fires one outside Read of `path` and returns what the hook answered, the events sent and the copy's contents. */
+    const readOutside = async (
+      runConfig: Config,
+      path: string,
+      { replies = [] as DecisionReply[], sessionDirs = {} } = {},
+    ) => {
+      const { sent, polls, deps } = api(...replies);
+      let answers: unknown[] = [];
+      let copied: string | undefined;
+      const query = scripted([
+        init,
+        async (options: Options) => {
+          answers = await fire(options, "PreToolUse", readOf(path));
+          const copy = updatedPath(answers);
+          if (copy) copied = readFileSync(copy, "utf8");
+        },
+        success,
+      ]);
+      await runSession(runConfig, { ...deps, query, ...sessionDirs });
+      return { sent, polls, answers, copied };
+    };
+
+    /** Fires one outside Read of `path`; what the hook answered, the events sent, and what the run's `approved` copies held once it was answered. */
+    const readLeavingNoCopy = async (
+      runConfig: Config,
+      path: string,
+      sessionDirs: object = {},
+    ) => {
+      const { sent, polls, deps } = api();
+      let answers: unknown[] = [];
+      let copies: string[] = [];
+      const query = scripted([
+        init,
+        async (options: Options) => {
+          const approved = join(
+            options.additionalDirectories?.[0] ?? "",
+            "approved",
+          );
+          answers = await fire(options, "PreToolUse", readOf(path));
+          copies = existsSync(approved)
+            ? readdirSync(approved, { recursive: true }).map(String)
+            : [];
+        },
+        success,
+      ]);
+      await runSession(runConfig, { ...deps, query, ...sessionDirs });
+      return { sent, polls, answers, copies };
+    };
+
+    test("where the env's policy does not gate Read, an outside Read is copied into scratch without asking", async () => {
+      const outside = join(root, "elsewhere.log");
+      writeFileSync(outside, "outside contents\n");
+      const { sent, polls, answers, copied } = await readOutside(
+        config,
+        outside,
+      );
+      expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+      expect(polls).toEqual([]);
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "allow" } },
+      ]);
+      expect(copied).toBe("outside contents\n");
+      expect(sent.map((e) => e.type)).not.toContain("runner.warning");
+    });
+
+    test("where the env's policy gates Read, an outside Read asks, and the person's denial declines it with a warning naming the path", async () => {
+      const outside = join(root, "elsewhere.log");
+      writeFileSync(outside, "outside contents\n");
+      const { sent, answers } = await readOutside(gated(), outside, {
+        replies: [decided({ decision: "deny" })],
+      });
+      expect(sent.map((e) => e.type)).toContain("run.waiting");
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+      ]);
+      expect(
+        sent.find((e) => e.type === "runner.warning")?.payload,
+      ).toMatchObject({
+        message: expect.stringContaining(realpathSync(outside)),
+      });
+    });
+
+    test("a refused path stays refused whatever the policy: not asked, declined with a warning, though the policy gates nothing", async () => {
+      const home = join(root, "home");
+      mkdirSync(join(home, ".claude"), { recursive: true });
+      writeFileSync(join(home, ".claude", ".credentials.json"), "secret");
+      const { sent, polls, answers } = await readOutside(
+        config,
+        join(home, ".claude", ".credentials.json"),
+        {
+          sessionDirs: {
+            settingsDirs: {
+              userDirs: [join(home, ".claude")],
+              managedDir: join(root, "managed"),
+            },
+          },
+        },
+      );
+      expect(polls).toEqual([]);
+      expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+      ]);
+      expect(sent.map((e) => e.type)).toContain("runner.warning");
+    });
+
+    describe("Claude Code's config directory", () => {
+      const cfg = () => join(root, "claude-config");
+      const dirs = () => ({
+        settingsDirs: { userDirs: [cfg()], managedDir: join(root, "managed") },
+      });
+      const put = (relative: string) => {
+        const path = join(cfg(), relative);
+        mkdirSync(join(path, ".."), { recursive: true });
+        writeFileSync(path, "saved output\n");
+        return path;
+      };
+
+      test("this session's saved tool output is copied without asking, though the policy gates Read", async () => {
+        const path = put("projects/-work-repo/sess-new/tool-results/a1.txt");
+        const { sent, polls, copied } = await readOutside(gated(), path, {
+          sessionDirs: dirs(),
+        });
+        expect(polls).toEqual([]);
+        expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+        expect(copied).toBe("saved output\n");
+      });
+
+      test.each([
+        "projects/-work-repo/sess-other/tool-results/a1.txt",
+        "projects/-work-repo/sess-new.jsonl",
+        "projects/-work-repo/sess-new/notes.txt",
+        "settings.json",
+      ])(
+        "%s, in the config directory but not this session's saved output, asks even where the policy gates nothing",
+        async (file) => {
+          const path = put(file);
+          const { sent, copied } = await readOutside(config, path, {
+            replies: [decided({ decision: "approve" })],
+            sessionDirs: dirs(),
+          });
+          expect(sent.map((e) => e.type)).toContain("run.waiting");
+          expect(copied).toBe("saved output\n");
+        },
+      );
+
+      /** The decision each Read answer carried: `allow` for a call pointed at a copy, `deny` for one declined. */
+      const decisionsOf = (answers: unknown[]) =>
+        (
+          answers as { hookSpecificOutput?: { permissionDecision?: string } }[]
+        ).map((answer) => answer.hookSpecificOutput?.permissionDecision);
+
+      /** Fires Reads of `before` ahead of the init message and of `after` once it is in; each answer's decision and the asks made. */
+      const readsAroundInit = async (
+        runConfig: Config,
+        initMessage: object,
+        { before, after }: { before: string[]; after: string[] },
+        replies: DecisionReply[],
+        /** Takes the run's events in place of the poster, which refuses an init with no session id. */
+        post?: (event: RunnerEventPost) => Promise<void>,
+      ) => {
+        const { sent, deps } = api(...replies);
+        const answered: Record<"before" | "after", unknown[]> = {
+          before: [],
+          after: [],
+        };
+        const readAll =
+          (paths: string[], into: unknown[]): Step =>
+          async (options) => {
+            for (const path of paths)
+              into.push(...(await fire(options, "PreToolUse", readOf(path))));
+          };
+        const query = scripted([
+          readAll(before, answered.before),
+          initMessage,
+          readAll(after, answered.after),
+          success,
+        ]);
+        await runSession(runConfig, {
+          ...deps,
+          ...(post && { post }),
+          query,
+          ...dirs(),
+        });
+        return {
+          before: decisionsOf(answered.before),
+          after: decisionsOf(answered.after),
+          waits: sent.filter((e) => e.type === "run.waiting").length,
+        };
+      };
+
+      test("a resumed run's own id decides until the init message, which then names the session whose saved output is unasked", async () => {
+        const old = put("projects/-work-repo/sess-old/tool-results/a.txt");
+        const current = put("projects/-work-repo/sess-new/tool-results/a.txt");
+        const { before, after, waits } = await readsAroundInit(
+          gated({ sessionId: "sess-old" }),
+          init,
+          { before: [old], after: [old, current] },
+          [decided({ decision: "deny" })],
+        );
+        expect(before).toEqual(["allow"]);
+        expect(after).toEqual(["deny", "allow"]);
+        expect(waits).toBe(1);
+      });
+
+      test("with no id to resume, nothing is session output before the init message, and its id is after it", async () => {
+        const current = put("projects/-work-repo/sess-new/tool-results/a.txt");
+        const { before, after, waits } = await readsAroundInit(
+          gated(),
+          init,
+          { before: [current], after: [current] },
+          [decided({ decision: "deny" })],
+        );
+        expect(before).toEqual(["deny"]);
+        expect(after).toEqual(["allow"]);
+        expect(waits).toBe(1);
+      });
+
+      test("an init message with an empty session id makes no saved output this session's, the resumed run's own included", async () => {
+        const old = put("projects/-work-repo/sess-old/tool-results/a.txt");
+        const unnamed = put("projects/-work-repo/tool-results/a.txt");
+        const { before, after } = await readsAroundInit(
+          gated({ sessionId: "sess-old" }),
+          { ...init, session_id: "" },
+          { before: [old], after: [old, unnamed] },
+          [decided({ decision: "deny" })],
+          recorder().post,
+        );
+        expect(before).toEqual(["allow"]);
+        // both asked, and the person's denial answered both
+        expect(after).toEqual(["deny", "deny"]);
+      });
+
+      test("a Grep or Glob of this session's saved output runs unasked on a copy of it, and the Glob keeps its pattern", async () => {
+        const file = put("projects/-work-repo/sess-new/tool-results/a1.txt");
+        const dir = dirname(file);
+        const { sent, polls, deps } = api();
+        type Answer = {
+          hookSpecificOutput: {
+            permissionDecision: string;
+            updatedInput: { path: string; pattern: string };
+          };
+        };
+        let scratch = "";
+        const answers: Answer[] = [];
+        const listed: string[][] = [];
+        const query = scripted([
+          init,
+          async (options: Options) => {
+            scratch = options.additionalDirectories?.[0] ?? "";
+            for (const call of [
+              {
+                tool_name: "Grep",
+                tool_input: { pattern: "saved", path: dir },
+                tool_use_id: "t1",
+              },
+              {
+                tool_name: "Glob",
+                tool_input: { pattern: "*.txt", path: dir },
+                tool_use_id: "t2",
+              },
+            ]) {
+              const [answer] = (await fire(
+                options,
+                "PreToolUse",
+                call,
+              )) as unknown as Answer[];
+              if (!answer) continue;
+              answers.push(answer);
+              listed.push(
+                readdirSync(answer.hookSpecificOutput.updatedInput.path),
+              );
+            }
+          },
+          success,
+        ]);
+        await runSession(gated(), { ...deps, query, ...dirs() });
+        expect(polls).toEqual([]);
+        expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+        expect(
+          answers.map((a) => a.hookSpecificOutput.permissionDecision),
+        ).toEqual(["allow", "allow"]);
+        for (const answer of answers)
+          expect(
+            answer.hookSpecificOutput.updatedInput.path.startsWith(
+              `${scratch}/`,
+            ),
+          ).toBe(true);
+        expect(listed).toEqual([["a1.txt"], ["a1.txt"]]);
+        expect(answers[0]?.hookSpecificOutput.updatedInput.pattern).toBe(
+          "saved",
+        );
+        expect(answers[1]?.hookSpecificOutput.updatedInput.pattern).toBe(
+          "*.txt",
+        );
+      });
+
+      test("a Grep or Glob of another session's saved output asks", async () => {
+        const file = put("projects/-work-repo/sess-other/tool-results/a1.txt");
+        const { answers, waits } = await fireOutside(
+          gated(),
+          () => [
+            {
+              tool_name: "Grep",
+              tool_input: { pattern: "saved", path: dirname(file) },
+              tool_use_id: "t1",
+            },
+            {
+              tool_name: "Glob",
+              tool_input: { pattern: "*.txt", path: dirname(file) },
+              tool_use_id: "t2",
+            },
+          ],
+          { replies: [decided({ decision: "deny" })], sessionDirs: dirs() },
+        );
+        expect(waits).toBe(2);
+        expect(decisionsOf(answers)).toEqual(["deny", "deny"]);
+      });
+
+      test.each([
+        ["Claude Code's login file", () => join(cfg(), ".credentials.json")],
+        ["its account file", () => join(root, "home", ".claude.json")],
+      ])(
+        "a hard link to %s inside this session's saved output is declined at the copy, asking no one, and leaves no copy",
+        async (_name, source) => {
+          const secret = source();
+          mkdirSync(dirname(secret), { recursive: true });
+          writeFileSync(secret, "secret");
+          const linked = put(
+            "projects/-work-repo/sess-new/tool-results/a1.txt",
+          );
+          rmSync(linked);
+          linkSync(secret, linked);
+          const { sent, polls, answers, copies } = await readLeavingNoCopy(
+            gated(),
+            linked,
+            { ...dirs(), env: { HOME: join(root, "home") } },
+          );
+          expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+          expect(polls).toEqual([]);
+          expect(answers).toMatchObject([
+            {
+              hookSpecificOutput: {
+                permissionDecision: "deny",
+                permissionDecisionReason: expect.stringMatching(
+                  /could not be copied: .* is a hard link to a credential file\./,
+                ),
+              },
+            },
+          ]);
+          expect(sent.filter((e) => e.type === "runner.warning")).toHaveLength(
+            1,
+          );
+          expect(copies).toEqual([]);
+        },
+      );
+    });
+
+    /** Fires one PreToolUse per call `callsIn(cwd)` returns, and returns each answer and the events sent. */
+    const fireOutside = async (
+      runConfig: Config,
+      callsIn: (cwd: string) => object[],
+      { replies = [] as DecisionReply[], sessionDirs = {} } = {},
+    ) => {
+      const { sent, deps } = api(...replies);
+      const answers: unknown[] = [];
+      const query = scripted([
+        init,
+        async (options: Options) => {
+          for (const call of callsIn(options.cwd ?? ""))
+            answers.push(...(await fire(options, "PreToolUse", call)));
+        },
+        success,
+      ]);
+      await runSession(runConfig, { ...deps, query, ...sessionDirs });
+      return {
+        answers,
+        sent,
+        waits: sent.filter((e) => e.type === "run.waiting").length,
+      };
+    };
+
+    test("a `Read(prefix:*)` pattern holds its path spelled with `~`, a doubled slash or a link in the worktree, and a Grep of a tree holding it; a sibling runs unasked", async () => {
+      const held = join(root, "srv", "private");
+      mkdirSync(held, { recursive: true });
+      writeFileSync(join(held, "k"), "private\n");
+      mkdirSync(join(root, "srv", "public"));
+      writeFileSync(join(root, "srv", "public", "p"), "public\n");
+      const home = join(root, "home");
+      mkdirSync(home);
+      const { answers, waits } = await fireOutside(
+        {
+          ...config,
+          approvalPolicy: [`Read(${held}:*)`],
+          sessionEnv: { HOME: home },
+        },
+        (cwd) => {
+          symlinkSync(held, join(cwd, "link"));
+          return [
+            readOf("~/../srv/private/k"),
+            readOf(`${root}/srv//private/k`),
+            readOf(join(cwd, "link", "k")),
+            {
+              tool_name: "Grep",
+              tool_input: { pattern: ".", path: join(root, "srv") },
+              tool_use_id: "t2",
+            },
+            readOf(join(root, "srv", "public", "p")),
+          ];
+        },
+        { replies: [decided({ decision: "deny" })] },
+      );
+      expect(waits).toBe(4);
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "allow" } },
+      ]);
+    });
+
+    test("a Grep of a home holding `.claude`, or of the directory holding the config directory, asks where the policy gates nothing", async () => {
+      const home = join(root, "home");
+      const configParent = join(root, "conf");
+      mkdirSync(join(home, ".claude"), { recursive: true });
+      mkdirSync(join(configParent, "claude"), { recursive: true });
+      const grepOf = (path: string) => ({
+        tool_name: "Grep",
+        tool_input: { pattern: ".", path },
+        tool_use_id: "t1",
+      });
+      const { answers, waits } = await fireOutside(
+        config,
+        () => [grepOf(home), grepOf(configParent)],
+        {
+          replies: [decided({ decision: "deny" })],
+          sessionDirs: {
+            settingsDirs: {
+              userDirs: [join(home, ".claude"), join(configParent, "claude")],
+              managedDir: join(root, "managed"),
+            },
+          },
+        },
+      );
+      expect(waits).toBe(2);
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+      ]);
+    });
+
+    test("where the policy gates nothing, a Read of a refused file by a link, `~` or a relative path is declined with a warning each, asking no one", async () => {
+      const home = join(root, "home");
+      const claudeDir = join(home, ".claude");
+      mkdirSync(claudeDir, { recursive: true });
+      writeFileSync(join(claudeDir, ".credentials.json"), "secret");
+      writeFileSync(join(home, ".claude.json"), "{}");
+      mkdirSync(join(root, "links"));
+      symlinkSync(
+        join(claudeDir, ".credentials.json"),
+        join(root, "links", "login"),
+      );
+      const { answers, waits, sent } = await fireOutside(
+        { ...config, sessionEnv: { HOME: home } },
+        (cwd) => [
+          readOf(join(root, "links", "login")),
+          readOf("~/.claude.json"),
+          readOf(relative(cwd, join(claudeDir, ".credentials.json"))),
+        ],
+        {
+          sessionDirs: {
+            env: { HOME: home },
+            settingsDirs: {
+              userDirs: [claudeDir],
+              managedDir: join(root, "managed"),
+            },
+          },
+        },
+      );
+      expect(waits).toBe(0);
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+      ]);
+      const warnings = sent
+        .filter((e) => e.type === "runner.warning")
+        .map((e) => (e.payload as { message: string }).message);
+      expect(warnings).toHaveLength(3);
+      for (const message of warnings)
+        expect(message).toContain(
+          "was declined: it is Claude Code's login or account file.",
+        );
+    });
+
+    test("where the policy gates nothing, a Read of a file over the copy size cap is declined at the copy with a warning, asking no one, and leaves no copy", async () => {
+      const big = join(root, "big.bin");
+      writeFileSync(big, "");
+      truncateSync(big, STAGE_MAX_BYTES + 1);
+      const { sent, polls, answers, copies } = await readLeavingNoCopy(
+        config,
+        big,
+      );
+      expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+      expect(polls).toEqual([]);
+      expect(answers).toMatchObject([
+        {
+          hookSpecificOutput: {
+            permissionDecision: "deny",
+            permissionDecisionReason: expect.stringMatching(
+              /could not be copied: .* is larger than \d+ MiB\./,
+            ),
+          },
+        },
+      ]);
+      expect(sent.filter((e) => e.type === "runner.warning")).toHaveLength(1);
+      expect(copies).toEqual([]);
+    }, 30_000);
+
+    test.each([["Grep"], ["Bash"]])(
+      "a policy holding only %s leaves an outside Read unasked, copied into scratch",
+      async (tool) => {
+        const outside = join(root, "elsewhere.log");
+        writeFileSync(outside, "outside contents\n");
+        const { sent, polls, answers, copied } = await readOutside(
+          { ...config, approvalPolicy: [tool] },
+          outside,
+        );
+        expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+        expect(polls).toEqual([]);
+        expect(answers).toMatchObject([
+          { hookSpecificOutput: { permissionDecision: "allow" } },
+        ]);
+        expect(copied).toBe("outside contents\n");
+      },
+    );
+  });
+
+  test("a Read inside the worktree, a Grep with no path and a relative Read inside it run unasked", async () => {
+    const { sent, deps } = api();
+    let answers: unknown[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        const cwd = options.cwd ?? "";
+        answers = [
+          ...(await fire(options, "PreToolUse", readOf(join(cwd, "README")))),
+          ...(await fire(options, "PreToolUse", readOf("README", { cwd }))),
+          ...(await fire(options, "PreToolUse", {
+            tool_name: "Grep",
+            tool_input: { pattern: "hi" },
+            tool_use_id: "t2",
+          })),
+        ];
+      },
+      success,
+    ]);
+    await runSession(config, { ...deps, query });
+    expect(answers).toEqual([
+      { continue: true },
+      { continue: true },
+      { continue: true },
+    ]);
+    expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+  });
+});
+
+describe("the run's scratch directory on disk", () => {
+  test("a directory left at its path is replaced by an empty one only its owner can enter", () => {
+    const runner = join(root, "sky-runner-1");
+    const leftover = join(runner, "scratch-run_1");
+    mkdirSync(leftover, { recursive: true });
+    chmodSync(leftover, 0o777);
+    writeFileSync(join(leftover, "planted.txt"), "planted");
+    const dir = scratchDirOf("run_1", runner);
+    expect(dir).toBe(leftover);
+    expect(readdirSync(dir)).toEqual([]);
+    expect(statSync(dir).mode & 0o077).toBe(0);
+    removeScratchNow();
+  });
+
+  test("removeScratchNow, which a runner dying by a second signal or an uncaught exception calls, deletes the scratch directory and its approved copies", () => {
+    const dir = scratchDirOf("run_1", join(root, "sky-runner-1"));
+    mkdirSync(join(dir, "approved", "1"), { recursive: true });
+    writeFileSync(join(dir, "approved", "1", "copy.txt"), "approved copy");
+    removeScratchNow();
+    expect(existsSync(dir)).toBe(false);
+    expect(() => removeScratchNow()).not.toThrow();
   });
 });

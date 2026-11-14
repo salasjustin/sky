@@ -182,6 +182,26 @@ const RUNNER_DIR = /^sky-runner-(\d+)$/;
 export const credentialDir = (root: string = tmpdir(), pid = process.pid) =>
   join(root, `sky-runner-${pid}`);
 
+/**
+ * Every runner's credential directory in `root` now, each holding that runner's login files and its
+ * runs' scratch directories; this runner's is among them whether or not it exists yet.
+ */
+export function runnerDirs(
+  root: string = tmpdir(),
+  pid = process.pid,
+): string[] {
+  let names: string[] = [];
+  try {
+    names = readdirSync(root).filter((name) => RUNNER_DIR.test(name));
+  } catch {}
+  return [
+    ...new Set([
+      credentialDir(root, pid),
+      ...names.map((name) => join(root, name)),
+    ]),
+  ];
+}
+
 const uid = () => process.getuid?.() ?? "user";
 const NESTED_DIR = /^sky-nested-claude-/;
 

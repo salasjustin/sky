@@ -72,6 +72,19 @@ export function matchesPolicy(
   return policy.some((pattern) => matchesOne(pattern, toolName, input));
 }
 
+export type ReadRule = { path: string; prefix: boolean };
+
+/** The path each parenthesised `Read` pattern of `policy` names, and whether it is a `prefix:*`. */
+export function readRules(policy: readonly string[]): ReadRule[] {
+  return policy.flatMap((pattern): ReadRule[] => {
+    const [, tool, rule] = PATTERN.exec(pattern) ?? [];
+    if (tool !== "Read" || rule === undefined) return [];
+    return rule.endsWith(":*")
+      ? [{ path: rule.slice(0, -2), prefix: true }]
+      : [{ path: rule, prefix: false }];
+  });
+}
+
 function matchesOne(pattern: string, toolName: string, input: unknown) {
   const [, tool, rule] = PATTERN.exec(pattern) ?? [];
   if (tool !== toolName) return false;
