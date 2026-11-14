@@ -1826,7 +1826,7 @@ test("the PreToolUse hook outlasts the longest wait, so a late approval still re
   }
 });
 
-test("a stop before the session starts still aborts it", async () => {
+test("a stop before setup ends the run without making the worktree or starting the session", async () => {
   const { posted, post } = recorder();
   const controller = new AbortController();
   controller.abort("SIGTERM");
@@ -1839,7 +1839,8 @@ test("a stop before the session starts still aborts it", async () => {
       awaitDecision: noDecision,
     }),
   ).toBe(1);
-  expect(query.calls[0]?.options.abortController?.signal.aborted).toBe(true);
+  expect(query.calls).toHaveLength(0);
+  expect(existsSync(join(config.worktreesDir, config.agentId))).toBe(false);
   expect(posted.at(-1)).toMatchObject({
     type: "run.failed",
     payload: { error: "interrupted by SIGTERM" },

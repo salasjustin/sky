@@ -819,13 +819,24 @@ const tooFarNote = (s: DefaultSync) =>
  * what that did or couldn't do. A public repo's default branch and a start branch come
  * over git, at no REST cost; a private one, or a failed fetch, goes through the connector. Without
  * a connector there is no way to reach GitHub, and the worktree is made or reused as it stands.
+ * A `signal` aborted before the repo lock is taken, queued behind another run's setup or earlier,
+ * rejects with its reason and leaves the worktree unmade.
  */
 export function prepareWorktree(
   config: PrepareConfig,
-  deps: { env: NodeJS.ProcessEnv; warn: (line: string) => void },
+  deps: {
+    env: NodeJS.ProcessEnv;
+    warn: (line: string) => void;
+    signal?: AbortSignal;
+  },
 ): Promise<{ cwd: string; notes: string[] }> {
   // every step writes the repo every sprite run shares: runs starting at once take turns
-  return withRepoLock(config.repoDir, () => prepareLocked(config, deps));
+  return withRepoLock(
+    config.repoDir,
+    () => prepareLocked(config, deps),
+    undefined,
+    deps.signal,
+  );
 }
 
 type PrepareConfig = {

@@ -489,6 +489,7 @@ export async function runSession(
     ended = true;
     await post(event);
   };
+  const interrupted = () => `interrupted by ${String(deps.signal.reason)}`;
   const fail = async (error: string, usage?: Usage, rollup?: RunRollup) => {
     await end({
       type: "run.failed",
@@ -510,8 +511,11 @@ export async function runSession(
       // what the session's own `publish` reads, so the sync looks where it publishes
       env: { ...process.env, ...config.sessionEnv },
       warn,
+      // a stop while queued behind another run's setup must not go on to make the worktree
+      signal: deps.signal,
     }));
   } catch (error) {
+    if (deps.signal.aborted) return fail(interrupted());
     return fail(`worktree setup failed: ${messageOf(error)}`);
   }
   // fails early, naming file and key, on what is on disk now; endpoint and credential `env` entries a
@@ -844,9 +848,7 @@ export async function runSession(
       }
     }
   } catch (error) {
-    streamError = deps.signal.aborted
-      ? `interrupted by ${String(deps.signal.reason)}`
-      : messageOf(error);
+    streamError = deps.signal.aborted ? interrupted() : messageOf(error);
   } finally {
     deps.signal.removeEventListener("abort", forward);
     endHold();
