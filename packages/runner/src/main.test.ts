@@ -431,10 +431,7 @@ test("the runner holds the sprite through the Tasks API at SKY_SPRITE_API_SOCKET
   api.listen(0, "127.0.0.1");
   await once(api, "listening");
   const { port } = api.address() as AddressInfo;
-  const env = runEnv(
-    `http://127.0.0.1:${port}`,
-    join(sockets, "run_1.prompt"),
-  );
+  const env = runEnv(`http://127.0.0.1:${port}`, join(sockets, "run_1.prompt"));
   try {
     const { code } = await runBundle({
       ...env,
