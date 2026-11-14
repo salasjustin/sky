@@ -449,6 +449,64 @@ describe("where a read sits against Claude Code's config directories", () => {
     expect(configDirPlace(config, [config], "s1")).toBe("config");
   });
 
+  test("only a `projects` folder holds session output: another top folder, or a path a level short, is the config's", () => {
+    expect(
+      configDirPlace(
+        join(config, "todos", "-repo", "s1", "tool-results", "a.txt"),
+        [config],
+        "s1",
+      ),
+    ).toBe("config");
+    expect(
+      configDirPlace(
+        join(config, "projects", "s1", "tool-results", "a.txt"),
+        [config],
+        "s1",
+      ),
+    ).toBe("config");
+  });
+
+  describe("with several config directories", () => {
+    let second: string;
+    const output = (dir: string, session: string) =>
+      join(dir, "projects", "-repo", session, "tool-results", "a.txt");
+
+    beforeEach(() => {
+      second = join(root, "other", ".claude");
+      mkdirSync(second, { recursive: true });
+    });
+
+    test("this session's saved output under either of two is session output; another session's under the second is the config's", () => {
+      expect(configDirPlace(output(config, "s1"), [config, second], "s1")).toBe(
+        "session-output",
+      );
+      expect(configDirPlace(output(second, "s1"), [config, second], "s1")).toBe(
+        "session-output",
+      );
+      expect(configDirPlace(output(second, "s2"), [config, second], "s1")).toBe(
+        "config",
+      );
+    });
+
+    test("the same session id under a directory that is not a config directory is no one's", () => {
+      expect(
+        configDirPlace(
+          output(join(root, "third", ".claude"), "s1"),
+          [config, second],
+          "s1",
+        ),
+      ).toBeUndefined();
+    });
+
+    test("a config directory given through a link still matches the real path of a read in it", () => {
+      const link = join(root, "config-link");
+      symlinkSync(second, link);
+      expect(configDirPlace(output(second, "s1"), [link], "s1")).toBe(
+        "session-output",
+      );
+    });
+  });
+
   test("a directory holding a config directory is the config's, even through a link to it; a sibling is not", () => {
     symlinkSync(config, join(root, "config-link"));
     for (const dirs of [[config], [join(root, "config-link")]]) {
