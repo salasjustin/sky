@@ -331,8 +331,9 @@ async function heldFiles(
 }
 
 /**
- * Each path under `.github/workflows/` that differs between two `.github/workflows` trees, "" for
- * none; a rename names both ends. Both trees must be in this clone.
+ * Each path under `.github/workflows/` that differs between two `.github/workflows` trees, either
+ * of which is "" where there is no such tree; a rename names both ends. Both trees must be in this
+ * clone.
  */
 async function workflowPathsBetween(
   cwd: string,
@@ -1220,7 +1221,7 @@ export async function publish(options: {
       ) {
         throw error;
       }
-      // unnamed, GitHub's own error stands
+      // with no file to name, GitHub's own error stands
       const files = await workflowPathsBetween(
         cwd,
         theirWorkflows,
