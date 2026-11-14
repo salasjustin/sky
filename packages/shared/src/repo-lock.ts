@@ -5,7 +5,7 @@ export const REPO_LOCK_FILE = "sky-repo.lock";
 export const REPO_LOCK_TIMED_OUT = 75;
 
 /**
- * How long, in seconds, run setup waits for the repo lock before it fails naming the lock. Worktree
- * removal in the API waits less, because its exec has a shorter bound.
+ * How long, in seconds, a caller of the repo lock waits when it is given no bound of its own. Run setup
+ * is given the launch deadline; worktree removal in the API waits less, because its exec has a shorter bound.
  */
 export const REPO_LOCK_WAIT_S = 120;

@@ -206,6 +206,7 @@ test("launch uploads the bundle, then starts the runner as a detached session an
     APPROVAL_POLICY: "[]",
     AUTO_APPROVE: JSON.stringify({ defaults: true, commands: [] }),
     WAIT_TIMEOUT_MINUTES: "120",
+    LAUNCH_DEADLINE_MINUTES: "15",
   });
   // the secrets ride in a file only the sprite user can read, which the command sources and deletes
   expect(envFileOf(wire, session)).toEqual({

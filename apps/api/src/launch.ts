@@ -717,6 +717,7 @@ export function createLauncher({
             APPROVAL_POLICY: JSON.stringify(launch.approvalPolicy),
             AUTO_APPROVE: JSON.stringify(launch.autoApprove),
             WAIT_TIMEOUT_MINUTES: String(config.waitTimeoutMs / 60_000),
+            LAUNCH_DEADLINE_MINUTES: String(config.launchDeadlineMs / 60_000),
             ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
             ...(launch.remoteBranch
               ? { START_BRANCH: launch.remoteBranch }

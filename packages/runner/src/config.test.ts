@@ -28,6 +28,7 @@ test("reads a run from env, defaulting the sprite paths", () => {
     checks: [],
     mcpServers: {},
     waitTimeoutMs: 120 * 60_000,
+    launchDeadlineMs: 15 * 60_000,
     startBranch: undefined,
   });
 });

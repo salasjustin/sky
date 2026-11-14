@@ -86,6 +86,7 @@ beforeEach(() => {
     checks: [],
     mcpServers: {},
     waitTimeoutMs: 60_000,
+    launchDeadlineMs: 15 * 60_000,
     startBranch: undefined,
   };
 });

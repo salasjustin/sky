@@ -1,5 +1,11 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { REPO_LOCK_FILE, REPO_LOCK_TIMED_OUT } from "@sky/shared";
@@ -63,8 +69,12 @@ describe.skipIf(!canRun)("REMOVE_WORKTREE under real bash", () => {
       { stdio: ["ignore", "pipe", "ignore"] },
     );
     holders.push(holder);
-    const exited = new Promise<void>((resolve) => holder.on("close", () => resolve()));
-    await new Promise<void>((resolve) => holder.stdout?.once("data", () => resolve()));
+    const exited = new Promise<void>((resolve) =>
+      holder.on("close", () => resolve()),
+    );
+    await new Promise<void>((resolve) =>
+      holder.stdout?.once("data", () => resolve()),
+    );
     return async () => {
       holder.kill("SIGKILL");
       await exited;

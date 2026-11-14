@@ -511,6 +511,7 @@ export async function runSession(
       // what the session's own `publish` reads, so the sync looks where it publishes
       env: { ...process.env, ...config.sessionEnv },
       warn,
+      lockWaitS: Math.ceil(config.launchDeadlineMs / 1000),
       // a stop while queued behind another run's setup must not go on to make the worktree
       signal: deps.signal,
     }));

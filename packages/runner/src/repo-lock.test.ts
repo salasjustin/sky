@@ -133,13 +133,19 @@ const hold = async () => {
 
 describe("retryOnLock", () => {
   test.each([
-    ["config lock", "error: could not lock config file .git/config: File exists"],
+    [
+      "config lock",
+      "error: could not lock config file .git/config: File exists",
+    ],
     ["upstream write", "error: unable to write upstream branch configuration"],
     [
       "ref lock",
       "fatal: Unable to create '/r/.git/refs/heads/claude/agt_1.lock': File exists.",
     ],
-    ["index lock", "fatal: Unable to create '/r/.git/index.lock': File exists."],
+    [
+      "index lock",
+      "fatal: Unable to create '/r/.git/index.lock': File exists.",
+    ],
     ["bare index.lock", "index.lock is held"],
   ])("a step git refused for a held %s is retried once", async (_, message) => {
     const step = vi
@@ -191,9 +197,7 @@ describe("ensureWorktree", () => {
       );
     });
     expect(calls).toBe(2);
-    expect(git(path, "rev-parse", "--abbrev-ref", "HEAD")).toBe(
-      "claude/agt_1",
-    );
+    expect(git(path, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
   });
 
   test("the worktree's branch has no upstream configured, so the repo's config lock is never taken", async () => {
@@ -204,9 +208,7 @@ describe("ensureWorktree", () => {
       worktreesDir,
       agentId: "agt_1",
     });
-    expect(git(path, "rev-parse", "--abbrev-ref", "HEAD")).toBe(
-      "claude/agt_1",
-    );
+    expect(git(path, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
     rmSync(join(repoDir, ".git", "config.lock"));
     const upstream = (branch: string) =>
       spawnSync(
@@ -247,6 +249,29 @@ describe.skipIf(!canFlock)("with flock", () => {
     const { cwd } = await launched;
     expect(cwd).toBe(join(worktreesDir, "agt_1"));
     expect(existsSync(cwd)).toBe(true);
+  });
+
+  test("a launch queues for the repo lock as long as its launch deadline allows, past the 120 s default", async () => {
+    const lock = repoLockPath(repoDir);
+    const { release, holding } = await hold();
+    const launched = prepareWorktree(
+      { repoDir, worktreesDir, agentId: "agt_1" },
+      // the runner's 15 minute launch deadline, in seconds
+      { env: {}, warn: () => {}, lockWaitS: 900 },
+    );
+    // the queued flock's own bound is on its command line; no time has to pass for it to be checked
+    const waits = () =>
+      flocksOn(lock).map((pid) => {
+        const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+        return argv[argv.indexOf("-w") + 1];
+      });
+    await vi.waitFor(() => expect(waits()).toHaveLength(2), {
+      timeout: 20_000,
+    });
+    expect([...waits()].sort()).toEqual(["120", "900"]);
+    release();
+    await holding;
+    expect((await launched).cwd).toBe(join(worktreesDir, "agt_1"));
   });
 
   test("a second caller's task runs only after the first's has finished", async () => {
@@ -322,15 +347,20 @@ describe.skipIf(!canFlock)("with flock", () => {
       (error: Error) => error,
     );
     expect(failure).toBeInstanceOf(Error);
-    expect((failure as Error).message).toContain(
-      `can't take the repo lock ${repoLockPath(repoDir)}: flock exited 1`,
+    // the status flock gives an unopenable file differs by util-linux version
+    expect((failure as Error).message).toMatch(
+      new RegExp(
+        `^can't take the repo lock ${repoLockPath(repoDir).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: flock exited (?!75\\b)\\d+`,
+      ),
     );
     expect((failure as Error).message).not.toContain("another run's setup");
   });
 
   test("a lock file left behind with no holder does not block", async () => {
     writeFileSync(repoLockPath(repoDir), "999999\n");
-    await expect(withRepoLock(repoDir, async () => "ok", 2)).resolves.toBe("ok");
+    await expect(withRepoLock(repoDir, async () => "ok", 2)).resolves.toBe(
+      "ok",
+    );
   });
 
   test("a holder killed with SIGKILL frees the lock for the next caller", async () => {
