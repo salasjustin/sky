@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -42,9 +43,9 @@ async function orphan(
 ): Promise<number> {
   const shell = spawn(
     "sh",
-    ["-c", `node -e '${script}' >/dev/null 2>&1 </dev/null & echo $!`],
+    ["-c", `"$NODE" -e '${script}' >/dev/null 2>&1 </dev/null & echo $!`],
     {
-      env: { PATH: process.env.PATH ?? "", ...env },
+      env: { PATH: process.env.PATH ?? "", NODE: process.execPath, ...env },
       stdio: ["ignore", "pipe", "ignore"],
     },
   );
@@ -55,14 +56,36 @@ async function orphan(
   return pid;
 }
 
-/** A node that is a child of this process, as the runner's own `claude` is. */
-function child(env: Record<string, string>): number {
-  const proc = spawn("node", ["-e", SLEEP], {
-    env: { PATH: process.env.PATH ?? "", ...env },
-    stdio: "ignore",
-  });
-  started.push(proc.pid as number);
-  return proc.pid as number;
+/**
+ * A run id no other process on the machine carries: the reap matches on `RUN_ID` across all of `/proc`,
+ * so a fixed id would also match the same test running in another checkout or worker.
+ */
+const uniqueRun = (name: string) => `run_${name}_${randomUUID()}`;
+
+/**
+ * A stand-in for the runner (a shell) with a node under it, as the runner's own `claude` is. Reaping
+ * with the shell's pid as `pid` makes the node its only descendant, whatever else this process runs.
+ */
+async function runnerWithChild(
+  env: Record<string, string>,
+): Promise<{ runner: number; worker: number }> {
+  const runner = spawn(
+    "sh",
+    ["-c", `"$NODE" -e '${SLEEP}' >/dev/null 2>&1 </dev/null & echo $!; wait`],
+    {
+      env: { PATH: process.env.PATH ?? "", NODE: process.execPath, ...env },
+      stdio: ["ignore", "pipe", "ignore"],
+    },
+  );
+  started.push(runner.pid as number);
+  let out = "";
+  for await (const chunk of runner.stdout) {
+    out += chunk;
+    if (out.includes("\n")) break;
+  }
+  const worker = Number(out.trim());
+  started.push(worker);
+  return { runner: runner.pid as number, worker };
 }
 
 const running = async (pid: number) => {
@@ -87,18 +110,20 @@ const settled = async (...pids: number[]) => {
 test_(
   "ends the run's descendants and its daemonised leftovers, and no other run's processes",
   async () => {
-    const daemon = await orphan({ RUN_ID: "run_aaa" });
+    const runId = uniqueRun("aaa");
+    const daemon = await orphan({ RUN_ID: runId });
     // an environment scrubbed of the mark still hangs off the runner
-    const worker = child({});
-    const otherRun = await orphan({ RUN_ID: "run_bbb" });
+    const { runner, worker } = await runnerWithChild({});
+    const otherRun = await orphan({ RUN_ID: uniqueRun("bbb") });
     // a run whose id merely starts with this one's is another run
-    const prefixed = await orphan({ RUN_ID: "run_aaa2" });
+    const prefixed = await orphan({ RUN_ID: `${runId}2` });
     const bystander = await orphan({});
     await settled(daemon, worker, otherRun, prefixed, bystander);
 
     const warnings: string[] = [];
     const ended = await endSessionProcesses({
-      runId: "run_aaa",
+      runId,
+      pid: runner,
       graceMs: 2_000,
       warn: (line) => warnings.push(line),
     });
@@ -127,8 +152,9 @@ test_(
     roots.push(dir);
     const ready = join(dir, "ready");
     const termed = join(dir, "termed");
+    const runId = uniqueRun("ccc");
     const stubborn = await orphan(
-      { RUN_ID: "run_ccc", READY: ready, TERMED: termed },
+      { RUN_ID: runId, READY: ready, TERMED: termed },
       IGNORES_SIGTERM,
     );
     // the handler is installed before the marker is written
@@ -137,7 +163,7 @@ test_(
     expect(existsSync(ready)).toBe(true);
 
     await endSessionProcesses({
-      runId: "run_ccc",
+      runId,
       graceMs: 300,
       warn: () => {},
     });
@@ -153,7 +179,7 @@ test_(
   async () => {
     const warnings: string[] = [];
     const ended = await endSessionProcesses({
-      runId: "run_ddd",
+      runId: uniqueRun("ddd"),
       warn: (line) => warnings.push(line),
     });
     expect(ended).toBe(0);
