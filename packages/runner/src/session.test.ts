@@ -4792,7 +4792,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     expect(prompt).not.toMatch(/never to \/tmp/);
     expect(prompt).not.toContain("nothing outside it and the repo");
     expect(prompt).toContain(
-      "a read anywhere else waits for a person's approval",
+      "a read anywhere else waits for a person's approval or is declined.",
     );
   });
 

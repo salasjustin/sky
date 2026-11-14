@@ -279,8 +279,8 @@ let unremovedScratch: string | undefined;
  * The run's scratch directory, a 0700 child of the runner's own temp directory (`credentialDir`), so
  * a runner killed outright has it swept with the rest. It is the one directory beyond the worktree
  * the session may read: the nested login file and the other credential files stay in its parent,
- * outside it. Where a check's nested `claude` writes its log. A directory already at its path is
- * removed first, so its contents and modes are never this run's.
+ * outside it. A check's nested `claude` writes its log there. A directory already at its path is
+ * removed first, so this run never inherits its contents or modes.
  */
 export function scratchDirOf(
   runId: string,
@@ -339,7 +339,7 @@ const checkInstructions = (
           `Use that form on this run in place of any nested \`claude\` command or credential file path from an earlier run of this session.`,
           ...(scratchDir
             ? [
-                `Write each nested \`claude\` command's output to a file in ${scratchDir}, such as \`… > ${scratchDir}/<name>.log 2>&1\`, and read it with the Read tool rather than \`cat\`: the Read tool reads that directory and the repo without asking, and a read anywhere else waits for a person's approval.`,
+                `Write each nested \`claude\` command's output to a file in ${scratchDir}, such as \`… > ${scratchDir}/<name>.log 2>&1\`, and read it with the Read tool rather than \`cat\`: the Read tool reads that directory and the repo without asking, and a read anywhere else waits for a person's approval or is declined.`,
               ]
             : []),
           `A nested \`claude\` session run that way is logged in with this run's subscription: the command reads it from the file it names, which is expected, so run the command as given. Leave that file to the command: never read, print, copy or edit it yourself, never set or use another credential for the nested session, and never print or read any other credential file or token. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
@@ -705,7 +705,7 @@ export async function runSession(
     permissionDecisionReason: reason,
   });
 
-  // set once the session starts; a read of it before then has only the worktree to be inside
+  // set once the session starts; a read gated before then has only the worktree to be inside
   let scratch: string | undefined;
   // where the Claude process takes a read's `~` from
   const claudeHome = sessionEnvOf(config).HOME || homedir();
@@ -779,7 +779,7 @@ export async function runSession(
           },
         };
       } catch (error) {
-        return declined(`it could not be read: ${messageOf(error)}.`);
+        return declined(`it could not be copied: ${messageOf(error)}.`);
       }
     }
     if (decision === undefined) return waitEnded();
@@ -815,6 +815,7 @@ export async function runSession(
     const outcome = policyOutcome(
       config.approvalPolicy,
       config.autoApprove,
+      // the hook's cwd is the shell's, which an earlier `cd` may have moved off the worktree
       { root: cwd, cwd: input.cwd, realpath: realpathSync.native },
       input.tool_name,
       input.tool_input,
