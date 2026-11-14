@@ -4348,6 +4348,12 @@ describe("keeping the run's Claude credential from the repo's processes", () => 
 
 describe("the run's scratch directory and reads outside the worktree", () => {
   const TOKEN = "subscription-token-scratch";
+  /** An env that gates the read tools: its approval policy has a person decide an outside read. */
+  const gated = (extra: Partial<Config> = {}): Config => ({
+    ...config,
+    approvalPolicy: ["Read", "Grep", "Glob"],
+    ...extra,
+  });
   const readOf = (file_path: string, extra: object = {}) => ({
     tool_name: "Read",
     tool_input: { file_path },
@@ -4397,6 +4403,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     let inside: string[] = [];
     let loginPath = "";
     let loginContents = "";
+    let realLogin = "";
     let answers: unknown[] = [];
     const query = scripted([
       init,
@@ -4410,6 +4417,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
             "",
         );
         loginContents = readFileSync(loginPath, "utf8");
+        realLogin = realpathSync(loginPath);
         answers = await fire(options, "PreToolUse", readOf(loginPath));
       },
       success,
@@ -4435,7 +4443,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     ]);
     const warning = sent.find((e) => e.type === "runner.warning");
     expect(warning?.payload).toEqual({
-      message: `Read of ${realpathSync(loginPath)} was declined: it is in a runner's credential directory.`,
+      message: `Read of ${realLogin} was declined: it is in a runner's credential directory.`,
     });
   });
 
@@ -4453,7 +4461,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       },
       success,
     ]);
-    await runSession(config, { ...deps, query });
+    await runSession(gated(), { ...deps, query });
     expect(waitingSummary(sent)).toMatchObject({
       request: {
         kind: "approval",
@@ -4498,7 +4506,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       },
       success,
     ]);
-    await runSession(config, { ...deps, query });
+    await runSession(gated(), { ...deps, query });
     expect(contents).toBe("outside contents\n");
   });
 
@@ -4516,7 +4524,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       },
       success,
     ]);
-    await runSession(config, { ...deps, query });
+    await runSession(gated(), { ...deps, query });
     expect(answers).toEqual([
       {
         continue: true,
@@ -4547,7 +4555,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       },
       success,
     ]);
-    await runSession(config, { ...deps, query });
+    await runSession(gated(), { ...deps, query });
     expect(answers).toMatchObject([
       { hookSpecificOutput: { permissionDecision: "deny" } },
     ]);
@@ -4569,7 +4577,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       },
       success,
     ]);
-    await runSession(config, {
+    await runSession(gated(), {
       ...deps,
       query,
       signal: controller.signal,
@@ -4721,10 +4729,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       },
       success,
     ]);
-    await runSession(
-      { ...config, sessionEnv: { HOME: home } },
-      { ...deps, query },
-    );
+    await runSession(gated({ sessionEnv: { HOME: home } }), { ...deps, query });
     expect(waitingSummary(sent)).toMatchObject({
       request: {
         kind: "approval",
@@ -4753,7 +4758,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       },
       success,
     ]);
-    await runSession(config, { ...deps, query });
+    await runSession(gated(), { ...deps, query });
     expect(waitingSummary(sent)).toMatchObject({
       request: { toolName: "Glob", toolSummary: realpathSync(outside) },
     });
@@ -4792,7 +4797,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     expect(prompt).not.toMatch(/never to \/tmp/);
     expect(prompt).not.toContain("nothing outside it and the repo");
     expect(prompt).toContain(
-      "a read anywhere else waits for a person's approval or is declined.",
+      "a read anywhere else may wait for a person's approval, and is declined if it is refused.",
     );
   });
 
@@ -4825,13 +4830,144 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       },
       success,
     ]);
-    await runSession(config, { ...deps, query });
+    await runSession(gated(), { ...deps, query });
     const warnings = sent
       .filter((e) => e.type === "runner.warning")
       .map((e) => (e.payload as { message: string }).message);
     expect(warnings).toHaveLength(3);
     for (const message of warnings)
       expect(message).toContain(realpathSync(outside));
+  });
+
+  describe("which outside reads ask a person", () => {
+    const updatedPath = (answers: unknown[]) =>
+      (
+        answers[0] as {
+          hookSpecificOutput?: { updatedInput?: { file_path?: string } };
+        }
+      ).hookSpecificOutput?.updatedInput?.file_path ?? "";
+
+    /** Fires one outside Read of `path` and returns what the hook answered, the events sent and the copy's contents. */
+    const readOutside = async (
+      runConfig: Config,
+      path: string,
+      { replies = [] as DecisionReply[], sessionDirs = {} } = {},
+    ) => {
+      const { sent, polls, deps } = api(...replies);
+      let answers: unknown[] = [];
+      let copied: string | undefined;
+      const query = scripted([
+        init,
+        async (options: Options) => {
+          answers = await fire(options, "PreToolUse", readOf(path));
+          const copy = updatedPath(answers);
+          if (copy) copied = readFileSync(copy, "utf8");
+        },
+        success,
+      ]);
+      await runSession(runConfig, { ...deps, query, ...sessionDirs });
+      return { sent, polls, answers, copied };
+    };
+
+    test("where the env's policy does not gate Read, an outside Read is copied into scratch without asking", async () => {
+      const outside = join(root, "elsewhere.log");
+      writeFileSync(outside, "outside contents\n");
+      const { sent, polls, answers, copied } = await readOutside(
+        config,
+        outside,
+      );
+      expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+      expect(polls).toEqual([]);
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "allow" } },
+      ]);
+      expect(copied).toBe("outside contents\n");
+      expect(sent.map((e) => e.type)).not.toContain("runner.warning");
+    });
+
+    test("where the env's policy gates Read, an outside Read asks, and the person's denial declines it with a warning naming the path", async () => {
+      const outside = join(root, "elsewhere.log");
+      writeFileSync(outside, "outside contents\n");
+      const { sent, answers } = await readOutside(gated(), outside, {
+        replies: [decided({ decision: "deny" })],
+      });
+      expect(sent.map((e) => e.type)).toContain("run.waiting");
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+      ]);
+      expect(
+        sent.find((e) => e.type === "runner.warning")?.payload,
+      ).toMatchObject({
+        message: expect.stringContaining(realpathSync(outside)),
+      });
+    });
+
+    test("a refused path stays refused whatever the policy: not asked, declined with a warning, though the policy gates nothing", async () => {
+      const home = join(root, "home");
+      mkdirSync(join(home, ".claude"), { recursive: true });
+      writeFileSync(join(home, ".claude", ".credentials.json"), "secret");
+      const { sent, polls, answers } = await readOutside(
+        config,
+        join(home, ".claude", ".credentials.json"),
+        {
+          sessionDirs: {
+            settingsDirs: {
+              userDirs: [join(home, ".claude")],
+              managedDir: join(root, "managed"),
+            },
+          },
+        },
+      );
+      expect(polls).toEqual([]);
+      expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+      ]);
+      expect(sent.map((e) => e.type)).toContain("runner.warning");
+    });
+
+    describe("Claude Code's config directory", () => {
+      const cfg = () => join(root, "claude-config");
+      const dirs = () => ({
+        settingsDirs: { userDirs: [cfg()], managedDir: join(root, "managed") },
+      });
+      const put = (relative: string) => {
+        const path = join(cfg(), relative);
+        mkdirSync(join(path, ".."), { recursive: true });
+        writeFileSync(path, "saved output\n");
+        return path;
+      };
+
+      test("this session's saved tool output is copied without asking, though the policy gates Read", async () => {
+        const path = put("projects/-work-repo/sess-new/tool-results/a1.txt");
+        const { sent, polls, copied } = await readOutside(gated(), path, {
+          sessionDirs: dirs(),
+        });
+        expect(polls).toEqual([]);
+        expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+        expect(copied).toBe("saved output\n");
+      });
+
+      test("another session's saved output, and the rest of the config directory, ask even where the policy gates nothing", async () => {
+        for (const relative of [
+          "projects/-work-repo/sess-other/tool-results/a1.txt",
+          "projects/-work-repo/sess-new.jsonl",
+          "projects/-work-repo/sess-new/notes.txt",
+          "settings.json",
+        ]) {
+          const path = put(relative);
+          const { sent, copied } = await readOutside(config, path, {
+            replies: [decided({ decision: "approve" })],
+            sessionDirs: dirs(),
+          });
+          expect(
+            sent.map((e) => e.type),
+            relative,
+          ).toContain("run.waiting");
+          expect(copied, relative).toBe("saved output\n");
+        }
+      });
+    });
   });
 
   test("a Read inside the worktree, a Grep with no path and a relative Read inside it run unasked", async () => {

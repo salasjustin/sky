@@ -53,6 +53,7 @@ import {
   userScopeServers,
 } from "./mcp.js";
 import {
+  configDirPlace,
   type OutsideRead,
   outsideRead,
   pathRefusal,
@@ -339,7 +340,7 @@ const checkInstructions = (
           `Use that form on this run in place of any nested \`claude\` command or credential file path from an earlier run of this session.`,
           ...(scratchDir
             ? [
-                `Write each nested \`claude\` command's output to a file in ${scratchDir}, such as \`… > ${scratchDir}/<name>.log 2>&1\`, and read it with the Read tool rather than \`cat\`: the Read tool reads that directory and the repo without asking, and a read anywhere else waits for a person's approval or is declined.`,
+                `Write each nested \`claude\` command's output to a file in ${scratchDir}, such as \`… > ${scratchDir}/<name>.log 2>&1\`, and read it with the Read tool rather than \`cat\`: the Read tool reads that directory and the repo without asking, and a read anywhere else may wait for a person's approval, and is declined if it is refused.`,
               ]
             : []),
           `A nested \`claude\` session run that way is logged in with this run's subscription: the command reads it from the file it names, which is expected, so run the command as given. Leave that file to the command: never read, print, copy or edit it yourself, never set or use another credential for the nested session, and never print or read any other credential file or token. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
@@ -710,6 +711,8 @@ export async function runSession(
   // where the Claude process takes a read's `~` from
   const claudeHome = sessionEnvOf(config).HOME || homedir();
   let staged = 0;
+  // the session whose saved tool output a read may take without asking
+  let sessionId = config.sessionId;
   /**
    * Taken at each gate and each copy: every runner's credential directory (the nested login files,
    * every run's scratch), Claude Code's login and account files, and the kernel's directories.
@@ -752,15 +755,31 @@ export async function runSession(
     // no person is asked about what no answer would copy
     const refusal = pathRefusal(scratch, refusedReads())(read.path);
     if (refusal) return declined(`it ${refusal}.`);
-    const decision = await decide(
-      {
-        kind: "approval",
-        toolName: input.tool_name,
-        toolSummary: bound(read.path),
-      },
-      signal,
-    );
-    if (decision?.decision === "approve") {
+    // the env's approval policy answers, as it does for the same tool inside the worktree; Claude
+    // Code's saved output for this session is always readable, and the rest of its config directory
+    // is always a person's to approve
+    const place = configDirPlace(read.path, settingsDirs.userDirs, sessionId);
+    const asks =
+      place === "config" ||
+      (place === undefined &&
+        policyOutcome(
+          config.approvalPolicy,
+          config.autoApprove,
+          { root: cwd, cwd: input.cwd, realpath: realpathSync.native },
+          input.tool_name,
+          input.tool_input,
+        ) === "hold");
+    const decision = asks
+      ? await decide(
+          {
+            kind: "approval",
+            toolName: input.tool_name,
+            toolSummary: bound(read.path),
+          },
+          signal,
+        )
+      : "unasked";
+    if (decision === "unasked" || decision?.decision === "approve") {
       // never the worktree, where the run's commit would take the copy in
       if (!scratch)
         return declined("the run has no scratch directory to copy it into.");
@@ -969,6 +988,7 @@ export async function runSession(
     for await (const message of stream) {
       if (message.type === "system" && message.subtype === "init" && !started) {
         started = true;
+        sessionId = message.session_id;
         // Claude is past its exec, so what the kernel does with its `/proc` entries is settled
         const exposed = deps.seal.check();
         if (exposed)

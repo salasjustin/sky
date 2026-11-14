@@ -116,6 +116,29 @@ export function outsideRead(
   return glob ? { field, path, pattern: glob.rest } : { field, path };
 }
 
+/**
+ * Whether the real path `path` is in one of the Claude config directories `configDirs`, and whether it
+ * is in the saved tool output of session `sessionId` there: `projects/<project>/<sessionId>/tool-results`.
+ */
+export function configDirPlace(
+  path: string,
+  configDirs: readonly string[],
+  sessionId: string | undefined,
+): "session-output" | "config" | undefined {
+  for (const dir of configDirs) {
+    const root = realpathLoose(dir);
+    if (!within(root, path)) continue;
+    const [top, , session, folder] = relative(root, path).split(sep);
+    return top === "projects" &&
+      sessionId !== undefined &&
+      session === sessionId &&
+      folder === "tool-results"
+      ? "session-output"
+      : "config";
+  }
+  return undefined;
+}
+
 /** What no approval copies, whatever the person answered. */
 export type RefusedPaths = {
   /** Directories nothing is copied from, nor a hard link to any file in them: the runners' credential directories. */
@@ -257,11 +280,7 @@ async function copyFile(
  * always remove the copy. A symlink is copied as the link, and a read through it is gated again;
  * sockets, FIFOs and devices are skipped.
  */
-async function copyEntry(
-  src: string,
-  dest: string,
-  walk: Walk,
-): Promise<void> {
+async function copyEntry(src: string, dest: string, walk: Walk): Promise<void> {
   if (++walk.entries > walk.maxEntries)
     throw new Error(
       `${walk.source} holds more than ${walk.maxEntries} files and directories`,

@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -14,12 +15,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import {
-  type AddressInfo,
-  createServer as createSocketServer,
-} from "node:net";
+import { type AddressInfo, createServer as createSocketServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -28,11 +25,7 @@ import {
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import {
-  outsideRead,
-  type RefusedPaths,
-  stageRead,
-} from "./outside-reads.js";
+import { outsideRead, type RefusedPaths, stageRead } from "./outside-reads.js";
 
 // the Claude Code binary the Agent SDK ships beside itself: the platform package for this arch and libc
 // undefined when the SDK or its platform package isn't installed, so the block skips instead of failing collection
@@ -544,11 +537,7 @@ describe("staging an approved outside read", () => {
     chmodSync(tree, 0o555);
     try {
       const copy = await stage(tree);
-      for (const path of [
-        copy,
-        join(copy, "sub"),
-        join(copy, "sub", "a.txt"),
-      ])
+      for (const path of [copy, join(copy, "sub"), join(copy, "sub", "a.txt")])
         expect(statSync(path).mode & 0o077).toBe(0);
       rmSync(slot(), { recursive: true });
       expect(existsSync(slot())).toBe(false);
@@ -578,7 +567,9 @@ describe("staging an approved outside read", () => {
       mkdirSync(tree);
       writeFileSync(join(tree, "a.txt"), "a");
       const socket = createSocketServer();
-      await new Promise<void>((done) => socket.listen(join(tree, "sock"), done));
+      await new Promise<void>((done) =>
+        socket.listen(join(tree, "sock"), done),
+      );
       try {
         expect(lstatSync(join(tree, "sock")).isSocket()).toBe(true);
         const copy = await stage(tree);
