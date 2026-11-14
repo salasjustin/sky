@@ -15,6 +15,7 @@ import {
   stat,
   symlink,
 } from "node:fs/promises";
+import { homedir } from "node:os";
 import {
   basename,
   dirname,
@@ -22,6 +23,7 @@ import {
   join,
   relative,
   resolve,
+  sep,
 } from "node:path";
 import { pipeline } from "node:stream/promises";
 
@@ -38,7 +40,12 @@ export const STAGE_MAX_BYTES = 64 * 1024 * 1024;
 /** The most files, directories and links an approved outside read copies. */
 export const STAGE_MAX_ENTRIES = 10_000;
 
-export type OutsideRead = { field: string; path: string };
+/**
+ * `path` is where the call reads; an approved call has `field` pointed at the copy. A Glob whose
+ * pattern climbs out names its literal prefix as `path`, and `pattern` is the rest of it, which the
+ * approved call takes in place of its own.
+ */
+export type OutsideRead = { field: string; path: string; pattern?: string };
 
 /** The real path of `path`, or of its nearest existing ancestor with the rest appended when it isn't there yet. */
 function realpathLoose(path: string): string {
@@ -52,29 +59,61 @@ function realpathLoose(path: string): string {
 
 const within = (root: string, path: string) => {
   const rel = relative(root, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  // a top-level entry named `..foo` is inside
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 };
+
+/** `value` with a leading `~` or `~/` taken as `home`, as Claude Code takes it. */
+const expandHome = (value: string, home: string) =>
+  value === "~" || value.startsWith("~/") ? home + value.slice(1) : value;
+
+const GLOB_META = /[*?[{]/;
+
+/**
+ * A Glob pattern split where matching starts: the segments before the first one holding a glob
+ * metacharacter, and the rest. The last segment is always in the rest, so the prefix is a directory.
+ */
+function splitGlob(pattern: string): { prefix: string; rest: string } {
+  const segments = pattern.split("/");
+  const first = segments.findIndex((segment) => GLOB_META.test(segment));
+  const at = first === -1 ? segments.length - 1 : first;
+  return {
+    prefix:
+      segments.slice(0, at).join("/") || (pattern.startsWith("/") ? "/" : ""),
+    rest: segments.slice(at).join("/"),
+  };
+}
 
 /**
  * The path a Read, Grep or Glob call names when it lies outside every one of `roots`, else
- * undefined. A relative path is taken from `cwd`, and symlinks are resolved first, as Claude Code
- * resolves them: a link inside the worktree that points out is outside. A Grep or Glob with no
- * `path` searches the worktree.
+ * undefined. A relative path is taken from `cwd`, a leading `~` from `home`, and symlinks are
+ * resolved first, as Claude Code resolves them: a link inside the worktree that points out is
+ * outside. A Grep or Glob with no `path` searches `cwd`. A Glob's `pattern` is read from its literal
+ * prefix joined to that, so an absolute, `~` or `..` pattern is outside too; Grep's `glob` only
+ * filters names under its search root.
  */
 export function outsideRead(
   toolName: string,
   input: unknown,
   roots: readonly string[],
   cwd: string,
+  home: string = homedir(),
 ): OutsideRead | undefined {
   const field = PATH_FIELD[toolName];
   if (field === undefined) return undefined;
-  const value = (input as Record<string, unknown> | null)?.[field];
-  if (typeof value !== "string" || value === "") return undefined;
-  const path = realpathLoose(resolve(cwd, value));
-  return roots.some((root) => within(realpathLoose(root), path))
-    ? undefined
-    : { field, path };
+  const fields = input as Record<string, unknown> | null;
+  const value = fields?.[field];
+  const named = typeof value === "string" && value !== "";
+  const base = named ? resolve(cwd, expandHome(value, home)) : cwd;
+  const pattern = fields?.pattern;
+  const glob =
+    toolName === "Glob" && typeof pattern === "string"
+      ? splitGlob(expandHome(pattern, home))
+      : undefined;
+  if (!named && !glob?.prefix) return undefined;
+  const path = realpathLoose(glob ? resolve(base, glob.prefix) : base);
+  if (roots.some((root) => within(realpathLoose(root), path))) return undefined;
+  return glob ? { field, path, pattern: glob.rest } : { field, path };
 }
 
 /** What no approval copies, whatever the person answered. */
@@ -113,6 +152,31 @@ async function collectInodes(
 type Refusal = (path: string, info: Stats) => string | undefined;
 
 /**
+ * Why a real path is never copied by its name alone, or undefined: what `refused` holds, outside the
+ * run's own `scratch`. A hard link to a credential file is `refusalOf`'s to find, at copy time.
+ */
+export function pathRefusal(
+  scratch: string | undefined,
+  refused: RefusedPaths,
+): (path: string) => string | undefined {
+  const own = scratch === undefined ? undefined : realpathLoose(scratch);
+  const secretDirs = refused.secretDirs.map(realpathLoose);
+  const systemDirs = refused.systemDirs.map(realpathLoose);
+  const secretFiles = new Set(refused.secretFiles.map(realpathLoose));
+  return (path) => {
+    if (secretFiles.has(path)) return "is Claude Code's login or account file";
+    if (systemDirs.some((dir) => within(dir, path)))
+      return "is in a system directory";
+    if (
+      !(own !== undefined && within(own, path)) &&
+      secretDirs.some((dir) => within(dir, path))
+    )
+      return "is in a runner's credential directory";
+    return undefined;
+  };
+}
+
+/**
  * Taken when the copy starts, after the approval: the credential files of a runner started since then
  * are refused by path but not by hard link.
  */
@@ -121,22 +185,18 @@ async function refusalOf(
   refused: RefusedPaths,
 ): Promise<Refusal> {
   const own = realpathLoose(scratch);
-  const secretDirs = refused.secretDirs.map(realpathLoose);
-  const systemDirs = refused.systemDirs.map(realpathLoose);
-  const secretFiles = new Set(refused.secretFiles.map(realpathLoose));
+  const byPath = pathRefusal(scratch, refused);
   const secretInodes = new Set<string>();
   for (const file of refused.secretFiles) {
     const info = await stat(file).catch(() => undefined);
     if (info?.isFile()) secretInodes.add(inodeOf(info));
   }
   // the run's own scratch holds only approved copies, each a file of its own
-  for (const dir of secretDirs) await collectInodes(dir, own, secretInodes);
+  for (const dir of refused.secretDirs.map(realpathLoose))
+    await collectInodes(dir, own, secretInodes);
   return (path, info) => {
-    if (secretFiles.has(path)) return "is Claude Code's login or account file";
-    if (systemDirs.some((dir) => within(dir, path)))
-      return "is in a system directory";
-    if (!within(own, path) && secretDirs.some((dir) => within(dir, path)))
-      return "is in a runner's credential directory";
+    const why = byPath(path);
+    if (why) return why;
     if (info.isFile() && secretInodes.has(inodeOf(info)))
       return "is a hard link to a credential file";
     return undefined;

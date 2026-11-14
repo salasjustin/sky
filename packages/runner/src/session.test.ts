@@ -5,6 +5,7 @@ import {
   spawnSync,
 } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -43,7 +44,9 @@ import type { Seal } from "./seal.js";
 import {
   nestedClaude,
   type QueryFn,
+  removeScratchNow,
   repoLockWaitS,
+  scratchDirOf,
   sessionGitIdentity,
 } from "./session.js";
 import {
@@ -4386,8 +4389,8 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     expect(prompt).toContain(`> ${scratch}/<name>.log`);
   });
 
-  test("the nested login file is never in the scratch directory, and reading it asks", async () => {
-    const { sent, deps } = api(decided({ decision: "deny" }));
+  test("the nested login file is never in the scratch directory, and reading it is declined at once with a runner.warning, asking no one", async () => {
+    const { sent, polls, deps } = api(decided({ decision: "approve" }));
     let inside: string[] = [];
     let loginPath = "";
     let loginContents = "";
@@ -4415,12 +4418,22 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     expect(loginPath).toMatch(/sky-nested-claude-run_1-/);
     expect(inside).toEqual([]);
     expect(loginContents).toBe(TOKEN);
-    expect(waitingSummary(sent)).toMatchObject({
-      request: { kind: "approval", toolName: "Read", toolSummary: loginPath },
-    });
-    expect(answers).toMatchObject([
-      { hookSpecificOutput: { permissionDecision: "deny" } },
+    expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+    expect(polls).toEqual([]);
+    expect(answers).toEqual([
+      {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "it is in a runner's credential directory.",
+        },
+      },
     ]);
+    const warning = sent.find((e) => e.type === "runner.warning");
+    expect(warning?.payload).toEqual({
+      message: `Read of ${realpathSync(loginPath)} was declined: it is in a runner's credential directory.`,
+    });
   });
 
   test("a Read outside the worktree creates an approval request, and approving it reads a copy from the scratch directory", async () => {
@@ -4517,7 +4530,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     });
   });
 
-  test("an approved Read of the nested login file, Claude Code's login or account file, or a /proc file is declined with a runner.warning naming it", async () => {
+  test("a Read of the nested login file, Claude Code's login or account file, or a /proc file is declined with a runner.warning naming it, asking no one", async () => {
     const configDir = join(root, "claude-config");
     const home = join(root, "home");
     mkdirSync(configDir);
@@ -4573,6 +4586,94 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     expect(warnings).toHaveLength(paths.length);
     for (const [i, path] of paths.entries())
       expect(warnings[i]).toContain(`Read of ${path} was declined:`);
+    expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+  });
+
+  test("a Read of `~/…` is taken from the session env's HOME, and asks", async () => {
+    const home = join(root, "home");
+    mkdirSync(home);
+    writeFileSync(join(home, "notes.txt"), "home notes\n");
+    const { sent, deps } = api(decided({ decision: "deny" }));
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        await fire(options, "PreToolUse", readOf("~/notes.txt"));
+      },
+      success,
+    ]);
+    await runSession(
+      { ...config, sessionEnv: { HOME: home } },
+      { ...deps, query },
+    );
+    expect(waitingSummary(sent)).toMatchObject({
+      request: {
+        kind: "approval",
+        toolName: "Read",
+        toolSummary: realpathSync(join(home, "notes.txt")),
+      },
+    });
+  });
+
+  test("an approved Glob whose pattern climbs out is pointed at the copy of its literal prefix, with the rest of its pattern", async () => {
+    const outside = join(root, "elsewhere");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "a.txt"), "a\n");
+    const { sent, deps } = api(decided({ decision: "approve" }));
+    let answers: unknown[] = [];
+    let scratch = "";
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        scratch = options.additionalDirectories?.[0] ?? "";
+        answers = await fire(options, "PreToolUse", {
+          tool_name: "Glob",
+          tool_input: { pattern: `${outside}/**/*.txt` },
+          tool_use_id: "t1",
+        });
+      },
+      success,
+    ]);
+    await runSession(config, { ...deps, query });
+    expect(waitingSummary(sent)).toMatchObject({
+      request: { toolName: "Glob", toolSummary: realpathSync(outside) },
+    });
+    const [answer] = answers as {
+      hookSpecificOutput: {
+        permissionDecision: string;
+        updatedInput: { path: string; pattern: string };
+      };
+    }[];
+    expect(answer?.hookSpecificOutput.permissionDecision).toBe("allow");
+    expect(answer?.hookSpecificOutput.updatedInput.pattern).toBe("**/*.txt");
+    const copy = answer?.hookSpecificOutput.updatedInput.path ?? "";
+    expect(copy.startsWith(`${scratch}/`)).toBe(true);
+    expect(copy.endsWith("/elsewhere")).toBe(true);
+  });
+
+  test("the check instructions name the scratch directory, forbid no temp directory, and say reads elsewhere ask", async () => {
+    let prompt = "";
+    let scratch = "";
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        scratch = options.additionalDirectories?.[0] ?? "";
+        prompt = (options.systemPrompt as { append: string }).append;
+      },
+      success,
+    ]);
+    const { deps } = api();
+    await runSession(
+      { ...config, checks: ["claude -p /check"] },
+      { ...deps, query, credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN } },
+    );
+    expect(scratch).not.toBe("");
+    expect(prompt).toContain(`> ${scratch}/<name>.log`);
+    // the scratch directory is itself under the temp directory
+    expect(prompt).not.toMatch(/never to \/tmp/);
+    expect(prompt).not.toContain("nothing outside it and the repo");
+    expect(prompt).toContain(
+      "a read anywhere else waits for a person's approval",
+    );
   });
 
   test("a Grep or Glob of an outside directory, and a link in the worktree that points out, are held too", async () => {
@@ -4639,5 +4740,29 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       { continue: true },
     ]);
     expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+  });
+});
+
+describe("the run's scratch directory on disk", () => {
+  test("a directory left at its path is replaced by an empty one only its owner can enter", () => {
+    const runner = join(root, "sky-runner-1");
+    const leftover = join(runner, "scratch-run_1");
+    mkdirSync(leftover, { recursive: true });
+    chmodSync(leftover, 0o777);
+    writeFileSync(join(leftover, "planted.txt"), "planted");
+    const dir = scratchDirOf("run_1", runner);
+    expect(dir).toBe(leftover);
+    expect(readdirSync(dir)).toEqual([]);
+    expect(statSync(dir).mode & 0o077).toBe(0);
+    removeScratchNow();
+  });
+
+  test("removeScratchNow, which a runner dying by a second signal or an uncaught exception calls, deletes the scratch directory and its approved copies", () => {
+    const dir = scratchDirOf("run_1", join(root, "sky-runner-1"));
+    mkdirSync(join(dir, "approved", "1"), { recursive: true });
+    writeFileSync(join(dir, "approved", "1", "copy.txt"), "approved copy");
+    removeScratchNow();
+    expect(existsSync(dir)).toBe(false);
+    expect(() => removeScratchNow()).not.toThrow();
   });
 });

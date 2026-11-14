@@ -259,6 +259,77 @@ describe.skipIf(!claudeBinary)(
   },
 );
 
+describe("which reads are outside the worktree", () => {
+  /** A worktree two levels under `root`, as `<worktreesDir>/<agent>` sits. */
+  let worktree: string;
+  let home: string;
+  const outsideOf = (toolName: string, input: object) =>
+    outsideRead(toolName, input, [worktree], worktree, home);
+
+  beforeEach(() => {
+    worktree = join(root, "worktrees", "agt_1");
+    mkdirSync(join(worktree, "src"), { recursive: true });
+    home = join(root, "home");
+    mkdirSync(join(home, "x"), { recursive: true });
+  });
+
+  test("a Read of `~/…` is taken from the home it is given", () => {
+    expect(outsideOf("Read", { file_path: "~/x" })).toEqual({
+      field: "file_path",
+      path: join(home, "x"),
+    });
+    expect(outsideOf("Read", { file_path: "~" })).toEqual({
+      field: "file_path",
+      path: home,
+    });
+  });
+
+  test("a Glob whose pattern is absolute, climbs out with `..` or starts with `~` is outside, at its literal prefix", () => {
+    expect(outsideOf("Glob", { pattern: "/etc/**" })).toEqual({
+      field: "path",
+      path: realpathSync("/etc"),
+      pattern: "**",
+    });
+    mkdirSync(join(root, "x"));
+    expect(outsideOf("Glob", { pattern: "../../x/*" })).toEqual({
+      field: "path",
+      path: join(root, "x"),
+      pattern: "*",
+    });
+    expect(outsideOf("Glob", { pattern: "~/x/*" })).toEqual({
+      field: "path",
+      path: join(home, "x"),
+      pattern: "*",
+    });
+  });
+
+  test("a Glob whose path and pattern prefix are both inside is not outside", () => {
+    expect(outsideOf("Glob", { pattern: "src/**/*.ts" })).toBeUndefined();
+    expect(outsideOf("Glob", { pattern: "**/*.ts" })).toBeUndefined();
+    expect(
+      outsideOf("Glob", { path: "src", pattern: "../README*" }),
+    ).toBeUndefined();
+  });
+
+  test("Grep's `glob` filters names under its search root and is never outside", () => {
+    expect(
+      outsideOf("Grep", { pattern: "a", glob: "/etc/**" }),
+    ).toBeUndefined();
+  });
+
+  test("an entry named `..foo` at the top of the worktree is inside", () => {
+    mkdirSync(join(worktree, "..foo"));
+    expect(
+      outsideOf("Read", { file_path: join(worktree, "..foo", "a") }),
+    ).toBeUndefined();
+    expect(outsideOf("Read", { file_path: "..foo/a" })).toBeUndefined();
+    expect(outsideOf("Read", { file_path: "../a" })).toEqual({
+      field: "file_path",
+      path: join(root, "worktrees", "a"),
+    });
+  });
+});
+
 describe("staging an approved outside read", () => {
   /** A runner's credential directory, holding a nested login file and this run's scratch. */
   let secrets: string;

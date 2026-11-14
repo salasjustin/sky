@@ -17,7 +17,7 @@ import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
 import { claimRunLog, processAlive } from "./runlog.js";
 import { createSeal, removeSealedCopiesNow } from "./seal.js";
-import { runSession } from "./session.js";
+import { removeScratchNow, runSession } from "./session.js";
 import { storeSyncMain, syncStoreQuietly } from "./store.js";
 import { branchCheckMain } from "./sync.js";
 
@@ -91,6 +91,8 @@ async function main(): Promise<void> {
   }
   // the session's `finally` never runs for an uncaught exception, which still fires 'exit'
   removeCredentialFilesOnExit();
+  // and the run's scratch directory, with the approved copies of outside reads it holds
+  process.on("exit", removeScratchNow);
   // the copy of Claude's binary the session started from goes the same way
   process.on("exit", removeSealedCopiesNow);
   // a runner killed outright (SIGKILL, the OOM killer) left its credential files and its copy of
@@ -125,6 +127,7 @@ async function main(): Promise<void> {
     // the session's `finally` never runs on this path, and its files may hold the project's key or
     // the run's own credential
     removeCredentialFilesNow();
+    removeScratchNow();
     removeSealedCopiesNow();
     process.kill(process.pid, signal);
   };
