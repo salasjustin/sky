@@ -2889,7 +2889,7 @@ test("the primary rate limit on a ref update that changes GitHub's workflows is 
   expect((error as Error).message).toMatch(/hit GitHub's rate limit/);
 });
 
-test.each([
+test.each<{ how: string; message: string; headers: Record<string, string> }>([
   {
     how: "a retry-after past what is waited out",
     message: "Forbidden",
