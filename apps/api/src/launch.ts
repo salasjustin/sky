@@ -285,7 +285,7 @@ const REMOVE_LOCK_WAIT_S = 20;
 // a worktree the runner never created (or whose directory is gone) counts as removed. The removal
 // writes the shared repo's .git, so it takes the lock run setup takes; REPO_LOCK_TIMED_OUT is a lock
 // that stayed held
-const REMOVE_WORKTREE = `flock -x -w ${REMOVE_LOCK_WAIT_S} -E ${REPO_LOCK_TIMED_OUT} .git/${REPO_LOCK_FILE} git worktree remove --force "$1"; case $? in 0) ;; ${REPO_LOCK_TIMED_OUT}) echo "can't take the repo lock ${REPO_DIR}/.git/${REPO_LOCK_FILE} within ${REMOVE_LOCK_WAIT_S}s: another run's setup is holding it" >&2; exit ${REPO_LOCK_TIMED_OUT};; *) ! test -e "$1";; esac`;
+export const REMOVE_WORKTREE = `flock -x -w ${REMOVE_LOCK_WAIT_S} -E ${REPO_LOCK_TIMED_OUT} .git/${REPO_LOCK_FILE} git worktree remove --force "$1"; case $? in 0) ;; ${REPO_LOCK_TIMED_OUT}) echo "can't take the repo lock ${REPO_DIR}/.git/${REPO_LOCK_FILE} within ${REMOVE_LOCK_WAIT_S}s: another run's setup is holding it" >&2; exit ${REPO_LOCK_TIMED_OUT};; *) ! test -e "$1";; esac`;
 
 /**
  * Removes the agent's worktree; its branch stays. With `stoppedRunId`, first waits for that run's
