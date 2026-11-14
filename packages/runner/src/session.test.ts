@@ -4968,6 +4968,99 @@ describe("the run's scratch directory and reads outside the worktree", () => {
         }
       });
     });
+
+    /** Fires one PreToolUse per call `callsIn(cwd)` returns, and returns each answer and the events sent. */
+    const fireOutside = async (
+      runConfig: Config,
+      callsIn: (cwd: string) => object[],
+      { replies = [] as DecisionReply[], sessionDirs = {} } = {},
+    ) => {
+      const { sent, deps } = api(...replies);
+      const answers: unknown[] = [];
+      const query = scripted([
+        init,
+        async (options: Options) => {
+          for (const call of callsIn(options.cwd ?? ""))
+            answers.push(...(await fire(options, "PreToolUse", call)));
+        },
+        success,
+      ]);
+      await runSession(runConfig, { ...deps, query, ...sessionDirs });
+      return {
+        answers,
+        waits: sent.filter((e) => e.type === "run.waiting").length,
+      };
+    };
+
+    test("a `Read(prefix:*)` pattern holds its path spelled with `~`, a doubled slash or a link in the worktree, and a Grep of a tree holding it; a sibling runs unasked", async () => {
+      const held = join(root, "srv", "private");
+      mkdirSync(held, { recursive: true });
+      writeFileSync(join(held, "k"), "private\n");
+      mkdirSync(join(root, "srv", "public"));
+      writeFileSync(join(root, "srv", "public", "p"), "public\n");
+      const home = join(root, "home");
+      mkdirSync(home);
+      const { answers, waits } = await fireOutside(
+        {
+          ...config,
+          approvalPolicy: [`Read(${held}:*)`],
+          sessionEnv: { HOME: home },
+        },
+        (cwd) => {
+          symlinkSync(held, join(cwd, "link"));
+          return [
+            readOf("~/../srv/private/k"),
+            readOf(`${root}/srv//private/k`),
+            readOf(join(cwd, "link", "k")),
+            {
+              tool_name: "Grep",
+              tool_input: { pattern: ".", path: join(root, "srv") },
+              tool_use_id: "t2",
+            },
+            readOf(join(root, "srv", "public", "p")),
+          ];
+        },
+        { replies: [decided({ decision: "deny" })] },
+      );
+      expect(waits).toBe(4);
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "allow" } },
+      ]);
+    });
+
+    test("a Grep of a home holding `.claude`, or of the directory holding the config directory, asks where the policy gates nothing", async () => {
+      const home = join(root, "home");
+      const configParent = join(root, "conf");
+      mkdirSync(join(home, ".claude"), { recursive: true });
+      mkdirSync(join(configParent, "claude"), { recursive: true });
+      const grepOf = (path: string) => ({
+        tool_name: "Grep",
+        tool_input: { pattern: ".", path },
+        tool_use_id: "t1",
+      });
+      const { answers, waits } = await fireOutside(
+        config,
+        () => [grepOf(home), grepOf(configParent)],
+        {
+          replies: [decided({ decision: "deny" })],
+          sessionDirs: {
+            settingsDirs: {
+              userDirs: [join(home, ".claude"), join(configParent, "claude")],
+              managedDir: join(root, "managed"),
+            },
+          },
+        },
+      );
+      expect(waits).toBe(2);
+      expect(answers).toMatchObject([
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+        { hookSpecificOutput: { permissionDecision: "deny" } },
+      ]);
+    });
   });
 
   test("a Read inside the worktree, a Grep with no path and a relative Read inside it run unasked", async () => {

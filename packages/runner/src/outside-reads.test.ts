@@ -25,7 +25,13 @@ import {
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { outsideRead, type RefusedPaths, stageRead } from "./outside-reads.js";
+import {
+  configDirPlace,
+  outsideRead,
+  readRuleCovers,
+  type RefusedPaths,
+  stageRead,
+} from "./outside-reads.js";
 
 // the Claude Code binary the Agent SDK ships beside itself: the platform package for this arch and libc
 // undefined when the SDK or its platform package isn't installed, so the block skips instead of failing collection
@@ -343,6 +349,117 @@ describe("which reads are outside the worktree", () => {
       field: "file_path",
       path: join(root, "worktrees", "a"),
     });
+  });
+});
+
+describe("which outside reads a `Read(...)` pattern covers", () => {
+  let held: string;
+  let worktree: string;
+  let home: string;
+  const covers = (pattern: string, path: string) =>
+    readRuleCovers([pattern], path, worktree, home);
+
+  beforeEach(() => {
+    held = join(root, "srv", "private");
+    mkdirSync(held, { recursive: true });
+    mkdirSync(join(root, "srv", "public"));
+    worktree = join(root, "worktrees", "agt_1");
+    mkdirSync(worktree, { recursive: true });
+    home = join(root, "home");
+    mkdirSync(home);
+  });
+
+  test("a prefix pattern covers what is under its path, however the pattern spells it", () => {
+    symlinkSync(held, join(home, "p"));
+    for (const pattern of [
+      `Read(${held}:*)`,
+      `Read(${root}/srv//private:*)`,
+      "Read(../../srv/private:*)",
+      "Read(~/p:*)",
+      "Read(~/../srv/private:*)",
+    ]) {
+      expect(covers(pattern, join(held, "k")), pattern).toBe(true);
+      expect(covers(pattern, join(root, "srv", "public", "k")), pattern).toBe(
+        false,
+      );
+    }
+  });
+
+  test("a prefix that stops mid-name covers the names it starts", () => {
+    const pattern = `Read(${root}/srv/priv:*)`;
+    expect(covers(pattern, join(held, "k"))).toBe(true);
+    expect(covers(pattern, join(root, "srv", "public", "k"))).toBe(false);
+  });
+
+  test("a tree holding the pattern's path is covered, for a prefix or an exact pattern; a sibling tree is not", () => {
+    for (const pattern of [`Read(${held}:*)`, `Read(${held}/k)`]) {
+      expect(covers(pattern, join(root, "srv")), pattern).toBe(true);
+      expect(covers(pattern, root), pattern).toBe(true);
+      expect(covers(pattern, "/"), pattern).toBe(true);
+      expect(covers(pattern, join(root, "srv", "public")), pattern).toBe(
+        false,
+      );
+    }
+  });
+
+  test("an exact pattern covers its own path, not a sibling or a file under it", () => {
+    const pattern = `Read(${held}/k)`;
+    expect(covers(pattern, join(held, "k"))).toBe(true);
+    expect(covers(pattern, join(held, "k2"))).toBe(false);
+    expect(covers(`Read(${held})`, join(held, "k"))).toBe(false);
+  });
+
+  test("an empty prefix covers every path", () => {
+    expect(covers("Read(:*)", join(root, "srv", "public", "k"))).toBe(true);
+  });
+
+  test("a bare `Read` and other tools' patterns cover nothing here", () => {
+    expect(
+      readRuleCovers(
+        ["Read", `Write(${held}:*)`, `Bash(cat ${held}:*)`],
+        join(held, "k"),
+        worktree,
+        home,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("where a read sits against Claude Code's config directories", () => {
+  let config: string;
+
+  beforeEach(() => {
+    config = join(root, "home", ".claude");
+    mkdirSync(join(config, "projects", "-repo", "s1", "tool-results"), {
+      recursive: true,
+    });
+  });
+
+  test("this session's saved tool output, and the rest of the config directory", () => {
+    const output = join(config, "projects", "-repo", "s1", "tool-results");
+    expect(configDirPlace(join(output, "a.txt"), [config], "s1")).toBe(
+      "session-output",
+    );
+    expect(configDirPlace(join(output, "a.txt"), [config], "s2")).toBe(
+      "config",
+    );
+    expect(configDirPlace(join(config, "settings.json"), [config], "s1")).toBe(
+      "config",
+    );
+    expect(configDirPlace(config, [config], "s1")).toBe("config");
+  });
+
+  test("a directory holding a config directory is the config's, even through a link to it; a sibling is not", () => {
+    symlinkSync(config, join(root, "config-link"));
+    for (const dirs of [[config], [join(root, "config-link")]]) {
+      expect(configDirPlace(join(root, "home"), dirs, "s1")).toBe("config");
+      expect(configDirPlace(root, dirs, "s1")).toBe("config");
+      expect(configDirPlace("/", dirs, "s1")).toBe("config");
+    }
+    mkdirSync(join(root, "home", "notes"));
+    expect(configDirPlace(join(root, "home", "notes"), [config], "s1")).toBe(
+      undefined,
+    );
   });
 });
 

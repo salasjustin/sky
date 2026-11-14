@@ -26,6 +26,7 @@ import {
   sep,
 } from "node:path";
 import { pipeline } from "node:stream/promises";
+import { readRules } from "./policy.js";
 
 /** The path input of each file-reading tool, which Claude Code refuses outside its working directories. */
 const PATH_FIELD: Record<string, string> = {
@@ -117,16 +118,47 @@ export function outsideRead(
 }
 
 /**
- * Whether the real path `path` is in one of the Claude config directories `configDirs`, and whether it
- * is in the saved tool output of session `sessionId` there: `projects/<project>/<sessionId>/tool-results`.
+ * Whether a `Read(...)` pattern of `policy` covers the real path `path` once the pattern's own path is
+ * resolved the way a read's is (a leading `~` from `home`, a relative path from `cwd`, symlinks
+ * followed): `path` is that path or, for `prefix:*`, starts with it; or that path lies inside `path`,
+ * a tree a Grep, Glob or directory Read searches.
+ */
+export function readRuleCovers(
+  policy: readonly string[],
+  path: string,
+  cwd: string,
+  home: string = homedir(),
+): boolean {
+  return readRules(policy).some((rule) => {
+    if (rule.prefix && rule.path === "") return true;
+    const named = resolve(cwd, expandHome(rule.path, home));
+    // a prefix may stop mid-name (`/srv/priv:*`), which only its parent's real path keeps
+    const spellings = [
+      realpathLoose(named),
+      join(realpathLoose(dirname(named)), basename(named)),
+    ];
+    return spellings.some(
+      (rulePath) =>
+        within(path, rulePath) ||
+        (rule.prefix ? path.startsWith(rulePath) : path === rulePath),
+    );
+  });
+}
+
+/**
+ * Whether the real path `path` is in, or holds, one of the Claude config directories `configDirs`, and
+ * whether it is in the saved tool output of session `sessionId` there:
+ * `projects/<project>/<sessionId>/tool-results`.
  */
 export function configDirPlace(
   path: string,
   configDirs: readonly string[],
   sessionId: string | undefined,
 ): "session-output" | "config" | undefined {
-  for (const dir of configDirs) {
-    const root = realpathLoose(dir);
+  const roots = configDirs.map(realpathLoose);
+  // a search of a tree that holds a config directory reads all of it
+  if (roots.some((root) => within(path, root))) return "config";
+  for (const root of roots) {
     if (!within(root, path)) continue;
     const [top, , session, folder] = relative(root, path).split(sep);
     return top === "projects" &&

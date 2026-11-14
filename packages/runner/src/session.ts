@@ -57,6 +57,7 @@ import {
   type OutsideRead,
   outsideRead,
   pathRefusal,
+  readRuleCovers,
   type RefusedPaths,
   stageRead,
 } from "./outside-reads.js";
@@ -755,20 +756,27 @@ export async function runSession(
     // no person is asked about what no answer would copy
     const refusal = pathRefusal(scratch, refusedReads())(read.path);
     if (refusal) return declined(`it ${refusal}.`);
-    // the env's approval policy answers, as it does for the same tool inside the worktree; Claude
-    // Code's saved output for this session is always readable, and the rest of its config directory
-    // is always a person's to approve
+    // the env's approval policy answers, as it does for the same tool inside the worktree, and a
+    // `Read(...)` pattern also holds any spelling of its path and any search of a tree around it;
+    // Claude Code's saved output for this session is always readable, and the rest of its config
+    // directory is always a person's to approve
     const place = configDirPlace(read.path, settingsDirs.userDirs, sessionId);
     const asks =
       place === "config" ||
       (place === undefined &&
-        policyOutcome(
+        (readRuleCovers(
           config.approvalPolicy,
-          config.autoApprove,
-          { root: cwd, cwd: input.cwd, realpath: realpathSync.native },
-          input.tool_name,
-          input.tool_input,
-        ) === "hold");
+          read.path,
+          input.cwd,
+          claudeHome,
+        ) ||
+          policyOutcome(
+            config.approvalPolicy,
+            config.autoApprove,
+            { root: cwd, cwd: input.cwd, realpath: realpathSync.native },
+            input.tool_name,
+            input.tool_input,
+          ) === "hold"));
     const decision = asks
       ? await decide(
           {
