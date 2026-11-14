@@ -26,6 +26,7 @@ import {
   usageScore,
 } from "./claude-usage.js";
 import { type Config, loadConfig } from "./config.js";
+import { runError } from "./runs.js";
 import { spriteNameFor } from "./sprites.js";
 import { fiveHourLimit, weeklyLimit } from "./testing/limits.js";
 import {
@@ -1025,4 +1026,115 @@ test("a patch that doesn't name claudePool leaves an ordered pool's list as it i
   });
   expect(reset.status).toBe(200);
   expect(await reset.json()).toMatchObject({ claudePool: null });
+});
+
+// --- Cloudflare's challenge on Claude's login -------------------------------------------------------------
+
+const CHALLENGE =
+  "Claude Code returned an error result: Failed to authenticate. API Error: 403 Attention Required! | Cloudflare";
+const CHALLENGE_DELAY_MS = 60_000;
+
+/** Fakes only setTimeout, so the retry's delay can be stepped without freezing the clock or the sockets. */
+const fakeDelay = () => vi.useFakeTimers({ toFake: ["setTimeout"] });
+
+test("a Cloudflare challenge retries the run once on the same credential after the delay, in the same session", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  readings[WORK_TOKEN] = { h5: 0.5, d7: 0.5 };
+  const r = await launchedRun(poolEnv(["personal", "work"]));
+  expect(tokenOfFile(r.file)).toBe(PERSONAL_TOKEN);
+  fakeDelay();
+  await failWith(r, CHALLENGE);
+  // personal is limited while the retry waits: it still isn't moved to work
+  markLimited(db, "personal", new Date(Date.now() + 3_600_000));
+
+  await vi.advanceTimersByTimeAsync(CHALLENGE_DELAY_MS - 1);
+  expect(wire.sessions).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1);
+  await sessionOpened(2);
+  await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
+  vi.useRealTimers();
+
+  expect(wire.sessions).toHaveLength(2);
+  const retry = wire.sessions[1];
+  expect(tokenOfFile(envFileOf(wire, retry))).toBe(PERSONAL_TOKEN);
+  expect(retry?.env.SESSION_ID).toBe("sess-1");
+  expect(runRow(String(retry?.env.RUN_ID))).toMatchObject({
+    claudeCredential: "personal",
+    retryOf: r.run.id,
+    agentId: r.agent.id,
+  });
+  // the challenge was not a limit: the only mark is the one this test put there
+  expect(logs.join("\n")).not.toContain("usage limit");
+});
+
+test("a Cloudflare challenge never marks a credential limited", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  const r = await launchedRun(poolEnv(["personal", "work"]));
+  fakeDelay();
+  await failWith(r, CHALLENGE);
+  await vi.advanceTimersByTimeAsync(CHALLENGE_DELAY_MS);
+  await sessionOpened(2);
+  vi.useRealTimers();
+  expect(limitedUntil(db, "personal")).toBeUndefined();
+  expect(limitedUntil(db, "work")).toBeUndefined();
+  expect(limitedUntil(db, "default")).toBeUndefined();
+});
+
+test("a retry that meets the challenge again fails upstream_blocked and is not retried", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  const r = await launchedRun(poolEnv(["personal", "work"]));
+  fakeDelay();
+  await failWith(r, CHALLENGE);
+  await vi.advanceTimersByTimeAsync(CHALLENGE_DELAY_MS);
+  await sessionOpened(2);
+  const retry = wire.sessions[1];
+  const retryId = String(retry?.env.RUN_ID);
+  const res = await postEvent(envFileOf(wire, retry).AGENT_TOKEN, {
+    runId: retryId,
+    type: "run.failed",
+    payload: { error: CHALLENGE },
+  });
+  expect(res.status).toBe(201);
+  await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
+  vi.useRealTimers();
+
+  expect(runError(db, retryId as RunId)).toBe(
+    "upstream_blocked: Anthropic's API answered with a Cloudflare challenge twice; retry later",
+  );
+  expect(runRow(retryId)?.status).toBe("failed");
+  expect(wire.sessions).toHaveLength(2);
+  expect(limitedUntil(db, "personal")).toBeUndefined();
+});
+
+test.each([
+  [
+    "another authentication failure",
+    "Failed to authenticate. API Error: 401 invalid x-api-key",
+  ],
+  [
+    "a 403 that is not Cloudflare's",
+    "Failed to authenticate. API Error: 403 Forbidden",
+  ],
+])("%s is not retried", async (_name, error) => {
+  const r = await launchedRun(poolEnv(["personal", "work"]));
+  fakeDelay();
+  await failWith(r, error);
+  await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
+  vi.useRealTimers();
+  expect(wire.sessions).toHaveLength(1);
+  expect(exitWaits()).toBe(0);
+  expect(runError(db, r.run.id as RunId)).toBe(error);
+});
+
+test("a usage limit still marks the subscription limited and fails over at once, with no delay", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  readings[WORK_TOKEN] = { h5: 0.5, d7: 0.5 };
+  const r = await launchedRun(poolEnv(["personal", "work"]));
+  fakeDelay();
+  await failWith(r, FIVE_HOUR);
+  await vi.advanceTimersByTimeAsync(0);
+  await sessionOpened(2);
+  vi.useRealTimers();
+  expect(tokenOfFile(envFileOf(wire, wire.sessions[1]))).toBe(WORK_TOKEN);
+  expect(limitedUntil(db, "personal")).toBeDefined();
 });

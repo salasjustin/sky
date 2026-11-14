@@ -288,5 +288,18 @@ export function parseUsageLimit(
   };
 }
 
+/**
+ * Whether a run's error is Claude's login meeting a Cloudflare challenge in front of Anthropic's API:
+ * a transient block on the path, neither a usage limit nor a bad credential.
+ */
+export const isCloudflareChallenge = (error: string): boolean =>
+  /Failed to authenticate/i.test(error) &&
+  /\b403\b/.test(error) &&
+  /Attention Required! \| Cloudflare/i.test(error);
+
+/** The error of a run whose retry met the Cloudflare challenge too. */
+export const UPSTREAM_BLOCKED =
+  "upstream_blocked: Anthropic's API answered with a Cloudflare challenge twice; retry later";
+
 /** How long a limit whose reset the message didn't give is held: short, so a wrong guess costs one failed launch. */
 export const UNKNOWN_RESET_MS = 15 * 60_000;

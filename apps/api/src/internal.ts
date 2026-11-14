@@ -15,6 +15,10 @@ import {
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { isAgentTokenFor, mintAgentToken } from "./agent-token.js";
+import {
+  isCloudflareChallenge,
+  UPSTREAM_BLOCKED,
+} from "./claude-credentials.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { redactDeep } from "./redact.js";
@@ -24,6 +28,7 @@ import {
   agentStatusFor,
   isActive,
   recordEvent,
+  runError,
   type Tx,
 } from "./runs.js";
 import { body, jsonBody } from "./validation.js";
@@ -173,6 +178,15 @@ export function internalRoutes(
           if (redacted.type === "run.waiting") {
             redacted.payload.request = trimRequest(redacted.payload.request);
             openRequest(tx, run.id, redacted.payload.request);
+          }
+          // the retry of a run the challenge failed, failing the same way: not tried a third time
+          if (
+            redacted.type === "run.failed" &&
+            run.retryOf &&
+            isCloudflareChallenge(redacted.payload.error) &&
+            isCloudflareChallenge(runError(tx, run.retryOf) ?? "")
+          ) {
+            redacted.payload.error = UPSTREAM_BLOCKED;
           }
           const { id, enqueued } = recordEvent(
             tx,

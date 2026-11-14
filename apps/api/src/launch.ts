@@ -16,6 +16,7 @@ import {
   apiKeyAuth,
   type ClaudeAuth,
   ClaudeCredentialError,
+  isCloudflareChallenge,
   limitedUntil,
   markLimited,
   parseUsageLimit,
@@ -346,7 +347,12 @@ export type Launch = {
    * when the retry launches is dropped, and the retry resolves as a fresh launch would.
    */
   forceCredential?: string;
+  /** Set with `forceCredential` on the retry of a Cloudflare challenge: that credential is used even if it is limited by now. */
+  keepCredential?: boolean;
 };
+
+// how long a run that met Cloudflare's challenge waits before its one retry
+const CHALLENGE_RETRY_MS = 60_000;
 
 // how long a launch is kept in memory for a retry after a usage limit; a run that long has ended
 const REMEMBER_LAUNCH_MS = 12 * 3_600_000;
@@ -531,6 +537,11 @@ export function createLauncher({
   /** The credential the launch runs on, by its environment's assignment; throws a `ClaudeCredentialError` when none is usable. */
   async function claudeAuthFor(launch: Launch): Promise<ClaudeAuth> {
     const forced = launch.forceCredential;
+    if (forced && launch.keepCredential) {
+      return forced === API_KEY_CREDENTIAL
+        ? apiKeyAuth(config, "the retry")
+        : subscriptionAuth(config, forced);
+    }
     if (forced && stillAllowed(forced, currentAssignment(launch.envId))) {
       return forced === API_KEY_CREDENTIAL
         ? apiKeyAuth(config, "the retry")
@@ -745,13 +756,27 @@ export function createLauncher({
    * tried, then to the API key on the same terms, else notes the earliest reset on the run.
    */
   function onRunFailed(runId: RunId, error: string): void {
-    const limit = parseUsageLimit(error);
-    if (!limit) return;
     const credential = db
       .select({ credential: runs.claudeCredential })
       .from(runs)
       .where(eq(runs.id, runId))
       .get()?.credential;
+    if (isCloudflareChallenge(error)) {
+      // transient: the credential is untouched and the retry stays on it
+      if (!credential) return;
+      setTimeout(() => {
+        void retryAfterLimit(runId, () => credential, true).catch(
+          (err: unknown) => {
+            log(
+              `retrying ${runId} after a Cloudflare challenge failed: ${err}`,
+            );
+          },
+        );
+      }, CHALLENGE_RETRY_MS).unref();
+      return;
+    }
+    const limit = parseUsageLimit(error);
+    if (!limit) return;
     // a run on the API key hit something other than a subscription's limit
     if (!credential || credential === API_KEY_CREDENTIAL) return;
     const until = limit.resetsAt ?? new Date(Date.now() + UNKNOWN_RESET_MS);
@@ -759,7 +784,7 @@ export function createLauncher({
     log(
       `Claude credential ${credential} is at its ${limit.window} usage limit until ${until.toISOString()}`,
     );
-    void retryAfterLimit(runId).catch((err: unknown) => {
+    void retryAfterLimit(runId, retryTarget).catch((err: unknown) => {
       log(`retrying ${runId} after its usage limit failed: ${err}`);
     });
   }
@@ -796,7 +821,12 @@ export function createLauncher({
     return undefined;
   }
 
-  async function retryAfterLimit(failedId: RunId): Promise<void> {
+  /** Retries a failed run once on the credential `targetOf` names, resuming its session. */
+  async function retryAfterLimit(
+    failedId: RunId,
+    targetOf: (failedId: RunId, launch: Launch) => string | undefined,
+    keepCredential = false,
+  ): Promise<void> {
     const entry = launches.get(failedId);
     if (!entry) {
       log(`no launch of ${failedId} is held; it is not retried`);
@@ -805,7 +835,7 @@ export function createLauncher({
     // once: a second failure of the same run finds nothing
     launches.delete(failedId);
     const { launch } = entry;
-    const target = retryTarget(failedId, launch);
+    const target = targetOf(failedId, launch);
     if (!target) return;
     // the failed runner commits in the worktree the retry resumes in
     if (!(await awaitRunnerExit(sprites, launch.spriteName, failedId))) {
@@ -861,6 +891,7 @@ export function createLauncher({
       sessionId: agent.sessionId,
       prompt: agent.sessionId ? resumedPrompt(launch.prompt) : launch.prompt,
       forceCredential: target,
+      keepCredential,
     });
   }
 
