@@ -9,13 +9,14 @@ import {
   type RunId,
   spriteTaskNameFor,
 } from "@sky/shared";
-import { and, eq } from "drizzle-orm";
+import { and, eq, gte, ne } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
 import { runEnv } from "./base-profile.js";
 import {
   apiKeyAuth,
   type ClaudeAuth,
   ClaudeCredentialError,
+  credentialNameOf,
   isCloudflareChallenge,
   limitedUntil,
   markLimited,
@@ -50,6 +51,7 @@ import {
   isActive,
   isSilentLaunch,
   recordEvent,
+  type Tx,
 } from "./runs.js";
 import {
   hasConnectorSecret,
@@ -347,7 +349,11 @@ export type Launch = {
    * when the retry launches is dropped, and the retry resolves as a fresh launch would.
    */
   forceCredential?: string;
-  /** Set with `forceCredential` on the retry of a Cloudflare challenge: that credential is used even if it is limited by now. */
+  /**
+   * Set with `forceCredential` on the retry of a Cloudflare challenge: that credential is used even if
+   * it is limited by now. The retry is dropped before it launches when the environment no longer
+   * assigns it.
+   */
   keepCredential?: boolean;
 };
 
@@ -572,6 +578,25 @@ export function createLauncher({
     return assignment;
   }
 
+  /**
+   * Whether the environment is ready and still assigns `credential`: as its own, as a member of its
+   * pool, or as its API key fallback. Whether it is limited is not asked.
+   */
+  function stillAssigned(credential: string, envId: EnvironmentId): boolean {
+    const env = assignmentOf(envId);
+    if (env?.status !== "ready") return false;
+    if (credential === API_KEY_CREDENTIAL) {
+      return (
+        env.claudeCredential === API_KEY_CREDENTIAL ||
+        env.claudeFallback !== "none"
+      );
+    }
+    if (env.claudeCredential === POOL_CREDENTIAL) {
+      return poolMembers(config, env.claudePool).includes(credential);
+    }
+    return credentialNameOf(env.claudeCredential) === credential;
+  }
+
   const assignmentOf = (envId: EnvironmentId) =>
     db
       .select({
@@ -740,39 +765,61 @@ export function createLauncher({
     }
   }
 
-  // launches by run, so a run that fails on its subscription's usage limit can be retried once. In
-  // memory: a restart between the launch and the failure loses the retry, never the limit
+  // launches by run, so a run that fails on its subscription's usage limit or Cloudflare's challenge
+  // can be retried once. In memory: a restart between the launch and a limit failure loses the retry,
+  // never the limit; a restart during a challenge retry's wait loses the retry, and the run stays
+  // failed with the challenge's error
   const launches = new Map<RunId, { launch: Launch; at: number }>();
+  // challenge retries waiting out their delay or still launching, by failed run; a stop on the agent
+  // cancels its own
+  const challengeRetries = new Map<
+    RunId,
+    { agentId: AgentId; timer: ReturnType<typeof setTimeout> }
+  >();
   // runs whose launch is at or past the runner's start: one that fails there (a start that timed out
   // may still have spawned it) has its runner signalled, as a run failed `runner_timeout` does
   const maybeStarted = new Set<RunId>();
 
   /**
-   * A run failed with `error`. When that is its subscription reaching its usage limit, the
-   * subscription is marked limited until the reset time the error gives, and the run is retried
-   * once, resuming its session. An environment that isn't a pool retries on the API key, unless it
-   * turns the fallback off or the server has none: never on another subscription. A pool
-   * environment goes on to the next subscription in its pool that its chain of retries hasn't
-   * tried, then to the API key on the same terms, else notes the earliest reset on the run.
+   * A run failed with `error`, and is retried once, resuming its session, when that is either of:
+   *
+   * - Cloudflare's challenge on Claude's login: after `CHALLENGE_RETRY_MS`, on the same credential
+   *   even if it is limited by then, which is never marked limited. Dropped when the environment is
+   *   no longer ready or no longer assigns the credential, and cancelled by a stop on the agent.
+   * - its subscription reaching its usage limit: the subscription is marked limited until the reset
+   *   time the error gives and the retry launches at once. An environment that isn't a pool retries
+   *   on the API key, unless it turns the fallback off or the server has none: never on another
+   *   subscription. A pool environment goes on to the next subscription in its pool that its chain of
+   *   retries hasn't tried, then to the API key on the same terms, else notes the earliest reset on
+   *   the run.
+   *
+   * Either retry is dropped when the agent has a run created after the failed one.
    */
   function onRunFailed(runId: RunId, error: string): void {
-    const credential = db
-      .select({ credential: runs.claudeCredential })
+    const failed = db
+      .select({ credential: runs.claudeCredential, agentId: runs.agentId })
       .from(runs)
       .where(eq(runs.id, runId))
-      .get()?.credential;
+      .get();
+    const credential = failed?.credential;
     if (isCloudflareChallenge(error)) {
       // transient: the credential is untouched and the retry stays on it
-      if (!credential) return;
-      setTimeout(() => {
-        void retryAfterLimit(runId, () => credential, true).catch(
-          (err: unknown) => {
+      if (!failed || !credential) return;
+      const timer = setTimeout(() => {
+        void retryFailedRun(
+          runId,
+          (_, launch) => challengeTarget(runId, launch.envId, credential),
+          true,
+        )
+          .catch((err: unknown) => {
             log(
               `retrying ${runId} after a Cloudflare challenge failed: ${err}`,
             );
-          },
-        );
-      }, CHALLENGE_RETRY_MS).unref();
+          })
+          .finally(() => challengeRetries.delete(runId));
+      }, CHALLENGE_RETRY_MS);
+      timer.unref();
+      challengeRetries.set(runId, { agentId: failed.agentId, timer });
       return;
     }
     const limit = parseUsageLimit(error);
@@ -784,7 +831,7 @@ export function createLauncher({
     log(
       `Claude credential ${credential} is at its ${limit.window} usage limit until ${until.toISOString()}`,
     );
-    void retryAfterLimit(runId, retryTarget).catch((err: unknown) => {
+    void retryFailedRun(runId, retryTarget).catch((err: unknown) => {
       log(`retrying ${runId} after its usage limit failed: ${err}`);
     });
   }
@@ -821,8 +868,47 @@ export function createLauncher({
     return undefined;
   }
 
-  /** Retries a failed run once on the credential `targetOf` names, resuming its session. */
-  async function retryAfterLimit(
+  /** Where a run that met Cloudflare's challenge on `credential` goes next: that one, while its environment still assigns it. */
+  function challengeTarget(
+    failedId: RunId,
+    envId: EnvironmentId,
+    credential: string,
+  ): string | undefined {
+    if (stillAssigned(credential, envId)) return credential;
+    log(
+      `${failedId} is not retried after the Cloudflare challenge: its environment is not ready or no longer assigns Claude credential ${credential}`,
+    );
+    return undefined;
+  }
+
+  /** Whether the agent has a run other than `runId` created since it. */
+  const hasRunAfter = (tx: Tx, agentId: AgentId, runId: RunId) => {
+    const failedAt = tx
+      .select({ createdAt: runs.createdAt })
+      .from(runs)
+      .where(eq(runs.id, runId))
+      .get()?.createdAt;
+    return (
+      failedAt !== undefined &&
+      tx
+        .select({ id: runs.id })
+        .from(runs)
+        .where(
+          and(
+            eq(runs.agentId, agentId),
+            ne(runs.id, runId),
+            gte(runs.createdAt, failedAt),
+          ),
+        )
+        .get() !== undefined
+    );
+  };
+
+  /**
+   * Retries a failed run once on the credential `targetOf` names, resuming its session.
+   * `keepCredential` marks a challenge retry (see `onRunFailed`).
+   */
+  async function retryFailedRun(
     failedId: RunId,
     targetOf: (failedId: RunId, launch: Launch) => string | undefined,
     keepCredential = false,
@@ -846,7 +932,7 @@ export function createLauncher({
       openRunEnvVars(db, config.secretEncryptionKey, failedId),
     );
     const retryId = mintId("run");
-    const agent = db.transaction(
+    const outcome = db.transaction(
       (tx) => {
         const found = tx
           .select()
@@ -855,7 +941,21 @@ export function createLauncher({
           .get();
         // an archived agent, or one a follow-up already took, is not run twice
         if (!found || found.archivedAt || activeRunOf(tx, found.id)) {
-          return undefined;
+          return { kind: "taken" } as const;
+        }
+        // a follow-up sent since the failure moved the agent on, even one that has ended by now
+        if (hasRunAfter(tx, found.id, failedId)) {
+          return { kind: "superseded" } as const;
+        }
+        if (keepCredential) {
+          // a stop cancelled it while the failed runner exited
+          if (!challengeRetries.has(failedId)) {
+            return { kind: "cancelled" } as const;
+          }
+          // the assignment can change while the failed runner exits too
+          if (!challengeTarget(failedId, launch.envId, target)) {
+            return { kind: "unassigned" } as const;
+          }
         }
         tx.insert(runs)
           .values({
@@ -878,11 +978,22 @@ export function createLauncher({
           .set({ status: "running" })
           .where(eq(agents.id, found.id))
           .run();
-        return found;
+        return { kind: "created", agent: found } as const;
       },
       { behavior: "immediate" },
     );
-    if (!agent) return;
+    switch (outcome.kind) {
+      case "superseded":
+        log(`${failedId} is not retried: its agent has a newer run`);
+        return;
+      case "taken":
+        return;
+      // logged where they were decided
+      case "cancelled":
+      case "unassigned":
+        return;
+    }
+    const { agent } = outcome;
     registerRunEnvVars(secrets, retryId, envVars);
     log(`retrying ${failedId} as ${retryId} on Claude credential ${target}`);
     api.start({
@@ -897,6 +1008,16 @@ export function createLauncher({
 
   const api = {
     onRunFailed,
+    /** Cancels the agent's challenge retry, if one is pending: a stop ends the task, run or not. */
+    cancelChallengeRetry(agentId: AgentId): void {
+      for (const [failedId, pending] of challengeRetries) {
+        if (pending.agentId !== agentId) continue;
+        clearTimeout(pending.timer);
+        challengeRetries.delete(failedId);
+        launches.delete(failedId);
+        log(`${failedId} is not retried: its agent was stopped`);
+      }
+    },
     start(launch: Launch): void {
       const now = Date.now();
       for (const [id, held] of launches) {

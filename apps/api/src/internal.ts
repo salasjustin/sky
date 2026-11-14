@@ -129,6 +129,22 @@ const eventPost = (log: (line: string) => void) =>
     return { ...raw, payload };
   }, RunnerEventPost);
 
+/** Whether `runId` or a run along its chain of retries failed on Cloudflare's challenge. */
+function challengedEarlier(tx: Tx, runId: RunId | null): boolean {
+  let next = runId;
+  // a chain is at most a run per subscription, one on the key and its challenge retry
+  for (let i = 0; next !== null && i < 64; i++) {
+    if (isCloudflareChallenge(runError(tx, next) ?? "")) return true;
+    next =
+      tx
+        .select({ retryOf: runs.retryOf })
+        .from(runs)
+        .where(eq(runs.id, next))
+        .get()?.retryOf ?? null;
+  }
+  return false;
+}
+
 /** `longPollMs`: how long the decision long-poll waits before answering pending. */
 export function internalRoutes(
   longPollMs: number,
@@ -179,12 +195,11 @@ export function internalRoutes(
             redacted.payload.request = trimRequest(redacted.payload.request);
             openRequest(tx, run.id, redacted.payload.request);
           }
-          // the retry of a run the challenge failed, failing the same way: not tried a third time
+          // a chain of retries gets one challenge retry: a challenge after one is final
           if (
             redacted.type === "run.failed" &&
-            run.retryOf &&
             isCloudflareChallenge(redacted.payload.error) &&
-            isCloudflareChallenge(runError(tx, run.retryOf) ?? "")
+            challengedEarlier(tx, run.retryOf)
           ) {
             redacted.payload.error = UPSTREAM_BLOCKED;
           }

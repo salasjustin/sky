@@ -1138,3 +1138,115 @@ test("a usage limit still marks the subscription limited and fails over at once,
   expect(tokenOfFile(envFileOf(wire, wire.sessions[1]))).toBe(WORK_TOKEN);
   expect(limitedUntil(db, "personal")).toBeDefined();
 });
+
+/** Fails the run of the `index`th launched session with `error`; its run id. */
+async function failSession(index: number, error: string) {
+  const session = wire.sessions[index];
+  const runId = String(session?.env.RUN_ID);
+  const res = await postEvent(envFileOf(wire, session).AGENT_TOKEN, {
+    runId,
+    type: "run.failed",
+    payload: { error },
+  });
+  expect(res.status).toBe(201);
+  return runId;
+}
+
+test("stopping the agent while a challenge retry waits cancels the retry", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  const r = await launchedRun(poolEnv(["personal", "work"]));
+  fakeDelay();
+  await failWith(r, CHALLENGE);
+  const stop = await call(admin, "POST", `/v1/agents/${r.agent.id}/stop`);
+  expect(stop.status).toBe(200);
+  expect(await stop.json()).toMatchObject({ run: null });
+
+  await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
+  vi.useRealTimers();
+
+  expect(wire.sessions).toHaveLength(1);
+  expect(exitWaits()).toBe(0);
+  expect(retryOf(r.run.id)).toBeUndefined();
+});
+
+test("a follow-up sent while a challenge retry waits supersedes the retry, even once it has ended", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  const r = await launchedRun(poolEnv(["personal", "work"]));
+  fakeDelay();
+  await failWith(r, CHALLENGE);
+  const followUp = await call(admin, "POST", `/v1/agents/${r.agent.id}/runs`, {
+    prompt: "now rename the helper",
+  });
+  expect(followUp.status).toBe(202);
+  await sessionOpened(2);
+  const token = envFileOf(wire, wire.sessions[1]).AGENT_TOKEN;
+  const followUpId = String(wire.sessions[1]?.env.RUN_ID);
+  await postEvent(token, {
+    runId: followUpId,
+    type: "run.started",
+    payload: { sessionId: "sess-1" },
+  });
+  const finished = await postEvent(token, {
+    runId: followUpId,
+    type: "run.finished",
+    payload: { summary: "renamed" },
+  });
+  expect(finished.status).toBe(201);
+
+  await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
+  vi.useRealTimers();
+
+  expect(wire.sessions).toHaveLength(2);
+  expect(retryOf(r.run.id)).toBeUndefined();
+  expect(logs.join("\n")).toContain(`${r.run.id} is not retried`);
+});
+
+test.each([
+  ["reassigned to a pool without its credential", { claudePool: ["work"] }],
+  [
+    "reassigned to another subscription",
+    { claudeCredential: "work", claudePool: null },
+  ],
+  ["no longer ready", { status: "failed" as const, failureStep: "create" as const }],
+])("an environment %s while a challenge retry waits gets no retry, and nothing is marked limited", async (_name, change) => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  readings[WORK_TOKEN] = { h5: 0.5, d7: 0.5 };
+  const env = poolEnv(["personal", "work"]);
+  const r = await launchedRun(env);
+  fakeDelay();
+  await failWith(r, CHALLENGE);
+  db.update(environments).set(change).where(eq(environments.id, env)).run();
+
+  await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
+  vi.useRealTimers();
+
+  expect(wire.sessions).toHaveLength(1);
+  expect(retryOf(r.run.id)).toBeUndefined();
+  expect(limitedUntil(db, "personal")).toBeUndefined();
+  expect(limitedUntil(db, "work")).toBeUndefined();
+  expect(logs.join("\n")).toContain(`${r.run.id} is not retried`);
+});
+
+test("a challenge after a usage limit that followed a challenge fails upstream_blocked and is not retried", async () => {
+  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+  readings[WORK_TOKEN] = { h5: 0.5, d7: 0.5 };
+  const r = await launchedRun(poolEnv(["personal", "work"]));
+  fakeDelay();
+  await failWith(r, CHALLENGE);
+  await vi.advanceTimersByTimeAsync(CHALLENGE_DELAY_MS);
+  await sessionOpened(2);
+  await failSession(1, FIVE_HOUR);
+  await vi.advanceTimersByTimeAsync(0);
+  await sessionOpened(3);
+  expect(credentialsUsed()).toEqual(["personal", "personal", "work"]);
+
+  const last = await failSession(2, CHALLENGE);
+  await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
+  vi.useRealTimers();
+
+  expect(runError(db, last as RunId)).toBe(
+    "upstream_blocked: Anthropic's API answered with a Cloudflare challenge twice; retry later",
+  );
+  expect(wire.sessions).toHaveLength(3);
+  expect(retryOf(last)).toBeUndefined();
+});
