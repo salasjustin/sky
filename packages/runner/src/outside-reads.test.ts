@@ -14,8 +14,12 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import {
+  type AddressInfo,
+  createServer as createSocketServer,
+} from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -31,10 +35,19 @@ import {
 } from "./outside-reads.js";
 
 // the Claude Code binary the Agent SDK ships beside itself: the platform package for this arch and libc
+// undefined when the SDK or its platform package isn't installed, so the block skips instead of failing collection
 const claudeBinary = (() => {
-  const sdk = realpathSync(
-    join(import.meta.dirname, "../node_modules/@anthropic-ai/claude-agent-sdk"),
-  );
+  let sdk: string;
+  try {
+    sdk = realpathSync(
+      join(
+        import.meta.dirname,
+        "../node_modules/@anthropic-ai/claude-agent-sdk",
+      ),
+    );
+  } catch {
+    return undefined;
+  }
   return ["", "-musl"]
     .map((libc) =>
       join(
@@ -162,6 +175,8 @@ async function run(options: Options): Promise<{ asked: string[] }> {
   mkdirSync(worktree, { recursive: true });
   mkdirSync(join(root, "home"), { recursive: true });
   const asked: string[] = [];
+  // the child must not outlive a failed assertion
+  const controller = new AbortController();
   const stream = query({
     prompt: "read it",
     options: {
@@ -170,6 +185,9 @@ async function run(options: Options): Promise<{ asked: string[] }> {
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       settingSources: [],
+      abortController: controller,
+      // the binary the skip check found, not whichever the SDK would resolve
+      ...(claudeBinary && { pathToClaudeCodeExecutable: claudeBinary }),
       env: {
         PATH: process.env.PATH,
         HOME: join(root, "home"),
@@ -185,8 +203,12 @@ async function run(options: Options): Promise<{ asked: string[] }> {
       ...options,
     },
   });
-  for await (const message of stream as AsyncIterable<SDKMessage>)
-    if (message.type === "result") break;
+  try {
+    for await (const message of stream as AsyncIterable<SDKMessage>)
+      if (message.type === "result") break;
+  } finally {
+    controller.abort();
+  }
   return { asked };
 }
 
@@ -205,7 +227,8 @@ describe.skipIf(!claudeBinary)(
     test("with reads outside the working directories blocked, the Read is declined and nothing is asked", async () => {
       const { asked } = await run({ settings: BLOCKED });
       expect(toolResults).toHaveLength(1);
-      expect(toolResults[0]).toContain("blockReadsOutsideWorkingDirectories");
+      // refused, whatever Claude Code words it as; the scratch-directory test below is the live read
+      expect(toolResults[0]).not.toContain("OUTSIDE");
       expect(asked).toEqual([]);
     }, 90_000);
 
@@ -534,6 +557,37 @@ describe("staging an approved outside read", () => {
       chmodSync(join(tree, "sub"), 0o755);
     }
   });
+
+  /** Makes a FIFO at `path`; false where the platform has no `mkfifo`. */
+  const makeFifo = (path: string) =>
+    process.platform !== "win32" && spawnSync("mkfifo", [path]).status === 0;
+
+  test("a FIFO inside an approved directory is skipped, and its siblings are copied", async (context) => {
+    const tree = join(root, "tree");
+    mkdirSync(tree);
+    writeFileSync(join(tree, "a.txt"), "a");
+    if (!makeFifo(join(tree, "pipe"))) return context.skip();
+    const copy = await stage(tree);
+    expect(readdirSync(copy)).toEqual(["a.txt"]);
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a socket inside an approved directory is skipped, and its siblings are copied",
+    async () => {
+      const tree = join(root, "tree");
+      mkdirSync(tree);
+      writeFileSync(join(tree, "a.txt"), "a");
+      const socket = createSocketServer();
+      await new Promise<void>((done) => socket.listen(join(tree, "sock"), done));
+      try {
+        expect(lstatSync(join(tree, "sock")).isSocket()).toBe(true);
+        const copy = await stage(tree);
+        expect(readdirSync(copy)).toEqual(["a.txt"]);
+      } finally {
+        await new Promise((done) => socket.close(done));
+      }
+    },
+  );
 
   test("a path that no longer exists is refused", async () => {
     const gone = join(root, "gone.txt");

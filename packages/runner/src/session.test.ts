@@ -4361,6 +4361,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
   test("the session may read the scratch directory, and a check's nested log written there is read with no approval", async () => {
     const { sent, deps } = api();
     let scratch = "";
+    let realScratch = "";
     let answers: unknown[] = [];
     let seen: Options | undefined;
     const query = scripted([
@@ -4368,6 +4369,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       async (options: Options) => {
         seen = options;
         scratch = options.additionalDirectories?.[0] ?? "";
+        realScratch = realpathSync(scratch);
         const log = join(scratch, "reflect.log");
         writeFileSync(log, "nested result\n");
         answers = await fire(options, "PreToolUse", readOf(log));
@@ -4383,7 +4385,8 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     expect(sent.map((e) => e.type)).not.toContain("run.waiting");
     // the run's own directory of the runner's temp area, which the run's end removes
     expect(scratch).toContain(`scratch-${config.runId}`);
-    expect(scratch.startsWith(tmpdir())).toBe(true);
+    // real paths on both sides: the temp directory can sit behind a link (macOS /var -> /private/var)
+    expect(realScratch.startsWith(`${realpathSync(tmpdir())}/`)).toBe(true);
     expect(existsSync(scratch)).toBe(false);
     const prompt = JSON.stringify(seen?.systemPrompt);
     expect(prompt).toContain(`> ${scratch}/<name>.log`);
@@ -4527,6 +4530,123 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     const warning = sent.find((e) => e.type === "runner.warning");
     expect(warning?.payload).toEqual({
       message: `Read of ${realpathSync(outside)} was declined: not that file`,
+    });
+  });
+
+  test("a denied Read leaves no approved copy in the scratch directory", async () => {
+    const outside = join(root, "elsewhere.log");
+    writeFileSync(outside, "outside contents\n");
+    const { deps } = api(decided({ decision: "deny" }));
+    let answers: unknown[] = [];
+    let held: string[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        answers = await fire(options, "PreToolUse", readOf(outside));
+        held = readdirSync(options.additionalDirectories?.[0] ?? "");
+      },
+      success,
+    ]);
+    await runSession(config, { ...deps, query });
+    expect(answers).toMatchObject([
+      { hookSpecificOutput: { permissionDecision: "deny" } },
+    ]);
+    expect(held).toEqual([]);
+  });
+
+  test("a run aborted while a Read waits for its answer stops the call and leaves no approved copy", async () => {
+    const outside = join(root, "elsewhere.log");
+    writeFileSync(outside, "outside contents\n");
+    const controller = new AbortController();
+    const { sent, deps } = api();
+    let answers: unknown[] = [];
+    let held: string[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        answers = await fire(options, "PreToolUse", readOf(outside));
+        held = readdirSync(options.additionalDirectories?.[0] ?? "");
+      },
+      success,
+    ]);
+    await runSession(config, {
+      ...deps,
+      query,
+      signal: controller.signal,
+      // the abort lands while the request is open
+      awaitDecision: async (_requestId, signal) => {
+        controller.abort("SIGTERM");
+        throw signal.reason;
+      },
+    });
+    expect(sent.map((e) => e.type)).toContain("run.waiting");
+    expect(answers).toMatchObject([
+      {
+        continue: false,
+        hookSpecificOutput: { permissionDecision: "deny" },
+      },
+    ]);
+    expect(held).toEqual([]);
+  });
+
+  describe("a run that does not finish removes its scratch directory and the approved copies in it", () => {
+    /** Approves a Read so a copy is live in the scratch directory, then ends the script as `tail` says. */
+    const scratchAround = async (
+      tail: unknown[],
+      controller = new AbortController(),
+    ) => {
+      const outside = join(root, "elsewhere.log");
+      writeFileSync(outside, "outside contents\n");
+      const { deps } = api(decided({ decision: "approve" }));
+      let scratch = "";
+      let copy = "";
+      let liveCopy = false;
+      const query = scripted([
+        init,
+        async (options: Options) => {
+          scratch = options.additionalDirectories?.[0] ?? "";
+          const [answer] = (await fire(
+            options,
+            "PreToolUse",
+            readOf(outside),
+          )) as unknown as {
+            hookSpecificOutput: { updatedInput: { file_path: string } };
+          }[];
+          copy = answer?.hookSpecificOutput.updatedInput.file_path ?? "";
+          liveCopy = existsSync(copy);
+        },
+        ...tail,
+      ]);
+      const code = await runSession(config, {
+        ...deps,
+        query,
+        signal: controller.signal,
+      });
+      return { code, scratch, copy, liveCopy };
+    };
+
+    test("an SDK that throws", async () => {
+      const { code, scratch, copy, liveCopy } = await scratchAround([
+        new Error("Claude Code process exited with code 1"),
+      ]);
+      expect(code).toBe(1);
+      expect(liveCopy).toBe(true);
+      expect(scratch).not.toBe("");
+      expect(existsSync(scratch)).toBe(false);
+      expect(existsSync(copy)).toBe(false);
+    });
+
+    test("a run aborted by its signal", async () => {
+      const controller = new AbortController();
+      const { code, scratch, copy, liveCopy } = await scratchAround(
+        [async () => controller.abort("SIGTERM"), success],
+        controller,
+      );
+      expect(code).toBe(1);
+      expect(liveCopy).toBe(true);
+      expect(scratch).not.toBe("");
+      expect(existsSync(scratch)).toBe(false);
+      expect(existsSync(copy)).toBe(false);
     });
   });
 
