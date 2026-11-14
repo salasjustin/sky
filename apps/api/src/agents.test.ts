@@ -164,10 +164,33 @@ test("POST returns 202 with the agent on claude/<agentId> and a starting run", a
   await sessionOpened();
 });
 
+/**
+ * Launches a run in `envId` that, as its runner starts, was created `agoMs` earlier by a clock frozen
+ * from the step before (the sprite hold), so the deadline's time left doesn't depend on how long the
+ * launch took. The database stamps createdAt by its own clock, so the run's is rewritten to match.
+ */
+async function launchedCreatedAgo(envId: string, agoMs: number) {
+  const now = Date.parse("2026-06-01T12:00:00.000Z");
+  wire.afterExec = (call) => {
+    if (!/ curl .* PUT /.test(call)) return;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
+    db.update(runs)
+      .set({ createdAt: new Date(now - agoMs).toISOString() })
+      .run();
+  };
+  try {
+    const out = await launched(envId);
+    await sessionOpened();
+    return out;
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 test("launch uploads the bundle, then starts the runner as a detached session and lets go of it", async () => {
   const envId = readyEnv();
-  const { agent, run } = await launched(envId);
-  await sessionOpened();
+  const { agent, run } = await launchedCreatedAgo(envId, 0);
   const sprite = spriteNameFor(envId);
   expect(wire.calls).toEqual([
     // the sprite's free memory is checked before anything is written to it
@@ -218,6 +241,18 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   expect(session?.argv.join(" ")).toMatch(
     /set -a && \. "\$ENV_FILE" && set \+a && rm -f "\$ENV_FILE" && /,
   );
+});
+
+test("the runner is given what is left of the launch deadline, not the whole of it", async () => {
+  // 15 minutes less the 6.5 the launch has taken since the run was created
+  await launchedCreatedAgo(readyEnv(), 6.5 * 60_000);
+  expect(wire.sessions[0]?.env.LAUNCH_DEADLINE_MINUTES).toBe("8.5");
+});
+
+test("a runner started past its launch deadline is still given a positive bound, one second", async () => {
+  await launchedCreatedAgo(readyEnv(), 20 * 60_000);
+  const left = Number(wire.sessions[0]?.env.LAUNCH_DEADLINE_MINUTES);
+  expect(left * 60_000).toBeCloseTo(1_000);
 });
 
 test("the runner, and so its agent's shell, finds the pnpm provisioning enabled under ~/.local/bin", async () => {

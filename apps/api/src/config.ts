@@ -46,8 +46,10 @@ const configSchema = z
      */
     RUN_PROBE_MINUTES: z.coerce.number().positive().optional(),
     /**
-     * A run still starting with no event this long after it was created is failed with `launch_timeout`.
-     * Past the runner's longest startup: a store lock wait (10 minutes) and the plugin refresh.
+     * A run still starting with no event this long after it was created is failed with `launch_timeout`
+     * and its runner signalled. The runner gets what is left of it at launch and bounds its queue for
+     * the repo lock by that, so a run queued too long fails with its own error naming the lock. Keep it
+     * past a store lock wait (10 minutes) plus the plugin refresh.
      */
     LAUNCH_DEADLINE_MINUTES: z.coerce.number().positive().default(15),
     /**

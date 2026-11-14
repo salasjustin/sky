@@ -278,9 +278,9 @@ export async function stopLingeringRunner(
 // bounded: a runner that outlives the wait loses whatever its commit hadn't written. Its 30 s runs
 // in the same exec as REMOVE_WORKTREE, so the two waits share `sprites.timeoutMs`
 const AWAIT_RUNNER_EXIT = `for _ in $(seq 30); do pgrep -f "$2" >/dev/null || break; sleep 1; done; `;
-// shorter than run setup's REPO_LOCK_WAIT_S (@sky/shared): AWAIT_RUNNER_EXIT's 30 s plus this plus
-// git's own removal must finish inside `sprites.timeoutMs`, or the exec times out before flock can
-// report the lock
+// fixed, not what is left of a launch's deadline as run setup's wait is: AWAIT_RUNNER_EXIT's 30 s
+// plus this plus git's own removal must finish inside `sprites.timeoutMs`, or the exec times out
+// before flock can report the lock
 const REMOVE_LOCK_WAIT_S = 20;
 // a worktree the runner never created (or whose directory is gone) counts as removed. The removal
 // writes the shared repo's .git, so it takes the lock run setup takes; REPO_LOCK_TIMED_OUT is a lock
@@ -365,6 +365,10 @@ export type Launch = {
   keepCredential?: boolean;
 };
 
+// what the runner is given once its launch deadline has passed: its config rejects 0, and the sweep
+// fails the run anyway
+const LAUNCH_LEFT_FLOOR_MS = 1_000;
+
 // how long a run that met Cloudflare's challenge waits before its one retry
 const CHALLENGE_RETRY_MS = 60_000;
 
@@ -414,6 +418,24 @@ export function createLauncher({
     return profile && !connector
       ? { ...profile, storeRepo: undefined }
       : profile;
+  }
+
+  /**
+   * What is left of the run's launch deadline, in minutes, for the runner to bound its wait for the
+   * repo lock by: the sweep fails the run at its createdAt plus the deadline, so a runner given the
+   * whole deadline would still be queued then and its error naming the lock would never be seen.
+   * Measured here rather than on the sprite, whose clock may differ.
+   */
+  function launchMinutesLeft(runId: RunId): number {
+    const createdAt = db
+      .select({ createdAt: runs.createdAt })
+      .from(runs)
+      .where(eq(runs.id, runId))
+      .get()?.createdAt;
+    const leftMs = createdAt
+      ? Date.parse(createdAt) + config.launchDeadlineMs - Date.now()
+      : 0;
+    return Math.max(leftMs, LAUNCH_LEFT_FLOOR_MS) / 60_000;
   }
 
   /** Runs one launch step, logging how long it took, so a stuck launch shows where it stopped. */
@@ -717,7 +739,7 @@ export function createLauncher({
             APPROVAL_POLICY: JSON.stringify(launch.approvalPolicy),
             AUTO_APPROVE: JSON.stringify(launch.autoApprove),
             WAIT_TIMEOUT_MINUTES: String(config.waitTimeoutMs / 60_000),
-            LAUNCH_DEADLINE_MINUTES: String(config.launchDeadlineMs / 60_000),
+            LAUNCH_DEADLINE_MINUTES: String(launchMinutesLeft(launch.runId)),
             ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
             ...(launch.remoteBranch
               ? { START_BRANCH: launch.remoteBranch }
