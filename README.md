@@ -313,7 +313,7 @@ Checks on every command:
 
 An agent's sandbox holds no GitHub token, so `git push` and `gh` don't work there. Agents publish through a Sprites connector to GitHub instead:
 
-1. In the Sprites org whose token Sky runs with (`SPRITES_TOKEN`), connect GitHub and give the connector a policy with `name_prefix: sky-`, so every Sky sandbox can use it.
+1. In the Sprites org whose token Sky runs with (`SPRITES_TOKEN`), connect GitHub and give the connector a policy with `name_prefix: sky-`, so every Sky sandbox can use it. The connector needs the `workflow` scope.
 2. Hand its connection id to an environment:
 
    ```
@@ -321,6 +321,10 @@ An agent's sandbox holds no GitHub token, so `git push` and `gh` don't work ther
    ```
 
 Agents in that environment then get `GITHUB_CONNECTOR` and are told to publish with Sky's own command, which sends the branch's commits to GitHub and opens a pull request into the default branch, or updates the one already open. The connector must belong to the same Sprites org as `SPRITES_TOKEN`; another org's connector doesn't recognize Sky's sandboxes.
+
+Commits are published with their `.github/workflows/` files like any other path, which is why the connector needs the `workflow` scope. When GitHub refuses a ref update with a 404 or 403 and the commits sent change workflow files, `publish` fails with `workflow_files_blocked` and names those files, since GitHub's bare `404 Not Found` reads as lost repo access. The fix is to give the connector the `workflow` scope and publish again. Any other refusal, and any rate limit, is reported as GitHub sent it.
+
+Earlier versions of `publish` held workflow changes back, sending the default branch's workflow files in their place and leaving a patch to apply by hand. If a pull request published that way never had its patch applied, `publish` refuses to update it, because GitHub's head isn't a commit the agent made. Fix it once: apply the patch to the pull request's branch from outside the sandbox, or publish to a new branch with `--branch`; after that `publish` works as normal.
 
 A merge commit is published with all its parents, so after an agent merges the default branch into its own, GitHub sees the pull request as up to date and CI runs. Every parent other than the first must already be on GitHub, as the default branch's head is. A merge of a branch that exists only in the sandbox is refused and nothing is sent; merge only branches GitHub has, or rebase instead. When the default branch has moved on GitHub since the merge, `publish` rebases a branch the agent started onto it first, which drops a merge of the default branch and replays only the branch's own commits; a branch the agent continues from an existing pull request is never rebased, and is published with its merge as it is.
 
@@ -332,7 +336,6 @@ Follow-up, not built: a GitHub App that mints a short-lived read token per clone
 
 Some repos reject commits by unverified authors, or commits with a `Co-authored-by` trailer. For those:
 
-- **Workflow files.** Commits are published with their `.github/workflows/` files like any other path, which needs the `workflow` scope on the GitHub connector. When GitHub refuses a ref update with a 404 or 403 and the commits sent change workflow files, `publish` fails with `workflow_files_blocked` and names those files, since GitHub's bare `404 Not Found` reads as lost repo access. The fix is to give the connector the `workflow` scope and publish again. Any other refusal, and any rate limit, is reported as GitHub sent it.
 - **Author.** Set `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` as secrets of the environment (`sky secret set web GIT_AUTHOR_EMAIL`, and the same for the name). The agent's commits and the commits `publish` sends to GitHub then carry that author and committer, including commits the agent made before the variables were set; commits an earlier `publish` already sent to the branch stay on GitHub as they were sent. `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL` set a different committer. Unless both author variables are set, commits are by `Claude <noreply@anthropic.com>`; setting only one of them falls back to Claude for both.
 - **Trailers.** Claude Code's own commit and pull request attribution is turned off for the agent's session, though not for the `claude -p` runs it starts, and `publish` strips every `Co-authored-by` trailer, and the "Generated with Claude Code" footer, from commit messages and pull request bodies.
 - **Branch.** `publish --branch <name>` sends the commits to the GitHub branch `<name>` and opens the pull request from it, while the agent's worktree stays on `claude/<agent id>`. Set the secret `SKY_PUBLISH_BRANCH` to make it the default. The order is the flag, then the branch the agent was started on with `sky agent start --branch` (see [Fetching from GitHub](#fetching-from-github)), then the secret. That secret is shared by every agent in the environment, and two agents publishing to one branch collide, so with several agents pass `--branch` per agent. Use a new branch name: a branch that already holds commits this agent never made is not overwritten. The name must be a valid branch name and not the base or default branch. The `compareUrl` an agent reports still names `claude/<agent id>`, unless it was started on a branch, whose name it uses.

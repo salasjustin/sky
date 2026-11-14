@@ -179,16 +179,6 @@ async function changes(cwd: string, from: string, to: string) {
   return result;
 }
 
-type TreeItemEntry = { mode: string; type: string; sha: string; path: string };
-
-/** Writes a tree of `entries`; the trees they name needn't be in this clone. */
-const mktree = (cwd: string, entries: TreeItemEntry[]) =>
-  repoGit(cwd)(["mktree", "--missing", "-z"], {
-    input: entries
-      .map((e) => `${e.mode} ${e.type} ${e.sha}\t${e.path}\0`)
-      .join(""),
-  });
-
 /**
  * Each path under `.github/workflows/` that differs between two `.github/workflows` trees, either
  * of which is "" where there is no such tree; a rename names both ends. Both trees must be in this
@@ -200,7 +190,7 @@ async function workflowPathsBetween(
   to: string,
 ): Promise<string[]> {
   if (from === to) return [];
-  const empty = await mktree(cwd, []);
+  const empty = await repoGit(cwd)(["mktree"], { input: "" });
   const out = await git(
     cwd,
     "diff-tree",
@@ -502,8 +492,8 @@ export async function publish(options: {
   /** Replaces the author and committer of each commit sent; their dates stay. */
   identity?: { author: PersonName; committer: PersonName };
 }): Promise<PublishResult> {
-  // git takes a pathspec (`-- .github/workflows`, `ls-files`'s implicit one) relative to the
-  // directory it runs in, while `<rev>:<path>` is from the top, so every call runs from the top
+  // `ls-files` takes its implicit pathspec relative to the directory it runs in, while
+  // `<rev>:<path>` is from the top, so every call runs from the top
   const cwd = (await git(options.cwd, "rev-parse", "--show-toplevel")).trim();
   const rebasing = await rebaseInProgress(cwd);
   if (rebasing !== undefined) {
