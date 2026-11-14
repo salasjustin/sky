@@ -115,7 +115,7 @@ describe.skipIf(!canRun)("REMOVE_WORKTREE under real bash", () => {
 
   test("a lock held past the wait fails with the timeout status, naming the lock, and removes nothing", async () => {
     const release = await holdLock();
-    // the 20 s wait is baked into the script; shorten it so the test waits 1 s
+    // the removal's lock wait is baked into the script; shorten it so the test waits 1 s
     const shortened = REMOVE_WORKTREE.replace(/-w \d+ /, "-w 1 ");
     expect(shortened).not.toBe(REMOVE_WORKTREE);
     const held = remove(shortened);

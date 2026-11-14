@@ -26,7 +26,7 @@ const LOCK_ERROR =
   /could not lock config file|unable to write upstream branch configuration|Unable to create '[^']*\.lock'|index\.lock/i;
 const LOCK_RETRY_DELAY_MS = 250;
 
-/** Runs `step`, and once more after a short delay when git reported a config or index lock held. */
+/** Runs `step`, and once more after a short delay when git refused it for a lock another process held. */
 export async function retryOnLock<T>(step: () => Promise<T>): Promise<T> {
   try {
     return await step();
