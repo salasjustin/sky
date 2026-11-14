@@ -329,11 +329,11 @@ async function copyEntry(src: string, dest: string, walk: Walk): Promise<void> {
 }
 
 /**
- * Copies an approved outside read into `scratch` and returns the copy's path, which Claude Code can
+ * Copies an allowed outside read into `scratch` and returns the copy's path, which Claude Code can
  * read without leaving its working directories. The path is resolved again first, since the tree may
- * have changed while the approval waited. Throws, leaving no partial copy, when the path is missing or
- * not a file or directory, when anything in it is `refused` (outside the run's own `scratch`), or past
- * `maxBytes` read or `maxEntries` copied.
+ * have changed since the gate, while a person was asked. Throws, leaving no partial copy, when the
+ * path is missing or not a file or directory, when anything in it is `refused` (outside the run's own
+ * `scratch`), or past `maxBytes` read or `maxEntries` copied.
  */
 export async function stageRead(
   read: OutsideRead,

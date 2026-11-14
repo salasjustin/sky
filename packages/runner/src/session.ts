@@ -341,7 +341,7 @@ const checkInstructions = (
           `Use that form on this run in place of any nested \`claude\` command or credential file path from an earlier run of this session.`,
           ...(scratchDir
             ? [
-                `Write each nested \`claude\` command's output to a file in ${scratchDir}, such as \`… > ${scratchDir}/<name>.log 2>&1\`, and read it with the Read tool rather than \`cat\`: the Read tool reads that directory and the repo without asking, and a read anywhere else may wait for a person's approval, and is declined if it is refused.`,
+                `Write each nested \`claude\` command's output to a file in ${scratchDir}, such as \`… > ${scratchDir}/<name>.log 2>&1\`, and read it with the Read tool rather than \`cat\`: the Read tool reads that directory and the repo without asking, and a read anywhere else may wait for a person's approval, and a read of a credential file or a system directory is declined.`,
               ]
             : []),
           `A nested \`claude\` session run that way is logged in with this run's subscription: the command reads it from the file it names, which is expected, so run the command as given. Leave that file to the command: never read, print, copy or edit it yourself, never set or use another credential for the nested session, and never print or read any other credential file or token. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.`,
@@ -735,10 +735,12 @@ export async function runSession(
     "The user denied this tool call.";
 
   /**
-   * Holds a Read, Grep or Glob of a path outside the worktree and the scratch directory for the
-   * person's answer. Claude Code can't be told to allow one its settings block, so an approved path
-   * is copied into the scratch directory and the call is pointed at the copy. A path `refusedReads`
-   * holds is declined at once, with no one asked; a hard link to one is found at the copy.
+   * Decides a Read, Grep or Glob of a path outside the worktree and the scratch directory: the env's
+   * approval policy holds it for a person's answer or lets it run, a path in or around Claude Code's
+   * config directory always waits for one, and this session's saved tool output never does. Claude
+   * Code can't be told to allow one its settings block, so an allowed path is copied into the scratch
+   * directory and the call is pointed at the copy. A path `refusedReads` holds is declined at once,
+   * with no one asked; a hard link to one is found at the copy.
    */
   const gateOutsideRead = async (
     input: PreToolUseHookInput,
