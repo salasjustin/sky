@@ -273,7 +273,7 @@ describe.skipIf(!canFlock)("with flock", () => {
     const stop = new AbortController();
     const launched = prepareWorktree(
       { repoDir, worktreesDir, agentId: "agt_1" },
-      // the runner's 15 minute launch deadline, in seconds
+      // a launch-length bound, in seconds, well past the 120 s default
       { env: {}, warn: () => {}, lockWaitS: 900, signal: stop.signal },
     );
     cleanups.push(async () => {
