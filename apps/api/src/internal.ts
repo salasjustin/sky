@@ -15,6 +15,10 @@ import {
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { isAgentTokenFor, mintAgentToken } from "./agent-token.js";
+import {
+  isCloudflareChallenge,
+  UPSTREAM_BLOCKED,
+} from "./claude-credentials.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { redactDeep } from "./redact.js";
@@ -24,6 +28,7 @@ import {
   agentStatusFor,
   isActive,
   recordEvent,
+  runError,
   type Tx,
 } from "./runs.js";
 import { body, jsonBody } from "./validation.js";
@@ -124,6 +129,22 @@ const eventPost = (log: (line: string) => void) =>
     return { ...raw, payload };
   }, RunnerEventPost);
 
+/** Whether `runId` or a run along its chain of retries failed on Cloudflare's challenge. */
+function challengedEarlier(tx: Tx, runId: RunId | null): boolean {
+  let next = runId;
+  // a chain is at most a run per subscription, one on the key and its challenge retry
+  for (let i = 0; next !== null && i < 64; i++) {
+    if (isCloudflareChallenge(runError(tx, next) ?? "")) return true;
+    next =
+      tx
+        .select({ retryOf: runs.retryOf })
+        .from(runs)
+        .where(eq(runs.id, next))
+        .get()?.retryOf ?? null;
+  }
+  return false;
+}
+
 /** `longPollMs`: how long the decision long-poll waits before answering pending. */
 export function internalRoutes(
   longPollMs: number,
@@ -173,6 +194,14 @@ export function internalRoutes(
           if (redacted.type === "run.waiting") {
             redacted.payload.request = trimRequest(redacted.payload.request);
             openRequest(tx, run.id, redacted.payload.request);
+          }
+          // a chain of retries gets one challenge retry: a challenge after one is final
+          if (
+            redacted.type === "run.failed" &&
+            isCloudflareChallenge(redacted.payload.error) &&
+            challengedEarlier(tx, run.retryOf)
+          ) {
+            redacted.payload.error = UPSTREAM_BLOCKED;
           }
           const { id, enqueued } = recordEvent(
             tx,

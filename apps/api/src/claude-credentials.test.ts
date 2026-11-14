@@ -16,10 +16,12 @@ import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
 import {
+  isCloudflareChallenge,
   limitedUntil,
   MAX_RESET_MS,
   markLimited,
   parseUsageLimit,
+  UPSTREAM_BLOCKED,
 } from "./claude-credentials.js";
 import type { Config } from "./config.js";
 import { KnownSecrets } from "./redact.js";
@@ -254,6 +256,48 @@ test("a reset time in an unknown zone leaves the reset unread, not guessed", () 
       NOW,
     )?.resetsAt,
   ).toBeNull();
+});
+
+// --- Cloudflare's challenge on Claude's login -----------------------------------------------------
+
+test.each([
+  "Claude Code returned an error result: Failed to authenticate. API Error: 403 Attention Required! | Cloudflare",
+  "failed to authenticate. api error: 403 attention required! | cloudflare",
+  "FAILED TO AUTHENTICATE. API ERROR: 403 ATTENTION REQUIRED! | CLOUDFLARE",
+  "Failed to authenticate (403)\n<title>Attention Required! | Cloudflare</title>",
+])("%j is Cloudflare's challenge", (error) => {
+  expect(isCloudflareChallenge(error)).toBe(true);
+});
+
+test.each([
+  [
+    "no authentication failure",
+    "API Error: 403 Attention Required! | Cloudflare",
+  ],
+  [
+    "another status",
+    "Failed to authenticate. API Error: 401 Attention Required! | Cloudflare",
+  ],
+  [
+    "a 403 only inside a longer number",
+    "Failed to authenticate. API Error: 4030 Attention Required! | Cloudflare",
+  ],
+  [
+    "a 403 only glued to a word",
+    "Failed to authenticate. API Error: x403 Attention Required! | Cloudflare",
+  ],
+  [
+    "a 403 that is not Cloudflare's",
+    "Failed to authenticate. API Error: 403 Forbidden",
+  ],
+  [
+    "the challenge's title without its vendor",
+    "Failed to authenticate. API Error: 403 Attention Required!",
+  ],
+  ["the stored final error of a second challenge", UPSTREAM_BLOCKED],
+  ["an empty error", ""],
+])("%s is not Cloudflare's challenge", (_name, error) => {
+  expect(isCloudflareChallenge(error)).toBe(false);
 });
 
 // --- assignment: which credential a run uses ------------------------------------------------------

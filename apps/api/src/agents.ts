@@ -653,6 +653,7 @@ export function agentRoutes(
           return archived(c);
       }
       const { run, spriteName } = outcome;
+      launcher.cancelChallengeRetry(id);
       if (run) c.var.nudgeDeliveries();
       // the run is stopped either way: a runner that missed the signal is refused its next post
       if (run) await signalRunner(sprites, spriteName, run.id, log);
