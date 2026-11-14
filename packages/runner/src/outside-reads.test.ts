@@ -1,9 +1,17 @@
 import {
+  chmodSync,
   existsSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -16,7 +24,11 @@ import {
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { outsideRead, stageRead } from "./outside-reads.js";
+import {
+  outsideRead,
+  type RefusedPaths,
+  stageRead,
+} from "./outside-reads.js";
 
 // the Claude Code binary the Agent SDK ships beside itself: the platform package for this arch and libc
 const claudeBinary = (() => {
@@ -216,10 +228,11 @@ describe.skipIf(!claudeBinary)(
         join(root, "worktree"),
       );
       expect(outside).toEqual({ field: "file_path", path: readTarget });
-      const copy = stageRead(
+      const copy = await stageRead(
         outside as NonNullable<typeof outside>,
         scratch,
         1,
+        { secretDirs: [], secretFiles: [], systemDirs: [] },
       );
       await run({
         settings: BLOCKED,
@@ -245,3 +258,215 @@ describe.skipIf(!claudeBinary)(
     }, 90_000);
   },
 );
+
+describe("staging an approved outside read", () => {
+  /** A runner's credential directory, holding a nested login file and this run's scratch. */
+  let secrets: string;
+  let scratch: string;
+  let login: string;
+  /** Claude Code's config directory and the home holding its account file. */
+  let config: string;
+  let home: string;
+  /** Stands in for /proc, /sys and /dev, which the session hands over. */
+  let system: string;
+  let refused: RefusedPaths;
+
+  beforeEach(() => {
+    secrets = join(root, "sky-runner-1");
+    scratch = join(secrets, "scratch-run_1");
+    mkdirSync(scratch, { recursive: true });
+    login = join(secrets, "sky-nested-claude-run_1-abc");
+    writeFileSync(login, "TOKEN");
+    config = join(root, "home", ".claude");
+    home = join(root, "home");
+    mkdirSync(join(config, "projects", "p", "tool-results"), {
+      recursive: true,
+    });
+    writeFileSync(join(config, ".credentials.json"), '{"token":"TOKEN"}');
+    writeFileSync(
+      join(config, "projects", "p", "tool-results", "out.txt"),
+      "large tool output\n",
+    );
+    writeFileSync(join(home, ".claude.json"), '{"oauthAccount":{}}');
+    system = join(root, "system");
+    mkdirSync(system);
+    writeFileSync(join(system, "environ"), "SECRET=1");
+    refused = {
+      secretDirs: [secrets],
+      secretFiles: [
+        join(config, ".credentials.json"),
+        join(home, ".claude.json"),
+      ],
+      systemDirs: [system],
+    };
+  });
+
+  const slot = () => join(scratch, "approved", "1");
+  const stage = (path: string, limits?: Parameters<typeof stageRead>[4]) =>
+    stageRead({ field: "file_path", path }, scratch, 1, refused, limits);
+  /** Every regular file under `dir`, with its contents. */
+  const filesUnder = (dir: string) =>
+    readdirSync(dir, { recursive: true })
+      .map((name) => join(dir, String(name)))
+      .filter((path) => lstatSync(path).isFile())
+      .map((path) => readFileSync(path, "utf8"));
+
+  test("an approved file is copied into the run's slot, readable by its owner alone", async () => {
+    const outside = join(root, "notes.txt");
+    writeFileSync(outside, "notes\n");
+    const copy = await stage(outside);
+    expect(copy).toBe(join(slot(), "notes.txt"));
+    expect(readFileSync(copy, "utf8")).toBe("notes\n");
+    expect(statSync(copy).mode & 0o077).toBe(0);
+    expect(statSync(slot()).mode & 0o077).toBe(0);
+  });
+
+  test.each([
+    ["a file in a runner's credential directory", () => login],
+    ["a runner's credential directory itself", () => secrets],
+    [
+      "another run's scratch directory",
+      () => {
+        const other = join(secrets, "scratch-run_2");
+        mkdirSync(other);
+        writeFileSync(join(other, "copy.txt"), "theirs");
+        return other;
+      },
+    ],
+    ["Claude Code's login file", () => join(config, ".credentials.json")],
+    ["Claude Code's account file", () => join(home, ".claude.json")],
+    ["a file under a system directory", () => join(system, "environ")],
+    ["a system directory itself", () => system],
+  ])("%s is refused, approved or not", async (_, pathOf) => {
+    const path = pathOf();
+    await expect(stage(path)).rejects.toThrow(path);
+    expect(existsSync(slot())).toBe(false);
+  });
+
+  test("Claude Code's config directory is refused whole for its login file, and its other files are copied", async () => {
+    await expect(stage(config)).rejects.toThrow(
+      join(config, ".credentials.json"),
+    );
+    const output = join(config, "projects", "p", "tool-results", "out.txt");
+    expect(readFileSync(await stage(output), "utf8")).toBe(
+      "large tool output\n",
+    );
+  });
+
+  test("a path that became a link to the login file while the approval waited is resolved again and refused", async () => {
+    const approved = join(root, "approved.txt");
+    writeFileSync(approved, "harmless");
+    rmSync(approved);
+    symlinkSync(login, approved);
+    await expect(stage(approved)).rejects.toThrow(login);
+    expect(existsSync(slot())).toBe(false);
+  });
+
+  test("a hard link to a file in a runner's credential directory is refused, alone or in an approved directory", async () => {
+    const link = join(root, "notes.txt");
+    linkSync(login, link);
+    await expect(stage(link)).rejects.toThrow(link);
+    const tree = join(root, "tree");
+    mkdirSync(tree);
+    writeFileSync(join(tree, "a.txt"), "a");
+    linkSync(login, join(tree, "b.txt"));
+    await expect(stage(tree)).rejects.toThrow(join(tree, "b.txt"));
+    expect(existsSync(slot())).toBe(false);
+  });
+
+  test("a hard link to Claude Code's login file is refused", async () => {
+    const link = join(root, "creds.txt");
+    linkSync(join(config, ".credentials.json"), link);
+    await expect(stage(link)).rejects.toThrow(link);
+  });
+
+  test("a symlink inside an approved directory that points at the login file is copied as a link, never its contents", async () => {
+    const tree = join(root, "tree");
+    mkdirSync(tree);
+    writeFileSync(join(tree, "a.txt"), "a");
+    symlinkSync(login, join(tree, "login"));
+    const copy = await stage(tree);
+    const link = join(copy, "login");
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(link)).toBe(login);
+    expect(filesUnder(slot())).toEqual(["a"]);
+  });
+
+  test("a file with more bytes than the limit is refused and leaves no copy", async () => {
+    const big = join(root, "big.log");
+    writeFileSync(big, "x".repeat(2048));
+    await expect(stage(big, { maxBytes: 1024 })).rejects.toThrow(
+      `${big} is larger than 1024 bytes`,
+    );
+    expect(existsSync(slot())).toBe(false);
+  });
+
+  test("the limit counts bytes across the whole tree", async () => {
+    const tree = join(root, "tree");
+    mkdirSync(tree);
+    writeFileSync(join(tree, "a.log"), "x".repeat(600));
+    writeFileSync(join(tree, "b.log"), "x".repeat(600));
+    await expect(stage(tree, { maxBytes: 1024 })).rejects.toThrow(
+      "larger than 1024 bytes",
+    );
+    expect(existsSync(slot())).toBe(false);
+  });
+
+  // a /proc file reports size 0 and reads more, as a file growing between stat and copy does
+  test.skipIf(!existsSync("/proc/self/status"))(
+    "a file that reads more bytes than its size said is cut off at the limit",
+    async () => {
+      expect(lstatSync("/proc/self/status").size).toBe(0);
+      await expect(
+        stageRead(
+          { field: "file_path", path: "/proc/self/status" },
+          scratch,
+          1,
+          { secretDirs: [secrets], secretFiles: [], systemDirs: [] },
+          { maxBytes: 16 },
+        ),
+      ).rejects.toThrow("larger than 16 bytes");
+      expect(existsSync(slot())).toBe(false);
+    },
+  );
+
+  test("a tree with more entries than the cap is refused, and what it copied before is removed", async () => {
+    const tree = join(root, "tree");
+    mkdirSync(tree);
+    for (const name of ["a", "b", "c", "d", "e"])
+      writeFileSync(join(tree, name), name);
+    await expect(stage(tree, { maxEntries: 3 })).rejects.toThrow(
+      `${tree} holds more than 3 files and directories`,
+    );
+    expect(existsSync(slot())).toBe(false);
+  });
+
+  test("a copied read-only directory is the owner's alone and can be removed", async () => {
+    const tree = join(root, "readonly");
+    mkdirSync(join(tree, "sub"), { recursive: true });
+    writeFileSync(join(tree, "sub", "a.txt"), "a");
+    chmodSync(join(tree, "sub", "a.txt"), 0o444);
+    chmodSync(join(tree, "sub"), 0o555);
+    chmodSync(tree, 0o555);
+    try {
+      const copy = await stage(tree);
+      for (const path of [
+        copy,
+        join(copy, "sub"),
+        join(copy, "sub", "a.txt"),
+      ])
+        expect(statSync(path).mode & 0o077).toBe(0);
+      rmSync(slot(), { recursive: true });
+      expect(existsSync(slot())).toBe(false);
+    } finally {
+      chmodSync(tree, 0o755);
+      chmodSync(join(tree, "sub"), 0o755);
+    }
+  });
+
+  test("a path that no longer exists is refused", async () => {
+    const gone = join(root, "gone.txt");
+    await expect(stage(gone)).rejects.toThrow(`${gone} does not exist`);
+    expect(existsSync(slot())).toBe(false);
+  });
+});

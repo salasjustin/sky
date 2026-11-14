@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
   CanUseTool,
@@ -33,10 +34,12 @@ import {
   HOST_MANAGED,
   type NestedLogin,
   type NestedPrefix,
+  nestedLoginDir,
   ownDirectory,
   PROJECT_VARIABLES,
   prepareCommandEnv,
   prepareNestedLogin,
+  runnerDirs,
 } from "./claude-auth.js";
 import type { Config } from "./config.js";
 import { type PostEvent, RunEndedError } from "./events.js";
@@ -46,9 +49,14 @@ import {
   type SessionMcpServer,
   sessionMcpServers,
   unresolvedServersWarning,
+  userConfigFile,
   userScopeServers,
 } from "./mcp.js";
-import { outsideRead, stageRead } from "./outside-reads.js";
+import {
+  outsideRead,
+  type RefusedPaths,
+  stageRead,
+} from "./outside-reads.js";
 import { policyOutcome } from "./policy.js";
 import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
@@ -576,10 +584,12 @@ export async function runSession(
   }
   // fails early, naming file and key, on what is on disk now; endpoint and credential `env` entries a
   // settings file gains mid-run are ignored by Claude in the host-managed mode `claudeProcessEnv` sets
+  const settingsDirs =
+    deps.settingsDirs ?? defaultSettingsDirs(deps.env ?? process.env);
   const redirects = settingsRedirects({
     cwd,
     repoDir: config.repoDir,
-    ...(deps.settingsDirs ?? defaultSettingsDirs(deps.env ?? process.env)),
+    ...settingsDirs,
   });
   if (redirects.length > 0) return fail(redirects.join(" "));
   // what HEAD holds before Claude touches the worktree; the run's commits are the ones after it
@@ -676,6 +686,22 @@ export async function runSession(
   // set once the session starts; a read of it before then has only the worktree to be inside
   let scratch: string | undefined;
   let staged = 0;
+  /**
+   * Taken at each copy: every runner's credential directory (the nested login files, every run's
+   * scratch), Claude Code's login and account files, and the kernel's directories.
+   */
+  const refusedReads = (): RefusedPaths => {
+    const env = deps.env ?? process.env;
+    return {
+      secretDirs: [...runnerDirs(), nestedLoginDir()],
+      secretFiles: [
+        ...settingsDirs.userDirs.map((dir) => join(dir, ".credentials.json")),
+        userConfigFile(env),
+        join(env.HOME || homedir(), ".claude.json"),
+      ],
+      systemDirs: ["/proc", "/sys", "/dev"],
+    };
+  };
   const visibleReason = (decision: Decision | undefined) =>
     (decision?.decision === "deny" && decision.reason) ||
     "The user denied this tool call.";
@@ -683,7 +709,8 @@ export async function runSession(
   /**
    * Holds a Read, Grep or Glob of a path outside the worktree and the scratch directory for the
    * person's answer. Claude Code can't be told to allow one its settings block, so an approved path
-   * is copied into the scratch directory and the call is pointed at the copy.
+   * is copied into the scratch directory and the call is pointed at the copy; one `refusedReads`
+   * holds is declined whatever the answer.
    */
   const gateOutsideRead = async (
     input: PreToolUseHookInput,
@@ -707,8 +734,11 @@ export async function runSession(
       return { continue: true, hookSpecificOutput: denyCall(reason) };
     };
     if (decision?.decision === "approve") {
+      // never the worktree, where the run's commit would take the copy in
+      if (!scratch)
+        return declined("the run has no scratch directory to copy it into.");
       try {
-        const copy = stageRead(read, scratch ?? cwd, ++staged);
+        const copy = await stageRead(read, scratch, ++staged, refusedReads());
         return {
           continue: true,
           hookSpecificOutput: {

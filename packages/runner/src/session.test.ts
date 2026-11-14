@@ -4517,6 +4517,64 @@ describe("the run's scratch directory and reads outside the worktree", () => {
     });
   });
 
+  test("an approved Read of the nested login file, Claude Code's login or account file, or a /proc file is declined with a runner.warning naming it", async () => {
+    const configDir = join(root, "claude-config");
+    const home = join(root, "home");
+    mkdirSync(configDir);
+    mkdirSync(home);
+    mkdirSync(join(root, "managed"));
+    writeFileSync(join(configDir, ".credentials.json"), '{"t":"x"}');
+    writeFileSync(join(home, ".claude.json"), "{}");
+    const { sent, deps } = api(decided({ decision: "approve" }));
+    const paths: string[] = [];
+    const answers: unknown[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        const parent = join(options.additionalDirectories?.[0] ?? "", "..");
+        const login = readdirSync(parent).find((n) =>
+          n.startsWith("sky-nested-claude-"),
+        );
+        paths.push(
+          realpathSync(join(parent, login ?? "")),
+          realpathSync(join(configDir, ".credentials.json")),
+          realpathSync(join(home, ".claude.json")),
+        );
+        if (existsSync("/proc/self/status"))
+          paths.push(realpathSync("/proc/self/status"));
+        for (const path of paths)
+          answers.push(...(await fire(options, "PreToolUse", readOf(path))));
+      },
+      success,
+    ]);
+    await runSession(
+      { ...config, checks: ["claude -p /check"] },
+      {
+        ...deps,
+        query,
+        env: { HOME: home },
+        settingsDirs: {
+          userDirs: [configDir],
+          managedDir: join(root, "managed"),
+        },
+        credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      },
+    );
+    expect(answers).toHaveLength(paths.length);
+    for (const answer of answers)
+      expect(answer).toMatchObject({
+        continue: true,
+        hookSpecificOutput: { permissionDecision: "deny" },
+      });
+    const warnings = sent
+      .filter((e) => e.type === "runner.warning")
+      .map((e) => (e.payload as { message: string }).message)
+      .filter((message) => message.startsWith("Read of "));
+    expect(warnings).toHaveLength(paths.length);
+    for (const [i, path] of paths.entries())
+      expect(warnings[i]).toContain(`Read of ${path} was declined:`);
+  });
+
   test("a Grep or Glob of an outside directory, and a link in the worktree that points out, are held too", async () => {
     const outside = join(root, "elsewhere");
     mkdirSync(outside);
