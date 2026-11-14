@@ -2738,7 +2738,7 @@ const answer = (
   );
 
 const blocked = (gatewayError: string, files = ".github/workflows/ci.yml") =>
-  `workflow_files_blocked: GitHub refused to update claude/agt_1 to commits that change ${files}, and that update needs the \`workflow\` scope, which Sky's GitHub connection may lack. Publish the rest without them (move the workflow change to its own commit and drop it from this branch), and have the PM commit the workflow change (${gatewayError})`;
+  `workflow_files_blocked: GitHub refused to update claude/agt_1 to commits that change ${files}, and that update needs the \`workflow\` scope, which Sky's GitHub connection may lack. Those workflow files are main's, carried onto claude/agt_1 by this update; give the connection the \`workflow\` scope, or have someone merge main into claude/agt_1 from outside the sandbox, then publish again (${gatewayError})`;
 
 const REFUSALS = [
   { status: 404, message: "Not Found" },

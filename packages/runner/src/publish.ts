@@ -1228,7 +1228,7 @@ export async function publish(options: {
       ).catch((): string[] => []);
       if (files.length === 0) throw error;
       throw new PublishError(
-        `workflow_files_blocked: GitHub refused to update ${remoteBranch} to commits that change ${files.join(", ")}, and that update needs the \`workflow\` scope, which Sky's GitHub connection may lack. Publish the rest without them (move the workflow change to its own commit and drop it from this branch), and have the PM commit the workflow change (${error.message})`,
+        `workflow_files_blocked: GitHub refused to update ${remoteBranch} to commits that change ${files.join(", ")}, and that update needs the \`workflow\` scope, which Sky's GitHub connection may lack. Those workflow files are ${base}'s, carried onto ${remoteBranch} by this update; give the connection the \`workflow\` scope, or have someone merge ${base} into ${remoteBranch} from outside the sandbox, then publish again (${error.message})`,
       );
     });
 
