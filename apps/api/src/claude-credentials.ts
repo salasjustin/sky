@@ -297,7 +297,7 @@ export const isCloudflareChallenge = (error: string): boolean =>
   /\b403\b/.test(error) &&
   /Attention Required! \| Cloudflare/i.test(error);
 
-/** The error of a run whose retry met the Cloudflare challenge too. */
+/** The error of a run that met the Cloudflare challenge after an earlier run in its chain of retries did. */
 export const UPSTREAM_BLOCKED =
   "upstream_blocked: Anthropic's API answered with a Cloudflare challenge twice; retry later";
 
