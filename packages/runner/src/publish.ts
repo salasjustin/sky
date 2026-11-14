@@ -21,6 +21,8 @@ export class GatewayError extends Error {
   constructor(
     message: string,
     readonly status?: number,
+    /** True for GitHub's primary or secondary rate limit, which answer 403 as well as 429. */
+    readonly rateLimited = false,
   ) {
     super(message);
   }
@@ -328,6 +330,35 @@ async function heldFiles(
   return files;
 }
 
+/**
+ * Each path under `.github/workflows/` that differs between two `.github/workflows` trees, either
+ * of which is "" where there is no such tree; a rename names both ends. Both trees must be in this
+ * clone.
+ */
+async function workflowPathsBetween(
+  cwd: string,
+  from: string,
+  to: string,
+): Promise<string[]> {
+  if (from === to) return [];
+  const empty = await mktree(cwd, []);
+  const out = await git(
+    cwd,
+    "diff-tree",
+    "-r",
+    "-z",
+    "--name-only",
+    "--no-renames",
+    from || empty,
+    to || empty,
+  );
+  return out
+    .split("\0")
+    .filter(Boolean)
+    .map((path) => `${WORKFLOWS_DIR}/${path}`)
+    .sort();
+}
+
 // GitHub's secondary rate limit answers 403 or 429 with a `retry-after`; a pause this long is waited out
 const MAX_RETRY_AFTER_S = 60;
 const RETRIES = 3;
@@ -385,6 +416,7 @@ export function gateway(options: {
           throw new GatewayError(
             `GitHub gateway: ${where} hit GitHub's rate limit, which resets at ${new Date(resetAt * 1000).toISOString()} (in ${Math.ceil(waitS / 60)} min); try again then`,
             response.status,
+            true,
           );
         }
         await response.body?.cancel();
@@ -410,9 +442,18 @@ export function gateway(options: {
       const parsed = JSON.parse(text) as { message?: unknown };
       if (typeof parsed.message === "string") detail = parsed.message;
     } catch {}
+    // a rate limit past what is waited out above: GitHub answers a secondary one with a
+    // `retry-after` or a message naming it, and a primary one with no remaining quota
+    const rateLimited =
+      response.status === 429 ||
+      (response.status === 403 &&
+        (response.headers.has("retry-after") ||
+          response.headers.get("x-ratelimit-remaining") === "0" ||
+          /rate limit/i.test(detail)));
     throw new GatewayError(
       `GitHub gateway: ${where} returned ${response.status}: ${detail}`,
       response.status,
+      rateLimited,
     );
   };
 }
@@ -827,6 +868,9 @@ export async function publish(options: {
   // GitHub's head's, so a push of the held workflows there is kept, not undone; the base's again
   // for a rewrite over a head whose workflows are only an older base's
   let baseline = baseWorkflows;
+  // the .github/workflows tree on GitHub's side of the ref update: its head's, or the base's for a
+  // new branch
+  let theirWorkflows = baseWorkflows;
   // GitHub's tree for the commit replay resumes from
   let resumeTree: string | undefined;
   if (remote) {
@@ -923,6 +967,8 @@ export async function publish(options: {
       }
       if (at !== -1) resumeTree = remoteTree;
     }
+    // each lookup above sets the baseline to GitHub's head's workflows
+    theirWorkflows = baseline;
     // a continued branch is someone's pull request: its head is theirs even when it sits in this
     // branch's reflog, as the head the worktree was made from always does
     if (at === -1 && continued && remoteBranch === continued) {
@@ -1162,8 +1208,33 @@ export async function publish(options: {
     );
   }
 
+  // GitHub refuses a ref update that changes .github/workflows/ when the token lacks the `workflow`
+  // scope, with a 404 or 403 that reads, bare, as lost repo access; this publish's object writes
+  // have succeeded by now, so the update's workflow change is named as the likely cause. What is
+  // sent carries the baseline's workflows, so only a baseline moved off GitHub's side changes any
+  const writeRef = (method: string, path: string, body: unknown) =>
+    call(method, path, body).catch(async (error: unknown) => {
+      if (
+        !(error instanceof GatewayError) ||
+        error.rateLimited ||
+        (error.status !== 404 && error.status !== 403)
+      ) {
+        throw error;
+      }
+      // with no file to name, GitHub's own error stands
+      const files = await workflowPathsBetween(
+        cwd,
+        theirWorkflows,
+        baseline,
+      ).catch((): string[] => []);
+      if (files.length === 0) throw error;
+      throw new PublishError(
+        `workflow_files_blocked: GitHub refused to update ${remoteBranch} to commits that change ${files.join(", ")}, and that update needs the \`workflow\` scope, which Sky's GitHub connection may lack. Those workflow files are ${base}'s, carried onto ${remoteBranch} by this update; give the connection the \`workflow\` scope, or have someone merge ${base} into ${remoteBranch} from outside the sandbox, then publish again (${error.message})`,
+      );
+    });
+
   if (remote === null) {
-    await call("POST", "/git/refs", {
+    await writeRef("POST", "/git/refs", {
       ref: `refs/heads/${remoteBranch}`,
       sha: parent,
     });
@@ -1179,9 +1250,12 @@ export async function publish(options: {
         `${remoteBranch} moved on GitHub to ${now.object.sha} while this publish ran; nothing was overwritten, publish again`,
       );
     }
-    await call("PATCH", `/git/refs/${refPath}`, { sha: parent, force: true });
+    await writeRef("PATCH", `/git/refs/${refPath}`, {
+      sha: parent,
+      force: true,
+    });
   } else if (remote !== parent) {
-    await call("PATCH", `/git/refs/${refPath}`, {
+    await writeRef("PATCH", `/git/refs/${refPath}`, {
       sha: parent,
       force: false,
     }).catch((error: unknown) => {

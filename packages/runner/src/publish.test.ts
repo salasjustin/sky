@@ -20,6 +20,7 @@ import {
   HELD_PATCH_BEGIN,
   HELD_PATCH_END,
   PUBLISH_USAGE,
+  PublishError,
   publish,
   publishMain,
   stripAttribution,
@@ -2664,4 +2665,282 @@ test("a continued branch with its own workflow changes merges an unchanged base 
   expect(gh.refWrites).toEqual([
     { method: "PATCH", body: { sha: "commit1", force: false } },
   ]);
+});
+
+const CI_V2 = () =>
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: ci v2\n");
+
+/**
+ * A branch published once, then rebased here onto a base whose `change` is under
+ * .github/workflows/: the forced update takes GitHub's head from the old base's workflows to the
+ * new base's.
+ */
+const rewriteOverBaseWorkflows = async (change = CI_V2) => {
+  baseWithWorkflows();
+  const oldBase = baseSha;
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  await run();
+  git(work, "checkout", "-q", "--detach", baseSha);
+  change();
+  const newBase = commit("Base moves");
+  git(work, "checkout", "-q", "claude/agt_1");
+  const gh = fakeGitHub({
+    ref: "commit1",
+    commitTrees: {
+      commit1: git(work, "rev-parse", `${first}^{tree}`),
+      [oldBase]: git(work, "rev-parse", `${oldBase}^{tree}`),
+    },
+    commitParents: { commit1: [oldBase], [oldBase]: [] },
+    pulls: [OPEN_PR],
+    allowPullUpdates: true,
+  });
+  baseMovesTo(newBase);
+  return gh;
+};
+
+/**
+ * GitHub's branch sits on a base commit with nothing of its own, and the base has since moved past
+ * it, changing ci.yml: the fast-forward takes GitHub's head to the new base's workflows.
+ */
+const fastForwardOverBaseWorkflows = () => {
+  baseWithWorkflows();
+  const oldBase = baseSha;
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  // made off the branch, so its reflog never held it
+  const mid = nextBase({ "m.txt": "mid\n" });
+  baseSha = mid;
+  const gh = fakeGitHub({
+    ref: mid,
+    commitTrees: { [mid]: git(work, "rev-parse", `${mid}^{tree}`) },
+    commitParents: { [mid]: [oldBase] },
+  });
+  // b.txt keeps the new base's tree apart from mid's outside .github/workflows
+  baseMoves({ ".github/workflows/ci.yml": "name: ci v2\n", "b.txt": "b\n" });
+  return gh;
+};
+
+const REF_PATCH = `${REPO}/git/refs/heads/claude/agt_1`;
+
+const answer = (
+  method: "post" | "patch",
+  url: string,
+  status: number,
+  message: string,
+  headers: Record<string, string> = {},
+) =>
+  server.use(
+    http[method](url, () =>
+      HttpResponse.json({ message }, { status, headers }),
+    ),
+  );
+
+const blocked = (gatewayError: string, files = ".github/workflows/ci.yml") =>
+  `workflow_files_blocked: GitHub refused to update claude/agt_1 to commits that change ${files}, and that update needs the \`workflow\` scope, which Sky's GitHub connection may lack. Those workflow files are main's, carried onto claude/agt_1 by this update; give the connection the \`workflow\` scope, or have someone merge main into claude/agt_1 from outside the sandbox, then publish again (${gatewayError})`;
+
+const REFUSALS = [
+  { status: 404, message: "Not Found" },
+  { status: 403, message: "Resource not accessible by integration" },
+];
+
+test.each(REFUSALS)(
+  "a $status on the forced ref update that changes GitHub's workflows names the files and keeps GitHub's error",
+  async ({ status, message }) => {
+    await rewriteOverBaseWorkflows();
+    answer("patch", REF_PATCH, status, message);
+
+    const error = await run().catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(PublishError);
+    expect((error as Error).message).toBe(
+      blocked(
+        `GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned ${status}: ${message}`,
+      ),
+    );
+  },
+);
+
+test.each(REFUSALS)(
+  "a $status on the fast-forward that changes GitHub's workflows names the files, past the fast-forward's own 422 handling",
+  async ({ status, message }) => {
+    fastForwardOverBaseWorkflows();
+    answer("patch", REF_PATCH, status, message);
+
+    const error = await run().catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(PublishError);
+    expect((error as Error).message).toBe(
+      blocked(
+        `GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned ${status}: ${message}`,
+      ),
+    );
+  },
+);
+
+test("the files named are every path the ref update changes under .github/workflows/: an edit, an add, and both ends of a rename", async () => {
+  await rewriteOverBaseWorkflows(() => {
+    CI_V2();
+    writeFileSync(join(work, ".github/workflows/new.yml"), "name: new\n");
+    git(
+      work,
+      "mv",
+      ".github/workflows/old.yml",
+      ".github/workflows/renamed.yml",
+    );
+  });
+  answer("patch", REF_PATCH, 404, "Not Found");
+
+  const error = await run().catch((e: unknown) => e);
+
+  expect((error as Error).message).toBe(
+    blocked(
+      "GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 404: Not Found",
+      ".github/workflows/ci.yml, .github/workflows/new.yml, .github/workflows/old.yml, .github/workflows/renamed.yml",
+    ),
+  );
+});
+
+test("a ref creation refused while the branch's workflow change is held stays GitHub's own error: what is sent keeps the base's workflows", async () => {
+  baseWithWorkflows();
+  const gh = fakeGitHub();
+  answer("post", `${REPO}/git/refs`, 404, "Not Found");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a and change CI");
+
+  const error = await run().catch((e: unknown) => e);
+
+  expect(error).toBeInstanceOf(GatewayError);
+  expect((error as Error).message).toBe(
+    "GitHub gateway: POST /repos/acme/widgets/git/refs returned 404: Not Found",
+  );
+  // the object writes went through; only the ref was refused
+  expect(gh.commits).toHaveLength(1);
+});
+
+const objectWriteSetups = [
+  {
+    name: "a new branch whose commit changes a workflow",
+    setup: async () => {
+      baseWithWorkflows();
+      fakeGitHub();
+      writeFileSync(join(work, "a.txt"), "first\n");
+      writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+      commit("Add a and change CI");
+    },
+  },
+  {
+    name: "a rewrite onto a base that changed a workflow",
+    setup: () => rewriteOverBaseWorkflows(),
+  },
+];
+
+test.each(objectWriteSetups)(
+  "a 404 on a blob write stays GitHub's own error, for $name",
+  async ({ setup }) => {
+    await setup();
+    answer("post", `${REPO}/git/blobs`, 404, "Not Found");
+
+    const error = await run().catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(GatewayError);
+    expect((error as Error).message).not.toMatch(/workflow_files_blocked/);
+    expect((error as Error).message).toBe(
+      "GitHub gateway: POST /repos/acme/widgets/git/blobs returned 404: Not Found",
+    );
+  },
+);
+
+test.each(objectWriteSetups)(
+  "a 403 on a commit write stays GitHub's own error, for $name",
+  async ({ setup }) => {
+    await setup();
+    answer(
+      "post",
+      `${REPO}/git/commits`,
+      403,
+      "Resource not accessible by integration",
+    );
+
+    const error = await run().catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(GatewayError);
+    expect((error as Error).message).not.toMatch(/workflow_files_blocked/);
+    expect((error as Error).message).toBe(
+      "GitHub gateway: POST /repos/acme/widgets/git/commits returned 403: Resource not accessible by integration",
+    );
+  },
+);
+
+test("the primary rate limit on a ref update that changes GitHub's workflows is reported as the rate limit", async () => {
+  await rewriteOverBaseWorkflows();
+  answer("patch", REF_PATCH, 403, "API rate limit exceeded", {
+    "x-ratelimit-remaining": "0",
+    "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+  });
+
+  const error = await run().catch((e: unknown) => e);
+
+  expect(error).toBeInstanceOf(GatewayError);
+  expect((error as GatewayError).rateLimited).toBe(true);
+  expect((error as Error).message).not.toMatch(/workflow_files_blocked/);
+  expect((error as Error).message).toMatch(/hit GitHub's rate limit/);
+});
+
+test.each<{ how: string; message: string; headers: Record<string, string> }>([
+  {
+    how: "a retry-after past what is waited out",
+    message: "Forbidden",
+    headers: { "retry-after": "120" },
+  },
+  {
+    how: "its message alone",
+    message:
+      "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+    headers: {},
+  },
+])(
+  "the secondary rate limit, known by $how, on a ref update that changes GitHub's workflows stays GitHub's own error",
+  async ({ message, headers }) => {
+    await rewriteOverBaseWorkflows();
+    answer("patch", REF_PATCH, 403, message, headers);
+
+    const error = await run().catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(GatewayError);
+    expect((error as GatewayError).rateLimited).toBe(true);
+    expect((error as Error).message).toBe(
+      `GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 403: ${message}`,
+    );
+  },
+);
+
+test("the command reports a held workflow change only after the publish, with nothing said up front", async () => {
+  baseWithWorkflows();
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, ".github/workflows/ci.yml"), "name: changed\n");
+  commit("Add a and change CI");
+
+  const { status, stderr } = await publishMainWith(["--title", "T"], {});
+
+  expect(status).toBe(0);
+  expect(stderr.split("\n")[0]).toBe("sky publish: opened pull request #7");
+  expect(stderr).toContain(
+    "sky publish: held back 1 change under .github/workflows/",
+  );
+});
+
+test("the command prints a refused ref update's workflow_files_blocked on stderr and exits 1", async () => {
+  await rewriteOverBaseWorkflows();
+  answer("patch", REF_PATCH, 404, "Not Found");
+
+  const { status, stderr } = await publishMainWith(["--title", "T"], {});
+
+  expect(status).toBe(1);
+  expect(stderr).toBe(
+    `sky publish: ${blocked("GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 404: Not Found")}\n`,
+  );
 });
