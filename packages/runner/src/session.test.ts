@@ -4983,15 +4983,18 @@ describe("the run's scratch directory and reads outside the worktree", () => {
         "projects/-work-repo/sess-new.jsonl",
         "projects/-work-repo/sess-new/notes.txt",
         "settings.json",
-      ])("%s, in the config directory but not this session's saved output, asks even where the policy gates nothing", async (file) => {
-        const path = put(file);
-        const { sent, copied } = await readOutside(config, path, {
-          replies: [decided({ decision: "approve" })],
-          sessionDirs: dirs(),
-        });
-        expect(sent.map((e) => e.type)).toContain("run.waiting");
-        expect(copied).toBe("saved output\n");
-      });
+      ])(
+        "%s, in the config directory but not this session's saved output, asks even where the policy gates nothing",
+        async (file) => {
+          const path = put(file);
+          const { sent, copied } = await readOutside(config, path, {
+            replies: [decided({ decision: "approve" })],
+            sessionDirs: dirs(),
+          });
+          expect(sent.map((e) => e.type)).toContain("run.waiting");
+          expect(copied).toBe("saved output\n");
+        },
+      );
 
       /** The decision each Read answer carried: `allow` for a call pointed at a copy, `deny` for one declined. */
       const decisionsOf = (answers: unknown[]) =>
@@ -5005,6 +5008,8 @@ describe("the run's scratch directory and reads outside the worktree", () => {
         initMessage: object,
         { before, after }: { before: string[]; after: string[] },
         replies: DecisionReply[],
+        /** Takes the run's events in place of the poster, which refuses an init with no session id. */
+        post?: (event: RunnerEventPost) => Promise<void>,
       ) => {
         const { sent, deps } = api(...replies);
         const answered: Record<"before" | "after", unknown[]> = {
@@ -5023,7 +5028,12 @@ describe("the run's scratch directory and reads outside the worktree", () => {
           readAll(after, answered.after),
           success,
         ]);
-        await runSession(runConfig, { ...deps, query, ...dirs() });
+        await runSession(runConfig, {
+          ...deps,
+          ...(post && { post }),
+          query,
+          ...dirs(),
+        });
         return {
           before: decisionsOf(answered.before),
           after: decisionsOf(answered.after),
@@ -5061,15 +5071,16 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       test("an init message with an empty session id makes no saved output this session's, the resumed run's own included", async () => {
         const old = put("projects/-work-repo/sess-old/tool-results/a.txt");
         const unnamed = put("projects/-work-repo/tool-results/a.txt");
-        const { before, after, waits } = await readsAroundInit(
+        const { before, after } = await readsAroundInit(
           gated({ sessionId: "sess-old" }),
           { ...init, session_id: "" },
           { before: [old], after: [old, unnamed] },
           [decided({ decision: "deny" })],
+          recorder().post,
         );
         expect(before).toEqual(["allow"]);
+        // both asked, and the person's denial answered both
         expect(after).toEqual(["deny", "deny"]);
-        expect(waits).toBe(2);
       });
 
       test("a Grep or Glob of this session's saved output runs unasked on a copy of it, and the Glob keeps its pattern", async () => {
@@ -5161,33 +5172,40 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       test.each([
         ["Claude Code's login file", () => join(cfg(), ".credentials.json")],
         ["its account file", () => join(root, "home", ".claude.json")],
-      ])("a hard link to %s inside this session's saved output is declined at the copy, asking no one, and leaves no copy", async (_name, source) => {
-        const secret = source();
-        mkdirSync(dirname(secret), { recursive: true });
-        writeFileSync(secret, "secret");
-        const linked = put("projects/-work-repo/sess-new/tool-results/a1.txt");
-        rmSync(linked);
-        linkSync(secret, linked);
-        const { sent, polls, answers, copies } = await readLeavingNoCopy(
-          gated(),
-          linked,
-          { ...dirs(), env: { HOME: join(root, "home") } },
-        );
-        expect(sent.map((e) => e.type)).not.toContain("run.waiting");
-        expect(polls).toEqual([]);
-        expect(answers).toMatchObject([
-          {
-            hookSpecificOutput: {
-              permissionDecision: "deny",
-              permissionDecisionReason: expect.stringMatching(
-                /could not be copied: .* is a hard link to a credential file\./,
-              ),
+      ])(
+        "a hard link to %s inside this session's saved output is declined at the copy, asking no one, and leaves no copy",
+        async (_name, source) => {
+          const secret = source();
+          mkdirSync(dirname(secret), { recursive: true });
+          writeFileSync(secret, "secret");
+          const linked = put(
+            "projects/-work-repo/sess-new/tool-results/a1.txt",
+          );
+          rmSync(linked);
+          linkSync(secret, linked);
+          const { sent, polls, answers, copies } = await readLeavingNoCopy(
+            gated(),
+            linked,
+            { ...dirs(), env: { HOME: join(root, "home") } },
+          );
+          expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+          expect(polls).toEqual([]);
+          expect(answers).toMatchObject([
+            {
+              hookSpecificOutput: {
+                permissionDecision: "deny",
+                permissionDecisionReason: expect.stringMatching(
+                  /could not be copied: .* is a hard link to a credential file\./,
+                ),
+              },
             },
-          },
-        ]);
-        expect(sent.filter((e) => e.type === "runner.warning")).toHaveLength(1);
-        expect(copies).toEqual([]);
-      });
+          ]);
+          expect(sent.filter((e) => e.type === "runner.warning")).toHaveLength(
+            1,
+          );
+          expect(copies).toEqual([]);
+        },
+      );
     });
 
     /** Fires one PreToolUse per call `callsIn(cwd)` returns, and returns each answer and the events sent. */

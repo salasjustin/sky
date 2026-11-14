@@ -57,8 +57,8 @@ import {
   type OutsideRead,
   outsideRead,
   pathRefusal,
-  readRuleCovers,
   type RefusedPaths,
+  readRuleCovers,
   stageRead,
 } from "./outside-reads.js";
 import { policyOutcome } from "./policy.js";

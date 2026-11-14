@@ -28,8 +28,8 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
   configDirPlace,
   outsideRead,
-  readRuleCovers,
   type RefusedPaths,
+  readRuleCovers,
   stageRead,
 } from "./outside-reads.js";
 
@@ -396,9 +396,7 @@ describe("which outside reads a `Read(...)` pattern covers", () => {
       expect(covers(pattern, join(root, "srv")), pattern).toBe(true);
       expect(covers(pattern, root), pattern).toBe(true);
       expect(covers(pattern, "/"), pattern).toBe(true);
-      expect(covers(pattern, join(root, "srv", "public")), pattern).toBe(
-        false,
-      );
+      expect(covers(pattern, join(root, "srv", "public")), pattern).toBe(false);
     }
   });
 
