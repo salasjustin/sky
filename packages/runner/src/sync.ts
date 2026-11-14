@@ -18,6 +18,7 @@ import {
   rebaseInProgress,
 } from "./publish.js";
 import { editShallow, fetchCommit, shallowCommits } from "./repo.js";
+import { withRepoLock } from "./repo-lock.js";
 import { git, messageOf } from "./store.js";
 import { adoptAgentBranch, ensureWorktree } from "./worktree.js";
 
@@ -818,14 +819,37 @@ const tooFarNote = (s: DefaultSync) =>
  * what that did or couldn't do. A public repo's default branch and a start branch come
  * over git, at no REST cost; a private one, or a failed fetch, goes through the connector. Without
  * a connector there is no way to reach GitHub, and the worktree is made or reused as it stands.
+ * A `signal` aborted before the repo lock is taken, queued behind another run's setup or earlier,
+ * rejects with its reason and leaves the worktree unmade.
  */
-export async function prepareWorktree(
-  config: {
-    repoDir: string;
-    worktreesDir: string;
-    agentId: AgentId;
-    startBranch?: string;
+export function prepareWorktree(
+  config: PrepareConfig,
+  deps: {
+    env: NodeJS.ProcessEnv;
+    warn: (line: string) => void;
+    /** Seconds to queue for the repo lock; `REPO_LOCK_WAIT_S` when absent. */
+    lockWaitS?: number;
+    signal?: AbortSignal;
   },
+): Promise<{ cwd: string; notes: string[] }> {
+  // every step writes the repo every sprite run shares: runs starting at once take turns
+  return withRepoLock(
+    config.repoDir,
+    () => prepareLocked(config, deps),
+    deps.lockWaitS,
+    deps.signal,
+  );
+}
+
+type PrepareConfig = {
+  repoDir: string;
+  worktreesDir: string;
+  agentId: AgentId;
+  startBranch?: string;
+};
+
+async function prepareLocked(
+  config: PrepareConfig,
   deps: { env: NodeJS.ProcessEnv; warn: (line: string) => void },
 ): Promise<{ cwd: string; notes: string[] }> {
   const notes: string[] = [];

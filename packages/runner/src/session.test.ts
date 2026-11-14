@@ -1,4 +1,9 @@
-import { execFileSync } from "node:child_process";
+import {
+  type ChildProcess,
+  execFileSync,
+  spawn,
+  spawnSync,
+} from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -31,9 +36,15 @@ import {
 } from "./claude-auth.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
+import { repoLockPath } from "./repo-lock.js";
 import { createDecisionWaiter } from "./requests.js";
 import type { Seal } from "./seal.js";
-import { nestedClaude, type QueryFn, sessionGitIdentity } from "./session.js";
+import {
+  nestedClaude,
+  type QueryFn,
+  repoLockWaitS,
+  sessionGitIdentity,
+} from "./session.js";
 import {
   defaultSettingsDirs,
   PINNED_SETTINGS,
@@ -86,6 +97,7 @@ beforeEach(() => {
     checks: [],
     mcpServers: {},
     waitTimeoutMs: 60_000,
+    launchDeadlineMs: 15 * 60_000,
     startBranch: undefined,
   };
 });
@@ -1826,7 +1838,7 @@ test("the PreToolUse hook outlasts the longest wait, so a late approval still re
   }
 });
 
-test("a stop before the session starts still aborts it", async () => {
+test("a stop before setup ends the run without making the worktree or starting the session", async () => {
   const { posted, post } = recorder();
   const controller = new AbortController();
   controller.abort("SIGTERM");
@@ -1839,12 +1851,108 @@ test("a stop before the session starts still aborts it", async () => {
       awaitDecision: noDecision,
     }),
   ).toBe(1);
-  expect(query.calls[0]?.options.abortController?.signal.aborted).toBe(true);
+  expect(query.calls).toHaveLength(0);
+  expect(existsSync(join(config.worktreesDir, config.agentId))).toBe(false);
   expect(posted.at(-1)).toMatchObject({
     type: "run.failed",
     payload: { error: "interrupted by SIGTERM" },
   });
 });
+
+test.each([
+  ["the whole wait, less the margin", 15 * 60_000, 0, 870],
+  ["less what the runner has spent", 15 * 60_000, 60_000, 810],
+  ["rounded up to a whole second", 31_500, 0, 2],
+  ["at least 1 s with nothing left past the margin", 30_000, 0, 1],
+  ["at least 1 s past the deadline", 60_000, 10 * 60_000, 1],
+])("repoLockWaitS: %s", (_, launchDeadlineMs, elapsedMs, expected) => {
+  expect(repoLockWaitS(launchDeadlineMs, elapsedMs)).toBe(expected);
+});
+
+const canFlock = spawnSync("flock", ["-V"]).status === 0;
+
+describe.skipIf(!canFlock)(
+  "a run queued behind another holding the repo lock",
+  () => {
+    let holder: ChildProcess | undefined;
+    let stop: AbortController;
+    beforeEach(() => {
+      stop = new AbortController();
+    });
+    afterEach(() => {
+      // a wait that outlived a failed assertion must not hold the lock or keep its flock queued
+      stop.abort("test over");
+      holder?.kill("SIGKILL");
+      holder = undefined;
+    });
+
+    /** Takes the clone's repo lock in another process, held until the test ends. */
+    const holdRepoLock = async () => {
+      const lock = repoLockPath(config.repoDir);
+      // one process owns the lock's fd, so killing it frees the lock
+      holder = spawn(
+        "sh",
+        [
+          "-c",
+          'exec 9>"$1"; flock -x 9; echo held; exec sleep 3600',
+          "_",
+          lock,
+        ],
+        { stdio: ["ignore", "pipe", "ignore"] },
+      );
+      await new Promise<void>((resolve) =>
+        holder?.stdout?.once("data", () => resolve()),
+      );
+      return lock;
+    };
+
+    /** Runs the session with the runner `elapsedMs` into its launch; the 1 s wait each case ends at is real. */
+    const queuedRun = async (elapsedMs: number) => {
+      const { posted, post } = recorder();
+      const query = scripted([init, success]);
+      const code = await runSession(config, {
+        query,
+        post,
+        signal: stop.signal,
+        awaitDecision: noDecision,
+        elapsedMs: () => elapsedMs,
+      });
+      return { code, posted, query };
+    };
+
+    // a bound that ignored the elapsed time or the margin would wait minutes, past the test's timeout
+    test("gives up on the lock with what is left of its launch, less the runner's own time and the margin", async () => {
+      const lock = await holdRepoLock();
+      const { code, posted, query } = await queuedRun(
+        config.launchDeadlineMs - 30_000 - 500,
+      );
+      expect(code).toBe(1);
+      expect(query.calls).toHaveLength(0);
+      expect(existsSync(join(config.worktreesDir, config.agentId))).toBe(false);
+      expect(posted).toHaveLength(1);
+      expect(posted[0]).toMatchObject({
+        type: "run.failed",
+        payload: { error: expect.stringMatching(/^worktree setup failed: /) },
+      });
+      expect(posted[0]?.payload).toMatchObject({
+        error: expect.stringContaining(
+          `can't take the repo lock ${lock} within 1s:`,
+        ),
+      });
+    }, 20_000);
+
+    test("past its launch's deadline still gives the lock 1 s", async () => {
+      const lock = await holdRepoLock();
+      const { code, posted } = await queuedRun(config.launchDeadlineMs * 2);
+      expect(code).toBe(1);
+      expect(posted.at(-1)?.payload).toMatchObject({
+        error: expect.stringContaining(
+          `can't take the repo lock ${lock} within 1s:`,
+        ),
+      });
+    }, 20_000);
+  },
+);
 
 test("a new session passes no resume", async () => {
   const query = scripted([init, success]);

@@ -40,6 +40,9 @@ const Env = z.object({
     commands: [],
   }),
   WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
+  // what is left of the launch's deadline when the API starts the runner; the API fails a run that hasn't
+  // reported by then, so worktree setup's wait for the repo lock ends inside it
+  LAUNCH_DEADLINE_MINUTES: z.coerce.number().positive().default(15),
   // the env's base profile: variables for the session, and the lines it is told to follow before finishing
   SKY_SESSION_ENV: json.pipe(z.record(z.string(), z.string())).default({}),
   SKY_CHECKS: json.pipe(z.array(z.string().min(1))).default([]),
@@ -81,6 +84,11 @@ export type Config = {
   mcpServers: Record<string, BaseProfileMcpServer>;
   /** How long one wait for an answer or approval may last before the run fails. */
   waitTimeoutMs: number;
+  /**
+   * The time the launch has left, counted from this process's start, before the API fails the run
+   * as `launch_timeout`; the wait for the repo lock ends early enough inside it to report its own failure.
+   */
+  launchDeadlineMs: number;
   /** An existing GitHub branch the agent's work continues; `publish` updates it instead of `claude/<agentId>`. */
   startBranch: string | undefined;
 };
@@ -119,6 +127,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     checks: e.SKY_CHECKS,
     mcpServers: e.SKY_MCP_SERVERS,
     waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
+    launchDeadlineMs: e.LAUNCH_DEADLINE_MINUTES * 60_000,
     startBranch: e.START_BRANCH,
   };
 }

@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import {
   type AgentId,
@@ -19,6 +21,24 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return stdout.trim();
 }
 
+// git's refusals when another process holds a lock it needs, which pass once that process is done
+const LOCK_ERROR =
+  /could not lock config file|unable to write upstream branch configuration|Unable to create '[^']*\.lock'|index\.lock/i;
+const LOCK_RETRY_DELAY_MS = 250;
+
+/** Runs `step`, and once more after a short delay when git refused it for a lock another process held. */
+export async function retryOnLock<T>(step: () => Promise<T>): Promise<T> {
+  try {
+    return await step();
+  } catch (error) {
+    if (!LOCK_ERROR.test(error instanceof Error ? error.message : "")) {
+      throw error;
+    }
+    await sleep(LOCK_RETRY_DELAY_MS);
+    return step();
+  }
+}
+
 /** The agent's worktree on `claude/<agentId>`, created from `from` (the clone's `origin/HEAD` by default) on first use; an existing one is returned as it stands, `adoptAgentBranch` dealing with one on another branch. */
 export async function ensureWorktree(options: {
   repoDir: string;
@@ -29,22 +49,28 @@ export async function ensureWorktree(options: {
   const branch = agentBranch(options.agentId);
   const path = join(options.worktreesDir, options.agentId);
   if (existsSync(path)) return path;
-  // forget a worktree whose directory was deleted, so its branch can be checked out again
-  await git(options.repoDir, "worktree", "prune");
-  const branchExists = await git(options.repoDir, "branch", "--list", branch);
-  if (branchExists) {
-    await git(options.repoDir, "worktree", "add", path, branch);
-  } else {
-    await git(
-      options.repoDir,
-      "worktree",
-      "add",
-      "-b",
-      branch,
-      path,
-      options.from ?? "origin/HEAD",
-    );
-  }
+  await retryOnLock(async () => {
+    // a failed first try may have left the branch or half a directory; the directory did not exist before
+    await rm(path, { recursive: true, force: true });
+    // forget a worktree whose directory was deleted, so its branch can be checked out again
+    await git(options.repoDir, "worktree", "prune");
+    const branchExists = await git(options.repoDir, "branch", "--list", branch);
+    if (branchExists) {
+      await git(options.repoDir, "worktree", "add", path, branch);
+    } else {
+      // --no-track: nothing reads the branch's upstream, and writing it takes the repo's config lock
+      await git(
+        options.repoDir,
+        "worktree",
+        "add",
+        "--no-track",
+        "-b",
+        branch,
+        path,
+        options.from ?? "origin/HEAD",
+      );
+    }
+  });
   return path;
 }
 
