@@ -6,6 +6,9 @@ import {
   type BaseProfile,
   type EnvironmentId,
   POOL_CREDENTIAL,
+  REPO_LOCK_FILE,
+  REPO_LOCK_TIMED_OUT,
+  REPO_LOCK_WAIT_S,
   type RunId,
   spriteTaskNameFor,
 } from "@sky/shared";
@@ -276,8 +279,9 @@ export async function stopLingeringRunner(
 // bounded: a runner that outlives the wait loses whatever its commit hadn't written; the 30 s stays
 // well under `sprites.timeoutMs`, which bounds the exec
 const AWAIT_RUNNER_EXIT = `for _ in $(seq 30); do pgrep -f "$2" >/dev/null || break; sleep 1; done; `;
-// a worktree the runner never created (or whose directory is gone) counts as removed
-const REMOVE_WORKTREE = `git worktree remove --force "$1" || ! test -e "$1"`;
+// a worktree the runner never created (or whose directory is gone) counts as removed. The removal
+// writes the shared repo's .git, so it takes the lock run setup takes; exit 75 is a lock that stayed held
+const REMOVE_WORKTREE = `flock -x -w ${REPO_LOCK_WAIT_S} -E ${REPO_LOCK_TIMED_OUT} .git/${REPO_LOCK_FILE} git worktree remove --force "$1"; case $? in 0) ;; ${REPO_LOCK_TIMED_OUT}) echo "can't take the repo lock ${REPO_DIR}/.git/${REPO_LOCK_FILE} within ${REPO_LOCK_WAIT_S}s: another run's setup is holding it" >&2; exit ${REPO_LOCK_TIMED_OUT};; *) ! test -e "$1";; esac`;
 
 /**
  * Removes the agent's worktree; its branch stays. With `stoppedRunId`, first waits for that run's
