@@ -10,6 +10,8 @@ import {
   type EnvironmentId,
   EVENT_TEXT_MAX,
   HEARTBEAT_INTERVAL_MS,
+  REPO_LOCK_FILE,
+  REPO_LOCK_TIMED_OUT,
   type RunId,
   spriteTaskNameFor,
   truncationMarker,
@@ -3928,6 +3930,25 @@ test("archive stops the active run, waits for its runner, then removes the workt
   expect(removal?.endsWith(` ${runnerPattern(run.id)}`)).toBe(true);
   expect(wire.calls.join("\n")).not.toMatch(/git branch/);
   expect((await getRun(agent.id, run.id)).body.status).toBe("stopped");
+});
+
+test("archive's runner wait and lock wait leave git time inside the rm-worktree exec bound, so a held lock fails naming it", async () => {
+  const { agent } = await runningRun();
+  await action(agent.id, "archive");
+  const removal = wire.calls.at(-1) ?? "";
+  const runnerWaitS = Number(removal.match(/\$\(seq (\d+)\)/)?.[1]);
+  const lockWaitS = Number(removal.match(/flock -x -w (\d+) /)?.[1]);
+  expect(runnerWaitS).toBeGreaterThan(0);
+  expect(lockWaitS).toBeGreaterThan(0);
+  // rm-worktree passes no timeoutMs, so SPRITES_TIMEOUT_MS bounds it
+  const gitRemovalMarginMs = 10_000;
+  expect(
+    (runnerWaitS + lockWaitS) * 1000 + gitRemovalMarginMs,
+  ).toBeLessThanOrEqual(SPRITES_TIMEOUT_MS);
+  expect(removal).toContain(`-E ${REPO_LOCK_TIMED_OUT} `);
+  expect(removal).toContain(
+    `can't take the repo lock /workspace/repo/.git/${REPO_LOCK_FILE} within ${lockWaitS}s`,
+  );
 });
 
 test("archiving an idle agent removes its worktree without signalling anything", async () => {
