@@ -29,7 +29,6 @@ import { type Config, loadConfig } from "./config.js";
 import { runError } from "./runs.js";
 import { spriteNameFor } from "./sprites.js";
 import { fiveHourLimit, weeklyLimit } from "./testing/limits.js";
-import { sseReader } from "./testing/sse.js";
 import {
   envFileOf,
   type SpritesWire,
@@ -37,6 +36,7 @@ import {
   stubSprites,
   testConfig,
 } from "./testing/sprites.js";
+import { sseReader } from "./testing/sse.js";
 
 // opaque, so only registered values could be scrubbed from anything
 const DEFAULT_TOKEN = "default-subscription-opaque-1";
@@ -1210,10 +1210,17 @@ test("a follow-up sent while a challenge retry waits supersedes the retry, even 
   const r = await launchedRun(poolEnv(["personal", "work"]));
   fakeDelay();
   await failWith(r, CHALLENGE);
-  const followUp = await call(admin, "POST", `/v1/agents/${r.agent.id}/runs`, {
-    prompt: "now rename the helper",
+  // the follow-up execs on the sprite first, and the stub streams its frames on faked timers:
+  // waiting on the state steps them (a few ms each), where awaiting the response would not
+  let followUpStatus: number | undefined;
+  void Promise.resolve(
+    call(admin, "POST", `/v1/agents/${r.agent.id}/runs`, {
+      prompt: "now rename the helper",
+    }),
+  ).then((res) => {
+    followUpStatus = res.status;
   });
-  expect(followUp.status).toBe(202);
+  await vi.waitFor(() => expect(followUpStatus).toBe(202));
   await sessionOpened(2);
   const token = envFileOf(wire, wire.sessions[1]).AGENT_TOKEN;
   const followUpId = String(wire.sessions[1]?.env.RUN_ID);
@@ -1225,7 +1232,16 @@ test("a follow-up sent while a challenge retry waits supersedes the retry, even 
   const finished = await postEvent(token, {
     runId: followUpId,
     type: "run.finished",
-    payload: { summary: "renamed" },
+    payload: {
+      summary: "renamed",
+      usage: {
+        inputTokens: 1,
+        outputTokens: 1,
+        costUsd: 0,
+        turns: 1,
+        durationMs: 1,
+      },
+    },
   });
   expect(finished.status).toBe(201);
 
@@ -1247,24 +1263,30 @@ test.each([
     "reassigned to another subscription",
     { claudeCredential: "work", claudePool: null },
   ],
-  ["no longer ready", { status: "failed" as const, failureStep: "create" as const }],
-])("an environment %s while a challenge retry waits gets no retry, and nothing is marked limited", async (_name, change) => {
-  readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
-  readings[WORK_TOKEN] = { h5: 0.5, d7: 0.5 };
-  const env = poolEnv(["personal", "work"]);
-  const r = await launchedRun(env);
-  fakeDelay();
-  await failWith(r, CHALLENGE);
-  db.update(environments).set(change).where(eq(environments.id, env)).run();
+  [
+    "no longer ready",
+    { status: "failed" as const, failureStep: "create" as const },
+  ],
+])(
+  "an environment %s while a challenge retry waits gets no retry, and nothing is marked limited",
+  async (_name, change) => {
+    readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
+    readings[WORK_TOKEN] = { h5: 0.5, d7: 0.5 };
+    const env = poolEnv(["personal", "work"]);
+    const r = await launchedRun(env);
+    fakeDelay();
+    await failWith(r, CHALLENGE);
+    db.update(environments).set(change).where(eq(environments.id, env)).run();
 
-  await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
+    await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
 
-  expect(wire.sessions).toHaveLength(1);
-  expect(retryOf(r.run.id)).toBeUndefined();
-  expect(limitedUntil(db, "personal")).toBeUndefined();
-  expect(limitedUntil(db, "work")).toBeUndefined();
-  expect(logs.join("\n")).toContain(`${r.run.id} is not retried`);
-});
+    expect(wire.sessions).toHaveLength(1);
+    expect(retryOf(r.run.id)).toBeUndefined();
+    expect(limitedUntil(db, "personal")).toBeUndefined();
+    expect(limitedUntil(db, "work")).toBeUndefined();
+    expect(logs.join("\n")).toContain(`${r.run.id} is not retried`);
+  },
+);
 
 test("a challenge after a usage limit that followed a challenge fails upstream_blocked and is not retried", async () => {
   readings[PERSONAL_TOKEN] = { h5: 0.1, d7: 0.1 };
@@ -1304,33 +1326,36 @@ test.each([
       return env;
     },
   ],
-])("a challenge on a run on the API key (%s) retries on the key and marks nothing limited", async (_name, makeEnv) => {
-  const r = await launchedRun(makeEnv());
-  expect(r.file).toMatchObject({
-    SKY_CLAUDE_AUTH: "api-key",
-    SKY_CLAUDE_API_KEY: API_KEY,
-  });
-  const limits = () =>
-    ["default", "personal", "work"].map((name) =>
-      limitedUntil(db, name)?.getTime(),
-    );
-  const before = limits();
-  fakeDelay();
-  await failWith(r, CHALLENGE);
-  await vi.advanceTimersByTimeAsync(CHALLENGE_DELAY_MS);
-  await sessionOpened(2);
+])(
+  "a challenge on a run on the API key (%s) retries on the key and marks nothing limited",
+  async (_name, makeEnv) => {
+    const r = await launchedRun(makeEnv());
+    expect(r.file).toMatchObject({
+      SKY_CLAUDE_AUTH: "api-key",
+      SKY_CLAUDE_API_KEY: API_KEY,
+    });
+    const limits = () =>
+      ["default", "personal", "work"].map((name) =>
+        limitedUntil(db, name)?.getTime(),
+      );
+    const before = limits();
+    fakeDelay();
+    await failWith(r, CHALLENGE);
+    await vi.advanceTimersByTimeAsync(CHALLENGE_DELAY_MS);
+    await sessionOpened(2);
 
-  const retry = wire.sessions[1];
-  expect(envFileOf(wire, retry)).toMatchObject({
-    SKY_CLAUDE_AUTH: "api-key",
-    SKY_CLAUDE_API_KEY: API_KEY,
-  });
-  expect(runRow(String(retry?.env.RUN_ID))).toMatchObject({
-    claudeCredential: "api-key",
-    retryOf: r.run.id,
-  });
-  expect(limits()).toEqual(before);
-});
+    const retry = wire.sessions[1];
+    expect(envFileOf(wire, retry)).toMatchObject({
+      SKY_CLAUDE_AUTH: "api-key",
+      SKY_CLAUDE_API_KEY: API_KEY,
+    });
+    expect(runRow(String(retry?.env.RUN_ID))).toMatchObject({
+      claudeCredential: "api-key",
+      retryOf: r.run.id,
+    });
+    expect(limits()).toEqual(before);
+  },
+);
 
 /** The error of the `run.failed` frame on the run's event stream, as a consumer receives it. */
 async function streamedFailure(agentId: string, runId: string) {
