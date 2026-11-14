@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import {
   chmodSync,
@@ -619,10 +620,12 @@ test.skipIf(!linux)(
     const dir = mkdtempSync(join(tmpdir(), "runner-main-reap-"));
     const { seen, base } = await apiAndGateway();
     try {
-      const server = await leftover("run_reap1", dir);
+      // an id of its own: the reap matches every process on the machine carrying it
+      const runId = `run_reap1${randomUUID().replaceAll("-", "")}`;
+      const server = await leftover(runId, dir);
       const { code, stderr } = await runBundle({
         ...runEnv(base, join(dir, "run_reap1.prompt")),
-        RUN_ID: "run_reap1",
+        RUN_ID: runId,
       });
       expect(seen).toEqual(["api"]);
       expect(code).toBe(1);
@@ -653,10 +656,11 @@ test.skipIf(!linux)(
     await once(api, "listening");
     const { port } = api.address() as AddressInfo;
     try {
-      const server = await leftover("run_reap2", dir, true);
+      const runId = `run_reap2${randomUUID().replaceAll("-", "")}`;
+      const server = await leftover(runId, dir, true);
       const child = spawn(
         process.execPath,
-        ["--import", preload("capable"), bundle, "run_reap2"],
+        ["--import", preload("capable"), bundle, runId],
         {
           env: {
             PATH: process.env.PATH ?? "",
@@ -666,7 +670,7 @@ test.skipIf(!linux)(
               `http://127.0.0.1:${port}`,
               join(dir, "run_reap2.prompt"),
             ),
-            RUN_ID: "run_reap2",
+            RUN_ID: runId,
           },
           stdio: "ignore",
         },
