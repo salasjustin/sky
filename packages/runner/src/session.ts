@@ -449,6 +449,20 @@ function sessionHooks(
   };
 }
 
+/** How long before the launch's deadline the runner stops waiting for the repo lock, so its failure is posted before the API's. */
+const LOCK_WAIT_MARGIN_MS = 30_000;
+
+/**
+ * Seconds worktree setup queues for the repo lock: the launch's time left as this process started,
+ * less `elapsedMs` it has spent since and `LOCK_WAIT_MARGIN_MS`. At least 1, because flock reads
+ * `-w 0` as not waiting at all.
+ */
+export const repoLockWaitS = (launchDeadlineMs: number, elapsedMs: number) =>
+  Math.max(
+    1,
+    Math.ceil((launchDeadlineMs - elapsedMs - LOCK_WAIT_MARGIN_MS) / 1000),
+  );
+
 /** Runs one Claude session for the run and reports it; resolves to the process exit code. */
 export async function runSession(
   config: Config,
@@ -466,6 +480,8 @@ export async function runSession(
     heartbeatMs?: number;
     /** `BACKGROUND_HOLD_MS` when absent. */
     backgroundHoldMs?: number;
+    /** Milliseconds since this process started, on its own monotonic clock; `performance.now()` when absent. */
+    elapsedMs?: () => number;
     /** The env holding the run's Claude credential, which the runner took out of its own. */
     credentialEnv: NodeJS.ProcessEnv;
     /** Keeps the credential out of the repo's processes' reach; a seal with a problem fails the run before it starts. */
@@ -511,7 +527,10 @@ export async function runSession(
       // what the session's own `publish` reads, so the sync looks where it publishes
       env: { ...process.env, ...config.sessionEnv },
       warn,
-      lockWaitS: Math.ceil(config.launchDeadlineMs / 1000),
+      lockWaitS: repoLockWaitS(
+        config.launchDeadlineMs,
+        deps.elapsedMs?.() ?? performance.now(),
+      ),
       // a stop while queued behind another run's setup must not go on to make the worktree
       signal: deps.signal,
     }));

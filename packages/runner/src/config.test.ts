@@ -109,6 +109,12 @@ test("reads the approval policy and the max wait", () => {
   });
 });
 
+test("reads the time the launch has left, in minutes, fractions included", () => {
+  expect(
+    loadConfig({ ...env, LAUNCH_DEADLINE_MINUTES: "0.5" }).launchDeadlineMs,
+  ).toBe(30_000);
+});
+
 test("reads the auto-approve overrides", () => {
   const config = loadConfig({
     ...env,
@@ -130,6 +136,9 @@ test.each([
   ["APPROVAL_POLICY", '["Bash("]'],
   ["WAIT_TIMEOUT_MINUTES", "0"],
   ["WAIT_TIMEOUT_MINUTES", "soon"],
+  ["LAUNCH_DEADLINE_MINUTES", "0"],
+  ["LAUNCH_DEADLINE_MINUTES", "soon"],
+  ["LAUNCH_DEADLINE_MINUTES", ""],
 ])("rejects %s=%s", (key, value) => {
   expect(() => loadConfig({ ...env, [key]: value })).toThrow(
     new ConfigError(`missing or invalid env: ${key}`),

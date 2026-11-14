@@ -65,7 +65,7 @@ export async function withRepoLock<T>(
         reject(
           new Error(
             code === REPO_LOCK_TIMED_OUT
-              ? `can't take the repo lock ${lock} within ${waitS}s: another run's setup is holding it; retry shortly`
+              ? `can't take the repo lock ${lock} within ${waitS}s: another run's setup or a worktree removal held it all that time and may be stuck`
               : `can't take the repo lock ${lock}: flock exited ${code}${stderr.trim() ? ` (${stderr.trim()})` : ""}`,
           ),
         );

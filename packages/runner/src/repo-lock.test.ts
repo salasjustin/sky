@@ -72,9 +72,12 @@ let root: string;
 let repoDir: string;
 let worktreesDir: string;
 let children: ChildProcess[];
+/** Run after each test, last registered first, so a failed assertion can't leave a flock holding or queued. */
+let cleanups: (() => Promise<unknown>)[];
 
 beforeEach(() => {
   children = [];
+  cleanups = [];
   for (const name of [
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
@@ -107,7 +110,8 @@ beforeEach(() => {
   );
   execFileSync("git", ["clone", "-q", origin, repoDir]);
 });
-afterEach(() => {
+afterEach(async () => {
+  for (const cleanup of cleanups.reverse()) await cleanup().catch(() => {});
   for (const child of children) child.kill("SIGKILL");
   vi.unstubAllEnvs();
   rmSync(root, { recursive: true, force: true });
@@ -119,13 +123,24 @@ const launch = (n: number) =>
     { env: {}, warn: () => {} },
   );
 
-/** Holds the repo lock until `release` is called; resolves once the task is running under it. */
-const hold = async () => {
+/**
+ * Holds the repo lock until `release` is called, or the test ends; resolves once the task is running
+ * under it. `waitS` is the holder's own bound on taking it.
+ */
+const hold = async (waitS?: number) => {
   const released = deferred();
   const entered = deferred();
-  const holding = withRepoLock(repoDir, async () => {
-    entered.resolve();
-    await released.promise;
+  const holding = withRepoLock(
+    repoDir,
+    async () => {
+      entered.resolve();
+      await released.promise;
+    },
+    waitS,
+  );
+  cleanups.push(async () => {
+    released.resolve();
+    await holding;
   });
   await entered.promise;
   return { release: released.resolve, holding };
@@ -251,14 +266,20 @@ describe.skipIf(!canFlock)("with flock", () => {
     expect(existsSync(cwd)).toBe(true);
   });
 
-  test("a launch queues for the repo lock as long as its launch deadline allows, past the 120 s default", async () => {
+  test("a launch queues for the repo lock for the bound it is given, not the default", async () => {
     const lock = repoLockPath(repoDir);
-    const { release, holding } = await hold();
+    // the holder's bound differs from the launch's and from the default, so each flock is told apart
+    const { release, holding } = await hold(3600);
+    const stop = new AbortController();
     const launched = prepareWorktree(
       { repoDir, worktreesDir, agentId: "agt_1" },
       // the runner's 15 minute launch deadline, in seconds
-      { env: {}, warn: () => {}, lockWaitS: 900 },
+      { env: {}, warn: () => {}, lockWaitS: 900, signal: stop.signal },
     );
+    cleanups.push(async () => {
+      stop.abort("test over");
+      await launched;
+    });
     // the queued flock's own bound is on its command line; no time has to pass for it to be checked
     const waits = () =>
       flocksOn(lock).map((pid) => {
@@ -268,7 +289,7 @@ describe.skipIf(!canFlock)("with flock", () => {
     await vi.waitFor(() => expect(waits()).toHaveLength(2), {
       timeout: 20_000,
     });
-    expect([...waits()].sort()).toEqual(["120", "900"]);
+    expect([...waits()].sort()).toEqual(["3600", "900"]);
     release();
     await holding;
     expect((await launched).cwd).toBe(join(worktreesDir, "agt_1"));
@@ -333,7 +354,7 @@ describe.skipIf(!canFlock)("with flock", () => {
     const { release, holding } = await hold();
     const task = vi.fn(async () => "ran");
     await expect(withRepoLock(repoDir, task, 0.3)).rejects.toThrow(
-      `can't take the repo lock ${repoLockPath(repoDir)} within 0.3s: another run's setup is holding it; retry shortly`,
+      `can't take the repo lock ${repoLockPath(repoDir)} within 0.3s: another run's setup or a worktree removal held it all that time and may be stuck`,
     );
     expect(task).not.toHaveBeenCalled();
     release();
@@ -353,7 +374,7 @@ describe.skipIf(!canFlock)("with flock", () => {
         `^can't take the repo lock ${repoLockPath(repoDir).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: flock exited (?!75\\b)\\d+`,
       ),
     );
-    expect((failure as Error).message).not.toContain("another run's setup");
+    expect((failure as Error).message).not.toContain("may be stuck");
   });
 
   test("a lock file left behind with no holder does not block", async () => {

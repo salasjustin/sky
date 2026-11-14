@@ -827,7 +827,7 @@ export function prepareWorktree(
   deps: {
     env: NodeJS.ProcessEnv;
     warn: (line: string) => void;
-    /** Seconds to queue for the repo lock; the launch's own time bound, `REPO_LOCK_WAIT_S` when absent. */
+    /** Seconds to queue for the repo lock; `REPO_LOCK_WAIT_S` when absent. */
     lockWaitS?: number;
     signal?: AbortSignal;
   },
