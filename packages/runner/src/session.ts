@@ -997,9 +997,7 @@ export async function runSession(
   // can lack it (or already have dropped it) when its parent's `result` arrives; so it counts by
   // agent id from its launch's result or its start hook, whichever comes first, until its stop
   // hook. A turn's `result` can't precede its own tool results, so a launch is counted before the
-  // result it must hold. Tasks the SDK flags `ambient` (watchers and housekeeping, never activity)
-  // stay out: they don't wake a turn, so holding for one would only keep a finished run open until
-  // the hold expires.
+  // result it must hold.
   const subagents = new Set<string>();
   const stoppedSubagents = new Set<string>();
   const unfinishedWork = () => liveTasks + subagents.size;
@@ -1033,7 +1031,8 @@ export async function runSession(
   };
   // A task or subagent ending wakes a turn, whose `result` decides again; but the hook can't tell a
   // main-thread subagent from one a subagent launched, whose stop wakes its launcher instead and
-  // brings no result, so a hold in effect gets a fresh window rather than none.
+  // brings no result. So a hold in effect restarts rather than clears: cleared, it would leave the
+  // input open with no limit.
   const restartHold = () => {
     if (holdTimer === undefined || inputClosed) return;
     endHold();
@@ -1109,6 +1108,8 @@ export async function runSession(
         message.type === "system" &&
         message.subtype === "background_tasks_changed"
       ) {
+        // tasks the SDK flags `ambient` (watchers and housekeeping, never activity) don't wake a
+        // turn, so holding for one would only keep a finished run open until the hold expires
         const live = message.tasks.filter((task) => !task.ambient);
         liveTasks = live.length;
         heartbeat.setBackground(
@@ -1136,7 +1137,7 @@ export async function runSession(
       ) {
         cancelWarned = true;
         const warning =
-          "the session's input closed while a background subagent was still running; its woken turn was cancelled";
+          "a background subagent was still running when the run stopped waiting for it; the turn it woke was cancelled";
         warn(`runner: ${warning}`);
         void post({
           type: "runner.warning",
@@ -1229,8 +1230,8 @@ function launchedAgentId(
 ): string | undefined {
   if (toolName !== "Agent" && toolName !== "Task") return undefined;
   const output = response as { status?: unknown; agentId?: unknown } | null;
-  // taken as the hooks' `agent_id`: the SDK's types call both the subagent's id, and nothing in
-  // its source (the CLI ships apart from it) ties one to the other
+  // assumed equal to the hooks' `agent_id`: the SDK's types call both the subagent's id, but
+  // nothing in its source ties one to the other (the CLI ships apart from it)
   return output?.status === "async_launched" &&
     typeof output.agentId === "string"
     ? output.agentId
@@ -1240,8 +1241,8 @@ function launchedAgentId(
 /**
  * How the SDK's interruption markers (in its `sdk.mjs`) begin for a call cut off by the input
  * closing: the cancel that reads as a user refusal, and the two for a session that ended. The rest
- * of that list name other causes, such as a person's interrupt or a turn ended to deliver a
- * message; and none of these begins a reason the gate denies a call with.
+ * of that list names other causes, such as a person's interrupt or a turn ended to deliver a
+ * message. None of these begins a reason the gate denies a call with.
  */
 const CANCELLED_CALL_PREFIXES = [
   "The user doesn't want to take this action right now",

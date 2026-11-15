@@ -1134,9 +1134,9 @@ type WokenTurn = (
 ) => Promise<unknown[] | undefined>;
 
 /**
- * A stand-in for the SDK and Claude's process for a woken turn: a `turn` is a function that gets the
- * session's options and whether the prompt had ended, and answers the messages it streams, as a
- * tool call the SDK cancels when stdin is closed and runs when it is open.
+ * A stand-in for the SDK and Claude's process across a woken turn: messages stream as given, and a
+ * function in the list is called, after a beat, with the session's options and whether the prompt
+ * had ended, and the messages it answers stream in its place.
  */
 function wakeProcess(turns: unknown[]): QueryFn {
   return ({ prompt, options }) =>
@@ -1180,7 +1180,7 @@ const subagentStop: Step = hook("SubagentStop", {
   agent_type: "general-purpose",
   last_assistant_message: "done",
 });
-/** The SDK's text for a call it cancelled as a refusal would read (its interruption markers in sdk.mjs). */
+/** The SDK's text for a call it cancelled, which reads as a user's refusal (one of its interruption markers in sdk.mjs). */
 const REFUSAL_CANCEL =
   "The user doesn't want to take this action right now. STOP what you are doing and wait for the user to tell you how to proceed.";
 /** Tool results Claude's process hands back for `toolu_woken`, as errors, one per `content`. */
@@ -1233,7 +1233,7 @@ const agentLaunched = (agentId: string): Step =>
   });
 
 const CANCEL_WARNING =
-  "the session's input closed while a background subagent was still running; its woken turn was cancelled";
+  "a background subagent was still running when the run stopped waiting for it; the turn it woke was cancelled";
 const cancelWarnings = (warnings: string[], posted: RunnerEventPost[]) => ({
   warned: warnings.filter((w) => w === `runner: ${CANCEL_WARNING}`).length,
   posted: posted.filter(
@@ -1483,7 +1483,7 @@ test("a nested subagent stopping with no result after it restarts the hold, and 
           agent_id: "agent-2",
           agent_type: "Explore",
         });
-        // past the first hold's end, inside the restarted one: both timers are set by now
+        // past where the first hold would have ended, and inside the restarted one
         await new Promise((resolve) => setTimeout(resolve, 50));
         warnedBeforeRestartedHoldEnds = holdWarnings(warnings).length;
         return undefined;
