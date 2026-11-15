@@ -15,6 +15,7 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -159,6 +160,26 @@ function fakeGitHub(base = REPO) {
             return { mode, type, sha, path };
           }),
       }),
+    ),
+    // GitHub's archive of a commit: the tree under `<owner>-<repo>-<sha>/`, gzipped
+    http.get(
+      `${base}/tarball/:ref`,
+      ({ params }) =>
+        new HttpResponse(
+          gzipSync(
+            execFileSync(
+              "git",
+              [
+                "archive",
+                "--format=tar",
+                `--prefix=acme-private-${String(params.ref).slice(0, 7)}/`,
+                String(params.ref),
+              ],
+              { cwd: remote, maxBuffer: 256 * 1024 * 1024 },
+            ),
+          ),
+          { headers: { "content-type": "application/x-gzip" } },
+        ),
     ),
     http.get(`${base}/git/blobs/:sha`, ({ params }) => {
       // a blob GitHub lacks is a 404, which is how publish learns to upload it
@@ -1749,7 +1770,7 @@ test("a pull that fails onto an existing checkout keeps it, and a later run fini
     writeFileSync(join(work, "new.txt"), "n\n"),
   );
   server.use(
-    http.get(`${REPO}/git/blobs/:sha`, () =>
+    http.get(`${REPO}/tarball/:ref`, () =>
       HttpResponse.json({ message: "Server Error" }, { status: 500 }),
     ),
   );
@@ -1767,7 +1788,7 @@ test("a pull that fails onto an existing checkout keeps it, and a later run fini
 test("a pull that fails part-way removes the checkout it started, so the next run starts clean", async () => {
   fakeGitHub();
   server.use(
-    http.get(`${REPO}/git/blobs/:sha`, () =>
+    http.get(`${REPO}/tarball/:ref`, () =>
       HttpResponse.json({ message: "Server Error" }, { status: 500 }),
     ),
   );
@@ -1825,10 +1846,10 @@ test("a truncated tree fails the pull as too large, and leaves nothing behind", 
   expect(existsSync(join(root, "fresh"))).toBe(false);
 });
 
-test("a blob GitHub 404s mid-fetch fails the pull naming the status, and removes the checkout", async () => {
+test("the archive GitHub 404s mid-fetch fails the pull naming the status, and removes the checkout", async () => {
   fakeGitHub();
   server.use(
-    http.get(`${REPO}/git/blobs/:sha`, () =>
+    http.get(`${REPO}/tarball/:ref`, () =>
       HttpResponse.json({ message: "Not Found" }, { status: 404 }),
     ),
   );
@@ -2146,4 +2167,118 @@ test("a repo with no commits over git says it is empty, then the connector is tr
   const { io, sink } = sinks();
   await repoPullMain(["acme/private", join(root, "x")], anonEnv, sink);
   expect(io.err).toContain("acme/private is empty");
+});
+
+// the connector's hourly quota is shared, so a pull's gateway calls must not grow with the repo
+/** Commits `count` more files on trunk of the bare remote; returns the new tip. */
+const growRemote = (count: number) =>
+  advanceTrunk((work) => {
+    mkdirSync(join(work, "bulk"));
+    for (let i = 0; i < count; i++) {
+      writeFileSync(join(work, "bulk", `f${i}.txt`), `file ${i}\n`);
+    }
+  });
+
+const countedPull = async (dir: string) => {
+  const calls = gatewayCalls();
+  await pull(dir);
+  calls.stop();
+  return calls.urls.map((url) =>
+    url.slice(GATEWAY.length + CONNECTOR.length + 2),
+  );
+};
+
+test("a pull's gateway calls don't grow with the repo's file count: the repo, the ref, the commit, the tree and one archive", async () => {
+  fakeGitHub();
+  const small = await countedPull(join(root, "small"));
+  growRemote(150);
+  const large = await countedPull(join(root, "large"));
+
+  expect(small).toHaveLength(5);
+  expect(large).toHaveLength(small.length);
+  expect(large.filter((url) => url.includes("/blobs/"))).toEqual([]);
+  expect(large.filter((url) => url.includes("/tarball/"))).toHaveLength(1);
+  expect(readFileSync(join(root, "large/bulk/f149.txt"), "utf8")).toBe(
+    "file 149\n",
+  );
+  expect(git(join(root, "large"), "status", "--porcelain")).toBe("");
+});
+
+test("a file the archive carries differently from git's blob is fetched by itself, the rest still come from the archive", async () => {
+  fakeGitHub();
+  server.use(
+    http.get(`${REPO}/tarball/:ref`, ({ params }) => {
+      const ref = String(params.ref);
+      const archive = execFileSync(
+        "git",
+        ["archive", "--format=tar", "--prefix=acme-private-x/", ref],
+        { cwd: remote, maxBuffer: 64 * 1024 * 1024 },
+      );
+      // an export-subst'd README: same path, other bytes
+      const edited = Buffer.from(
+        archive.toString("latin1").replace("private\n", "PRIVATE\n"),
+        "latin1",
+      );
+      return new HttpResponse(gzipSync(edited));
+    }),
+  );
+  const calls = gatewayCalls();
+  const dir = join(root, "repo");
+  await pull(dir);
+  calls.stop();
+
+  const blobs = calls.urls.filter((url) => url.includes("/git/blobs/"));
+  expect(blobs).toHaveLength(1);
+  expect(readFileSync(join(dir, "README.md"), "utf8")).toBe("private\n");
+  expect(git(dir, "status", "--porcelain")).toBe("");
+});
+
+test("a stale clone that lacks many blobs gets them from one archive when it fetches the base to publish on", async () => {
+  const seen = fakeGitHub();
+  const { dir, tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const fresh = growRemote(40);
+  const calls = gatewayCalls();
+
+  await publishFrom(tree);
+  calls.stop();
+
+  expect(seen.commits[0]?.parents).toEqual([fresh]);
+  expect(calls.urls.filter((url) => url.includes("/tarball/"))).toHaveLength(1);
+  // the 40 base files aren't read one by one: the only blob call is publish's check of the agent's own
+  expect(calls.urls.filter((url) => url.includes("/git/blobs/"))).toHaveLength(
+    1,
+  );
+  expect(git(dir, "cat-file", "-t", fresh)).toBe("commit");
+});
+
+test("a pull stopped by a spent hourly limit says when it ends, and no token appears in what it prints", async () => {
+  fakeGitHub();
+  const reset = Math.floor(Date.now() / 1000) + 3000;
+  server.use(
+    http.get(`${REPO}/git/commits/:sha`, () =>
+      HttpResponse.json(
+        { message: "API rate limit exceeded for user ID 1" },
+        {
+          status: 403,
+          headers: {
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(reset),
+          },
+        },
+      ),
+    ),
+  );
+  const { io, sink } = sinks();
+
+  expect(
+    await repoPullMain(["acme/private", join(root, "x")], mainEnv, sink),
+  ).toBe(1);
+
+  expect(io.err).toContain(
+    `repo pull: failed: github_rate_limited: GitHub's hourly API limit is used up until ${new Date(reset * 1000).toISOString()}`,
+  );
+  expect(io.err + io.out).not.toContain(CONNECTOR);
+  expect(io.err + io.out).not.toMatch(/authorization|bearer|ghp_|gho_/i);
 });

@@ -2575,3 +2575,71 @@ test("an env whose base profile was removed from the config fails provisioning n
   });
   expect(wire.calls).toEqual([]);
 });
+
+test("environments rebuilt at once pull through the connector two at a time, and all still finish", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sky-bundle-"));
+  const runnerBundlePath = join(dir, "runner.mjs");
+  writeFileSync(runnerBundlePath, "// runner");
+  app = createApp({
+    db,
+    config: testConfig({ runnerBundlePath, baseProfiles: profiles }),
+    sprites: new SpritesClient(spritesToken),
+    log: () => {},
+    nudgeDeliveries: () => {},
+  });
+  const ids: string[] = [];
+  for (const name of ["a", "b", "c", "d"]) {
+    ids.push(await ready({ name, repo: `acme/${name}`, setup: "true" }));
+    const put = await app.request(
+      `/v1/environments/${ids.at(-1)}/secrets/GITHUB_CONNECTOR`,
+      {
+        method: "PUT",
+        headers: json,
+        body: JSON.stringify({ connector: "VPpb7x" }),
+      },
+    );
+    expect(put.status).toBe(200);
+  }
+
+  // each repo pull holds its place until a second one is running beside it, then a moment longer, so a
+  // third that was let in would show; the others fall through to the Sprites fake
+  let running = 0;
+  let most = 0;
+  let pulls = 0;
+  let pair = () => {};
+  const together = new Promise<void>((resolve) => {
+    pair = resolve;
+  });
+  server.use(
+    http.post(
+      `https://api.sprites.dev/v1/sprites/:name/exec`,
+      async ({ request }) => {
+        const cmd = new URL(request.url).searchParams.getAll("cmd").join(" ");
+        if (!cmd.includes("repo-pull")) return;
+        pulls++;
+        running++;
+        most = Math.max(most, running);
+        if (running >= 2) pair();
+        await together;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        running--;
+      },
+    ),
+  );
+
+  const patched = await Promise.all(
+    ids.map((id) => patch(id, { setup: "true && true" })),
+  );
+  expect(patched.map((res) => res.status)).toEqual([202, 202, 202, 202]);
+  const done = await Promise.all(ids.map((id) => settled(id)));
+  rmSync(dir, { recursive: true, force: true });
+
+  expect(done.map((env) => env.status)).toEqual([
+    "ready",
+    "ready",
+    "ready",
+    "ready",
+  ]);
+  expect(pulls).toBe(4);
+  expect(most).toBe(2);
+});

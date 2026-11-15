@@ -6,6 +6,7 @@ import { type KnownSecrets, redact } from "./redact.js";
 import { cloneUrl } from "./remote.js";
 import type { BundleInstaller } from "./runner-bundle.js";
 import { hasConnectorSecret, openEnvSecrets } from "./secrets.js";
+import { createSemaphore } from "./semaphore.js";
 import {
   baseSpriteLabels,
   checkpointSprite,
@@ -284,6 +285,10 @@ const TAIL_CHARS = 4000;
 const INTERRUPTED =
   "interrupted: the API restarted during this step; a retry provisions from the start";
 
+// repo and store pulls through the connector at once; one more than one lets two environments overlap
+// their download and checkout, and four rebuilds still share what a single hour allows
+const CONNECTOR_CONCURRENCY = 2;
+
 class StepFailed extends Error {}
 
 type Deps = {
@@ -295,6 +300,8 @@ type Deps = {
   /** The API's configured base profiles, by name. */
   baseProfiles: Record<string, BaseProfile>;
   log: (line: string) => void;
+  /** How many provisions may run connector-heavy steps (the repo and store pulls) at once. */
+  connectorConcurrency?: number;
 };
 type Target = {
   id: EnvironmentId;
@@ -317,7 +324,10 @@ export function createProvisioner({
   ensureBundle,
   baseProfiles,
   log,
+  connectorConcurrency = CONNECTOR_CONCURRENCY,
 }: Deps) {
+  // the connector's GitHub quota is one hourly budget shared by every environment provisioning
+  const withConnectorSlot = createSemaphore(connectorConcurrency);
   async function run(env: Target): Promise<void> {
     const name = spriteNameFor(env.id);
     const profile = env.base === null ? undefined : baseProfiles[env.base];
@@ -397,11 +407,13 @@ export function createProvisioner({
           { op: "write-store-env", mode: 0o600, known },
         );
         try {
-          await execNoisy(
-            ["sh", "-c", PULL_STORE, "sh", STORE_ENV_FILE],
-            "store-pull",
-            "/tmp/sky-store.log",
-            { known },
+          await withConnectorSlot(() =>
+            execNoisy(
+              ["sh", "-c", PULL_STORE, "sh", STORE_ENV_FILE],
+              "store-pull",
+              "/tmp/sky-store.log",
+              { known },
+            ),
           );
           await execNoisy(
             ["bash", "-c", RUN_STORE_SETUP, "bash", STORE_ENV_FILE],
@@ -456,11 +468,13 @@ export function createProvisioner({
           mode: 0o600,
           known,
         });
-        await execNoisy(
-          ["sh", "-c", PULL_REPO, "sh", REPO_ENV_FILE, env.repo, REPO_DIR],
-          "clone",
-          "/tmp/sky-clone.log",
-          { known },
+        await withConnectorSlot(() =>
+          execNoisy(
+            ["sh", "-c", PULL_REPO, "sh", REPO_ENV_FILE, env.repo, REPO_DIR],
+            "clone",
+            "/tmp/sky-clone.log",
+            { known },
+          ),
         );
       } catch (err) {
         // the pull's failure is the one recorded; a file left behind is only logged

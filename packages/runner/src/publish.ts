@@ -213,8 +213,38 @@ const MAX_RETRY_AFTER_S = 60;
 const RETRIES = 3;
 // the primary rate limit resets on the hour at the latest; a reset this near is waited out, a farther one fails naming its time
 const MAX_RESET_WAIT_S = 300;
+// under this many calls left in the hour, calls are spaced out rather than spent as fast as they go
+const RATE_FLOOR = 500;
+const SLOW_PACE_MS = 1000;
 // a stalled gateway call fails rather than holding the caller
 const REQUEST_TIMEOUT_MS = 120_000;
+
+/** What the gateway does near GitHub's hourly limit; the defaults are what runs, a test sets its own. */
+export type RateLimitPolicy = {
+  /** Remaining calls under which each call waits `paceMs` first. */
+  floor: number;
+  paceMs: number;
+  /** The longest wait for a spent limit's reset; a later reset fails naming its time. */
+  maxResetWaitS: number;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+};
+
+const DEFAULT_POLICY: RateLimitPolicy = {
+  floor: RATE_FLOOR,
+  paceMs: SLOW_PACE_MS,
+  maxResetWaitS: MAX_RESET_WAIT_S,
+  now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+/** The error for an hourly limit that is used up until `resetAt` (epoch seconds). */
+const rateLimitedAt = (resetAt: number, where: string, status: number) =>
+  new GatewayError(
+    `github_rate_limited: GitHub's hourly API limit is used up until ${new Date(resetAt * 1000).toISOString()} (${where})`,
+    status,
+    true,
+  );
 
 /** GitHub's REST API for one repo, through the gateway, with no credential of its own. */
 export function gateway(options: {
@@ -222,17 +252,22 @@ export function gateway(options: {
   connectorId: string;
   owner: string;
   repo: string;
+  rateLimit?: Partial<RateLimitPolicy>;
 }) {
+  const policy = { ...DEFAULT_POLICY, ...options.rateLimit };
   const root = `${options.gatewayUrl.replace(/\/+$/, "")}/${encodeURIComponent(options.connectorId)}`;
   const repoPath = `/repos/${options.owner}/${options.repo}`;
-  return async function call<T>(
+  // the last `x-ratelimit-remaining` this gateway saw, which every call of it shares
+  let remaining = Number.POSITIVE_INFINITY;
+  async function request(
     method: string,
     path: string,
     body?: unknown,
-  ): Promise<T> {
+  ): Promise<Response> {
     const where = `${method} ${repoPath}${path}`;
     let response: Response;
     for (let attempt = 0; ; attempt++) {
+      if (remaining < policy.floor) await policy.sleep(policy.paceMs);
       try {
         response = await fetch(`${root}${repoPath}${path}`, {
           method,
@@ -251,25 +286,25 @@ export function gateway(options: {
           `GitHub gateway: ${where} failed: ${messageOf(error)}${cause ? ` (${messageOf(cause)})` : ""}`,
         );
       }
+      const left = response.headers.get("x-ratelimit-remaining");
+      if (left !== null && Number.isFinite(Number(left)))
+        remaining = Number(left);
       const retryAfter = Number(response.headers.get("retry-after") ?? NaN);
       // the primary limit: the quota is spent until `x-ratelimit-reset`, epoch seconds
       const resetAt = Number(response.headers.get("x-ratelimit-reset") ?? NaN);
       if (
         (response.status === 403 || response.status === 429) &&
-        response.headers.get("x-ratelimit-remaining") === "0" &&
+        left === "0" &&
         Number.isFinite(resetAt)
       ) {
-        const waitS = Math.max(0, resetAt - Date.now() / 1000);
-        if (waitS > MAX_RESET_WAIT_S || attempt >= RETRIES) {
-          await response.body?.cancel();
-          throw new GatewayError(
-            `GitHub gateway: ${where} hit GitHub's rate limit, which resets at ${new Date(resetAt * 1000).toISOString()} (in ${Math.ceil(waitS / 60)} min); try again then`,
-            response.status,
-            true,
-          );
-        }
+        const waitS = Math.max(0, resetAt - policy.now() / 1000);
         await response.body?.cancel();
-        await new Promise((resolve) => setTimeout(resolve, waitS * 1000 + 250));
+        if (waitS > policy.maxResetWaitS || attempt >= RETRIES) {
+          throw rateLimitedAt(resetAt, where, response.status);
+        }
+        await policy.sleep(waitS * 1000 + 250);
+        // the quota is whole again after the reset
+        remaining = Number.POSITIVE_INFINITY;
         continue;
       }
       if (
@@ -279,12 +314,12 @@ export function gateway(options: {
         attempt < RETRIES
       ) {
         await response.body?.cancel();
-        await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+        await policy.sleep(retryAfter * 1000);
         continue;
       }
       break;
     }
-    if (response.ok) return (await response.json()) as T;
+    if (response.ok) return response;
     const text = await response.text();
     let detail = text.trim() || response.statusText;
     try {
@@ -304,7 +339,18 @@ export function gateway(options: {
       response.status,
       rateLimited,
     );
+  }
+  const call = async function call<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<T> {
+    return (await (await request(method, path, body)).json()) as T;
   };
+  /** The bytes a GET answers with, such as a repo's tarball. */
+  call.bytes = async (path: string): Promise<Buffer> =>
+    Buffer.from(await (await request("GET", path)).arrayBuffer());
+  return call;
 }
 
 /**

@@ -21,13 +21,19 @@ import {
   gateway,
 } from "./publish.js";
 import {
+  BLOB_FETCH_CONCURRENCY,
+  eachLimited,
   fetchMissing,
   git,
   messageOf,
+  missingObjects,
+  PROGRESS_EVERY,
   type Progress,
   remoteHead,
   type TreeItem,
+  writeBlob,
 } from "./store.js";
+import { readTarball } from "./tarball.js";
 
 export const REPO_PULL_USAGE = "repo-pull <owner/repo> <dir>";
 
@@ -124,7 +130,7 @@ export function rebuildCommit(sha: string, commit: ApiCommit): string {
 
 /**
  * Materializes `repo`'s default branch in `dir` through the connector gateway, which carries REST
- * and no git transport: the branch's commit, its tree and every blob are fetched and written as git
+ * and no git transport: the branch's commit and tree are fetched, and the files come as one tarball, written as git
  * objects, so the checkout holds the same commit sha as GitHub, and `origin/HEAD` names it, which
  * is what a worktree branches from and what a publish takes as its parent. The commit is shallow:
  * its ancestors stay on GitHub. A failure removes what this run created; a checkout an earlier,
@@ -184,6 +190,7 @@ export async function pullRepo(options: {
     await writeCheckout(dir, options.repo, remote, commit, listing.tree, raw, {
       call,
       progress,
+      archiveFrom: 1,
     });
   } catch (error) {
     if (created) await rm(created, { recursive: true, force: true });
@@ -219,6 +226,51 @@ async function removeAbandonedIndexes(gitDir: string): Promise<void> {
   );
 }
 
+// a fetch that lacks fewer blobs than this asks for them one by one; more come as one archive
+const ARCHIVE_FROM = 20;
+
+/**
+ * Makes every blob of `blobs` present in the repo `g` runs in. The ones it lacks come from one
+ * tarball of `sha`, whose gateway cost doesn't grow with the file count, when at least `archiveFrom`
+ * are missing; a blob the archive doesn't carry as git stores it (an `export-ignore` or
+ * `export-subst` attribute changes the bytes) is fetched by itself.
+ */
+async function fetchBlobs(
+  g: ReturnType<typeof git>,
+  call: ReturnType<typeof gateway>,
+  sha: string,
+  blobs: TreeItem[],
+  progress: Progress,
+  archiveFrom: number,
+): Promise<void> {
+  const missing = new Set(
+    await missingObjects(g, [...new Set(blobs.map((item) => item.sha))]),
+  );
+  if (missing.size === 0) return;
+  if (missing.size < archiveFrom) {
+    await fetchMissing(g, call, blobs, progress, "repo pull");
+    return;
+  }
+  progress(`repo pull: downloading ${missing.size} blobs as one archive`);
+  const files = readTarball(await call.bytes(`/tarball/${sha}`));
+  const wanted = blobs.filter((item) => missing.has(item.sha));
+  const seen = new Set<string>();
+  let stored = 0;
+  await eachLimited(wanted, BLOB_FETCH_CONCURRENCY, async (item) => {
+    if (seen.has(item.sha)) return;
+    seen.add(item.sha);
+    const bytes = files.get(item.path);
+    if (!bytes || (await writeBlob(g, bytes)) !== item.sha) return;
+    missing.delete(item.sha);
+    stored++;
+    if (stored % PROGRESS_EVERY === 0) {
+      progress(`repo pull: stored ${stored}/${wanted.length} blobs`);
+    }
+  });
+  const rest = blobs.filter((item) => missing.has(item.sha));
+  if (rest.length > 0) await fetchMissing(g, call, rest, progress, "repo pull");
+}
+
 /**
  * Writes the commit, its tree and every blob into the repo `g` runs in as git objects, so
  * `remote.sha` resolves there; the checkout and refs are the caller's.
@@ -230,10 +282,21 @@ async function writeObjects(
   commit: ApiCommit,
   tree: TreeItem[],
   raw: string,
-  source: { call: ReturnType<typeof gateway>; progress: Progress },
+  source: {
+    call: ReturnType<typeof gateway>;
+    progress: Progress;
+    archiveFrom: number;
+  },
 ): Promise<void> {
   const blobs = tree.filter((item) => item.type === "blob");
-  await fetchMissing(g, source.call, blobs, source.progress, "repo pull");
+  await fetchBlobs(
+    g,
+    source.call,
+    sha,
+    blobs,
+    source.progress,
+    source.archiveFrom,
+  );
   // a submodule is a gitlink: a commit sha in the tree with nothing behind it here
   const entries = tree.filter(
     (item) => item.type === "blob" || item.type === "commit",
@@ -285,6 +348,7 @@ export async function fetchCommit(
   await writeObjects(g, gitDir, sha, commit, listing.tree, raw, {
     call,
     progress,
+    archiveFrom: ARCHIVE_FROM,
   });
   const here = async (parent: string) =>
     g(["cat-file", "-e", `${parent}^{commit}`]).then(
@@ -373,7 +437,11 @@ async function writeCheckout(
   commit: ApiCommit,
   tree: TreeItem[],
   raw: string,
-  source: { call: ReturnType<typeof gateway>; progress: Progress },
+  source: {
+    call: ReturnType<typeof gateway>;
+    progress: Progress;
+    archiveFrom: number;
+  },
 ): Promise<void> {
   const g = git(dir);
   await g(["init", "-q", "-b", remote.branch]);
