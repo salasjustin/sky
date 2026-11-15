@@ -2678,71 +2678,64 @@ const pulls = [
   },
 ] as const;
 
-test.each(
-  pulls,
-)("environments rebuilt at once pull the $kind through the connector two at a time, and all still finish", async ({
-  marker,
-  envFile,
-  base,
-}) => {
-  const { ids, sprites, wrote, start } = await rebuildTogether(
-    ["a", "b", "c", "d"],
-    base,
-  );
-  const gate = gatePulls(marker);
-  await start();
-  await wrote(envFile);
+test.each(pulls)(
+  "environments rebuilt at once pull the $kind through the connector two at a time, and all still finish",
+  async ({ marker, envFile, base }) => {
+    const { ids, sprites, wrote, start } = await rebuildTogether(
+      ["a", "b", "c", "d"],
+      base,
+    );
+    const gate = gatePulls(marker);
+    await start();
+    await wrote(envFile);
 
-  await vi.waitFor(() => expect(gate.started).toHaveLength(2));
-  expect(gate.inFlight()).toBe(2);
+    await vi.waitFor(() => expect(gate.started).toHaveLength(2));
+    expect(gate.inFlight()).toBe(2);
 
-  gate.release(gate.started[0]);
-  await vi.waitFor(() => expect(gate.started).toHaveLength(3));
-  expect(gate.inFlight()).toBe(2);
+    gate.release(gate.started[0]);
+    await vi.waitFor(() => expect(gate.started).toHaveLength(3));
+    expect(gate.inFlight()).toBe(2);
 
-  gate.release(gate.started[1]);
-  await vi.waitFor(() => expect(gate.started).toHaveLength(4));
-  expect(gate.inFlight()).toBe(2);
+    gate.release(gate.started[1]);
+    await vi.waitFor(() => expect(gate.started).toHaveLength(4));
+    expect(gate.inFlight()).toBe(2);
 
-  gate.release(gate.started[2]);
-  gate.release(gate.started[3]);
-  const done = await Promise.all(ids.map((id) => settled(id)));
+    gate.release(gate.started[2]);
+    gate.release(gate.started[3]);
+    const done = await Promise.all(ids.map((id) => settled(id)));
 
-  expect(done.map((env) => env.status)).toEqual(ids.map(() => "ready"));
-  expect([...gate.started].sort()).toEqual([...sprites].sort());
-  expect(gate.most()).toBe(2);
-});
+    expect(done.map((env) => env.status)).toEqual(ids.map(() => "ready"));
+    expect([...gate.started].sort()).toEqual([...sprites].sort());
+    expect(gate.most()).toBe(2);
+  },
+);
 
-test.each(
-  pulls,
-)("a failed $kind pull frees its connector slot for the next environment waiting", async ({
-  kind,
-  marker,
-  envFile,
-  base,
-}) => {
-  const { ids, wrote, start } = await rebuildTogether(["a", "b", "c"], base);
-  const gate = gatePulls(marker);
-  const exec = wire.exec;
-  wire.exec = (argv) =>
-    argv.join(" ").includes(marker)
-      ? { exitCode: 1, stderr: "pull failed" }
-      : exec(argv);
-  await start();
-  await wrote(envFile);
+test.each(pulls)(
+  "a failed $kind pull frees its connector slot for the next environment waiting",
+  async ({ kind, marker, envFile, base }) => {
+    const { ids, wrote, start } = await rebuildTogether(["a", "b", "c"], base);
+    const gate = gatePulls(marker);
+    const exec = wire.exec;
+    wire.exec = (argv) =>
+      argv.join(" ").includes(marker)
+        ? { exitCode: 1, stderr: "pull failed" }
+        : exec(argv);
+    await start();
+    await wrote(envFile);
 
-  await vi.waitFor(() => expect(gate.started).toHaveLength(2));
-  gate.release(gate.started[0]);
-  await vi.waitFor(() => expect(gate.started).toHaveLength(3));
-  expect(gate.inFlight()).toBe(2);
+    await vi.waitFor(() => expect(gate.started).toHaveLength(2));
+    gate.release(gate.started[0]);
+    await vi.waitFor(() => expect(gate.started).toHaveLength(3));
+    expect(gate.inFlight()).toBe(2);
 
-  gate.release(gate.started[1]);
-  gate.release(gate.started[2]);
-  const done = await Promise.all(ids.map((id) => settled(id)));
+    gate.release(gate.started[1]);
+    gate.release(gate.started[2]);
+    const done = await Promise.all(ids.map((id) => settled(id)));
 
-  // a failed repo pull fails the env; a failed store pull is only logged
-  expect(done.map((env) => env.status)).toEqual(
-    ids.map(() => (kind === "repo" ? "failed" : "ready")),
-  );
-  expect(gate.most()).toBe(2);
-});
+    // a failed repo pull fails the env; a failed store pull is only logged
+    expect(done.map((env) => env.status)).toEqual(
+      ids.map(() => (kind === "repo" ? "failed" : "ready")),
+    );
+    expect(gate.most()).toBe(2);
+  },
+);
