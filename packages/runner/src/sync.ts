@@ -18,7 +18,7 @@ import {
   rebaseInProgress,
 } from "./publish.js";
 import { editShallow, fetchCommit, shallowCommits } from "./repo.js";
-import { withRepoLock } from "./repo-lock.js";
+import { RepoLockBusyError, withRepoLock } from "./repo-lock.js";
 import { git, messageOf } from "./store.js";
 import { adoptAgentBranch, ensureWorktree } from "./worktree.js";
 
@@ -798,6 +798,9 @@ export async function branchCheckMain(
 
 export const SYNC_USAGE = "sync";
 
+/** Seconds `sync` waits for the repo lock: short, so the agent hears "busy" before its shell times out. */
+export const SYNC_LOCK_WAIT_S = 30;
+
 /**
  * `runner.mjs sync`, run by the agent from its worktree: brings `origin/<default>` to GitHub's tip
  * again, for a default branch that moved while the run worked. Prints what it did on stdout and
@@ -808,6 +811,7 @@ export async function syncMain(
   argv: string[],
   env: NodeJS.ProcessEnv,
   io: { cwd: string; stdout: (s: string) => void; stderr: (s: string) => void },
+  deps: { lockWaitS?: number } = {},
 ): Promise<number> {
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
     io.stdout(`usage: ${SYNC_USAGE}\n`);
@@ -843,8 +847,10 @@ export async function syncMain(
       owner,
       repo,
     });
-    const synced = await withRepoLock(repoDir, () =>
-      syncDefaultBranch({ repoDir, call }),
+    const synced = await withRepoLock(
+      repoDir,
+      () => syncDefaultBranch({ repoDir, call }),
+      deps.lockWaitS ?? SYNC_LOCK_WAIT_S,
     );
     const name = synced.default;
     if (synced.tooFar) {
@@ -890,7 +896,11 @@ export async function syncMain(
     }
     return 0;
   } catch (error) {
-    io.stderr(`sky sync: ${messageOf(error)}\n`);
+    io.stderr(
+      error instanceof RepoLockBusyError
+        ? "sky sync: the repo is busy: another run's setup holds its lock; try again in a minute\n"
+        : `sky sync: ${messageOf(error)}\n`,
+    );
     return 1;
   }
 }

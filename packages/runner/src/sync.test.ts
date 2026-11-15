@@ -11,12 +11,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { RunnerEventPost } from "@sky/shared";
+import { REPO_LOCK_WAIT_S, type RunnerEventPost } from "@sky/shared";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { gateway, publish as publishRun } from "./publish.js";
 import { pullRepo } from "./repo.js";
+import { withRepoLock } from "./repo-lock.js";
 import type { QueryFn } from "./session.js";
 import * as sync from "./sync.js";
 import { hermeticRunSession as runSessionRaw } from "./testing/hermetic-run.js";
@@ -1934,17 +1935,23 @@ const syncRun = async (
   cwd: string,
   env: NodeJS.ProcessEnv = ENV,
   argv: string[] = [],
+  lockWaitS?: number,
 ) => {
   const io = { out: "", err: "" };
-  const code = await syncMain(argv, env, {
-    cwd,
-    stdout: (s) => {
-      io.out += s;
+  const code = await syncMain(
+    argv,
+    env,
+    {
+      cwd,
+      stdout: (s) => {
+        io.out += s;
+      },
+      stderr: (s) => {
+        io.err += s;
+      },
     },
-    stderr: (s) => {
-      io.err += s;
-    },
-  });
+    { lockWaitS },
+  );
   return { code, ...io };
 };
 
@@ -1957,13 +1964,13 @@ test("sync moves origin's default branch to GitHub's new tip and prints it with 
   git(repoDir, "update-ref", "refs/heads/side", old);
   writeFileSync(join(cwd, "scratch.txt"), "uncommitted\n");
   const everythingButOrigin = () => ({
-    refs: git(
-      repoDir,
-      "for-each-ref",
-      "--format=%(refname) %(objectname)",
-    )
+    refs: git(repoDir, "for-each-ref", "--format=%(refname) %(objectname)")
       .split("\n")
-      .filter((line) => !/^refs\/remotes\/origin\/trunk |^refs\/sky\//.test(line)),
+      // origin/HEAD is a symbolic ref to origin/trunk, so it moves with it
+      .filter(
+        (line) =>
+          !/^refs\/remotes\/origin\/(trunk|HEAD) |^refs\/sky\//.test(line),
+      ),
     status: git(cwd, "status", "--porcelain"),
     head: git(cwd, "rev-parse", "HEAD"),
   });
@@ -2063,15 +2070,19 @@ test("sync after GitHub rewrote its default branch says how many commits were ad
 test("sync --help and -h print the usage on stdout and exit 0, before any connector check", async () => {
   for (const flag of ["--help", "-h"]) {
     const io = { out: "", err: "" };
-    const code = await syncMain([flag], {}, {
-      cwd: root,
-      stdout: (s) => {
-        io.out += s;
+    const code = await syncMain(
+      [flag],
+      {},
+      {
+        cwd: root,
+        stdout: (s) => {
+          io.out += s;
+        },
+        stderr: (s) => {
+          io.err += s;
+        },
       },
-      stderr: (s) => {
-        io.err += s;
-      },
-    });
+    );
     expect({ code, ...io }).toEqual({
       code: 0,
       out: "usage: sync\n",
@@ -2111,6 +2122,46 @@ test("sync without a connector exits 2 saying what to set, and asks GitHub for n
     err: "sky sync: GITHUB_CONNECTOR is not set; set a connector secret: sky secret set <env> GITHUB_CONNECTOR --connector=<connection id>\n",
   });
   expect(requests).toEqual([]);
+});
+
+test("sync waits at most 30 s for the repo lock, well under run setup's own wait", () => {
+  expect(sync.SYNC_LOCK_WAIT_S).toBe(30);
+  expect(sync.SYNC_LOCK_WAIT_S).toBeLessThan(REPO_LOCK_WAIT_S);
+});
+
+test("sync that can't take the repo lock in time says the repo is busy and to try again, and asks GitHub for nothing", async () => {
+  const { cwd } = await prepare();
+  const old = git(repoDir, "rev-parse", "origin/trunk");
+  pushToGitHub("trunk", "new.txt", "from outside\n");
+  requests = [];
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let taken = () => {};
+  const isHeld = new Promise<void>((resolve) => {
+    taken = resolve;
+  });
+  const holder = withRepoLock(repoDir, async () => {
+    taken();
+    await held;
+  });
+  try {
+    await isHeld;
+
+    const result = await syncRun(cwd, ENV, [], 1);
+
+    expect(result).toEqual({
+      code: 1,
+      out: "",
+      err: "sky sync: the repo is busy: another run's setup holds its lock; try again in a minute\n",
+    });
+    expect(requests).toEqual([]);
+    expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(old);
+  } finally {
+    release();
+    await holder;
+  }
 });
 
 test("sync with an argument other than --help exits 2 with the usage on stderr", async () => {

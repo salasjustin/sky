@@ -11,6 +11,9 @@ import {
 export const repoLockPath = (repoDir: string) =>
   join(repoDir, ".git", REPO_LOCK_FILE);
 
+/** The repo lock stayed held for the whole wait. */
+export class RepoLockBusyError extends Error {}
+
 /**
  * Runs `task` holding an exclusive `flock` on the shared repo's lock file, so runs starting at once on
  * one sprite take turns at everything that writes `.git` (worktree add, branch and config writes,
@@ -63,11 +66,13 @@ export async function withRepoLock<T>(
       holder.stdout.once("data", () => resolve());
       void closed.then((code) => {
         reject(
-          new Error(
-            code === REPO_LOCK_TIMED_OUT
-              ? `can't take the repo lock ${lock} within ${waitS}s: another run's setup or a worktree removal held it all that time and may be stuck`
-              : `can't take the repo lock ${lock}: flock exited ${code}${stderr.trim() ? ` (${stderr.trim()})` : ""}`,
-          ),
+          code === REPO_LOCK_TIMED_OUT
+            ? new RepoLockBusyError(
+                `can't take the repo lock ${lock} within ${waitS}s: another run's setup or a worktree removal held it all that time and may be stuck`,
+              )
+            : new Error(
+                `can't take the repo lock ${lock}: flock exited ${code}${stderr.trim() ? ` (${stderr.trim()})` : ""}`,
+              ),
         );
       });
     });
