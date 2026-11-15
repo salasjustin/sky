@@ -3224,7 +3224,7 @@ test.each([
         uptime: ` 17:03:01 up 1 day,  1:00,  0 users,  ${loads}`,
       }),
     );
-    expect(runFailure(run.id)).toContain(`(5-min load ${load5})`);
+    expect(runFailure(run.id)).toContain(`; 5-min load ${load5}).`);
   },
 );
 
@@ -3236,7 +3236,7 @@ test("the restart message says the load is unknown when the uptime line has no l
       uptime: " 17:03:01 up 1 day,  1:00,  0 users",
     }),
   );
-  expect(runFailure(run.id)).toContain("(5-min load unknown)");
+  expect(runFailure(run.id)).toContain("; 5-min load unknown).");
 });
 
 test.each([
@@ -3346,7 +3346,7 @@ async function restartAfterStoring(
   return runFailure(run.id) ?? "";
 }
 
-/** As `restartAfterStoring`, the last Bash call's `input` stored straight: the API's ingest neither redacts nor trims it. */
+/** As `restartAfterStoring`, the last Bash call's `input` stored straight, so the API's ingest doesn't redact or trim it. */
 const restartWithStoredInput = (input: string, secrets?: KnownSecrets) =>
   restartAfterStoring((run) => {
     insertEvent(run.id, "claude.PreToolUse", Date.now() + 1, {

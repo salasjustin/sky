@@ -61,14 +61,14 @@ function restartedError(
   const what =
     kind === "rebooted"
       ? "the machine rebooted"
-      : "its processes restarted: the machine stayed up but its init did not";
+      : "its processes restarted, pid 1 included, while the machine stayed up";
   const load = load5 === undefined ? "unknown" : String(load5);
   const redacted = lastCommand && redact(lastCommand, known);
   const command = redacted
     ? redacted.slice(0, LAST_COMMAND_MAX) +
       (redacted.length > LAST_COMMAND_MAX ? "…" : "")
     : "none recorded";
-  return `sandbox_restarted: the sandbox restarted at ${at} while this run was working on sprite ${spriteName} (${what}), most often because memory use passed the machine's limit (5-min load ${load}); the last command was: ${command}`;
+  return `sandbox_restarted: the sandbox restarted at ${at} while this run was working on sprite ${spriteName} (${what}; 5-min load ${load}). The usual cause is memory use past the machine's limit; the last command was: ${command}`;
 }
 
 /**
@@ -107,9 +107,9 @@ export async function wakeLaunch(
  * kill since the run began, or the sprite has less than `lowMemoryMb` available, the run fails with
  * `runner_killed`, else `runner_lost`. A sprite that booted, or whose pid 1 started, after the run's
  * `run.started` and before the probe's first exec on it (each with `restartSince`'s margin) restarted
- * under the runner, which fails the run as `sandbox_restarted` before either; a boot the launch's or
- * the probe's own wake of a cold sprite caused is not one. An exec on a sprite exiting 137 probes its
- * running runs at once (`probeSprite`).
+ * under the runner, which fails the run as `sandbox_restarted` ahead of either; a boot caused by the
+ * launch's or the probe's own wake of a cold sprite is not one. An exec on a sprite exiting 137 probes
+ * its running runs at once (`probeSprite`).
  */
 export function createRunProber({
   db,
