@@ -898,7 +898,7 @@ export async function syncMain(
   } catch (error) {
     io.stderr(
       error instanceof RepoLockBusyError
-        ? "sky sync: the repo is busy: another run's setup holds its lock; try again in a minute\n"
+        ? "sky sync: the repo is busy: another run is writing the shared repo; try again in a minute\n"
         : `sky sync: ${messageOf(error)}\n`,
     );
     return 1;

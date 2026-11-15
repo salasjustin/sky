@@ -1966,11 +1966,13 @@ test("sync moves origin's default branch to GitHub's new tip and prints it with 
   const everythingButOrigin = () => ({
     refs: git(repoDir, "for-each-ref", "--format=%(refname) %(objectname)")
       .split("\n")
-      // origin/HEAD is a symbolic ref to origin/trunk, so it moves with it
+      // origin/HEAD is a symbolic ref to origin/trunk, so it moves with it; `originHead` holds
+      // where it points
       .filter(
         (line) =>
           !/^refs\/remotes\/origin\/(trunk|HEAD) |^refs\/sky\//.test(line),
       ),
+    originHead: git(repoDir, "symbolic-ref", "refs/remotes/origin/HEAD"),
     status: git(cwd, "status", "--porcelain"),
     head: git(cwd, "rev-parse", "HEAD"),
   });
@@ -1978,6 +1980,7 @@ test("sync moves origin's default branch to GitHub's new tip and prints it with 
   expect(before.refs).toContain(`refs/heads/trunk ${old}`);
   expect(before.refs).toContain(`refs/heads/side ${old}`);
   expect(before.status).toBe("?? scratch.txt");
+  expect(before.originHead).toBe("refs/remotes/origin/trunk");
   pushToGitHub("trunk", "one.txt", "1\n");
   const tip = pushToGitHub("trunk", "two.txt", "2\n");
 
@@ -2154,7 +2157,7 @@ test("sync that can't take the repo lock in time says the repo is busy and to tr
     expect(result).toEqual({
       code: 1,
       out: "",
-      err: "sky sync: the repo is busy: another run's setup holds its lock; try again in a minute\n",
+      err: "sky sync: the repo is busy: another run is writing the shared repo; try again in a minute\n",
     });
     expect(requests).toEqual([]);
     expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(old);
