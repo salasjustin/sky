@@ -15,7 +15,8 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gzipSync } from "node:zlib";
+import { Readable } from "node:stream";
+import { createGzip, gzipSync } from "node:zlib";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -2489,6 +2490,224 @@ test("a blob write that fails while the archive is read fails the fetch with git
   expect(archiveCalls(calls.urls)).toHaveLength(1);
   expect(blobCalls(calls.urls)).toEqual([]);
   expect(lines.filter((line) => line.includes("archive failed"))).toEqual([]);
+});
+
+/** A clock the test moves, whose idle timers fire only once it passes their deadline. */
+const clockedGateway = () => {
+  let now = 0;
+  const timers = new Set<{ at: number; fire: () => void }>();
+  const call = gateway({
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    owner: "acme",
+    repo: "private",
+    rateLimit: { now: () => NOW_S * 1000, sleep: async () => {} },
+    timeout: {
+      arm: (onIdle, ms) => {
+        const timer = { at: now + ms, fire: onIdle };
+        timers.add(timer);
+        return () => timers.delete(timer);
+      },
+    },
+  });
+  return {
+    call,
+    elapse: (ms: number) => {
+      now += ms;
+      for (const timer of [...timers]) {
+        if (timer.at <= now) {
+          timers.delete(timer);
+          timer.fire();
+        }
+      }
+    },
+  };
+};
+
+/** `bulk/f<from>.txt` to `bulk/f<to - 1>.txt` as GitHub's archive carries them, under its top directory. */
+const bulkEntries = (from: number, to: number) =>
+  Array.from({ length: to - from }, (_, k) => {
+    const body = Buffer.from(`file ${from + k}\n`);
+    const header = Buffer.alloc(512);
+    header.write(`acme-private-x/bulk/f${from + k}.txt`, 0);
+    header.write("0000644\0", 100);
+    header.write(`${body.length.toString(8).padStart(11, "0")}\0`, 124);
+    header.write("0", 156);
+    header.write("ustar\0" + "00", 257);
+    return Buffer.concat([header, body, Buffer.alloc(512 - body.length)]);
+  });
+
+const TAR_END = Buffer.alloc(1024);
+
+/**
+ * An archive body the test feeds in parts: each `send` is flushed whole, so the reader has it
+ * before the next part exists, and a part never sent is a download that has gone quiet.
+ */
+const archiveInParts = () => {
+  const gz = createGzip();
+  return {
+    body: Readable.toWeb(gz) as unknown as ReadableStream<Uint8Array>,
+    send: (bytes: Buffer) => {
+      gz.write(bytes);
+      gz.flush();
+    },
+    finish: (bytes: Buffer) => {
+      gz.end(bytes);
+    },
+    fail: (error: Error) => {
+      gz.destroy(error);
+    },
+  };
+};
+
+const servingArchive = (body: ReadableStream<Uint8Array>) =>
+  server.use(http.get(`${REPO}/tarball/:ref`, () => new HttpResponse(body)));
+
+/** `g` with a promise that settles once its `count`th blob has been written to the object store. */
+const afterBlobWrites = (g: ReturnType<typeof runnerGit>, count: number) => {
+  let writes = 0;
+  let reached: () => void = () => {};
+  const done = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  const counted: typeof g = async (args, options) => {
+    const result = await g(args, options);
+    if (args.join(" ") === "hash-object -w --stdin" && ++writes === count) {
+      reached();
+    }
+    return result;
+  };
+  return { counted, done };
+};
+
+const blobOf = (tip: string, index: number) =>
+  git(remote, "rev-parse", `${tip}:bulk/f${index}.txt`);
+
+test.each(["errors", "goes quiet"] as const)(
+  "an archive that %s after 8 of 20 files keeps those 8 blobs and fetches only the other 12 one by one",
+  async (how) => {
+    fakeGitHub();
+    const { dir, tip } = await cloneBehind(20);
+    const STORED = 8;
+    const archive = archiveInParts();
+    archive.send(Buffer.concat(bulkEntries(0, STORED)));
+    servingArchive(archive.body);
+    const writes = afterBlobWrites(runnerGit(dir), STORED);
+    const gw = testGateway();
+    const lines: string[] = [];
+    const calls = gatewayCalls();
+    const fetching = fetchCommit(writes.counted, gw.call, tip, (line) =>
+      lines.push(line),
+    );
+    fetching.catch(() => {});
+    await writes.done;
+    if (how === "errors") archive.fail(new Error("connection reset"));
+    else gw.fireIdle();
+    await fetching;
+    calls.stop();
+
+    expect(lines.join("\n")).toContain("fetching 12 blobs one by one");
+    expect(
+      blobCalls(calls.urls)
+        .map((url) => url.split("/").pop())
+        .sort(),
+    ).toEqual(
+      Array.from({ length: 12 }, (_, k) => blobOf(tip, STORED + k)).sort(),
+    );
+    for (let i = 0; i < 20; i++) {
+      expect(git(dir, "cat-file", "-p", `${tip}:bulk/f${i}.txt`)).toBe(
+        `file ${i}`,
+      );
+    }
+  },
+);
+
+test("a blob is in the object store while the archive is still arriving", async () => {
+  fakeGitHub();
+  const { dir, tip } = await cloneBehind(20);
+  const archive = archiveInParts();
+  archive.send(bulkEntries(0, 1)[0] as Buffer);
+  servingArchive(archive.body);
+  const writes = afterBlobWrites(runnerGit(dir), 1);
+  const calls = gatewayCalls();
+  const fetching = fetchCommit(writes.counted, testGateway().call, tip);
+  fetching.catch(() => {});
+
+  await writes.done;
+  // the archive has sent one file and nothing more; it is not complete, yet the file is stored
+  expect(git(dir, "cat-file", "-t", blobOf(tip, 0))).toBe("blob");
+
+  archive.finish(Buffer.concat([...bulkEntries(1, 20), TAR_END]));
+  await fetching;
+  calls.stop();
+  expect(blobCalls(calls.urls)).toEqual([]);
+  expect(git(dir, "cat-file", "-p", `${tip}:bulk/f19.txt`)).toBe("file 19");
+});
+
+test("each chunk that arrives restarts the idle bound, so an archive slow past it as a whole is still read", async () => {
+  fakeGitHub();
+  const { dir, tip } = await cloneBehind(20);
+  const archive = gzipSync(Buffer.concat([...bulkEntries(0, 20), TAR_END]));
+  const PIECE = 64;
+  const gw = clockedGateway();
+  let sent = 0;
+  server.use(
+    http.get(
+      `${REPO}/tarball/:ref`,
+      () =>
+        new HttpResponse(
+          new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              // the reader restarts the bound on the last piece once the loop has turned
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              if (sent * PIECE >= archive.length) {
+                controller.close();
+                return;
+              }
+              // each piece comes 100 s after the one before: inside the 120 s bound alone, past it summed
+              gw.elapse(100_000);
+              controller.enqueue(
+                new Uint8Array(archive.subarray(sent * PIECE, ++sent * PIECE)),
+              );
+            },
+          }),
+        ),
+    ),
+  );
+  const lines: string[] = [];
+  const calls = gatewayCalls();
+  await fetchCommit(runnerGit(dir), gw.call, tip, (line) => lines.push(line));
+  calls.stop();
+
+  expect(sent).toBeGreaterThan(2);
+  expect(lines.filter((line) => line.includes("archive failed"))).toEqual([]);
+  expect(blobCalls(calls.urls)).toEqual([]);
+  expect(git(dir, "cat-file", "-p", `${tip}:bulk/f19.txt`)).toBe("file 19");
+});
+
+test("an archive answered 200 with a body that isn't gzip is named on one line, and every blob is fetched by itself", async () => {
+  fakeGitHub();
+  const { dir, tip } = await cloneBehind(20);
+  server.use(
+    http.get(
+      `${REPO}/tarball/:ref`,
+      () => new HttpResponse("this is not a gzip archive at all\n"),
+    ),
+  );
+  const lines: string[] = [];
+  const calls = gatewayCalls();
+  await fetchCommit(runnerGit(dir), testGateway().call, tip, (line) =>
+    lines.push(line),
+  );
+  calls.stop();
+
+  expect(lines).toContain(
+    `repo pull: the archive failed (GitHub gateway: GET /repos/acme/private/tarball/${tip} answered with an archive that can't be read: incorrect header check); fetching 20 blobs one by one`,
+  );
+  expect(lines.join("\n")).not.toContain(CONNECTOR);
+  expect(lines.join("\n")).not.toContain(GATEWAY);
+  expect(blobCalls(calls.urls)).toHaveLength(20);
+  expect(git(dir, "cat-file", "-p", `${tip}:bulk/f19.txt`)).toBe("file 19");
 });
 
 test("a pull stopped by a spent hourly limit says when it ends, and no token appears in what it prints", async () => {

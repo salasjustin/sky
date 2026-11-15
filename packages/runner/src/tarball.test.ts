@@ -107,10 +107,12 @@ test("an archive that is cut short, or isn't gzip, fails the walk", async () => 
   const tar = git("archive", "--format=tar", "--prefix=x/", "HEAD");
 
   const cut = gzipSync(tar.subarray(0, 2_000));
-  await expect(filesOf(chunked(cut))).rejects.toThrow();
+  await expect(filesOf(chunked(cut))).rejects.toThrow(
+    "the archive ends inside an entry",
+  );
   await expect(
     filesOf(chunked(Buffer.from("not an archive"))),
-  ).rejects.toThrow();
+  ).rejects.toThrow("incorrect header check");
 });
 
 const MIB = 1024 * 1024;
@@ -186,7 +188,8 @@ test("a file spanning many chunks is handed over in a buffer of its own, and the
 });
 
 test("a large archive is read as it downloads: each file is handed over while the rest is still to come, and what is held ahead stays small", async () => {
-  const FILES = 64;
+  // 16 MiB is already 8 times the first-file bound below, so a walker that reads the whole archive first still fails it
+  const FILES = 16;
   const ids = new Map<string, string>();
   // a tar of FILES one-MiB random files, made one file at a time, never whole
   async function* tar(): AsyncGenerator<Buffer> {
@@ -205,7 +208,8 @@ test("a large archive is read as it downloads: each file is handed over while th
     yield Buffer.alloc(1024);
   }
   let delivered = 0;
-  const gzipped = Readable.from(tar()).pipe(createGzip());
+  // level 1: random bytes don't compress at any level, so only the time spent trying differs
+  const gzipped = Readable.from(tar()).pipe(createGzip({ level: 1 }));
   async function* download(): AsyncGenerator<Buffer> {
     for await (const chunk of gzipped) {
       delivered += (chunk as Buffer).length;
@@ -238,4 +242,301 @@ test("a large archive is read as it downloads: each file is handed over while th
   expect(firstAt).toBeLessThan((FILES * MIB) / 8);
   // nothing ran more than a few files' worth ahead of the one being handled
   expect(mostAhead).toBeLessThan(4 * MIB);
+});
+
+const BLOCK = 512;
+const END = Buffer.alloc(2 * BLOCK);
+
+/** Lets the event loop go round `count` times, so what is already queued has run. */
+const turns = async (count = 5) => {
+  for (let i = 0; i < count; i++) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+};
+
+/** A whole entry: its header, then `body` padded to a block. Names stay under 100 bytes. */
+const entry = (name: string, body: Buffer | string = "", type = "0") => {
+  const bytes = Buffer.from(body);
+  const pad = Buffer.alloc((BLOCK - (bytes.length % BLOCK)) % BLOCK);
+  return Buffer.concat([tarHeader(name, bytes.length, type), bytes, pad]);
+};
+
+/** A symlink entry; git stores its target in the link field of the header, with a size of 0. */
+const symlinkEntry = (name: string, target: string) => {
+  const header = tarHeader(name, 0, "2");
+  header.write(target, 157);
+  return header;
+};
+
+/** One pax record, `<length> key=value\n`, where the length counts its own digits. */
+const paxRecord = (key: string, value: string) => {
+  const rest = Buffer.from(` ${key}=${value}\n`);
+  let length = rest.length;
+  while (String(length).length + rest.length !== length) {
+    length = String(length).length + rest.length;
+  }
+  return Buffer.concat([Buffer.from(String(length)), rest]);
+};
+
+/** The entries as a gzipped tar with its end marker. */
+const tarOf = (...entries: Buffer[]) =>
+  gzipSync(Buffer.concat([...entries, END]));
+
+/**
+ * `tar` gzipped up to a flush point and no further, as a download cut off after those bytes:
+ * everything before the cut inflates, and the stream then ends with no gzip trailer.
+ */
+const gzipCut = (tar: Buffer) =>
+  new Promise<Buffer>((resolve, reject) => {
+    const gz = createGzip();
+    const parts: Buffer[] = [];
+    gz.on("data", (part: Buffer) => parts.push(part));
+    gz.on("error", reject);
+    gz.write(tar);
+    gz.flush(() => {
+      gz.destroy();
+      resolve(Buffer.concat(parts));
+    });
+  });
+
+const textsOf = (files: Map<string, Buffer>) =>
+  Object.fromEntries(
+    [...files].map(([path, bytes]) => [path, bytes.toString()]),
+  );
+
+test("a pax header names the entry after it, by path and by link target, and no other", async () => {
+  const longName = "n".repeat(130);
+  const longTarget = `${"t".repeat(130)}/target`;
+  const archive = tarOf(
+    entry("top/PaxHeaders/0", paxRecord("path", `top/${longName}`), "x"),
+    entry("top/short", "pax body\n"),
+    entry(
+      "top/PaxHeaders/1",
+      Buffer.concat([
+        paxRecord("path", "top/lnk"),
+        paxRecord("linkpath", longTarget),
+      ]),
+      "x",
+    ),
+    symlinkEntry("top/placeholder", "short-target"),
+    entry("top/plain.txt", "plain\n"),
+  );
+
+  const files = await filesOf(chunked(archive, 300));
+
+  expect(textsOf(files)).toEqual({
+    [longName]: "pax body\n",
+    lnk: longTarget,
+    "plain.txt": "plain\n",
+  });
+});
+
+test("GNU long-name and long-link headers name the entry after them, and no other", async () => {
+  const longName = "g".repeat(130);
+  const longTarget = `${"k".repeat(130)}/target`;
+  const archive = tarOf(
+    entry("top/././@LongLink", `top/${longName}\0`, "L"),
+    entry("top/short", "gnu body\n"),
+    entry("top/././@LongLink", `${longTarget}\0`, "K"),
+    symlinkEntry("top/lnk", "short-target"),
+    entry("top/plain.txt", "plain\n"),
+  );
+
+  const files = await filesOf(chunked(archive, 300));
+
+  expect(textsOf(files)).toEqual({
+    [longName]: "gnu body\n",
+    lnk: longTarget,
+    "plain.txt": "plain\n",
+  });
+});
+
+// a download cut at a flush point loses its gzip trailer, so the inflater, not the walker, is what
+// finds the end: it reports the same for a cut anywhere, and the entries before the cut still arrive
+const AT_B = BLOCK + 5_120;
+test.each([
+  {
+    cut: "a header",
+    at: AT_B + 100,
+    wants: () => true,
+    handed: ["a.txt"],
+  },
+  {
+    cut: "the body of a file it wants",
+    at: BLOCK + 1_000,
+    wants: () => true,
+    handed: [],
+  },
+  {
+    cut: "the body of a file it skips",
+    at: AT_B + BLOCK + 1_000,
+    wants: (path: string) => path !== "b.txt",
+    handed: ["a.txt"],
+  },
+])(
+  "gzip bytes cut inside $cut fail the walk saying the stream ended, and nothing of the cut entry is handed over",
+  async ({ at, wants, handed }) => {
+    const tar = Buffer.concat([
+      entry("top/a.txt", Buffer.alloc(5_000, 2)),
+      entry("top/b.txt", Buffer.alloc(5_000, 3)),
+      END,
+    ]);
+    const cut = await gzipCut(tar.subarray(0, at));
+    const seen: string[] = [];
+
+    await expect(
+      walkTarball(chunked(cut), {
+        wants,
+        file: async (path) => {
+          seen.push(path);
+        },
+      }),
+    ).rejects.toThrow("unexpected end of file");
+    expect(seen).toEqual(handed);
+  },
+);
+
+test("an entry whose size can't be read fails the walk", async () => {
+  const header = tarHeader("top/a.txt", 0);
+  header.write("zzzzzzz\0", 124);
+
+  await expect(filesOf(chunked(tarOf(header)))).rejects.toThrow(
+    "the archive has an entry header that can't be read",
+  );
+});
+
+test.each(["x", "g", "L", "K"])(
+  "a %s header claiming a body past 1 MiB fails the walk without reading it",
+  async (type) => {
+    const archive = tarOf(tarHeader("top/header", 2 * MIB, type));
+
+    await expect(filesOf(chunked(archive))).rejects.toThrow(
+      "the archive has an entry header that is too large",
+    );
+  },
+);
+
+test("entries named with .. or an absolute path are never handed over, and a normalised twin doesn't replace the real file", async () => {
+  const allowed = new Set(["README.md", "docs/a.txt"]);
+  const archive = tarOf(
+    entry("x/README.md", "real\n"),
+    entry("x/../../evil", "evil\n"),
+    entry("x/a/../README.md", "evil\n"),
+    entry("/etc/evil", "evil\n"),
+    entry("x/docs/a.txt", "doc\n"),
+  );
+  const handed: [string, string][] = [];
+
+  await walkTarball(chunked(archive), {
+    wants: (path) => allowed.has(path),
+    file: async (path, bytes) => {
+      handed.push([path, bytes.toString()]);
+    },
+  });
+
+  expect(handed).toEqual([
+    ["README.md", "real\n"],
+    ["docs/a.txt", "doc\n"],
+  ]);
+});
+
+test("the walk stops at the end marker, and an entry after it is never read", async () => {
+  const archive = gzipSync(
+    Buffer.concat([
+      entry("top/a.txt", "a\n"),
+      END,
+      entry("top/after.txt", "after\n"),
+      END,
+    ]),
+  );
+
+  const files = await filesOf(chunked(archive));
+
+  expect([...files.keys()]).toEqual(["a.txt"]);
+});
+
+test("a file that throws stops the walk, cancels the download, and leaves most of it unread", async () => {
+  const archive = gzipSync(
+    Buffer.concat([
+      entry("top/first.txt", "first\n"),
+      entry("top/big.bin", randomBytes(MIB)),
+      END,
+    ]),
+    { level: 1 },
+  );
+  const CHUNK = 16_384;
+  const chunks = Math.ceil(archive.length / CHUNK);
+  let served = 0;
+  let cancelled = false;
+  async function* download(): AsyncGenerator<Buffer> {
+    try {
+      for (let at = 0; at < archive.length; at += CHUNK) {
+        served++;
+        yield archive.subarray(at, at + CHUNK);
+      }
+    } finally {
+      cancelled = true;
+    }
+  }
+
+  await expect(
+    walkTarball(download(), {
+      wants: () => true,
+      file: async () => {
+        throw new Error("disk full");
+      },
+    }),
+  ).rejects.toThrow("disk full");
+  await turns();
+
+  expect(cancelled).toBe(true);
+  expect(served).toBeLessThan(chunks / 2);
+});
+
+test("a consumer still busy with a file holds the download back: nothing past it is read, and the walk goes on when it is done", async () => {
+  const FILES = 8;
+  const archive = gzipSync(
+    Buffer.concat([
+      ...Array.from({ length: FILES }, (_, i) =>
+        entry(`top/file-${i}.bin`, randomBytes(MIB)),
+      ),
+      END,
+    ]),
+    { level: 1 },
+  );
+  const CHUNK = 16_384;
+  let delivered = 0;
+  async function* download(): AsyncGenerator<Buffer> {
+    for (let at = 0; at < archive.length; at += CHUNK) {
+      delivered = Math.min(at + CHUNK, archive.length);
+      yield archive.subarray(at, at + CHUNK);
+    }
+  }
+
+  let entered = 0;
+  let enteredWhileBusy = 0;
+  let deliveredWhileBusy = 0;
+  await walkTarball(download(), {
+    wants: () => true,
+    file: async () => {
+      entered++;
+      if (entered > 1) return;
+      // busy until the download has gone still for a run of turns; a slow machine can only end
+      // this early and miss a walker that reads ahead, never fail one that waits
+      let last = -1;
+      let still = 0;
+      while (still < 25) {
+        await turns(1);
+        still = delivered === last ? still + 1 : 0;
+        last = delivered;
+      }
+      enteredWhileBusy = entered;
+      deliveredWhileBusy = delivered;
+    },
+  });
+
+  expect(enteredWhileBusy).toBe(1);
+  // the first file is 1 MiB of the 8 MiB; what is held beyond it is a few buffers
+  expect(deliveredWhileBusy).toBeLessThan(2 * MIB);
+  expect(entered).toBe(FILES);
 });
