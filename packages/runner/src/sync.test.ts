@@ -36,6 +36,7 @@ const track =
 const publish = track(publishRun);
 const runSession = track(runSessionRaw);
 const branchCheckMain = track(sync.branchCheckMain);
+const syncMain = track(sync.syncMain);
 const fetchBranch = track(sync.fetchBranch);
 const prepareWorktree = track(sync.prepareWorktree);
 
@@ -1823,4 +1824,106 @@ test("a start branch is fetched through the connector once the anonymous fetch h
   expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
   expect(requests.length).toBeGreaterThan(0);
   expect(warnings.filter((w) => w.includes("anonymous git"))).toHaveLength(1);
+});
+
+test("the run's prompt names the origin tip the refresh reached, with its short sha and UTC time, and says git has no credential by design", async () => {
+  const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-03-04T05:06:07Z"));
+  try {
+    const { code, append } = await runOnce();
+
+    expect(code).toBe(0);
+    expect(append).toContain(
+      `That refresh moved \`origin/trunk\` to GitHub's tip, ${tip.slice(0, 7)}, as of 2026-03-04 05:06 UTC.`,
+    );
+    expect(append).toContain("`git fetch`");
+    expect(append).toContain("That is by design");
+    expect(append).toContain(" sync`");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a run whose refresh failed claims no refreshed tip", async () => {
+  server.use(
+    http.get(`${REPO}/git/ref/heads/trunk`, () =>
+      HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
+    ),
+  );
+
+  const { append } = await runOnce();
+
+  expect(append).not.toContain("That refresh moved");
+});
+
+const syncRun = async (cwd: string, env: NodeJS.ProcessEnv = ENV) => {
+  const io = { out: "", err: "" };
+  const code = await syncMain([], env, {
+    cwd,
+    stdout: (s) => {
+      io.out += s;
+    },
+    stderr: (s) => {
+      io.err += s;
+    },
+  });
+  return { code, ...io };
+};
+
+test("sync moves origin's default branch to GitHub's new tip and prints it with how many commits it moved", async () => {
+  const { cwd } = await prepare();
+  const head = git(cwd, "rev-parse", "HEAD");
+  const old = git(repoDir, "rev-parse", "origin/trunk");
+  pushToGitHub("trunk", "one.txt", "1\n");
+  const tip = pushToGitHub("trunk", "two.txt", "2\n");
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 0,
+    out: `origin/trunk moved from ${old.slice(0, 7)} to GitHub's tip ${tip.slice(0, 7)}, 2 commits ahead. Your worktree and local trunk were not changed.\n`,
+    err: "",
+  });
+  expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(tip);
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(head);
+});
+
+test("sync with no change says nothing moved", async () => {
+  const { cwd } = await prepare();
+  const tip = git(repoDir, "rev-parse", "origin/trunk");
+
+  expect(await syncRun(cwd)).toEqual({
+    code: 0,
+    out: `origin/trunk is already at GitHub's tip ${tip.slice(0, 7)}; nothing moved.\n`,
+    err: "",
+  });
+});
+
+test("sync reports a failed refresh plainly, with no credential in it", async () => {
+  const { cwd } = await prepare();
+  const old = git(repoDir, "rev-parse", "origin/trunk");
+  server.use(
+    http.get(`${REPO}/git/ref/heads/trunk`, () =>
+      HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
+    ),
+  );
+
+  const result = await syncRun(cwd, { ...ENV, GITHUB_TOKEN: "ghp_secret" });
+
+  expect(result).toEqual({
+    code: 1,
+    out: "",
+    err: "sky sync: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 502: Bad Gateway\n",
+  });
+  expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(old);
+});
+
+test("sync without a connector exits 2 saying what to set", async () => {
+  const { cwd } = await prepare();
+
+  const result = await syncRun(cwd, {});
+
+  expect(result.code).toBe(2);
+  expect(result.err).toContain("GITHUB_CONNECTOR is not set");
 });

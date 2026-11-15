@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { type AgentId, agentBranch } from "@sky/shared";
 import { anonGitEnabled, fetchOverGit, whyFailed } from "./gitfetch.js";
@@ -796,6 +796,78 @@ export async function branchCheckMain(
   }
 }
 
+export const SYNC_USAGE = "sync";
+
+/**
+ * `runner.mjs sync`, run by the agent from its worktree: brings `origin/<default>` to GitHub's tip
+ * again, for a default branch that moved while the run worked. Prints what it did on stdout and
+ * returns the exit status: 0 for a tip refreshed or already current, 2 for a usage or config error,
+ * 1 for anything else. It moves no local branch and touches no worktree.
+ */
+export async function syncMain(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  io: { cwd: string; stdout: (s: string) => void; stderr: (s: string) => void },
+): Promise<number> {
+  if (argv.length > 0) {
+    io.stderr(`sky sync: takes no arguments\nusage: ${SYNC_USAGE}\n`);
+    return 2;
+  }
+  const connectorId = env[CONNECTOR_ENV];
+  if (!connectorId) {
+    io.stderr(
+      `sky sync: ${CONNECTOR_ENV} is not set; set a connector secret: sky secret set <env> ${CONNECTOR_ENV} --connector=<connection id>\n`,
+    );
+    return 2;
+  }
+  try {
+    // the worktree's own git dir is the clone's `.git` once taken up one level from its common dir
+    const common = await inTree(
+      io.cwd,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    );
+    const repoDir = dirname(common);
+    const g = git(repoDir);
+    const { owner, repo } = parseOrigin(
+      await g(["remote", "get-url", "origin"]),
+    );
+    const call = gateway({
+      gatewayUrl: env[GATEWAY_URL_ENV] || DEFAULT_GATEWAY_URL,
+      connectorId,
+      owner,
+      repo,
+    });
+    const synced = await withRepoLock(repoDir, () =>
+      syncDefaultBranch({ repoDir, call }),
+    );
+    const name = synced.default;
+    if (synced.tooFar) {
+      io.stderr(`sky sync: ${tooFarNote(synced)}\n`);
+      return 1;
+    }
+    if (!synced.moved) {
+      io.stdout(
+        `origin/${name} is already at GitHub's tip ${short(synced.sha)}; nothing moved.\n`,
+      );
+      return 0;
+    }
+    const ahead = synced.previous
+      ? Number(
+          await g(["rev-list", "--count", `${synced.previous}..${synced.sha}`]),
+        )
+      : undefined;
+    io.stdout(
+      `origin/${name} moved ${synced.previous ? `from ${short(synced.previous)} ` : ""}to GitHub's tip ${short(synced.sha)}${ahead === undefined ? "" : `, ${commits(ahead)} ahead`}. Your worktree and local ${name} were not changed.\n`,
+    );
+    return 0;
+  } catch (error) {
+    io.stderr(`sky sync: ${messageOf(error)}\n`);
+    return 1;
+  }
+}
+
 /**
  * The GitHub branch `publish` sends `branch` to when no `--branch` is given: the branch a continued
  * agent was started on, then the environment's `SKY_PUBLISH_BRANCH`, then its own name.
@@ -831,7 +903,7 @@ export function prepareWorktree(
     lockWaitS?: number;
     signal?: AbortSignal;
   },
-): Promise<{ cwd: string; notes: string[] }> {
+): Promise<Prepared> {
   // every step writes the repo every sprite run shares: runs starting at once take turns
   return withRepoLock(
     config.repoDir,
@@ -848,11 +920,17 @@ type PrepareConfig = {
   startBranch?: string;
 };
 
+/** The default branch's tip GitHub reported when the run's refresh succeeded, and when. */
+export type Refreshed = { branch: string; sha: string; at: Date };
+
+type Prepared = { cwd: string; notes: string[]; refreshed?: Refreshed };
+
 async function prepareLocked(
   config: PrepareConfig,
   deps: { env: NodeJS.ProcessEnv; warn: (line: string) => void },
-): Promise<{ cwd: string; notes: string[] }> {
+): Promise<Prepared> {
   const notes: string[] = [];
+  let refreshed: Refreshed | undefined;
   const { startBranch } = config;
   const branch = agentBranch(config.agentId);
   const g = git(config.repoDir);
@@ -917,18 +995,18 @@ async function prepareLocked(
     }
   };
   const continueStartBranch = async (cwd: string) => {
-    if (!startBranch) return { cwd, notes };
+    if (!startBranch) return { cwd, notes, refreshed };
     // the repo's config, shared by every worktree, and `git config` fails outright while another
     // run holds its lock, so it is written only when it changes; the key is per branch
     const key = `branch.${branch}.${REMOTE_BRANCH_KEY}`;
     const held = await g(["config", "--get", key]).catch(() => "");
     if (held !== startBranch) await g(["config", key, startBranch]);
     // `publish` reads the checked-out branch's key, which is not this one
-    if (!onBranch) return { cwd, notes };
+    if (!onBranch) return { cwd, notes, refreshed };
     notes.push(
       `This worktree continues the existing GitHub branch \`${startBranch}\`; \`publish\` updates that branch (and its open pull request), not \`${branch}\`.`,
     );
-    return { cwd, notes };
+    return { cwd, notes, refreshed };
   };
   const connectorId = deps.env[CONNECTOR_ENV];
   if (!connectorId) {
@@ -986,6 +1064,8 @@ async function prepareLocked(
     }
     synced ??= await syncDefaultBranch({ repoDir: config.repoDir, call });
     if (synced.tooFar) notes.push(tooFarNote(synced));
+    else
+      refreshed = { branch: synced.default, sha: synced.sha, at: new Date() };
   } catch (error) {
     syncFailed(error);
   }

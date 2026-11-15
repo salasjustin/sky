@@ -19,7 +19,7 @@ import { claimRunLog, processAlive } from "./runlog.js";
 import { createSeal, removeSealedCopiesNow } from "./seal.js";
 import { removeScratchNow, runSession } from "./session.js";
 import { storeSyncMain, syncStoreQuietly } from "./store.js";
-import { branchCheckMain } from "./sync.js";
+import { branchCheckMain, syncMain } from "./sync.js";
 
 // the runner's stderr is the exec session's terminal, gone once the API detaches, so every line also
 // lands in a log file beside the run's prompt: what a stuck launch was doing is readable on the sprite.
@@ -42,7 +42,7 @@ function refuse(message: string): void {
 }
 
 const NOT_A_RUN =
-  "only the Sky API starts a run (an agent's own command is `runner.mjs publish`)";
+  "only the Sky API starts a run (an agent's own commands are `runner.mjs publish` and `runner.mjs sync`)";
 
 async function step<T>(name: string, task: () => Promise<T>): Promise<T> {
   const started = Date.now();
@@ -198,7 +198,7 @@ const io = {
   stdout: (s: string) => process.stdout.write(s),
   stderr: (s: string) => process.stderr.write(s),
 };
-// `runner.mjs publish …` is the agent's own command, run from its worktree; `store-sync` and
+// `runner.mjs publish …` and `sync` are the agent's own commands, run from its worktree; `store-sync` and
 // `repo-pull` are the API's, at provisioning, and `branch-check` before it starts an agent on an
 // existing branch; anything else is a run
 const commands: Record<
@@ -206,6 +206,7 @@ const commands: Record<
   (argv: string[], env: NodeJS.ProcessEnv) => Promise<number>
 > = {
   publish: (argv, env) => publishMain(argv, env, { cwd: process.cwd(), ...io }),
+  sync: (argv, env) => syncMain(argv, env, { cwd: process.cwd(), ...io }),
   "store-sync": (argv, env) => storeSyncMain(argv, env, io),
   "repo-pull": (argv, env) => repoPullMain(argv, env, io),
   "branch-check": (argv, env) => branchCheckMain(argv, env, io),
