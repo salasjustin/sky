@@ -230,10 +230,30 @@ async function removeAbandonedIndexes(gitDir: string): Promise<void> {
 const ARCHIVE_FROM = 20;
 
 /**
+ * The files of `sha`'s tarball by path. A failure the gateway didn't name, such as an archive that
+ * won't inflate, is a `GatewayError` naming the call too.
+ */
+async function readArchive(
+  call: ReturnType<typeof gateway>,
+  sha: string,
+): Promise<Map<string, Buffer>> {
+  const path = `/tarball/${sha}`;
+  const archive = await call.bytes(path);
+  try {
+    return readTarball(archive);
+  } catch (error) {
+    throw new GatewayError(
+      `GitHub gateway: ${call.where("GET", path)} answered with an archive that can't be read: ${messageOf(error)}`,
+    );
+  }
+}
+
+/**
  * Makes every blob of `blobs` present in the repo `g` runs in. The ones it lacks come from one
  * tarball of `sha`, whose gateway cost doesn't grow with the file count, when at least `archiveFrom`
  * are missing; a blob the archive doesn't carry as git stores it (an `export-ignore` or
- * `export-subst` attribute changes the bytes) is fetched by itself.
+ * `export-subst` attribute changes the bytes) is fetched by itself. An archive that fails for any
+ * reason but a rate limit is given up, said on one line, and every missing blob is fetched by itself.
  */
 async function fetchBlobs(
   g: ReturnType<typeof git>,
@@ -252,7 +272,18 @@ async function fetchBlobs(
     return;
   }
   progress(`repo pull: downloading ${missing.size} blobs as one archive`);
-  const files = readTarball(await call.bytes(`/tarball/${sha}`));
+  const files = await readArchive(call, sha).catch((error: unknown) => {
+    // per blob, a spent limit would only fail again, one call per blob
+    if (error instanceof GatewayError && error.rateLimited) throw error;
+    progress(
+      `repo pull: the archive failed (${whyFailed(error)}); fetching ${missing.size} blobs one by one`,
+    );
+    return undefined;
+  });
+  if (!files) {
+    await fetchMissing(g, call, blobs, progress, "repo pull");
+    return;
+  }
   const wanted = blobs.filter((item) => missing.has(item.sha));
   const seen = new Set<string>();
   let stored = 0;

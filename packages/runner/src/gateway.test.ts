@@ -193,6 +193,122 @@ test("a secondary limit's retry-after is waited out", async () => {
   expect(slept).toEqual([7000]);
 });
 
+const SECONDARY = {
+  message:
+    "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+};
+
+test("a secondary limit with no retry-after and calls still left waits a minute, then succeeds", async () => {
+  let answered = 0;
+  server.use(
+    http.get(`${REPO}/x`, () => {
+      answered++;
+      return answered === 1
+        ? HttpResponse.json(SECONDARY, { status: 403 })
+        : HttpResponse.json({ ok: true });
+    }),
+  );
+  const { call, slept } = gatewayWith();
+  expect(await call("GET", "/x")).toEqual({ ok: true });
+  expect(slept).toEqual([60_000]);
+});
+
+test("a secondary limit that outlasts the retries fails as rate limited, after a minute's wait per retry", async () => {
+  server.use(
+    http.get(`${REPO}/x`, () => HttpResponse.json(SECONDARY, { status: 403 })),
+  );
+  const { call, slept } = gatewayWith();
+  const error = await call("GET", "/x").catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(GatewayError);
+  expect((error as GatewayError).rateLimited).toBe(true);
+  expect((error as GatewayError).message).toContain("secondary rate limit");
+  expect(slept).toEqual([60_000, 60_000, 60_000]);
+});
+
+test("a 403 that names no rate limit is thrown at once, not waited on", async () => {
+  server.use(
+    http.get(`${REPO}/x`, () =>
+      HttpResponse.json(
+        { message: "Resource not accessible by integration" },
+        { status: 403, headers: limit(4000) },
+      ),
+    ),
+  );
+  const { call, slept } = gatewayWith();
+  const error = await call("GET", "/x").catch((e: unknown) => e);
+  expect((error as GatewayError).rateLimited).toBe(false);
+  expect(slept).toEqual([]);
+});
+
+test("an empty calls-left header is not read as none left", async () => {
+  server.use(
+    http.get(`${REPO}/x`, () =>
+      HttpResponse.json(
+        { ok: true },
+        { headers: { "x-ratelimit-remaining": "" } },
+      ),
+    ),
+  );
+  const { call, slept } = gatewayWith();
+  await call("GET", "/x");
+  await call("GET", "/x");
+  expect(slept).toEqual([]);
+});
+
+/** Idle timers the test fires itself: `fire()` runs every one still armed. */
+const manualIdle = () => {
+  const armed = new Set<() => void>();
+  return {
+    arm: (onIdle: () => void) => {
+      armed.add(onIdle);
+      return () => armed.delete(onIdle);
+    },
+    fire: () => {
+      for (const onIdle of [...armed]) onIdle();
+    },
+    armed,
+  };
+};
+
+test("an answer whose bytes stop arriving fails naming the call, never the connector or the gateway", async () => {
+  let stalled: () => void = () => {};
+  const reached = new Promise<void>((resolve) => {
+    stalled = resolve;
+  });
+  server.use(
+    http.get(`${REPO}/tarball/:ref`, () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([0x1f, 0x8b]));
+          stalled();
+        },
+      });
+      return new HttpResponse(body);
+    }),
+  );
+  const idle = manualIdle();
+  const call = gateway({
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    owner: "acme",
+    repo: "private",
+    timeout: { arm: idle.arm },
+  });
+  const pending = call.bytes(`/tarball/${"a".repeat(40)}`).catch((e) => e);
+  await reached;
+  idle.fire();
+  const error = await pending;
+
+  expect(error).toBeInstanceOf(GatewayError);
+  expect((error as Error).message).toContain(
+    `GET /repos/acme/private/tarball/${"a".repeat(40)} failed: no bytes arrived for 120 s`,
+  );
+  expect((error as GatewayError).rateLimited).toBe(false);
+  expect((error as Error).message).not.toContain(CONNECTOR);
+  expect((error as Error).message).not.toContain(GATEWAY);
+  expect(idle.armed.size).toBe(0);
+});
+
 test("a call sends no credential, and a failure never names the connector", async () => {
   let sent: Headers | undefined;
   server.use(
@@ -205,4 +321,5 @@ test("a call sends no credential, and a failure never names the connector", asyn
   const error = await call("GET", "/x").catch((e: unknown) => e);
   expect(sent?.get("authorization")).toBeNull();
   expect((error as Error).message).not.toContain(CONNECTOR);
+  expect((error as Error).message).not.toContain(GATEWAY);
 });

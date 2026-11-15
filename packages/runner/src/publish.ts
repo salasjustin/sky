@@ -210,14 +210,17 @@ async function workflowPathsBetween(
 
 // GitHub's secondary rate limit answers 403 or 429 with a `retry-after`; a pause this long is waited out
 const MAX_RETRY_AFTER_S = 60;
+// GitHub's minimum wait for a secondary limit that sends neither `retry-after` nor a spent quota
+const SECONDARY_WAIT_S = 60;
 const RETRIES = 3;
 // the primary rate limit resets on the hour at the latest; a reset this near is waited out, a farther one fails naming its time
 const MAX_RESET_WAIT_S = 300;
 // under this many calls left in the hour, calls are spaced out rather than spent as fast as they go
 const RATE_FLOOR = 500;
 const SLOW_PACE_MS = 1000;
-// a stalled gateway call fails rather than holding the caller
-const REQUEST_TIMEOUT_MS = 120_000;
+// a stalled gateway call fails rather than holding the caller; bounded by silence, not total time,
+// so a large archive that keeps arriving is never cut off
+const IDLE_TIMEOUT_MS = 120_000;
 
 /** What the gateway does near GitHub's hourly limit; the defaults are what runs, a test sets its own. */
 export type RateLimitPolicy = {
@@ -238,6 +241,96 @@ const DEFAULT_POLICY: RateLimitPolicy = {
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
+/** How long a call may go with no bytes arriving; the defaults are what runs, a test arms its own. */
+export type TimeoutPolicy = {
+  idleMs: number;
+  /** Runs `onIdle` after `ms` unless the returned function is called first. */
+  arm: (onIdle: () => void, ms: number) => () => void;
+};
+
+const DEFAULT_TIMEOUT: TimeoutPolicy = {
+  idleMs: IDLE_TIMEOUT_MS,
+  arm: (onIdle, ms) => {
+    const timer = setTimeout(onIdle, ms);
+    return () => clearTimeout(timer);
+  },
+};
+
+/** An abort signal that fires once `policy.idleMs` pass with no `touch()`. */
+function inactivity(policy: TimeoutPolicy) {
+  const controller = new AbortController();
+  const onIdle = () =>
+    controller.abort(
+      new DOMException(
+        `no bytes arrived for ${policy.idleMs / 1000} s`,
+        "TimeoutError",
+      ),
+    );
+  let disarm = policy.arm(onIdle, policy.idleMs);
+  return {
+    signal: controller.signal,
+    touch: () => {
+      disarm();
+      disarm = policy.arm(onIdle, policy.idleMs);
+    },
+    stop: () => disarm(),
+  };
+}
+
+/**
+ * The whole body, each chunk restarting the idle bound. Cancelling the reader ends a pending read
+ * with `done` rather than a rejection, so the abort is checked after every read.
+ */
+async function readBody(
+  response: Response,
+  idle: ReturnType<typeof inactivity>,
+): Promise<Buffer> {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const onAbort = () => {
+    reader.cancel(idle.signal.reason).catch(() => {});
+  };
+  idle.signal.addEventListener("abort", onAbort, { once: true });
+  const chunks: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (idle.signal.aborted) throw idle.signal.reason;
+      if (done) break;
+      idle.touch();
+      chunks.push(value);
+    }
+  } finally {
+    idle.signal.removeEventListener("abort", onAbort);
+  }
+  return Buffer.concat(chunks);
+}
+
+/** A header's number, or NaN when it is absent or empty: `Number("")` is 0. */
+const numberHeader = (headers: Headers, name: string) => {
+  const value = headers.get(name)?.trim();
+  return value ? Number(value) : Number.NaN;
+};
+
+// fetch's own message is just "fetch failed", and a cut body's "terminated"; the reason is the
+// cause. An abort is told by the signal's reason, whatever error the fetch implementation threw for it
+const failedCall = (where: string, thrown: unknown, signal: AbortSignal) => {
+  const error = signal.aborted ? signal.reason : thrown;
+  const cause = error instanceof Error ? error.cause : undefined;
+  return new GatewayError(
+    `GitHub gateway: ${where} failed: ${messageOf(error)}${cause ? ` (${messageOf(cause)})` : ""}`,
+  );
+};
+
+const detailOf = (body: Buffer, statusText: string) => {
+  const text = body.toString("utf8");
+  try {
+    const parsed = JSON.parse(text) as { message?: unknown };
+    if (typeof parsed.message === "string") return parsed.message;
+  } catch {}
+  return text.trim() || statusText;
+};
+
 /** The error for an hourly limit that is used up until `resetAt` (epoch seconds). */
 const rateLimitedAt = (resetAt: number, where: string, status: number) =>
   new GatewayError(
@@ -253,25 +346,35 @@ export function gateway(options: {
   owner: string;
   repo: string;
   rateLimit?: Partial<RateLimitPolicy>;
+  timeout?: Partial<TimeoutPolicy>;
 }) {
   const policy = { ...DEFAULT_POLICY, ...options.rateLimit };
+  const timeout = { ...DEFAULT_TIMEOUT, ...options.timeout };
   const root = `${options.gatewayUrl.replace(/\/+$/, "")}/${encodeURIComponent(options.connectorId)}`;
   const repoPath = `/repos/${options.owner}/${options.repo}`;
   // the last `x-ratelimit-remaining` this gateway saw, which every call of it shares
   let remaining = Number.POSITIVE_INFINITY;
+  // how messages name a call: never the root, which carries the connector id
+  const whereOf = (method: string, path: string) =>
+    `${method} ${repoPath}${path}`;
+  /** The body of a successful answer, read whole; anything else throws a `GatewayError`. */
   async function request(
     method: string,
     path: string,
     body?: unknown,
-  ): Promise<Response> {
-    const where = `${method} ${repoPath}${path}`;
+  ): Promise<Buffer> {
+    const where = whereOf(method, path);
     let response: Response;
+    let idle: ReturnType<typeof inactivity>;
+    // the body of a 403 or 429 already read to tell a secondary limit from a refusal
+    let limitBody: Buffer | undefined;
     for (let attempt = 0; ; attempt++) {
       if (remaining < policy.floor) await policy.sleep(policy.paceMs);
+      idle = inactivity(timeout);
       try {
         response = await fetch(`${root}${repoPath}${path}`, {
           method,
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          signal: idle.signal,
           headers: {
             accept: "application/vnd.github+json",
             "x-github-api-version": "2022-11-28",
@@ -280,23 +383,17 @@ export function gateway(options: {
           ...(body !== undefined && { body: JSON.stringify(body) }),
         });
       } catch (error) {
-        // fetch's own message is just "fetch failed"; the reason is its cause
-        const cause = error instanceof Error ? error.cause : undefined;
-        throw new GatewayError(
-          `GitHub gateway: ${where} failed: ${messageOf(error)}${cause ? ` (${messageOf(cause)})` : ""}`,
-        );
+        idle.stop();
+        throw failedCall(where, error, idle.signal);
       }
-      const left = response.headers.get("x-ratelimit-remaining");
-      if (left !== null && Number.isFinite(Number(left)))
-        remaining = Number(left);
-      const retryAfter = Number(response.headers.get("retry-after") ?? NaN);
+      const left = numberHeader(response.headers, "x-ratelimit-remaining");
+      if (Number.isFinite(left)) remaining = left;
+      const retryAfter = numberHeader(response.headers, "retry-after");
       // the primary limit: the quota is spent until `x-ratelimit-reset`, epoch seconds
-      const resetAt = Number(response.headers.get("x-ratelimit-reset") ?? NaN);
-      if (
-        (response.status === 403 || response.status === 429) &&
-        left === "0" &&
-        Number.isFinite(resetAt)
-      ) {
+      const resetAt = numberHeader(response.headers, "x-ratelimit-reset");
+      const limitStatus = response.status === 403 || response.status === 429;
+      if (limitStatus && left === 0 && Number.isFinite(resetAt)) {
+        idle.stop();
         const waitS = Math.max(0, resetAt - policy.now() / 1000);
         await response.body?.cancel();
         if (waitS > policy.maxResetWaitS || attempt >= RETRIES) {
@@ -308,31 +405,54 @@ export function gateway(options: {
         continue;
       }
       if (
-        (response.status === 403 || response.status === 429) &&
+        limitStatus &&
         retryAfter >= 0 &&
         retryAfter <= MAX_RETRY_AFTER_S &&
         attempt < RETRIES
       ) {
+        idle.stop();
         await response.body?.cancel();
         await policy.sleep(retryAfter * 1000);
         continue;
       }
+      if (limitStatus && !Number.isFinite(retryAfter) && left !== 0) {
+        try {
+          limitBody = await readBody(response, idle);
+        } catch (error) {
+          throw failedCall(where, error, idle.signal);
+        } finally {
+          idle.stop();
+        }
+        const secondary =
+          response.status === 429 ||
+          /secondary rate limit/i.test(
+            detailOf(limitBody, response.statusText),
+          );
+        if (secondary && attempt < RETRIES) {
+          limitBody = undefined;
+          await policy.sleep(SECONDARY_WAIT_S * 1000);
+          continue;
+        }
+      }
       break;
     }
-    if (response.ok) return response;
-    const text = await response.text();
-    let detail = text.trim() || response.statusText;
+    let answer: Buffer;
     try {
-      const parsed = JSON.parse(text) as { message?: unknown };
-      if (typeof parsed.message === "string") detail = parsed.message;
-    } catch {}
+      answer = limitBody ?? (await readBody(response, idle));
+    } catch (error) {
+      throw failedCall(where, error, idle.signal);
+    } finally {
+      idle.stop();
+    }
+    if (response.ok) return answer;
+    const detail = detailOf(answer, response.statusText);
     // a rate limit past what is waited out above: GitHub answers a secondary one with a
     // `retry-after` or a message naming it, and a primary one with no remaining quota
     const rateLimited =
       response.status === 429 ||
       (response.status === 403 &&
         (response.headers.has("retry-after") ||
-          response.headers.get("x-ratelimit-remaining") === "0" ||
+          numberHeader(response.headers, "x-ratelimit-remaining") === 0 ||
           /rate limit/i.test(detail)));
     throw new GatewayError(
       `GitHub gateway: ${where} returned ${response.status}: ${detail}`,
@@ -345,11 +465,19 @@ export function gateway(options: {
     path: string,
     body?: unknown,
   ): Promise<T> {
-    return (await (await request(method, path, body)).json()) as T;
+    const where = whereOf(method, path);
+    const answer = await request(method, path, body);
+    try {
+      return JSON.parse(answer.toString("utf8")) as T;
+    } catch (error) {
+      throw new GatewayError(
+        `GitHub gateway: ${where} answered with a body that isn't JSON: ${messageOf(error)}`,
+      );
+    }
   };
-  /** The bytes a GET answers with, such as a repo's tarball. */
-  call.bytes = async (path: string): Promise<Buffer> =>
-    Buffer.from(await (await request("GET", path)).arrayBuffer());
+  /** The bytes a GET answers with, such as a repo's tarball; only silence times it out. */
+  call.bytes = (path: string): Promise<Buffer> => request("GET", path);
+  call.where = whereOf;
   return call;
 }
 

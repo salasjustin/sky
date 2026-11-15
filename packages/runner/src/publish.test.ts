@@ -2603,13 +2603,6 @@ test.each<{
     headers: { "retry-after": "120" },
   },
   {
-    how: "its message alone",
-    status: 403,
-    message:
-      "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
-    headers: {},
-  },
-  {
     // a 429 is a rate limit whatever its headers; the retry-after is past the wait, so none is waited
     how: "a 429 with a retry-after past what is waited out",
     status: 429,
