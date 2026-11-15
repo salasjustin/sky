@@ -2467,6 +2467,30 @@ test("an archive refused by a spent hourly limit fails the fetch as github_rate_
   expect(lines.filter((line) => line.includes("one by one"))).toEqual([]);
 });
 
+test("a blob write that fails while the archive is read fails the fetch with git's error, with no blob fetched one by one", async () => {
+  fakeGitHub();
+  const { dir, tip } = await cloneBehind(20);
+  const diskFull = new Error(
+    "git hash-object -w --stdin failed: error: unable to create temporary file: No space left on device",
+  );
+  const real = runnerGit(dir);
+  const full: typeof real = (args, options) =>
+    args.join(" ") === "hash-object -w --stdin"
+      ? Promise.reject(diskFull)
+      : real(args, options);
+  const lines: string[] = [];
+  const calls = gatewayCalls();
+  const error = await fetchCommit(full, testGateway().call, tip, (line) =>
+    lines.push(line),
+  ).catch((e: unknown) => e);
+  calls.stop();
+
+  expect(error).toBe(diskFull);
+  expect(archiveCalls(calls.urls)).toHaveLength(1);
+  expect(blobCalls(calls.urls)).toEqual([]);
+  expect(lines.filter((line) => line.includes("archive failed"))).toEqual([]);
+});
+
 test("a pull stopped by a spent hourly limit says when it ends, and no token appears in what it prints", async () => {
   fakeGitHub();
   const reset = Math.floor(Date.now() / 1000) + 3000;

@@ -240,8 +240,8 @@ const blobId = (bytes: Buffer) =>
  * are missing. The archive is read as it downloads and each file is written to the object store in
  * turn, so memory is the largest file, not the archive. A blob the archive doesn't carry as git
  * stores it (an `export-ignore` or `export-subst` attribute changes the bytes) is fetched by itself.
- * An archive that fails for any reason but a rate limit is given up where it stopped, said on one
- * line, and every blob still missing is fetched by itself.
+ * An archive that fails for any reason but a rate limit or a failed local write is given up where it
+ * stopped, said on one line, and every blob still missing is fetched by itself.
  */
 async function fetchBlobs(
   g: ReturnType<typeof git>,
@@ -268,6 +268,8 @@ async function fetchBlobs(
   const total = missing.size;
   let stored = 0;
   const path = `/tarball/${sha}`;
+  // a local write that fails (a full volume) would fail every per-blob write too, so it is thrown as is
+  const local: { writeFailure?: { error: unknown } } = {};
   try {
     const archive = await call.stream(path);
     await walkTarball(archive, {
@@ -280,7 +282,11 @@ async function fetchBlobs(
         if (!item || !missing.has(item.sha) || blobId(bytes) !== item.sha) {
           return;
         }
-        if ((await writeBlob(g, bytes)) !== item.sha) return;
+        const written = await writeBlob(g, bytes).catch((error: unknown) => {
+          local.writeFailure = { error };
+          throw error;
+        });
+        if (written !== item.sha) return;
         missing.delete(item.sha);
         stored++;
         if (stored % PROGRESS_EVERY === 0) {
@@ -289,6 +295,7 @@ async function fetchBlobs(
       },
     });
   } catch (error) {
+    if (local.writeFailure?.error === error) throw error;
     // per blob, a spent limit would only fail again, one call per blob
     if (error instanceof GatewayError && error.rateLimited) throw error;
     const named =
