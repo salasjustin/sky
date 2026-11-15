@@ -387,6 +387,35 @@ export function silentRuns(
   return runningRuns(db, (last) => sql`${last} < ${cutoff}`, now);
 }
 
+/**
+ * The command of the run's latest `claude.PreToolUse` of the Bash tool, as stored (already redacted
+ * and trimmed); undefined when it ran none. A trimmed input isn't valid JSON, so its command is cut
+ * out of the text.
+ */
+export function lastBashCommand(db: Db, runId: RunId): string | undefined {
+  const row = db
+    .select({ payload: events.payload })
+    .from(events)
+    .where(
+      and(
+        eq(events.runId, runId),
+        eq(events.type, "claude.PreToolUse"),
+        sql`json_extract(${events.payload}, '$.toolName') = 'Bash'`,
+      ),
+    )
+    .orderBy(desc(events.id))
+    .limit(1)
+    .get();
+  if (!row) return undefined;
+  const { input } = row.payload as { input: string };
+  try {
+    const { command } = JSON.parse(input) as { command?: unknown };
+    return typeof command === "string" ? command : undefined;
+  } catch {
+    return /"command":\s*"((?:[^"\\]|\\.)*)/.exec(input)?.[1];
+  }
+}
+
 /** The `running` runs whose runner is on `spriteName`, silent or not; for a probe an exec's SIGKILL calls for. */
 export function runningRunsOn(
   db: Db,

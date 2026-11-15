@@ -52,6 +52,7 @@ const KERNEL_KILL = "out of memory|oom-kill|oom_reaper|killed process";
 const KERNEL_KILL_LINE = new RegExp(KERNEL_KILL, "i");
 const KERNEL_MARK = "== kernel kills";
 const UPTIME_MARK = "== seconds since boot";
+const INIT_MARK = "== seconds since pid 1 started";
 
 // into a file rather than back over the exec: its frames carry no length, and a few KB re-chunked by an
 // intermediary is misread (see `execLogged`); each command's failure is part of the report, never the script's
@@ -59,6 +60,7 @@ const DIAGNOSTICS_SCRIPT = `{
 echo "== free -m"; free -m
 echo "== uptime"; uptime
 echo "${UPTIME_MARK}"; cut -d' ' -f1 /proc/uptime
+echo "${INIT_MARK}"; ps -o etimes= -p 1
 echo "== top processes by RSS (pid ppid rss_kb elapsed command)"; ps -eo pid=,ppid=,rss=,etime=,args= --sort=-rss | head -n 12 | cut -c1-240
 echo "${KERNEL_MARK}"; if k=$(dmesg 2>&1); then printf '%s\\n' "$k" | grep -iE '${KERNEL_KILL}' | tail -n 8 | cut -c1-240; else echo "dmesg not readable"; fi
 } >"$1" 2>&1; exit 0`;
@@ -90,6 +92,19 @@ export function killLinesWithin(report: string, withinSec: number): string[] {
     });
 }
 
+const secondsAfter = (report: string, mark: string): number | undefined => {
+  const found = new RegExp(`^${mark}\n\\s*(\\d+(?:\\.\\d+)?)$`, "m").exec(
+    report,
+  );
+  return found ? Number(found[1]) : undefined;
+};
+
+/** The 5-minute load average on the report's `uptime` line; undefined when it isn't there. */
+function parseLoad5(report: string): number | undefined {
+  const found = /load averages?:\s*[\d.]+[,\s]+([\d.]+)/.exec(report);
+  return found ? Number(found[1]) : undefined;
+}
+
 /** The most of a sprite's diagnostics kept: under `EVENT_TEXT_MAX`, with room for the event's own heading. */
 export const DIAGNOSTICS_MAX = 3_400;
 
@@ -99,7 +114,26 @@ export type Diagnostics = {
   memory?: Memory;
   /** The kernel's kill lines since the run began: it killed a process for memory meanwhile. */
   killLines: string[];
+  /** Seconds since the machine booted, and since its pid 1 started; undefined where the report lacks them. */
+  bootAgeSec?: number;
+  initAgeSec?: number;
+  /** The 5-minute load average. */
+  load5?: number;
 };
+
+/**
+ * Whether a sprite restarted after a run began `runAgeSec` ago: the machine booted since (`rebooted`),
+ * or booted earlier but its pid 1 started since, so its processes were reset (`processes`). A report
+ * without the ages says nothing, so counts as no restart.
+ */
+export function restartSince(
+  { bootAgeSec, initAgeSec }: Diagnostics,
+  runAgeSec: number,
+): "rebooted" | "processes" | undefined {
+  if (bootAgeSec !== undefined && bootAgeSec < runAgeSec) return "rebooted";
+  if (initAgeSec !== undefined && initAgeSec < runAgeSec) return "processes";
+  return undefined;
+}
 
 const bounded = (text: string) =>
   text.length <= DIAGNOSTICS_MAX
@@ -152,6 +186,9 @@ export async function collectDiagnostics(
       text: bounded(text.trim()),
       memory: parseFree(text),
       killLines: killLinesWithin(text, withinSec),
+      bootAgeSec: secondsAfter(text, UPTIME_MARK),
+      initAgeSec: secondsAfter(text, INIT_MARK),
+      load5: parseLoad5(text),
     };
   } catch (err) {
     return {
