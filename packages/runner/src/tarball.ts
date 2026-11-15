@@ -32,49 +32,70 @@ function paxRecords(body: Buffer): Map<string, string> {
   return records;
 }
 
-/** Bytes pulled from a chunked source exactly as asked: a count held, a count dropped. */
+/**
+ * Bytes pulled from a chunked source exactly as asked: a count held, a count dropped. At most one
+ * source chunk is kept between calls, so taking `n` bytes holds `n` plus that chunk.
+ */
 class Reader {
-  private chunks: Buffer[] = [];
-  private held = 0;
+  /** The unread rest of the last chunk pulled; empty once it is used up. */
+  private head: Buffer = Buffer.alloc(0);
   private readonly source: AsyncIterator<Buffer>;
   constructor(source: AsyncIterator<Buffer>) {
     this.source = source;
   }
 
-  /** Moves the next chunk in; false at the end of the stream. */
-  private async more(): Promise<boolean> {
-    const next = await this.source.next();
-    if (next.done) return false;
-    this.chunks.push(next.value);
-    this.held += next.value.length;
+  /** Pulls a chunk in when none is left unread; false at the end of the stream. */
+  private async fill(): Promise<boolean> {
+    while (this.head.length === 0) {
+      const next = await this.source.next();
+      if (next.done) return false;
+      this.head = next.value;
+    }
     return true;
   }
 
-  /** The next `n` bytes, or fewer at the end of the stream. */
+  /** Moves up to `n` bytes off the front, each run handed to `each` at its offset; the count moved. */
+  private async consume(
+    n: number,
+    each?: (bytes: Buffer, at: number) => void,
+  ): Promise<number> {
+    let done = 0;
+    while (done < n && (await this.fill())) {
+      const cut = Math.min(n - done, this.head.length);
+      each?.(this.head.subarray(0, cut), done);
+      this.head = this.head.subarray(cut);
+      done += cut;
+    }
+    return done;
+  }
+
+  /**
+   * The next `n` bytes, or fewer at the end of the stream. Bytes within the chunk on hand come as a
+   * view of it, which pins no more than that chunk; more are copied, as they arrive, into one buffer
+   * of their own that nothing the reader keeps afterwards shares.
+   */
   async take(n: number): Promise<Buffer> {
-    while (this.held < n && (await this.more())) {}
-    const all =
-      this.chunks.length === 1 ? this.chunks[0] : Buffer.concat(this.chunks);
-    const out = all?.subarray(0, Math.min(n, this.held)) ?? Buffer.alloc(0);
-    const rest = all?.subarray(out.length);
-    this.chunks = rest?.length ? [rest] : [];
-    this.held = rest?.length ?? 0;
-    return out;
+    if (n > 0 && !(await this.fill())) return Buffer.alloc(0);
+    if (this.head.length >= n) {
+      const out = this.head.subarray(0, n);
+      this.head = this.head.subarray(n);
+      return out;
+    }
+    const out = Buffer.allocUnsafe(n);
+    const filled = await this.consume(n, (bytes, at) => bytes.copy(out, at));
+    return filled === n ? out : out.subarray(0, filled);
   }
 
   /** Drops the next `n` bytes without holding them; the count dropped, which is fewer at the end. */
-  async skip(n: number): Promise<number> {
-    let left = n;
-    while (left > 0) {
-      if (this.held === 0 && !(await this.more())) break;
-      const first = this.chunks[0] as Buffer;
-      const cut = Math.min(left, first.length);
-      if (cut === first.length) this.chunks.shift();
-      else this.chunks[0] = first.subarray(cut);
-      this.held -= cut;
-      left -= cut;
-    }
-    return n - left;
+  skip(n: number): Promise<number> {
+    return this.consume(n);
+  }
+}
+
+/** Drops an entry's `padded` body; throws when the archive ends first. */
+async function skipEntry(reader: Reader, padded: number): Promise<void> {
+  if ((await reader.skip(padded)) < padded) {
+    throw new Error("the archive ends inside an entry");
   }
 }
 
@@ -151,18 +172,16 @@ export async function walkTarball(
       const isFile = type === "0";
       const isLink = type === "2";
       if (!path || !(isFile || isLink) || !entries.wants(path)) {
-        if ((await reader.skip(padded)) < padded) {
-          throw new Error("the archive ends inside an entry");
-        }
+        await skipEntry(reader, padded);
         continue;
       }
       if (isLink) {
-        await reader.skip(padded);
+        await skipEntry(reader, padded);
         await entries.file(path, Buffer.from(link));
         continue;
       }
       if (size > MAX_FILE_BYTES) {
-        await reader.skip(padded);
+        await skipEntry(reader, padded);
         continue;
       }
       const body = await reader.take(padded);

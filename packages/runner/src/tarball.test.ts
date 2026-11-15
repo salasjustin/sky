@@ -118,16 +118,72 @@ const MIB = 1024 * 1024;
 const octal = (n: number, width: number) =>
   `${n.toString(8).padStart(width - 1, "0")}\0`;
 
-/** A tar entry's header block: name, mode, size, type `0` and the ustar magic. */
-const tarHeader = (name: string, size: number) => {
+/** A tar entry's header block: name, mode, size, type (`0`, a file, unless given) and the ustar magic. */
+const tarHeader = (name: string, size: number, type = "0") => {
   const block = Buffer.alloc(512);
   block.write(name, 0);
   block.write(octal(0o644, 8), 100);
   block.write(octal(size, 12), 124);
-  block.write("0", 156);
+  block.write(type, 156);
   block.write("ustar\0" + "00", 257);
   return block;
 };
+
+test.each([
+  // git writes a symlink with size 0; a header claiming a body that never comes is a cut archive
+  { kind: "a symlink", header: tarHeader("top/link", 1_024, "2") },
+  // past the cap the walk drops the body rather than hold it, and still has to see all of it
+  {
+    kind: "a file past the size cap",
+    header: tarHeader("top/huge.bin", 300 * MIB),
+  },
+])(
+  "an archive cut inside $kind fails the walk, and nothing of that entry is handed over",
+  async ({ header }) => {
+    const cut = gzipSync(Buffer.concat([header, Buffer.alloc(100, 1)]));
+    const handed: string[] = [];
+
+    await expect(
+      walkTarball(chunked(cut), {
+        wants: () => true,
+        file: async (path) => {
+          handed.push(path);
+        },
+      }),
+    ).rejects.toThrow("the archive ends inside an entry");
+    expect(handed).toEqual([]);
+  },
+);
+
+test("a file spanning many chunks is handed over in a buffer of its own, and the entry after it shares none of that memory", async () => {
+  // the large file's body ends inside a decompressed chunk, so bytes of the next entry arrive with it
+  const large = Buffer.alloc(100_000, 7);
+  const padded = Math.ceil(large.length / 512) * 512;
+  const tar = Buffer.concat([
+    tarHeader("top/large.bin", large.length),
+    large,
+    Buffer.alloc(padded - large.length),
+    tarHeader("top/small.txt", 2),
+    Buffer.from("s\n"),
+    Buffer.alloc(510),
+    Buffer.alloc(1024),
+  ]);
+  const archive = gzipSync(tar);
+  const memory = new Map<string, ArrayBufferLike>();
+
+  await walkTarball(chunked(archive, archive.length), {
+    wants: () => true,
+    file: async (path, bytes) => {
+      memory.set(path, bytes.buffer);
+    },
+  });
+
+  // held once at its padded size, not copied into a buffer that also carries what came after it
+  expect(memory.get("large.bin")?.byteLength).toBeLessThanOrEqual(padded);
+  // what the walk kept past the large file is not a view that pins the large file's buffer
+  expect(memory.get("small.txt")).toBeDefined();
+  expect(memory.get("small.txt")).not.toBe(memory.get("large.bin"));
+});
 
 test("a large archive is read as it downloads: each file is handed over while the rest is still to come, and what is held ahead stays small", async () => {
   const FILES = 64;
