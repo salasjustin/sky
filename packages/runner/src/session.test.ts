@@ -1128,6 +1128,222 @@ test("an ambient background task (a watcher) does not hold the prompt open", asy
   expect(seen).toEqual([true]);
 });
 
+type WokenTurn = (
+  options: Options,
+  inputEnded: boolean,
+) => Promise<unknown[] | undefined>;
+
+/**
+ * A stand-in for the SDK and Claude's process for a woken turn: a `turn` is a function that gets the
+ * session's options and whether the prompt had ended, and answers the messages it streams, as a
+ * tool call the SDK cancels when stdin is closed and runs when it is open.
+ */
+function wakeProcess(turns: unknown[]): QueryFn {
+  return ({ prompt, options }) =>
+    (async function* () {
+      let inputEnded = false;
+      const reading = (async () => {
+        for await (const _ of prompt);
+        inputEnded = true;
+      })();
+      for (const turn of turns) {
+        if (typeof turn !== "function") {
+          yield turn as SDKMessage;
+          continue;
+        }
+        // a beat for a closing input to be seen
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const answer = (await (turn as WokenTurn)(options, inputEnded)) ?? [];
+        for (const message of answer) yield message as SDKMessage;
+      }
+      await Promise.race([
+        reading,
+        new Promise((resolve) => setTimeout(resolve, 1000)),
+      ]);
+    })();
+}
+
+/** A point in a woken-turn script that records whether the prompt had ended. */
+const atIdle =
+  (seen: boolean[]): WokenTurn =>
+  async (_options, inputEnded) => {
+    seen.push(inputEnded);
+    return undefined;
+  };
+
+const subagentStart: Step = hook("SubagentStart", {
+  agent_id: "agent-1",
+  agent_type: "general-purpose",
+});
+const subagentStop: Step = hook("SubagentStop", {
+  agent_id: "agent-1",
+  agent_type: "general-purpose",
+  last_assistant_message: "done",
+});
+/** A woken turn's tool call: cancelled when the input had closed, run (its hooks fire) when open. */
+const wokenCall =
+  (ran: string[]): WokenTurn =>
+  async (options, inputEnded) => {
+    if (inputEnded)
+      return [
+        {
+          type: "user",
+          session_id: "sess-new",
+          parent_tool_use_id: null,
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_woken",
+                is_error: true,
+                content:
+                  "The user doesn't want to take this action right now. STOP what you are doing.",
+              },
+            ],
+          },
+        },
+      ];
+    await fire(options, "PreToolUse", {
+      tool_name: "Bash",
+      tool_use_id: "toolu_woken",
+      tool_input: { command: "ls" },
+    });
+    ran.push("ls");
+    return undefined;
+  };
+const backgroundAgentCall = assistant({
+  type: "tool_use",
+  id: "toolu_agent",
+  name: "Agent",
+  input: { run_in_background: true, prompt: "prove it" },
+});
+
+test("a result while a background subagent runs, which the task list doesn't show, keeps the prompt open and the woken turn's tool call runs", async () => {
+  const seen: boolean[] = [];
+  const ran: string[] = [];
+  const { posted, post } = recorder();
+  const outcome = await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      success,
+      // idle: the subagent still runs, so stdin must still be open
+      atIdle(seen),
+      subagentStop,
+      wokenCall(ran),
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: async () => ({ decision: "approve" }) as never,
+  });
+  expect(seen).toEqual([false, true]);
+  expect(ran).toEqual(["ls"]);
+  expect(posted.map((e) => e.type)).not.toContain("runner.warning");
+  expect(outcome).toBe(0);
+});
+
+test("a background Agent call whose subagent hasn't started yet counts as unfinished", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      backgroundAgentCall,
+      success,
+      atIdle(seen),
+      subagentStart,
+      subagentStop,
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([false, true]);
+});
+
+test("a subagent that stopped before the result leaves the prompt to close", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      subagentStop,
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([true]);
+});
+
+test("a background subagent that never finishes holds the prompt only for the hold, then the run ends with its result and a warning", async () => {
+  const seen: boolean[] = [];
+  const warnings: string[] = [];
+  const { post } = recorder();
+  const outcome = await runSession(config, {
+    query: wakeProcess([init, subagentStart, success, atIdle(seen)]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 5,
+  });
+  expect(seen).toEqual([true]);
+  expect(
+    warnings.some((w) => w.includes("1 background subagent(s) still running")),
+  ).toBe(true);
+  expect(outcome).toBe(0);
+});
+
+test("a woken turn's call cancelled after the input closed over a running subagent is reported as that, not as a refusal", async () => {
+  const warnings: string[] = [];
+  const ran: string[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      success,
+      // the hold expires (5 ms) before the subagent wakes the session
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        return undefined;
+      },
+      wokenCall(ran),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 5,
+  });
+  expect(ran).toEqual([]);
+  expect(warnings).toContain(
+    "runner: the session's input closed while a background subagent was still running; its woken turn was cancelled",
+  );
+});
+
+test("a cancelled call with no subagent running is not blamed on one", async () => {
+  const warnings: string[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([init, success, wokenCall([])]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+  });
+  expect(warnings.filter((w) => w.includes("subagent"))).toEqual([]);
+});
+
 test("without checks, the session is told nothing about them", async () => {
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
   try {

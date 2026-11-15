@@ -381,7 +381,9 @@ function sessionHooks(
     ) => Promise<SyncHookJSONOutput>;
     /** A tool call is running: it passed `gate`. */
     toolStarted: (toolUseId: string, toolName: string) => void;
-    toolEnded: (toolUseId: string) => void;
+    toolEnded: (toolUseId: string, failed: boolean) => void;
+    /** A subagent started or stopped, by its agent id. */
+    subagent: (agentId: string, running: boolean) => void;
   },
 ): Options["hooks"] {
   const matcher = <E extends HookEvent>(
@@ -438,7 +440,7 @@ function sessionHooks(
       return output;
     }, gateTimeout),
     PostToolUse: matcher<"PostToolUse">((input) => {
-      on.toolEnded(input.tool_use_id);
+      on.toolEnded(input.tool_use_id, false);
       const response = input.tool_response;
       on.event({
         type: "claude.PostToolUse",
@@ -456,7 +458,7 @@ function sessionHooks(
       });
     }),
     PostToolUseFailure: matcher<"PostToolUseFailure">((input) => {
-      on.toolEnded(input.tool_use_id);
+      on.toolEnded(input.tool_use_id, true);
       on.event({
         type: "claude.PostToolUseFailure",
         payload: {
@@ -472,12 +474,14 @@ function sessionHooks(
       });
     }),
     SubagentStart: matcher<"SubagentStart">((input) => {
+      on.subagent(input.agent_id, true);
       on.event({
         type: "claude.SubagentStart",
         payload: { subagentId: input.agent_id, agentType: input.agent_type },
       });
     }),
     SubagentStop: matcher<"SubagentStop">((input) => {
+      on.subagent(input.agent_id, false);
       on.event({
         type: "claude.SubagentStop",
         payload: {
@@ -967,12 +971,53 @@ export async function runSession(
     },
     gate,
     toolStarted: heartbeat.started,
-    toolEnded: heartbeat.ended,
+    toolEnded: (toolUseId, failed) => {
+      heartbeat.ended(toolUseId);
+      // a launch that failed starts no subagent to wait for
+      if (failed) launching.delete(toolUseId);
+    },
+    subagent: (agentId, running) => {
+      if (running) {
+        subagents.add(agentId);
+        // the launch it answers is now tracked by its id
+        for (const id of launching) {
+          launching.delete(id);
+          break;
+        }
+      } else {
+        subagents.delete(agentId);
+        // a subagent ending wakes a turn, as a task ending does
+        endHold();
+      }
+    },
   });
   const input = promptInput(config.prompt);
   // background tasks still running, such as a nested `claude -p`: a `result` that arrives while any
   // are leaves the input open for the turn their notification wakes, for at most the hold
   let liveTasks = 0;
+  // A background subagent wakes the session when it finishes, as a task does, but the task list
+  // can lack it (or already have dropped it) when its parent's `result` arrives; so the start and
+  // stop hooks count it by agent id, and a background `Agent` call counts from the assistant
+  // message that makes it until its subagent starts. Tasks the SDK flags `ambient` (watchers and
+  // housekeeping, never activity) stay out: they don't wake a turn, so holding for one would only
+  // keep a finished run open until the hold expires.
+  const subagents = new Set<string>();
+  const launching = new Set<string>();
+  const unfinishedWork = () => liveTasks + subagents.size + launching.size;
+  const describeUnfinished = () =>
+    [
+      liveTasks > 0 && `${liveTasks} background task(s)`,
+      subagents.size + launching.size > 0 &&
+        `${subagents.size + launching.size} background subagent(s)`,
+    ]
+      .filter(Boolean)
+      .join(" and ");
+  let inputClosed = false;
+  let cancelWarned = false;
+  const closeInput = () => {
+    inputClosed = true;
+    input.close();
+  };
   let holdTimer: NodeJS.Timeout | undefined;
   const endHold = () => clearTimeout(holdTimer);
   let commandEnv: CommandEnv | undefined;
@@ -1032,6 +1077,8 @@ export async function runSession(
           toolUseIdsOf(message.message.content),
           message.agent_id ?? parent ?? undefined,
         );
+        for (const block of message.message.content)
+          if (isBackgroundAgentCall(block) && !parent) launching.add(block.id);
         // queued, not awaited: the post waits behind every hook event already queued, and a slow API must not hold the loop
         for (const text of textOf(message.message.content))
           void post(
@@ -1062,15 +1109,26 @@ export async function runSession(
       } else if (message.type === "result") {
         result = message;
         endHold();
-        if (liveTasks === 0) input.close();
+        if (unfinishedWork() === 0) closeInput();
         else {
           holdTimer = setTimeout(() => {
             warn(
-              `runner: ${liveTasks} background task(s) still running ${Math.round((deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS) / 60_000)} minutes after the last result; ending the run with that result`,
+              `runner: ${describeUnfinished()} still running ${Math.round((deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS) / 60_000)} minutes after the last result; ending the run with that result`,
             );
-            input.close();
+            closeInput();
           }, deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS);
         }
+      } else if (
+        message.type === "user" &&
+        inputClosed &&
+        !cancelWarned &&
+        subagents.size + launching.size > 0 &&
+        hasCancelledCall(message.message.content)
+      ) {
+        cancelWarned = true;
+        warn(
+          "runner: the session's input closed while a background subagent was still running; its woken turn was cancelled",
+        );
       }
     }
   } catch (error) {
@@ -1078,7 +1136,7 @@ export async function runSession(
   } finally {
     deps.signal.removeEventListener("abort", forward);
     endHold();
-    input.close();
+    closeInput();
     heartbeat.stop();
     await commandEnv?.remove().catch(() => {});
     await nestedLogin?.remove().catch(() => {});
@@ -1145,6 +1203,35 @@ function textOf(content: AssistantContent): string[] {
     block.type === "text" && block.text.trim()
       ? [bound(block.text.trim())]
       : [],
+  );
+}
+
+/** An `Agent` (or `Task`) call the main thread made to run in the background. */
+function isBackgroundAgentCall(
+  block: AssistantContent[number],
+): block is Extract<AssistantContent[number], { type: "tool_use" }> {
+  return (
+    block.type === "tool_use" &&
+    (block.name === "Agent" || block.name === "Task") &&
+    typeof block.input === "object" &&
+    block.input !== null &&
+    (block.input as Record<string, unknown>).run_in_background === true
+  );
+}
+
+/** What the SDK answers a tool call it cancels, as a user refusal would read. */
+const CANCELLED_CALL = "doesn't want to take this action right now";
+
+/** A tool result in a user message that is the SDK cancelling the call. */
+function hasCancelledCall(content: unknown): boolean {
+  return (
+    Array.isArray(content) &&
+    content.some(
+      (block) =>
+        block?.type === "tool_result" &&
+        block.is_error === true &&
+        JSON.stringify(block.content ?? "").includes(CANCELLED_CALL),
+    )
   );
 }
 
