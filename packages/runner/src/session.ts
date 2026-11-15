@@ -1260,8 +1260,7 @@ function hasCancelledCall(content: unknown): boolean {
     CANCELLED_CALL_PREFIXES.some((prefix) => text.startsWith(prefix));
   const hasCancelText = (
     blocks: ({ type?: unknown; text?: unknown } | null)[],
-  ) =>
-    blocks.some((block) => block?.type === "text" && isCancel(block.text));
+  ) => blocks.some((block) => block?.type === "text" && isCancel(block.text));
   if (typeof content === "string") return isCancel(content);
   return (
     Array.isArray(content) &&

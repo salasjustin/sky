@@ -1237,8 +1237,7 @@ const CANCEL_WARNING =
 const cancelWarnings = (warnings: string[], posted: RunnerEventPost[]) => ({
   warned: warnings.filter((w) => w === `runner: ${CANCEL_WARNING}`).length,
   posted: posted.filter(
-    (e) =>
-      e.type === "runner.warning" && e.payload.message === CANCEL_WARNING,
+    (e) => e.type === "runner.warning" && e.payload.message === CANCEL_WARNING,
   ).length,
 });
 
@@ -1478,7 +1477,7 @@ test("a nested subagent stopping with no result after it restarts the hold, and 
       // the hold (60 ms) starts here and outlasts the next step's 20 ms beat
       success,
       // agent-2 was agent-1's: its stop wakes agent-1, so no result follows
-      async (options) => {
+      async (options: Options) => {
         await fire(options, "SubagentStop", {
           agent_id: "agent-2",
           agent_type: "Explore",
@@ -1613,12 +1612,15 @@ test("a woken turn's calls cancelled after the input closed over a running subag
 test.each([
   "[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown. Check whether it took effect before relying on it or running it again.]",
   "[Request interrupted: the session ended before this agent finished. Nobody asked it to stop.]",
-])("a call cancelled with the SDK's session-ended text %#, after the input closed over a running subagent, is reported the same way", async (ended) => {
-  expect(await closedOverSubagent(wokenCall([], ended))).toEqual({
-    warned: 1,
-    posted: 1,
-  });
-});
+])(
+  "a call cancelled with the SDK's session-ended text %#, after the input closed over a running subagent, is reported the same way",
+  async (ended) => {
+    expect(await closedOverSubagent(wokenCall([], ended))).toEqual({
+      warned: 1,
+      posted: 1,
+    });
+  },
+);
 
 test("a cancel delivered as text blocks in a tool result after the input closed over a running subagent is reported the same way", async () => {
   expect(
