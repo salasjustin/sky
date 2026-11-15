@@ -986,8 +986,7 @@ export async function runSession(
         }
       } else {
         subagents.delete(agentId);
-        // a subagent ending wakes a turn, as a task ending does
-        endHold();
+        restartHold();
       }
     },
   });
@@ -1019,7 +1018,28 @@ export async function runSession(
     input.close();
   };
   let holdTimer: NodeJS.Timeout | undefined;
-  const endHold = () => clearTimeout(holdTimer);
+  const endHold = () => {
+    clearTimeout(holdTimer);
+    holdTimer = undefined;
+  };
+  const holdMs = deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS;
+  /** Leaves the input open past a `result` for at most the hold, then ends the run with it. */
+  const startHold = () => {
+    holdTimer = setTimeout(() => {
+      warn(
+        `runner: ${describeUnfinished()} still running ${Math.round(holdMs / 60_000)} minutes after the last result; ending the run with that result`,
+      );
+      closeInput();
+    }, holdMs);
+  };
+  // A task or subagent ending wakes a turn, whose `result` decides again; but the hook can't tell a
+  // main-thread subagent from one a subagent launched, whose stop wakes its launcher instead and
+  // brings no result, so a hold in effect gets a fresh window rather than none.
+  const restartHold = () => {
+    if (holdTimer === undefined || inputClosed) return;
+    endHold();
+    startHold();
+  };
   let commandEnv: CommandEnv | undefined;
   let nestedLogin: NestedLogin | undefined;
   try {
@@ -1104,20 +1124,12 @@ export async function runSession(
         message.type === "system" &&
         message.subtype === "task_notification"
       ) {
-        // a task ended, so a woken turn is on its way
-        endHold();
+        restartHold();
       } else if (message.type === "result") {
         result = message;
         endHold();
         if (unfinishedWork() === 0) closeInput();
-        else {
-          holdTimer = setTimeout(() => {
-            warn(
-              `runner: ${describeUnfinished()} still running ${Math.round((deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS) / 60_000)} minutes after the last result; ending the run with that result`,
-            );
-            closeInput();
-          }, deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS);
-        }
+        else startHold();
       } else if (
         message.type === "user" &&
         inputClosed &&

@@ -1303,6 +1303,76 @@ test("a background subagent that never finishes holds the prompt only for the ho
   expect(outcome).toBe(0);
 });
 
+const holdWarnings = (warnings: string[]) =>
+  warnings.filter((w) => w.includes("minutes after the last result"));
+
+test("a nested subagent stopping with no result after it restarts the hold, and the run still ends when that hold expires", async () => {
+  const seen: boolean[] = [];
+  const warnings: string[] = [];
+  let warnedBeforeRestartedHoldEnds: number | undefined;
+  const { post } = recorder();
+  const outcome = await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      hook("SubagentStart", { agent_id: "agent-2", agent_type: "Explore" }),
+      // the hold (60 ms) starts here and outlasts the next step's 20 ms beat
+      success,
+      // agent-2 was agent-1's: its stop wakes agent-1, so no result follows
+      async (options) => {
+        await fire(options, "SubagentStop", {
+          agent_id: "agent-2",
+          agent_type: "Explore",
+        });
+        // past the first hold's end, inside the restarted one: both timers are set by now
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        warnedBeforeRestartedHoldEnds = holdWarnings(warnings).length;
+        return undefined;
+      },
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 60,
+  });
+  expect(warnedBeforeRestartedHoldEnds).toBe(0);
+  expect(seen).toEqual([true]);
+  expect(holdWarnings(warnings)).toEqual([
+    expect.stringContaining("1 background subagent(s) still running"),
+  ]);
+  expect(outcome).toBe(0);
+});
+
+test("a subagent stop and then a result with nothing unfinished close the input at that result, and no hold expires later", async () => {
+  const seen: boolean[] = [];
+  const warnings: string[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      success,
+      subagentStop,
+      success,
+      // past both the first hold and the one the stop restarted
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return undefined;
+      },
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 60,
+  });
+  expect(seen).toEqual([true]);
+  expect(holdWarnings(warnings)).toEqual([]);
+});
+
 test("a woken turn's call cancelled after the input closed over a running subagent is reported as that, not as a refusal", async () => {
   const warnings: string[] = [];
   const ran: string[] = [];
