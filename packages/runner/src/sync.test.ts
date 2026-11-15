@@ -1826,8 +1826,8 @@ test("a start branch is fetched through the connector once the anonymous fetch h
   expect(warnings.filter((w) => w.includes("anonymous git"))).toHaveLength(1);
 });
 
-// what the run's instructions say whether or not the refresh moved anything; none of these can be
-// satisfied by the older sentence naming `git fetch`, `git pull` and `git push`
+// what the run's instructions say whether or not the refresh moved anything; none of these is part of
+// the sentence naming `git fetch`, `git pull` and `git push`, so each goes red on its own
 const BY_DESIGN =
   "That is by design, not a fault to work around: the runner reaches GitHub for you.";
 const SYNC_COMMAND = `\`${process.execPath} ${process.argv[1]} sync\` when GitHub's default branch may have moved while you worked`;
@@ -1902,7 +1902,7 @@ test("a run whose default branch was too far ahead to fetch claims no refreshed 
 test("the run's prompt allows publish and sync in one sentence and says sync goes through the connector with a 100-commit limit", async () => {
   const { append = "" } = await runOnce();
 
-  const allowed = `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` and \`sync\` commands: its other subcommands are the Sky API's, and run with none it refuses: only the Sky API starts a run.`;
+  const allowed = `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` and \`sync\` commands. Its other subcommands are the Sky API's, and run with no subcommand it refuses, since only the Sky API starts a run.`;
   expect(append.split(allowed)).toHaveLength(2);
   expect(append).not.toContain("only for its `publish` command");
   expect(append).not.toContain("one other command");

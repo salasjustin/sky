@@ -275,7 +275,7 @@ const publishInstructions = (refreshed?: Refreshed) =>
           `\`origin/${refreshed.branch}\` is at GitHub's tip as of the start-of-run refresh: ${refreshed.sha.slice(0, 7)}, ${refreshed.at.toISOString().slice(0, 16).replace("T", " ")} UTC. The refresh touches only \`origin/${refreshed.branch}\`; local \`${refreshed.branch}\` stays where it was. A failed \`git fetch\` doesn't mean the base is stale.`,
         ]
       : []),
-    `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` and \`sync\` commands: its other subcommands are the Sky API's, and run with none it refuses: only the Sky API starts a run.`,
+    `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` and \`sync\` commands. Its other subcommands are the Sky API's, and run with no subcommand it refuses, since only the Sky API starts a run.`,
     `Run \`${process.execPath} ${process.argv[1]} ${SYNC_USAGE}\` when GitHub's default branch may have moved while you worked: it refreshes \`origin/<default>\` through the connector and prints the new tip and how many commits GitHub's branch gained or dropped. If GitHub is more than ${DEFAULT_MAX_COMMITS} commits ahead it stops and leaves \`origin/<default>\` where it was. It changes no local branch or worktree.`,
     "To publish your branch and open a pull request, commit your work, then run",
     `\`${process.execPath} ${process.argv[1]} ${PUBLISH_USAGE}\``,

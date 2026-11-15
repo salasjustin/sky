@@ -825,7 +825,7 @@ export async function syncMain(
     return 2;
   }
   try {
-    // the worktree's own git dir is the clone's `.git` once taken up one level from its common dir
+    // a worktree's common dir is the shared clone's `.git`, so the clone is its parent
     const common = await inTree(
       io.cwd,
       "rev-parse",
