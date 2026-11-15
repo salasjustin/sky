@@ -382,6 +382,10 @@ function sessionHooks(
     /** A tool call is running: it passed `gate`. */
     toolStarted: (toolUseId: string, toolName: string) => void;
     toolEnded: (toolUseId: string) => void;
+    /** A subagent started or stopped, by its agent id. */
+    subagent: (agentId: string, running: boolean) => void;
+    /** An `Agent` call returned with its subagent launched in the background. */
+    subagentLaunched: (agentId: string) => void;
   },
 ): Options["hooks"] {
   const matcher = <E extends HookEvent>(
@@ -440,6 +444,8 @@ function sessionHooks(
     PostToolUse: matcher<"PostToolUse">((input) => {
       on.toolEnded(input.tool_use_id);
       const response = input.tool_response;
+      const launched = launchedAgentId(input.tool_name, response);
+      if (launched) on.subagentLaunched(launched);
       on.event({
         type: "claude.PostToolUse",
         payload: {
@@ -472,12 +478,14 @@ function sessionHooks(
       });
     }),
     SubagentStart: matcher<"SubagentStart">((input) => {
+      on.subagent(input.agent_id, true);
       on.event({
         type: "claude.SubagentStart",
         payload: { subagentId: input.agent_id, agentType: input.agent_type },
       });
     }),
     SubagentStop: matcher<"SubagentStop">((input) => {
+      on.subagent(input.agent_id, false);
       on.event({
         type: "claude.SubagentStop",
         payload: {
@@ -968,13 +976,68 @@ export async function runSession(
     gate,
     toolStarted: heartbeat.started,
     toolEnded: heartbeat.ended,
+    subagent: (agentId, running) => {
+      if (running) subagents.add(agentId);
+      else {
+        subagents.delete(agentId);
+        stoppedSubagents.add(agentId);
+        restartHold();
+      }
+    },
+    // a subagent can stop before its launch's result is in, and must not be counted again then
+    subagentLaunched: (agentId) => {
+      if (!stoppedSubagents.has(agentId)) subagents.add(agentId);
+    },
   });
   const input = promptInput(config.prompt);
   // background tasks still running, such as a nested `claude -p`: a `result` that arrives while any
   // are leaves the input open for the turn their notification wakes, for at most the hold
   let liveTasks = 0;
+  // A background subagent wakes the session when it finishes, as a task does, but the task list
+  // can lack it (or already have dropped it) when its parent's `result` arrives; so it counts by
+  // agent id from its launch's result or its start hook, whichever comes first, until its stop
+  // hook. A turn's `result` can't precede its own tool results, so a launch is counted before the
+  // result it must hold.
+  const subagents = new Set<string>();
+  const stoppedSubagents = new Set<string>();
+  const unfinishedWork = () => liveTasks + subagents.size;
+  const describeUnfinished = () =>
+    [
+      liveTasks > 0 && `${liveTasks} background task(s)`,
+      subagents.size > 0 && `${subagents.size} background subagent(s)`,
+    ]
+      .filter(Boolean)
+      .join(" and ");
+  let inputClosed = false;
+  let cancelWarned = false;
+  const closeInput = () => {
+    inputClosed = true;
+    input.close();
+  };
   let holdTimer: NodeJS.Timeout | undefined;
-  const endHold = () => clearTimeout(holdTimer);
+  const endHold = () => {
+    clearTimeout(holdTimer);
+    holdTimer = undefined;
+  };
+  const holdMs = deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS;
+  /** Leaves the input open past a `result` for at most the hold, then ends the run with it. */
+  const startHold = () => {
+    holdTimer = setTimeout(() => {
+      warn(
+        `runner: ${describeUnfinished()} still running ${Math.round(holdMs / 60_000)} minutes after the last result; ending the run with that result`,
+      );
+      closeInput();
+    }, holdMs);
+  };
+  // A task or subagent ending wakes a turn, whose `result` decides again; but the hook can't tell a
+  // main-thread subagent from one a subagent launched, whose stop wakes its launcher instead and
+  // brings no result. So a hold in effect restarts rather than clears: cleared, it would leave the
+  // input open with no limit.
+  const restartHold = () => {
+    if (holdTimer === undefined || inputClosed) return;
+    endHold();
+    startHold();
+  };
   let commandEnv: CommandEnv | undefined;
   let nestedLogin: NestedLogin | undefined;
   try {
@@ -1045,6 +1108,8 @@ export async function runSession(
         message.type === "system" &&
         message.subtype === "background_tasks_changed"
       ) {
+        // tasks the SDK flags `ambient` (watchers and housekeeping, never activity) don't wake a
+        // turn, so holding for one would only keep a finished run open until the hold expires
         const live = message.tasks.filter((task) => !task.ambient);
         liveTasks = live.length;
         heartbeat.setBackground(
@@ -1057,20 +1122,27 @@ export async function runSession(
         message.type === "system" &&
         message.subtype === "task_notification"
       ) {
-        // a task ended, so a woken turn is on its way
-        endHold();
+        restartHold();
       } else if (message.type === "result") {
         result = message;
         endHold();
-        if (liveTasks === 0) input.close();
-        else {
-          holdTimer = setTimeout(() => {
-            warn(
-              `runner: ${liveTasks} background task(s) still running ${Math.round((deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS) / 60_000)} minutes after the last result; ending the run with that result`,
-            );
-            input.close();
-          }, deps.backgroundHoldMs ?? BACKGROUND_HOLD_MS);
-        }
+        if (unfinishedWork() === 0) closeInput();
+        else startHold();
+      } else if (
+        message.type === "user" &&
+        inputClosed &&
+        !cancelWarned &&
+        subagents.size > 0 &&
+        hasCancelledCall(message.message.content)
+      ) {
+        cancelWarned = true;
+        const warning =
+          "a background subagent was still running when the run stopped waiting for it; the turn it woke was cancelled";
+        warn(`runner: ${warning}`);
+        void post({
+          type: "runner.warning",
+          payload: { message: warning },
+        }).catch(() => {});
       }
     }
   } catch (error) {
@@ -1078,7 +1150,7 @@ export async function runSession(
   } finally {
     deps.signal.removeEventListener("abort", forward);
     endHold();
-    input.close();
+    closeInput();
     heartbeat.stop();
     await commandEnv?.remove().catch(() => {});
     await nestedLogin?.remove().catch(() => {});
@@ -1145,6 +1217,62 @@ function textOf(content: AssistantContent): string[] {
     block.type === "text" && block.text.trim()
       ? [bound(block.text.trim())]
       : [],
+  );
+}
+
+/**
+ * The subagent an `Agent` (or `Task`) call launched in the background, by the `agentId` of the
+ * SDK's `async_launched` output (`AgentOutput`); a foreground call answers `completed` instead.
+ */
+function launchedAgentId(
+  toolName: string,
+  response: unknown,
+): string | undefined {
+  if (toolName !== "Agent" && toolName !== "Task") return undefined;
+  const output = response as { status?: unknown; agentId?: unknown } | null;
+  // assumed equal to the hooks' `agent_id`: the SDK's types call both the subagent's id, but
+  // nothing in its source ties one to the other (the CLI ships apart from it)
+  return output?.status === "async_launched" &&
+    typeof output.agentId === "string"
+    ? output.agentId
+    : undefined;
+}
+
+/**
+ * How the SDK's interruption markers (in its `sdk.mjs`) begin for a call cut off by the input
+ * closing: the cancel that reads as a user refusal, and the two for a session that ended. The rest
+ * of that list names other causes, such as a person's interrupt or a turn ended to deliver a
+ * message. None of these begins a reason the gate denies a call with.
+ */
+const CANCELLED_CALL_PREFIXES = [
+  "The user doesn't want to take this action right now",
+  "[Tool call interrupted: the session ended",
+  "[Request interrupted: the session ended",
+];
+
+/**
+ * A user message holding one of those markers: as text, or as an errored tool result's content,
+ * which is a string or a list of blocks.
+ */
+function hasCancelledCall(content: unknown): boolean {
+  const isCancel = (text: unknown) =>
+    typeof text === "string" &&
+    CANCELLED_CALL_PREFIXES.some((prefix) => text.startsWith(prefix));
+  const hasCancelText = (
+    blocks: ({ type?: unknown; text?: unknown } | null)[],
+  ) => blocks.some((block) => block?.type === "text" && isCancel(block.text));
+  if (typeof content === "string") return isCancel(content);
+  return (
+    Array.isArray(content) &&
+    (hasCancelText(content) ||
+      content.some(
+        (block) =>
+          block?.type === "tool_result" &&
+          block.is_error === true &&
+          (Array.isArray(block.content)
+            ? hasCancelText(block.content)
+            : isCancel(block.content)),
+      ))
   );
 }
 

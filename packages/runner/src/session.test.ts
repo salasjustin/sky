@@ -1128,6 +1128,555 @@ test("an ambient background task (a watcher) does not hold the prompt open", asy
   expect(seen).toEqual([true]);
 });
 
+type WokenTurn = (
+  options: Options,
+  inputEnded: boolean,
+) => Promise<unknown[] | undefined>;
+
+/**
+ * A stand-in for the SDK and Claude's process across a woken turn: messages stream as given, and a
+ * function in the list is called, after a beat, with the session's options and whether the prompt
+ * had ended, and the messages it answers stream in its place.
+ */
+function wakeProcess(turns: unknown[]): QueryFn {
+  return ({ prompt, options }) =>
+    (async function* () {
+      let inputEnded = false;
+      const reading = (async () => {
+        for await (const _ of prompt);
+        inputEnded = true;
+      })();
+      for (const turn of turns) {
+        if (typeof turn !== "function") {
+          yield turn as SDKMessage;
+          continue;
+        }
+        // a beat for a closing input to be seen
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const answer = (await (turn as WokenTurn)(options, inputEnded)) ?? [];
+        for (const message of answer) yield message as SDKMessage;
+      }
+      await Promise.race([
+        reading,
+        new Promise((resolve) => setTimeout(resolve, 1000)),
+      ]);
+    })();
+}
+
+/** A point in a woken-turn script that records whether the prompt had ended. */
+const atIdle =
+  (seen: boolean[]): WokenTurn =>
+  async (_options, inputEnded) => {
+    seen.push(inputEnded);
+    return undefined;
+  };
+
+const subagentStart: Step = hook("SubagentStart", {
+  agent_id: "agent-1",
+  agent_type: "general-purpose",
+});
+const subagentStop: Step = hook("SubagentStop", {
+  agent_id: "agent-1",
+  agent_type: "general-purpose",
+  last_assistant_message: "done",
+});
+/** The SDK's text for a call it cancelled, which reads as a user's refusal (one of its interruption markers in sdk.mjs). */
+const REFUSAL_CANCEL =
+  "The user doesn't want to take this action right now. STOP what you are doing and wait for the user to tell you how to proceed.";
+/** Tool results Claude's process hands back for `toolu_woken`, as errors, one per `content`. */
+const erroredResult = (...contents: unknown[]) => ({
+  type: "user",
+  session_id: "sess-new",
+  parent_tool_use_id: null,
+  message: {
+    role: "user",
+    content: contents.map((content) => ({
+      type: "tool_result",
+      tool_use_id: "toolu_woken",
+      is_error: true,
+      content,
+    })),
+  },
+});
+/** A woken turn's tool call: cancelled when the input had closed, run (its hooks fire) when open. */
+const wokenCall =
+  (ran: string[], cancelText = REFUSAL_CANCEL): WokenTurn =>
+  async (options, inputEnded) => {
+    if (inputEnded) return [erroredResult(cancelText)];
+    await fire(options, "PreToolUse", {
+      tool_name: "Bash",
+      tool_use_id: "toolu_woken",
+      tool_input: { command: "ls" },
+    });
+    ran.push("ls");
+    return undefined;
+  };
+const backgroundAgentCall = assistant({
+  type: "tool_use",
+  id: "toolu_agent",
+  name: "Agent",
+  input: { run_in_background: true, prompt: "prove it" },
+});
+/** The SDK's answer to a background `Agent` call: launched, by the subagent's id (`AgentOutput` in sdk-tools.d.ts). */
+const agentLaunched = (agentId: string): Step =>
+  hook("PostToolUse", {
+    tool_name: "Agent",
+    tool_use_id: "toolu_agent",
+    tool_input: { prompt: "prove it" },
+    tool_response: {
+      status: "async_launched",
+      agentId,
+      description: "prove it",
+      prompt: "prove it",
+      outputFile: `/tmp/${agentId}.output`,
+    },
+  });
+
+const CANCEL_WARNING =
+  "a background subagent was still running when the run stopped waiting for it; the turn it woke was cancelled";
+const cancelWarnings = (warnings: string[], posted: RunnerEventPost[]) => ({
+  warned: warnings.filter((w) => w === `runner: ${CANCEL_WARNING}`).length,
+  posted: posted.filter(
+    (e) => e.type === "runner.warning" && e.payload.message === CANCEL_WARNING,
+  ).length,
+});
+
+test("a result while a background subagent runs, which the task list doesn't show, keeps the prompt open and the woken turn's tool call runs", async () => {
+  const seen: boolean[] = [];
+  const ran: string[] = [];
+  const warnings: string[] = [];
+  const { posted, post } = recorder();
+  const outcome = await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      success,
+      // idle: the subagent still runs, so stdin must still be open
+      atIdle(seen),
+      subagentStop,
+      wokenCall(ran),
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: async () => ({ decision: "approve" }) as never,
+    warn: (line) => warnings.push(line),
+  });
+  expect(seen).toEqual([false, true]);
+  expect(ran).toEqual(["ls"]);
+  expect(cancelWarnings(warnings, posted)).toEqual({ warned: 0, posted: 0 });
+  expect(outcome).toBe(0);
+});
+
+test("a background Agent call whose subagent hasn't started yet counts as unfinished", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      backgroundAgentCall,
+      agentLaunched("agent-1"),
+      success,
+      atIdle(seen),
+      subagentStart,
+      subagentStop,
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([false, true]);
+});
+
+test("a subagent that stopped before its launch result came leaves nothing unfinished", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      backgroundAgentCall,
+      subagentStart,
+      subagentStop,
+      agentLaunched("agent-1"),
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([true]);
+});
+
+test("a foreground Agent call's subagent starting and stopping beside a background launch leaves the background subagent counted", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      assistant(
+        {
+          type: "tool_use",
+          id: "toolu_fg",
+          name: "Agent",
+          input: { run_in_background: false, prompt: "look first" },
+        },
+        {
+          type: "tool_use",
+          id: "toolu_agent",
+          name: "Agent",
+          input: { prompt: "prove it" },
+        },
+      ),
+      hook("SubagentStart", { agent_id: "agent-fg", agent_type: "Explore" }),
+      hook("SubagentStop", {
+        agent_id: "agent-fg",
+        agent_type: "Explore",
+        last_assistant_message: "looked",
+      }),
+      hook("PostToolUse", {
+        tool_name: "Agent",
+        tool_use_id: "toolu_fg",
+        tool_input: { prompt: "look first" },
+        tool_response: {
+          status: "completed",
+          agentId: "agent-fg",
+          content: [{ type: "text", text: "looked" }],
+          prompt: "look first",
+        },
+      }),
+      agentLaunched("agent-1"),
+      success,
+      // the background subagent hasn't started: stdin must still be open
+      atIdle(seen),
+      subagentStart,
+      subagentStop,
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([false, true]);
+});
+
+test("a subagent started twice by one id, as a resume does, and stopped once leaves nothing unfinished", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      backgroundAgentCall,
+      agentLaunched("agent-1"),
+      subagentStart,
+      subagentStart,
+      subagentStop,
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([true]);
+});
+
+test("a background Agent call the gate denied launches nothing to wait for", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  let answers: unknown[] = [];
+  await runSession(
+    { ...config, approvalPolicy: ["Agent"] },
+    {
+      query: wakeProcess([
+        init,
+        backgroundAgentCall,
+        async (options: Options) => {
+          answers = await fire(options, "PreToolUse", {
+            tool_name: "Agent",
+            tool_use_id: "toolu_agent",
+            tool_input: { run_in_background: true, prompt: "prove it" },
+          });
+          return undefined;
+        },
+        success,
+        atIdle(seen),
+      ]),
+      post,
+      signal: new AbortController().signal,
+      awaitDecision: async () => ({
+        kind: "decided",
+        decision: { requestId: "req_x", decision: "deny" },
+      }),
+    },
+  );
+  expect(answers).toEqual([
+    expect.objectContaining({
+      hookSpecificOutput: expect.objectContaining({
+        permissionDecision: "deny",
+      }),
+    }),
+  ]);
+  expect(seen).toEqual([true]);
+});
+
+test("a subagent that stopped before the result leaves the prompt to close", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      subagentStop,
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([true]);
+});
+
+test("a background subagent that never finishes holds the prompt only for the hold, then the run ends with its result and a warning", async () => {
+  const seen: boolean[] = [];
+  const warnings: string[] = [];
+  const { post } = recorder();
+  const outcome = await runSession(config, {
+    query: wakeProcess([init, subagentStart, success, atIdle(seen)]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 5,
+  });
+  expect(seen).toEqual([true]);
+  expect(
+    warnings.some((w) => w.includes("1 background subagent(s) still running")),
+  ).toBe(true);
+  expect(outcome).toBe(0);
+});
+
+const holdWarnings = (warnings: string[]) =>
+  warnings.filter((w) => w.includes("minutes after the last result"));
+
+test("a nested subagent stopping with no result after it restarts the hold, and the run still ends when that hold expires", async () => {
+  const seen: boolean[] = [];
+  const warnings: string[] = [];
+  let warnedBeforeRestartedHoldEnds: number | undefined;
+  const { post } = recorder();
+  const outcome = await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      hook("SubagentStart", { agent_id: "agent-2", agent_type: "Explore" }),
+      // the hold (60 ms) starts here and outlasts the next step's 20 ms beat
+      success,
+      // agent-2 was agent-1's: its stop wakes agent-1, so no result follows
+      async (options: Options) => {
+        await fire(options, "SubagentStop", {
+          agent_id: "agent-2",
+          agent_type: "Explore",
+        });
+        // past where the first hold would have ended, and inside the restarted one
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        warnedBeforeRestartedHoldEnds = holdWarnings(warnings).length;
+        return undefined;
+      },
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 60,
+  });
+  expect(warnedBeforeRestartedHoldEnds).toBe(0);
+  expect(seen).toEqual([true]);
+  expect(holdWarnings(warnings)).toEqual([
+    expect.stringContaining("1 background subagent(s) still running"),
+  ]);
+  expect(outcome).toBe(0);
+});
+
+test("a task notification while the input is held open restarts the hold, and the run still ends when that hold expires", async () => {
+  const seen: boolean[] = [];
+  const warnings: string[] = [];
+  let warnedBeforeRestartedHoldEnds: number | undefined;
+  const { post } = recorder();
+  const outcome = await runSession(config, {
+    query: wakeProcess([
+      init,
+      backgroundTasks(1),
+      // the hold (30 ms) starts here, beside the next step's 20 ms beat, which ends first
+      success,
+      // the task list still shows the task, so no result follows the notification
+      async () => [
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "t0",
+          status: "completed",
+          output_file: "/tmp/t0.output",
+          summary: "claude -p /kru:reflect finished",
+          session_id: "sess-new",
+        },
+      ],
+      // this step's 20 ms beat starts with the restarted hold: it ends after the first hold's
+      // 30 ms (the notification came at least 20 ms in) and before the restarted one's
+      async () => {
+        warnedBeforeRestartedHoldEnds = holdWarnings(warnings).length;
+        return undefined;
+      },
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 30,
+  });
+  expect(warnedBeforeRestartedHoldEnds).toBe(0);
+  expect(seen).toEqual([true]);
+  expect(holdWarnings(warnings)).toEqual([
+    expect.stringContaining("1 background task(s) still running"),
+  ]);
+  expect(outcome).toBe(0);
+});
+
+test("a subagent stop and then a result with nothing unfinished close the input at that result, and no hold expires later", async () => {
+  const seen: boolean[] = [];
+  const warnings: string[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      success,
+      subagentStop,
+      success,
+      // past both the first hold and the one the stop restarted
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return undefined;
+      },
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 60,
+  });
+  expect(seen).toEqual([true]);
+  expect(holdWarnings(warnings)).toEqual([]);
+});
+
+/** A run whose hold (5 ms) expires over a running subagent before `afterClose` wakes it. */
+async function closedOverSubagent(...afterClose: unknown[]) {
+  const warnings: string[] = [];
+  const { posted, post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      success,
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        return undefined;
+      },
+      ...afterClose,
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 5,
+  });
+  return cancelWarnings(warnings, posted);
+}
+
+test("a woken turn's calls cancelled after the input closed over a running subagent are reported once as that, not as a refusal", async () => {
+  const ran: string[] = [];
+  expect(await closedOverSubagent(wokenCall(ran), wokenCall(ran))).toEqual({
+    warned: 1,
+    posted: 1,
+  });
+  expect(ran).toEqual([]);
+});
+
+test.each([
+  "[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown. Check whether it took effect before relying on it or running it again.]",
+  "[Request interrupted: the session ended before this agent finished. Nobody asked it to stop.]",
+])(
+  "a call cancelled with the SDK's session-ended text %#, after the input closed over a running subagent, is reported the same way",
+  async (ended) => {
+    expect(await closedOverSubagent(wokenCall([], ended))).toEqual({
+      warned: 1,
+      posted: 1,
+    });
+  },
+);
+
+test("a cancel delivered as text blocks in a tool result after the input closed over a running subagent is reported the same way", async () => {
+  expect(
+    await closedOverSubagent(async () => [
+      erroredResult([{ type: "text", text: REFUSAL_CANCEL }]),
+    ]),
+  ).toEqual({ warned: 1, posted: 1 });
+});
+
+test("the runner's own denials after the input closed over a running subagent are not reported as a cancel", async () => {
+  expect(
+    await closedOverSubagent(async () => [
+      erroredResult(
+        "The user denied this tool call.",
+        "The approval wait was cancelled.",
+        "The run is ending: run ended while waiting.",
+        "The user declined to answer.",
+      ),
+    ]),
+  ).toEqual({ warned: 0, posted: 0 });
+});
+
+test("a cancelled call while the input is still open is not reported as one the close cancelled", async () => {
+  const warnings: string[] = [];
+  const { posted, post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      subagentStart,
+      success,
+      async () => [erroredResult(REFUSAL_CANCEL)],
+      subagentStop,
+      success,
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+  });
+  expect(cancelWarnings(warnings, posted)).toEqual({ warned: 0, posted: 0 });
+});
+
+test("a cancelled call with no subagent running is not blamed on one", async () => {
+  const warnings: string[] = [];
+  const { posted, post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([init, success, wokenCall([])]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+  });
+  expect(warnings.filter((w) => w.includes("subagent"))).toEqual([]);
+  expect(cancelWarnings(warnings, posted)).toEqual({ warned: 0, posted: 0 });
+});
+
 test("without checks, the session is told nothing about them", async () => {
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
   try {
