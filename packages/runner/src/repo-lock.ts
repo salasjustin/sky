@@ -18,9 +18,10 @@ export class RepoLockBusyError extends Error {}
  * Runs `task` holding an exclusive `flock` on the shared repo's lock file, so runs starting at once on
  * one sprite take turns at everything that writes `.git` (worktree add, branch and config writes,
  * fetches). A child `flock` holds the lock while it reads stdin, so the kernel drops it when this
- * process dies and a lock file left behind never blocks anyone. Fails naming the lock file when
- * it stays held for `waitS` seconds. A `signal` aborted before the lock is taken stops the wait and
- * rejects with its reason, without running `task`; once `task` runs, it runs to the end.
+ * process dies and a lock file left behind never blocks anyone. Fails with a `RepoLockBusyError`
+ * naming the lock file when it stays held for `waitS` seconds. A `signal` aborted before the lock
+ * is taken stops the wait and rejects with its reason, without running `task`; once `task` runs, it
+ * runs to the end.
  */
 export async function withRepoLock<T>(
   repoDir: string,
