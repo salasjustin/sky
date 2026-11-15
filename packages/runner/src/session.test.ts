@@ -942,7 +942,7 @@ test("with a GitHub connector in its env, the session is told to publish through
       "The runner refreshed this repo from GitHub when this run started; what that changed, if anything, is in the notes at the end.",
     );
     expect(append).toContain(
-      `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` command: its other subcommands are the Sky API's, and run with none it refuses: only the Sky API starts a run.`,
+      `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` and \`sync\` commands. Its other subcommands are the Sky API's, and run with no subcommand it refuses, since only the Sky API starts a run.`,
     );
   } finally {
     vi.unstubAllEnvs();

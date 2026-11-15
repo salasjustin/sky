@@ -71,7 +71,12 @@ import {
   type SettingsDirs,
   settingsRedirects,
 } from "./settings-guard.js";
-import { prepareWorktree } from "./sync.js";
+import {
+  DEFAULT_MAX_COMMITS,
+  prepareWorktree,
+  type Refreshed,
+  SYNC_USAGE,
+} from "./sync.js";
 import { commitAll, diffRollup, headSha } from "./worktree.js";
 
 /** The Agent SDK's `query`, narrowed to what the runner calls; tests feed it scripted streams. */
@@ -207,6 +212,8 @@ export function sessionOptions(
   nestedLogin: NestedPrefix | undefined,
   /** The run's scratch directory; see `scratchDirOf`. */
   scratchDir?: string,
+  /** The default branch's tip the run's refresh reached; see `prepareWorktree`. */
+  refreshed?: Refreshed,
 ): Options {
   return {
     cwd,
@@ -233,7 +240,7 @@ export function sessionOptions(
       type: "preset",
       preset: "claude_code",
       append: [
-        ...(process.env[CONNECTOR_ENV] ? [publishInstructions()] : []),
+        ...(process.env[CONNECTOR_ENV] ? [publishInstructions(refreshed)] : []),
         ...(config.checks.length > 0
           ? [checkInstructions(config.checks, nestedLogin, scratchDir)]
           : []),
@@ -258,11 +265,18 @@ export function sessionOptions(
  * `gh` fail there; the runner reaches GitHub through the Sprites connector instead, refreshing the
  * repo before the session and publishing through its own `publish`.
  */
-const publishInstructions = () =>
+const publishInstructions = (refreshed?: Refreshed) =>
   [
     "This sandbox has no git transport and no GitHub credential: `git fetch`, `git pull` and `git push` fail here, and so does `gh`.",
+    "That is by design, not a fault to work around: the runner reaches GitHub for you.",
     "The runner refreshed this repo from GitHub when this run started; what that changed, if anything, is in the notes at the end.",
-    `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` command: its other subcommands are the Sky API's, and run with none it refuses: only the Sky API starts a run.`,
+    ...(refreshed
+      ? [
+          `\`origin/${refreshed.branch}\` is at GitHub's tip as of the start-of-run refresh: ${refreshed.sha.slice(0, 7)}, ${refreshed.at.toISOString().slice(0, 16).replace("T", " ")} UTC. The refresh touches only \`origin/${refreshed.branch}\`; local \`${refreshed.branch}\` stays where it was. A failed \`git fetch\` doesn't mean the base is stale.`,
+        ]
+      : []),
+    `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` and \`sync\` commands. Its other subcommands are the Sky API's, and run with no subcommand it refuses, since only the Sky API starts a run.`,
+    `Run \`${process.execPath} ${process.argv[1]} ${SYNC_USAGE}\` when GitHub's default branch may have moved while you worked: it refreshes \`origin/<default>\` through the connector and prints the new tip and how many commits GitHub's branch gained or dropped. If GitHub is more than ${DEFAULT_MAX_COMMITS} commits ahead it stops and leaves \`origin/<default>\` where it was. It changes no local branch or worktree.`,
     "To publish your branch and open a pull request, commit your work, then run",
     `\`${process.execPath} ${process.argv[1]} ${PUBLISH_USAGE}\``,
     "instead of `git push` or `gh pr create`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and prints its URL. Run it again after more commits to update the same pull request.",
@@ -590,8 +604,9 @@ export async function runSession(
 
   let cwd: string;
   let notes: string[];
+  let refreshed: Refreshed | undefined;
   try {
-    ({ cwd, notes } = await prepareWorktree(config, {
+    ({ cwd, notes, refreshed } = await prepareWorktree(config, {
       // what the session's own `publish` reads, so the sync looks where it publishes
       env: { ...process.env, ...config.sessionEnv },
       warn,
@@ -993,6 +1008,7 @@ export async function runSession(
         deps.seal.spawn,
         nestedLogin?.prefix,
         scratch,
+        refreshed,
       ),
     });
     for await (const message of stream) {
