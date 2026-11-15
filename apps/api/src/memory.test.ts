@@ -12,7 +12,13 @@ import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import type { RunId } from "@sky/shared";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { collectDiagnostics, killLinesWithin, parseFree } from "./memory.js";
+import {
+  collectDiagnostics,
+  type Diagnostics,
+  killLinesWithin,
+  parseFree,
+  restartSince,
+} from "./memory.js";
 import { KnownSecrets } from "./redact.js";
 import { SPRITES_TIMEOUT_MS, type SpriteOps } from "./sprites.js";
 import { spritesToken, stubSprites } from "./testing/sprites.js";
@@ -272,4 +278,73 @@ test("the real diagnostics script reports an unreadable dmesg as such and finds 
   expect(diagnostics.text).toContain("dmesg not readable");
   expect(diagnostics.killLines).toEqual([]);
   expect(diagnostics.memory?.availableMb).toBe(6200);
+});
+
+// the runner up at 1_000 s, the probe set out and the report taken at 1_600 s (epoch ms): with the 30 s
+// margin at both edges, only a restart strictly between 1_030 s and 1_570 s is inside the run
+const span = {
+  runnerStartedAt: 1_000_000,
+  probeStartedAt: 1_600_000,
+  now: 1_600_000,
+};
+const ages = (bootAgeSec?: number, initAgeSec?: number): Diagnostics => ({
+  text: "",
+  killLines: [],
+  bootAgeSec,
+  initAgeSec,
+});
+
+test.each([
+  [31, "at 1_569 s, the probe's side"],
+  [30.5, "at 1_569.5 s, the probe's side"],
+  [569, "at 1_031 s, the runner's side"],
+  [569.5, "at 1_030.5 s, the runner's side"],
+])("restartSince counts a boot %s s old (%s) as a reboot", (ageSec) => {
+  expect(restartSince(ages(ageSec), span)).toEqual({
+    kind: "rebooted",
+    ageSec,
+  });
+});
+
+test.each([
+  [30, "at 1_570 s, the probe's margin itself"],
+  [29.5, "at 1_570.5 s, past the probe's margin"],
+  [570, "at 1_030 s, the runner's margin itself"],
+  [570.5, "at 1_029.5 s, inside the runner's margin"],
+])("restartSince counts a boot %s s old (%s) as no restart", (ageSec) => {
+  expect(restartSince(ages(ageSec), span)).toBeUndefined();
+});
+
+test("restartSince reads the init age by the same edges, as a processes restart", () => {
+  expect(restartSince(ages(24_000, 569.5), span)).toEqual({
+    kind: "processes",
+    ageSec: 569.5,
+  });
+  expect(restartSince(ages(24_000, 30.5), span)).toEqual({
+    kind: "processes",
+    ageSec: 30.5,
+  });
+  expect(restartSince(ages(24_000, 30), span)).toBeUndefined();
+  expect(restartSince(ages(24_000, 570), span)).toBeUndefined();
+});
+
+test("restartSince names a reboot over a processes restart when both ages are inside the run", () => {
+  expect(restartSince(ages(300, 200), span)).toEqual({
+    kind: "rebooted",
+    ageSec: 300,
+  });
+});
+
+test("restartSince counts a report without ages as no restart", () => {
+  expect(restartSince(ages(), span)).toBeUndefined();
+});
+
+test("restartSince reads each age against the `now` it is given", () => {
+  const later = { ...span, now: 1_700_000 };
+  // 569.5 s before 1_700 s is 1_130.5 s: inside; 100 s before is 1_600 s: after the probe's margin
+  expect(restartSince(ages(569.5), later)).toEqual({
+    kind: "rebooted",
+    ageSec: 569.5,
+  });
+  expect(restartSince(ages(100), later)).toBeUndefined();
 });
