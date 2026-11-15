@@ -238,8 +238,9 @@ const blobId = (bytes: Buffer) =>
  * Makes every blob of `blobs` present in the repo `g` runs in. The ones it lacks come from one
  * tarball of `sha`, whose gateway cost doesn't grow with the file count, when at least `archiveFrom`
  * are missing. The archive is read as it downloads and each file is written to the object store in
- * turn, so memory is the largest file, not the archive. A blob the archive doesn't carry as git
- * stores it (an `export-ignore` or `export-subst` attribute changes the bytes) is fetched by itself.
+ * turn, so memory is the largest file, not the archive. A blob the archive leaves out or doesn't
+ * carry as git stores it (`export-ignore` drops the file, `export-subst` changes its bytes), or one
+ * past the walker's size cap, is fetched by itself.
  * An archive that fails for any reason but a rate limit or a failed local write is given up where it
  * stopped, said on one line, and every blob still missing is fetched by itself.
  */
