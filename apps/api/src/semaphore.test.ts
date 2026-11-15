@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { createSemaphore } from "./semaphore.js";
 
 const gate = () => {
@@ -20,15 +20,15 @@ test("no more than the limit run at once, and each waiting task starts when a sl
       return i;
     }),
   );
-  await Promise.resolve();
+  // a free slot runs its task synchronously, so only the first two have started
   expect(started).toEqual([0, 1]);
 
   gates[1]?.open();
   await runs[1];
-  await Promise.resolve();
-  expect(started).toEqual([0, 1, 2]);
+  await vi.waitFor(() => expect(started).toEqual([0, 1, 2]));
 
   gates[0]?.open();
+  await vi.waitFor(() => expect(started).toEqual([0, 1, 2, 3]));
   gates[2]?.open();
   gates[3]?.open();
   expect(await Promise.all(runs)).toEqual([0, 1, 2, 3]);
