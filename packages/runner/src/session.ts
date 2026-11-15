@@ -71,7 +71,12 @@ import {
   type SettingsDirs,
   settingsRedirects,
 } from "./settings-guard.js";
-import { prepareWorktree, type Refreshed, SYNC_USAGE } from "./sync.js";
+import {
+  DEFAULT_MAX_COMMITS,
+  prepareWorktree,
+  type Refreshed,
+  SYNC_USAGE,
+} from "./sync.js";
 import { commitAll, diffRollup, headSha } from "./worktree.js";
 
 /** The Agent SDK's `query`, narrowed to what the runner calls; tests feed it scripted streams. */
@@ -267,11 +272,11 @@ const publishInstructions = (refreshed?: Refreshed) =>
     "The runner refreshed this repo from GitHub when this run started; what that changed, if anything, is in the notes at the end.",
     ...(refreshed
       ? [
-          `That refresh moved \`origin/${refreshed.branch}\` to GitHub's tip, ${refreshed.sha.slice(0, 7)}, as of ${refreshed.at.toISOString().slice(0, 16).replace("T", " ")} UTC. Only \`origin/${refreshed.branch}\` moves; local \`${refreshed.branch}\` stays where it was. A failed \`git fetch\` doesn't mean the base is stale.`,
+          `\`origin/${refreshed.branch}\` is at GitHub's tip as of the start-of-run refresh: ${refreshed.sha.slice(0, 7)}, ${refreshed.at.toISOString().slice(0, 16).replace("T", " ")} UTC. The refresh touches only \`origin/${refreshed.branch}\`; local \`${refreshed.branch}\` stays where it was. A failed \`git fetch\` doesn't mean the base is stale.`,
         ]
       : []),
-    `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` command: its other subcommands are the Sky API's, and run with none it refuses: only the Sky API starts a run.`,
-    `The one other command you may run is \`${process.execPath} ${process.argv[1]} ${SYNC_USAGE}\`, when GitHub's default branch may have moved while you worked: it refreshes \`origin/<default>\` the same way and prints the new tip and how many commits it moved. It changes no local branch or worktree.`,
+    `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` and \`sync\` commands: its other subcommands are the Sky API's, and run with none it refuses: only the Sky API starts a run.`,
+    `Run \`${process.execPath} ${process.argv[1]} ${SYNC_USAGE}\` when GitHub's default branch may have moved while you worked: it refreshes \`origin/<default>\` through the connector and prints the new tip and how many commits GitHub's branch gained or dropped. If GitHub is more than ${DEFAULT_MAX_COMMITS} commits ahead it stops and leaves \`origin/<default>\` where it was. It changes no local branch or worktree.`,
     "To publish your branch and open a pull request, commit your work, then run",
     `\`${process.execPath} ${process.argv[1]} ${PUBLISH_USAGE}\``,
     "instead of `git push` or `gh pr create`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and prints its URL. Run it again after more commits to update the same pull request.",

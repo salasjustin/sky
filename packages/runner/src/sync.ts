@@ -38,7 +38,7 @@ export class BranchNotFoundError extends Error {
 /** The branch is more commits ahead of anything here than a fetch takes. */
 export class TooFarError extends Error {}
 
-const DEFAULT_MAX_COMMITS = 100;
+export const DEFAULT_MAX_COMMITS = 100;
 /** Pages of the default branch's listing `fetchStartBranch` reads before calling a branch too far. */
 const MAX_LISTING_PAGES = 10;
 
@@ -801,14 +801,18 @@ export const SYNC_USAGE = "sync";
 /**
  * `runner.mjs sync`, run by the agent from its worktree: brings `origin/<default>` to GitHub's tip
  * again, for a default branch that moved while the run worked. Prints what it did on stdout and
- * returns the exit status: 0 for a tip refreshed or already current, 2 for a usage or config error,
- * 1 for anything else. It moves no local branch and touches no worktree.
+ * returns the exit status: 0 for `--help` or a tip refreshed or already current, 2 for a usage or
+ * config error, 1 for anything else. It moves no local branch and touches no worktree.
  */
 export async function syncMain(
   argv: string[],
   env: NodeJS.ProcessEnv,
   io: { cwd: string; stdout: (s: string) => void; stderr: (s: string) => void },
 ): Promise<number> {
+  if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
+    io.stdout(`usage: ${SYNC_USAGE}\n`);
+    return 0;
+  }
   if (argv.length > 0) {
     io.stderr(`sky sync: takes no arguments\nusage: ${SYNC_USAGE}\n`);
     return 2;
@@ -853,14 +857,37 @@ export async function syncMain(
       );
       return 0;
     }
-    const ahead = synced.previous
-      ? Number(
-          await g(["rev-list", "--count", `${synced.previous}..${synced.sha}`]),
-        )
-      : undefined;
-    io.stdout(
-      `origin/${name} moved ${synced.previous ? `from ${short(synced.previous)} ` : ""}to GitHub's tip ${short(synced.sha)}${ahead === undefined ? "" : `, ${commits(ahead)} ahead`}. Your worktree and local ${name} were not changed.\n`,
-    );
+    const unchanged = `Your worktree and local ${name} were not changed.`;
+    const tip = `GitHub's tip ${short(synced.sha)}`;
+    if (!synced.previous) {
+      io.stdout(`origin/${name} moved to ${tip}. ${unchanged}\n`);
+      return 0;
+    }
+    const from = short(synced.previous);
+    // left: only in the old tip (dropped by GitHub); right: only in the new one
+    const [dropped = 0, added = 0] = (
+      await g([
+        "rev-list",
+        "--left-right",
+        "--count",
+        `${synced.previous}...${synced.sha}`,
+      ])
+    )
+      .split(/\s+/)
+      .map(Number);
+    if (dropped === 0) {
+      io.stdout(
+        `origin/${name} moved from ${from} to ${tip}, ${commits(added)} ahead. ${unchanged}\n`,
+      );
+    } else if (added === 0) {
+      io.stdout(
+        `origin/${name} moved back from ${from} to ${tip}: GitHub's ${name} dropped ${commits(dropped)}. ${unchanged}\n`,
+      );
+    } else {
+      io.stdout(
+        `origin/${name} moved from ${from} to ${tip}: GitHub's ${name} was rewritten, with ${commits(added)} added and ${commits(dropped)} dropped. ${unchanged}\n`,
+      );
+    }
     return 0;
   } catch (error) {
     io.stderr(`sky sync: ${messageOf(error)}\n`);

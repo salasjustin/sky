@@ -1835,7 +1835,7 @@ test("the run's prompt names the origin tip the refresh reached, with its short 
 
     expect(code).toBe(0);
     expect(append).toContain(
-      `That refresh moved \`origin/trunk\` to GitHub's tip, ${tip.slice(0, 7)}, as of 2026-03-04 05:06 UTC.`,
+      `\`origin/trunk\` is at GitHub's tip as of the start-of-run refresh: ${tip.slice(0, 7)}, 2026-03-04 05:06 UTC.`,
     );
     expect(append).toContain("`git fetch`");
     expect(append).toContain("That is by design");
@@ -1854,7 +1854,38 @@ test("a run whose refresh failed claims no refreshed tip", async () => {
 
   const { append } = await runOnce();
 
-  expect(append).not.toContain("That refresh moved");
+  expect(append).not.toContain("is at GitHub's tip as of");
+});
+
+test("the run's prompt allows publish and sync in one sentence and says sync goes through the connector with a 100-commit limit", async () => {
+  const { append = "" } = await runOnce();
+
+  const allowed = `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` and \`sync\` commands: its other subcommands are the Sky API's, and run with none it refuses: only the Sky API starts a run.`;
+  expect(append.split(allowed)).toHaveLength(2);
+  expect(append).not.toContain("only for its `publish` command");
+  expect(append).not.toContain("one other command");
+  expect(append).not.toContain("the same way");
+  expect(append).toContain(
+    "refreshes `origin/<default>` through the connector",
+  );
+  expect(append).toContain("more than 100 commits ahead");
+});
+
+test("the run's prompt names the tip of an origin that was already current without claiming it moved", async () => {
+  const tip = git(repoDir, "rev-parse", "origin/trunk");
+
+  const { append = "" } = await runOnce();
+
+  expect(append).toMatch(
+    new RegExp(
+      `\`origin/trunk\` is at GitHub's tip as of the start-of-run refresh: ${tip.slice(0, 7)}, \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} UTC\\.`,
+    ),
+  );
+  expect(append).toContain("local `trunk` stays where it was");
+  expect(append).toContain(
+    "A failed `git fetch` doesn't mean the base is stale.",
+  );
+  expect(append).not.toMatch(/moved `origin\//);
 });
 
 const syncRun = async (cwd: string, env: NodeJS.ProcessEnv = ENV) => {
@@ -1898,6 +1929,62 @@ test("sync with no change says nothing moved", async () => {
     out: `origin/trunk is already at GitHub's tip ${tip.slice(0, 7)}; nothing moved.\n`,
     err: "",
   });
+});
+
+test("sync after GitHub moved its default branch back says how many commits GitHub's branch dropped", async () => {
+  const a = pushToGitHub("trunk", "a.txt", "a\n");
+  pushToGitHub("trunk", "b.txt", "b\n");
+  const c = pushToGitHub("trunk", "c.txt", "c\n");
+  const { cwd } = await prepare();
+  git(seed, "push", "-qf", remote, `${a}:refs/heads/trunk`);
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 0,
+    out: `origin/trunk moved back from ${c.slice(0, 7)} to GitHub's tip ${a.slice(0, 7)}: GitHub's trunk dropped 2 commits. Your worktree and local trunk were not changed.\n`,
+    err: "",
+  });
+  expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(a);
+});
+
+test("sync after GitHub rewrote its default branch says how many commits were added and dropped", async () => {
+  const a = pushToGitHub("trunk", "a.txt", "a\n");
+  const b = pushToGitHub("trunk", "b.txt", "b\n");
+  const { cwd } = await prepare();
+  git(seed, "checkout", "-q", "-B", "trunk", a);
+  commitIn(seed, "c.txt", "c\n", "c");
+  const d = commitIn(seed, "d.txt", "d\n", "d");
+  git(seed, "push", "-qf", remote, `${d}:refs/heads/trunk`);
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 0,
+    out: `origin/trunk moved from ${b.slice(0, 7)} to GitHub's tip ${d.slice(0, 7)}: GitHub's trunk was rewritten, with 2 commits added and 1 commit dropped. Your worktree and local trunk were not changed.\n`,
+    err: "",
+  });
+  expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(d);
+});
+
+test("sync --help and -h print the usage on stdout and exit 0, before any connector check", async () => {
+  for (const flag of ["--help", "-h"]) {
+    const io = { out: "", err: "" };
+    const code = await syncMain([flag], {}, {
+      cwd: root,
+      stdout: (s) => {
+        io.out += s;
+      },
+      stderr: (s) => {
+        io.err += s;
+      },
+    });
+    expect({ code, ...io }).toEqual({
+      code: 0,
+      out: "usage: sync\n",
+      err: "",
+    });
+  }
 });
 
 test("sync reports a failed refresh plainly, with no credential in it", async () => {
