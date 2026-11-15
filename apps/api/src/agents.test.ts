@@ -3027,14 +3027,26 @@ test("a runner gone from a sprite with memory at the floor and no kill line is r
   );
 });
 
-/** Moves the run's start back `ms`, so a sprite can have booted after it began, or before. */
-const beganAgo = (runId: string, ms: number) =>
+/**
+ * Moves the run's `run.started` back `startedMs` and its creation back `createdMs` (as far, by
+ * default), so a sprite can have booted while its runner ran, before, or between the two.
+ */
+const beganAgo = (runId: string, startedMs: number, createdMs = startedMs) => {
   db.$client
     .prepare("update runs set created_at = ? where id = ?")
-    .run(new Date(Date.now() - ms).toISOString(), runId);
+    .run(new Date(Date.now() - createdMs).toISOString(), runId);
+  db.$client
+    .prepare(
+      "update events set ts = ? where run_id = ? and type = 'run.started'",
+    )
+    .run(new Date(Date.now() - startedMs).toISOString(), runId);
+};
 
-/** Gives the run a Bash call, then lets its runner be found gone on a sprite reporting `report`. */
-async function sweepGoneRun(report: string, secrets = new KnownSecrets()) {
+/** Gives the run a Bash call, then lets its runner be found gone on a sprite reporting `report`; `began` is as `beganAgo`'s. */
+async function sweepGoneRun(
+  report: string,
+  began = { startedMs: 600_000, createdMs: 600_000 },
+) {
   const envId = readyEnv();
   const { run, token } = await runningRun(envId);
   await postEvent(token, {
@@ -3042,7 +3054,7 @@ async function sweepGoneRun(report: string, secrets = new KnownSecrets()) {
     type: "run.started",
     payload: { sessionId: "s" },
   });
-  beganAgo(run.id, 600_000);
+  beganAgo(run.id, began.startedMs, began.createdMs);
   await postEvent(token, {
     runId: run.id,
     type: "claude.PreToolUse",
@@ -3054,20 +3066,24 @@ async function sweepGoneRun(report: string, secrets = new KnownSecrets()) {
   });
   pgrepAnswers(1);
   diagnosticsAnswer(report);
-  const { prober } = proberOver(secrets);
+  const { prober } = proberOver();
   await prober.sweep(silentFor(config.runProbeMs + 1000));
   return { run, sprite: spriteNameFor(envId) };
 }
 
-test("a runner gone from a machine that booted after the run began fails as sandbox_restarted (machine rebooted), with the time, load and last command", async () => {
+// a restart this long before the diagnostics falls well inside a run started 600 s ago, and well before its probe
+const RESTART_SEC = 300;
+
+test("a runner gone from a machine that booted while the runner ran fails as sandbox_restarted (machine rebooted), naming the sprite, with the time, load and last command", async () => {
   const { run, sprite } = await sweepGoneRun(
-    diagnosticsReport({ availableMb: 5_000, bootSec: 40 }),
+    diagnosticsReport({ availableMb: 5_000, bootSec: RESTART_SEC }),
   );
 
   const error = runFailure(run.id);
   expect(error).toMatch(
     /^sandbox_restarted: the sandbox restarted at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC /,
   );
+  expect(error).toContain(`while this run was working on sprite ${sprite} (`);
   expect(error).toContain("the machine rebooted");
   expect(error).toContain("5-min load 4.2");
   expect(error).toContain("the last command was: pnpm test:e2e --workers 8");
@@ -3076,13 +3092,18 @@ test("a runner gone from a machine that booted after the run began fails as sand
   );
 });
 
-test("a runner gone from a machine whose pid 1 started after the run began, though it booted long before, fails as sandbox_restarted (processes restarted)", async () => {
-  const { run } = await sweepGoneRun(
-    diagnosticsReport({ availableMb: 5_000, bootSec: 24_000, initSec: 120 }),
+test("a runner gone from a machine whose pid 1 started while the runner ran, though it booted long before, fails as sandbox_restarted (processes restarted)", async () => {
+  const { run, sprite } = await sweepGoneRun(
+    diagnosticsReport({
+      availableMb: 5_000,
+      bootSec: 24_000,
+      initSec: RESTART_SEC,
+    }),
   );
 
   const error = runFailure(run.id);
   expect(error).toMatch(/^sandbox_restarted: the sandbox restarted at /);
+  expect(error).toContain(`on sprite ${sprite}`);
   expect(error).toContain("its processes restarted");
   expect(error).not.toContain("the machine rebooted");
 });
@@ -3091,7 +3112,7 @@ test("a restart is named even when the sprite is low on memory or logged a kill"
   const { run } = await sweepGoneRun(
     diagnosticsReport({
       availableMb: 10,
-      bootSec: 30,
+      bootSec: RESTART_SEC,
       kernel: [kernelLine(0, "Out of memory: Killed process 3912 (node)")],
     }),
   );
@@ -3107,7 +3128,58 @@ test("a runner gone from a sprite that did not restart stays runner_lost, howeve
   );
 });
 
-test("the sandbox_restarted message redacts secrets in the last command and cuts it short", async () => {
+// created 600 s ago, its runner up 60 s ago: a sprite booted 300 s ago was woken to launch it
+const launchWake = { startedMs: 60_000, createdMs: 600_000 };
+
+test("a runner gone from a sprite that booted after the run was created, to launch it, is runner_lost: the boot is the launch's, not a restart", async () => {
+  const { run, sprite } = await sweepGoneRun(
+    diagnosticsReport({ availableMb: 5_000, bootSec: RESTART_SEC }),
+    launchWake,
+  );
+  expect(runFailure(run.id)).toBe(
+    `runner_lost: its runner is gone from sprite ${sprite}`,
+  );
+});
+
+test("a runner gone after a kill line from a sprite booted to launch the run is runner_killed, not sandbox_restarted", async () => {
+  const { run, sprite } = await sweepGoneRun(
+    diagnosticsReport({
+      availableMb: 5_000,
+      bootSec: RESTART_SEC,
+      kernel: [kernelLine(0, "Out of memory: Killed process 3912 (node)")],
+    }),
+    launchWake,
+  );
+  const error = runFailure(run.id);
+  expect(error).toMatch(
+    /^runner_killed: the sprite killed the runner, likely out of memory/,
+  );
+  expect(error).toContain(sprite);
+});
+
+test("a runner gone from a sprite that booted after the probe began, the probe's own wake of a cold pause, stays runner_lost", async () => {
+  const { run, sprite } = await sweepGoneRun(
+    diagnosticsReport({ availableMb: 5_000, bootSec: 2, initSec: 2 }),
+  );
+  expect(runFailure(run.id)).toBe(
+    `runner_lost: its runner is gone from sprite ${sprite}`,
+  );
+});
+
+test("a runner gone from a sprite whose pid 1 started after the probe began, though it booted long before, stays runner_lost", async () => {
+  const { run, sprite } = await sweepGoneRun(
+    diagnosticsReport({ availableMb: 5_000, bootSec: 24_000, initSec: 2 }),
+  );
+  expect(runFailure(run.id)).toBe(
+    `runner_lost: its runner is gone from sprite ${sprite}`,
+  );
+});
+
+/** Lets a started run's runner be found gone on a restarted sprite, its last Bash call stored as `input`. */
+async function restartWithStoredInput(
+  input: string,
+  secrets = new KnownSecrets(),
+) {
   const envId = readyEnv();
   const { run, token } = await runningRun(envId);
   await postEvent(token, {
@@ -3116,24 +3188,61 @@ test("the sandbox_restarted message redacts secrets in the last command and cuts
     payload: { sessionId: "s" },
   });
   beganAgo(run.id, 600_000);
-  // stored as the API trims it: past EVENT_TEXT_MAX, so no longer valid JSON
+  // stored straight, so the API's ingest neither redacts nor trims it further
   insertEvent(run.id, "claude.PreToolUse", Date.now() + 1, {
     toolName: "Bash",
     toolUseId: "t1",
-    input: `{"command":"curl -H 'x: hunter2-hunter2' ${"a".repeat(500)}`,
+    input,
   });
   pgrepAnswers(1);
-  diagnosticsAnswer(diagnosticsReport({ availableMb: 5_000, bootSec: 30 }));
-  const secrets = new KnownSecrets();
-  secrets.add("PROJECT_TOKEN", "hunter2-hunter2");
+  diagnosticsAnswer(
+    diagnosticsReport({ availableMb: 5_000, bootSec: RESTART_SEC }),
+  );
   const { prober } = proberOver(secrets);
   await prober.sweep(silentFor(config.runProbeMs + 1000));
+  return runFailure(run.id) ?? "";
+}
 
-  const error = runFailure(run.id) ?? "";
+test("the sandbox_restarted message redacts secrets in the last command and cuts it short", async () => {
+  const secrets = new KnownSecrets();
+  secrets.add("PROJECT_TOKEN", "hunter2-hunter2");
+  // as the API trims it: past EVENT_TEXT_MAX, so no longer valid JSON
+  const error = await restartWithStoredInput(
+    `{"command":"curl -H 'x: hunter2-hunter2' ${"a".repeat(500)}`,
+    secrets,
+  );
+
   expect(error).toContain("the last command was: curl -H 'x: [redacted]' aaa");
   expect(error).not.toContain("hunter2");
   expect(error.length).toBeLessThan(900);
   expect(error.endsWith("…")).toBe(true);
+});
+
+test("a redacted last command under the limit gets no …, though its raw form was longer", async () => {
+  const secret = `tok-${"k".repeat(400)}`;
+  const secrets = new KnownSecrets();
+  secrets.add("PROJECT_TOKEN", secret);
+  const error = await restartWithStoredInput(
+    JSON.stringify({ command: `curl -H 'x: ${secret}' https://example.test` }),
+    secrets,
+  );
+
+  expect(
+    error.endsWith(
+      "the last command was: curl -H 'x: [redacted]' https://example.test",
+    ),
+  ).toBe(true);
+  expect(error).not.toContain(secret);
+});
+
+test("a trimmed stored input's last command is shown unescaped", async () => {
+  const command = `echo "hi"\nls ${"a".repeat(500)}`;
+  const stored = JSON.stringify({ command });
+  // cut inside the command, as the API trims an input past EVENT_TEXT_MAX
+  const error = await restartWithStoredInput(stored.slice(0, 200));
+
+  expect(error).toContain('the last command was: echo "hi"\nls aaa');
+  expect(error).not.toContain('\\"');
 });
 
 test("the diagnostics file is removed from the sprite even when reading it back fails", async () => {

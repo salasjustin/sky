@@ -387,10 +387,33 @@ export function silentRuns(
   return runningRuns(db, (last) => sql`${last} < ${cutoff}`, now);
 }
 
+/** When the run's latest `run.started` was recorded, in epoch ms: its runner was up by then. Undefined without one. */
+export function runnerStartedAt(db: Db, runId: RunId): number | undefined {
+  const row = db
+    .select({ ts: events.ts })
+    .from(events)
+    .where(and(eq(events.runId, runId), eq(events.type, "run.started")))
+    .orderBy(desc(events.id))
+    .limit(1)
+    .get();
+  return row ? Date.parse(row.ts) : undefined;
+}
+
+// the end of a JSON string cut inside a `\uXXXX` escape; `lastBashCommand`'s pattern never captures a trailing lone `\`
+const SPLIT_ESCAPE = /\\u[0-9a-fA-F]{0,3}$/;
+
+const unescapeJson = (text: string): string | undefined => {
+  try {
+    return JSON.parse(`"${text}"`) as string;
+  } catch {
+    return undefined;
+  }
+};
+
 /**
  * The command of the run's latest `claude.PreToolUse` of the Bash tool, as stored (already redacted
  * and trimmed); undefined when it ran none. A trimmed input isn't valid JSON, so its command is cut
- * out of the text.
+ * out of the text and unescaped, less an escape the trim split; still JSON-escaped when that fails.
  */
 export function lastBashCommand(db: Db, runId: RunId): string | undefined {
   const row = db
@@ -412,7 +435,13 @@ export function lastBashCommand(db: Db, runId: RunId): string | undefined {
     const { command } = JSON.parse(input) as { command?: unknown };
     return typeof command === "string" ? command : undefined;
   } catch {
-    return /"command":\s*"((?:[^"\\]|\\.)*)/.exec(input)?.[1];
+    const escaped = /"command":\s*"((?:[^"\\]|\\.)*)/.exec(input)?.[1];
+    if (escaped === undefined) return undefined;
+    return (
+      unescapeJson(escaped) ??
+      unescapeJson(escaped.replace(SPLIT_ESCAPE, "")) ??
+      escaped
+    );
   }
 }
 
@@ -480,8 +509,9 @@ export function recordProbe(
 }
 
 /**
- * Fails, with `error` (`runner_lost` or `runner_killed`), a run that is still `running` and has no
- * event past `lastEventId`, the latest it had when the probe began: the probe found its runner gone.
+ * Fails, with `error` (`runner_lost`, `runner_killed` or `sandbox_restarted`), a run that is still
+ * `running` and has no event past `lastEventId`, the latest it had when the probe began: the probe
+ * found its runner gone.
  * A later event means the runner spoke meanwhile, and the sweep's next window judges it. Event ids,
  * not clock times: a fast host can stamp the last event and the probe's start in the same millisecond.
  * The sprite's `diagnostics`, when collected, are recorded as a `runner.warning` just before the

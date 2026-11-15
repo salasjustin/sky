@@ -55,13 +55,14 @@ const UPTIME_MARK = "== seconds since boot";
 const INIT_MARK = "== seconds since pid 1 started";
 
 // into a file rather than back over the exec: its frames carry no length, and a few KB re-chunked by an
-// intermediary is misread (see `execLogged`); each command's failure is part of the report, never the script's
+// intermediary is misread (see `execLogged`); each command's failure is part of the report, never the script's.
+// `LC_ALL=C`: a locale with a comma decimal prints the load as `0,52, 0,58`, which `parseLoad5` misreads
 const DIAGNOSTICS_SCRIPT = `{
 echo "== free -m"; free -m
-echo "== uptime"; uptime
+echo "== uptime"; LC_ALL=C uptime
 echo "${UPTIME_MARK}"; cut -d' ' -f1 /proc/uptime
-echo "${INIT_MARK}"; ps -o etimes= -p 1
-echo "== top processes by RSS (pid ppid rss_kb elapsed command)"; ps -eo pid=,ppid=,rss=,etime=,args= --sort=-rss | head -n 12 | cut -c1-240
+echo "${INIT_MARK}"; LC_ALL=C ps -o etimes= -p 1
+echo "== top processes by RSS (pid ppid rss_kb elapsed command)"; LC_ALL=C ps -eo pid=,ppid=,rss=,etime=,args= --sort=-rss | head -n 12 | cut -c1-240
 echo "${KERNEL_MARK}"; if k=$(dmesg 2>&1); then printf '%s\\n' "$k" | grep -iE '${KERNEL_KILL}' | tail -n 8 | cut -c1-240; else echo "dmesg not readable"; fi
 } >"$1" 2>&1; exit 0`;
 
@@ -121,17 +122,37 @@ export type Diagnostics = {
   load5?: number;
 };
 
+/** How the sprite restarted, and how many seconds before the diagnostics were taken. */
+export type Restart = { kind: "rebooted" | "processes"; ageSec: number };
+
+// how far inside the runner's run a restart must fall; it also absorbs the latency between the report's
+// ages being taken and the `now` they're read against
+const RESTART_MARGIN_SEC = 30;
+
 /**
- * Whether a sprite restarted after a run began `runAgeSec` ago: the machine booted since (`rebooted`),
- * or booted earlier but its pid 1 started since, so its processes were reset (`processes`). A report
- * without the ages says nothing, so counts as no restart.
+ * Whether a sprite restarted under a running runner: the machine booted (`rebooted`), or booted
+ * earlier but its pid 1 started (`processes`), at `now - ageSec`, more than `RESTART_MARGIN_SEC` after
+ * `runnerStartedAt` (the run's `run.started`) and more than that before `probeStartedAt` (when the
+ * probe's first exec on the sprite set out), all epoch ms. Not a restart: a boot before the runner was
+ * up, such as the launch's wake of a cold sprite, or after the probe set out, which is the probe's own
+ * wake of a sprite that slept under the run. A report without the ages counts as no restart.
  */
 export function restartSince(
   { bootAgeSec, initAgeSec }: Diagnostics,
-  runAgeSec: number,
-): "rebooted" | "processes" | undefined {
-  if (bootAgeSec !== undefined && bootAgeSec < runAgeSec) return "rebooted";
-  if (initAgeSec !== undefined && initAgeSec < runAgeSec) return "processes";
+  span: { runnerStartedAt: number; probeStartedAt: number; now: number },
+): Restart | undefined {
+  const after = span.runnerStartedAt + RESTART_MARGIN_SEC * 1000;
+  const before = span.probeStartedAt - RESTART_MARGIN_SEC * 1000;
+  const within = (ageSec: number) => {
+    const at = span.now - ageSec * 1000;
+    return at > after && at < before;
+  };
+  if (bootAgeSec !== undefined && within(bootAgeSec)) {
+    return { kind: "rebooted", ageSec: bootAgeSec };
+  }
+  if (initAgeSec !== undefined && within(initAgeSec)) {
+    return { kind: "processes", ageSec: initAgeSec };
+  }
   return undefined;
 }
 
