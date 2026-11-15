@@ -21,8 +21,6 @@ import {
   gateway,
 } from "./publish.js";
 import {
-  BLOB_FETCH_CONCURRENCY,
-  eachLimited,
   fetchMissing,
   git,
   messageOf,
@@ -33,7 +31,7 @@ import {
   type TreeItem,
   writeBlob,
 } from "./store.js";
-import { readTarball } from "./tarball.js";
+import { walkTarball } from "./tarball.js";
 
 export const REPO_PULL_USAGE = "repo-pull <owner/repo> <dir>";
 
@@ -229,31 +227,21 @@ async function removeAbandonedIndexes(gitDir: string): Promise<void> {
 // a fetch that lacks fewer blobs than this asks for them one by one; more come as one archive
 const ARCHIVE_FROM = 20;
 
-/**
- * The files of `sha`'s tarball by path. A failure the gateway didn't name, such as an archive that
- * won't inflate, is a `GatewayError` naming the call too.
- */
-async function readArchive(
-  call: ReturnType<typeof gateway>,
-  sha: string,
-): Promise<Map<string, Buffer>> {
-  const path = `/tarball/${sha}`;
-  const archive = await call.bytes(path);
-  try {
-    return readTarball(archive);
-  } catch (error) {
-    throw new GatewayError(
-      `GitHub gateway: ${call.where("GET", path)} answered with an archive that can't be read: ${messageOf(error)}`,
-    );
-  }
-}
+/** The id git gives `bytes` as a blob. */
+const blobId = (bytes: Buffer) =>
+  createHash("sha1")
+    .update(`blob ${bytes.length}\0`)
+    .update(bytes)
+    .digest("hex");
 
 /**
  * Makes every blob of `blobs` present in the repo `g` runs in. The ones it lacks come from one
  * tarball of `sha`, whose gateway cost doesn't grow with the file count, when at least `archiveFrom`
- * are missing; a blob the archive doesn't carry as git stores it (an `export-ignore` or
- * `export-subst` attribute changes the bytes) is fetched by itself. An archive that fails for any
- * reason but a rate limit is given up, said on one line, and every missing blob is fetched by itself.
+ * are missing. The archive is read as it downloads and each file is written to the object store in
+ * turn, so memory is the largest file, not the archive. A blob the archive doesn't carry as git
+ * stores it (an `export-ignore` or `export-subst` attribute changes the bytes) is fetched by itself.
+ * An archive that fails for any reason but a rate limit is given up where it stopped, said on one
+ * line, and every blob still missing is fetched by itself.
  */
 async function fetchBlobs(
   g: ReturnType<typeof git>,
@@ -272,32 +260,47 @@ async function fetchBlobs(
     return;
   }
   progress(`repo pull: downloading ${missing.size} blobs as one archive`);
-  const files = await readArchive(call, sha).catch((error: unknown) => {
+  const wanted = new Map<string, TreeItem>(
+    blobs
+      .filter((item) => missing.has(item.sha))
+      .map((item) => [item.path, item]),
+  );
+  const total = missing.size;
+  let stored = 0;
+  const path = `/tarball/${sha}`;
+  try {
+    const archive = await call.stream(path);
+    await walkTarball(archive, {
+      wants: (name) => {
+        const item = wanted.get(name);
+        return item !== undefined && missing.has(item.sha);
+      },
+      file: async (name, bytes) => {
+        const item = wanted.get(name);
+        if (!item || !missing.has(item.sha) || blobId(bytes) !== item.sha) {
+          return;
+        }
+        if ((await writeBlob(g, bytes)) !== item.sha) return;
+        missing.delete(item.sha);
+        stored++;
+        if (stored % PROGRESS_EVERY === 0) {
+          progress(`repo pull: stored ${stored}/${total} blobs`);
+        }
+      },
+    });
+  } catch (error) {
     // per blob, a spent limit would only fail again, one call per blob
     if (error instanceof GatewayError && error.rateLimited) throw error;
+    const named =
+      error instanceof GatewayError
+        ? error
+        : new GatewayError(
+            `GitHub gateway: ${call.where("GET", path)} answered with an archive that can't be read: ${messageOf(error)}`,
+          );
     progress(
-      `repo pull: the archive failed (${whyFailed(error)}); fetching ${missing.size} blobs one by one`,
+      `repo pull: the archive failed (${whyFailed(named)}); fetching ${missing.size} blobs one by one`,
     );
-    return undefined;
-  });
-  if (!files) {
-    await fetchMissing(g, call, blobs, progress, "repo pull");
-    return;
   }
-  const wanted = blobs.filter((item) => missing.has(item.sha));
-  const seen = new Set<string>();
-  let stored = 0;
-  await eachLimited(wanted, BLOB_FETCH_CONCURRENCY, async (item) => {
-    if (seen.has(item.sha)) return;
-    seen.add(item.sha);
-    const bytes = files.get(item.path);
-    if (!bytes || (await writeBlob(g, bytes)) !== item.sha) return;
-    missing.delete(item.sha);
-    stored++;
-    if (stored % PROGRESS_EVERY === 0) {
-      progress(`repo pull: stored ${stored}/${wanted.length} blobs`);
-    }
-  });
   const rest = blobs.filter((item) => missing.has(item.sha));
   if (rest.length > 0) await fetchMissing(g, call, rest, progress, "repo pull");
 }

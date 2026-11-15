@@ -26,12 +26,7 @@ import {
   PublishError,
   publish,
 } from "./publish.js";
-import {
-  fetchCommit,
-  pullRepo,
-  rebuildCommit,
-  repoPullMain,
-} from "./repo.js";
+import { fetchCommit, pullRepo, rebuildCommit, repoPullMain } from "./repo.js";
 import { git as runnerGit } from "./store.js";
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";

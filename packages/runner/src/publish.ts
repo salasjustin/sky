@@ -306,6 +306,42 @@ async function readBody(
   return Buffer.concat(chunks);
 }
 
+/** The chunks of a body as they arrive, each restarting the idle bound; ending early cancels the read. */
+async function* chunksOf(
+  response: Response,
+  idle: ReturnType<typeof inactivity>,
+  where: string,
+): AsyncGenerator<Buffer> {
+  if (!response.body) return;
+  const reader = response.body.getReader();
+  const onAbort = () => {
+    reader.cancel(idle.signal.reason).catch(() => {});
+  };
+  idle.signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    for (;;) {
+      let read: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        read = await reader.read();
+        if (idle.signal.aborted) throw idle.signal.reason;
+      } catch (error) {
+        throw failedCall(where, error, idle.signal);
+      }
+      if (read.done) return;
+      idle.touch();
+      yield Buffer.from(
+        read.value.buffer,
+        read.value.byteOffset,
+        read.value.byteLength,
+      );
+    }
+  } finally {
+    idle.signal.removeEventListener("abort", onAbort);
+    idle.stop();
+    await reader.cancel().catch(() => {});
+  }
+}
+
 /** A header's number, or NaN when it is absent or empty: `Number("")` is 0. */
 const numberHeader = (headers: Headers, name: string) => {
   const value = headers.get(name)?.trim();
@@ -357,12 +393,11 @@ export function gateway(options: {
   // how messages name a call: never the root, which carries the connector id
   const whereOf = (method: string, path: string) =>
     `${method} ${repoPath}${path}`;
-  /** The body of a successful answer, read whole; anything else throws a `GatewayError`. */
-  async function request(
-    method: string,
-    path: string,
-    body?: unknown,
-  ): Promise<Buffer> {
+  /**
+   * Sends the call, waiting out the limits it can; resolves with the answer's headers read and its
+   * body not (a 403 or 429 that had to be read to be told apart carries it as `limitBody`).
+   */
+  async function open(method: string, path: string, body?: unknown) {
     const where = whereOf(method, path);
     let response: Response;
     let idle: ReturnType<typeof inactivity>;
@@ -436,6 +471,11 @@ export function gateway(options: {
       }
       break;
     }
+    return { response, idle, where, limitBody };
+  }
+  type Opened = Awaited<ReturnType<typeof open>>;
+  /** The body of an answer, read whole; anything but success throws a `GatewayError`. */
+  async function settle({ response, idle, where, limitBody }: Opened) {
     let answer: Buffer;
     try {
       answer = limitBody ?? (await readBody(response, idle));
@@ -460,6 +500,8 @@ export function gateway(options: {
       rateLimited,
     );
   }
+  const request = async (method: string, path: string, body?: unknown) =>
+    settle(await open(method, path, body));
   const call = async function call<T>(
     method: string,
     path: string,
@@ -477,6 +519,20 @@ export function gateway(options: {
   };
   /** The bytes a GET answers with, such as a repo's tarball; only silence times it out. */
   call.bytes = (path: string): Promise<Buffer> => request("GET", path);
+  /**
+   * A GET's body as it arrives, for one too large to hold: each chunk restarts the idle bound, and
+   * stopping early cancels the download. Anything but success throws a `GatewayError` before a chunk.
+   */
+  call.stream = async (path: string): Promise<AsyncGenerator<Buffer>> => {
+    const opened = await open("GET", path);
+    if (!opened.response.ok || opened.limitBody) {
+      await settle(opened);
+      throw new GatewayError(
+        `GitHub gateway: ${opened.where} answered with an unexpected body`,
+      );
+    }
+    return chunksOf(opened.response, opened.idle, opened.where);
+  };
   call.where = whereOf;
   return call;
 }
