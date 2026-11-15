@@ -1135,9 +1135,13 @@ export async function runSession(
         hasCancelledCall(message.message.content)
       ) {
         cancelWarned = true;
-        warn(
-          "runner: the session's input closed while a background subagent was still running; its woken turn was cancelled",
-        );
+        const warning =
+          "the session's input closed while a background subagent was still running; its woken turn was cancelled";
+        warn(`runner: ${warning}`);
+        void post({
+          type: "runner.warning",
+          payload: { message: warning },
+        }).catch(() => {});
       }
     }
   } catch (error) {
@@ -1233,18 +1237,34 @@ function launchedAgentId(
     : undefined;
 }
 
-/** What the SDK answers a tool call it cancels, as a user refusal would read. */
-const CANCELLED_CALL = "doesn't want to take this action right now";
+/**
+ * How the SDK's interruption markers (in its `sdk.mjs`) begin for a call cut off by the input
+ * closing: the cancel that reads as a user refusal, and the two for a session that ended. The rest
+ * of that list name other causes, such as a person's interrupt or a turn ended to deliver a
+ * message; and none of these begins a reason the gate denies a call with.
+ */
+const CANCELLED_CALL_PREFIXES = [
+  "The user doesn't want to take this action right now",
+  "[Tool call interrupted: the session ended",
+  "[Request interrupted: the session ended",
+];
 
-/** A tool result in a user message that is the SDK cancelling the call. */
+/** A user message holding one of those markers, as an errored tool result or as text. */
 function hasCancelledCall(content: unknown): boolean {
+  const isCancel = (text: unknown) =>
+    typeof text === "string" &&
+    CANCELLED_CALL_PREFIXES.some((prefix) => text.startsWith(prefix));
+  if (typeof content === "string") return isCancel(content);
   return (
     Array.isArray(content) &&
-    content.some(
-      (block) =>
-        block?.type === "tool_result" &&
-        block.is_error === true &&
-        JSON.stringify(block.content ?? "").includes(CANCELLED_CALL),
+    content.some((block) =>
+      isCancel(
+        block?.type === "text"
+          ? block.text
+          : block?.type === "tool_result" && block.is_error === true
+            ? block.content
+            : undefined,
+      ),
     )
   );
 }
