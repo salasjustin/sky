@@ -2,8 +2,21 @@ import { type Db, runs } from "@sky/db";
 import type { RunId } from "@sky/shared";
 import { eq } from "drizzle-orm";
 import { isRunnerAlive } from "./launch.js";
-import { collectDiagnostics, type Diagnostics } from "./memory.js";
-import { failLostRun, recordProbe, runningRunsOn, silentRuns } from "./runs.js";
+import {
+  collectDiagnostics,
+  type Diagnostics,
+  type Restart,
+  restartSince,
+} from "./memory.js";
+import { redact } from "./redact.js";
+import {
+  failLostRun,
+  lastBashCommand,
+  recordProbe,
+  runnerStartedAt,
+  runningRunsOn,
+  silentRuns,
+} from "./runs.js";
 import { type SpriteOps, spriteExists } from "./sprites.js";
 
 type Deps = {
@@ -23,6 +36,39 @@ function killedError(spriteName: string, { memory }: Diagnostics): string {
     ? `${memory.availableMb} MB of ${memory.totalMb} MB available`
     : "its free memory could not be read";
   return `runner_killed: the sprite killed the runner, likely out of memory (sprite ${spriteName}: ${seen})`;
+}
+
+const LAST_COMMAND_MAX = 300;
+
+/**
+ * Says the sprite restarted while the run worked, naming the sprite, when (`ageSec` before `now`)
+ * and in what way, with the 5-minute load and the run's last Bash command (redacted by `known`, cut
+ * to `LAST_COMMAND_MAX`).
+ */
+function restartedError(
+  spriteName: string,
+  { kind, ageSec }: Restart,
+  now: number,
+  { load5 }: Diagnostics,
+  lastCommand: string | undefined,
+  known: readonly string[],
+): string {
+  const at = new Date(now - ageSec * 1000)
+    .toISOString()
+    .replace(/\.\d+Z$/, "Z")
+    .replace("T", " ")
+    .replace("Z", " UTC");
+  const what =
+    kind === "rebooted"
+      ? "the machine rebooted"
+      : "its processes restarted, pid 1 included, while the machine stayed up";
+  const load = load5 === undefined ? "unknown" : String(load5);
+  const redacted = lastCommand && redact(lastCommand, known);
+  const command = redacted
+    ? redacted.slice(0, LAST_COMMAND_MAX) +
+      (redacted.length > LAST_COMMAND_MAX ? "…" : "")
+    : "none recorded";
+  return `sandbox_restarted: the sandbox restarted at ${at} while this run was working on sprite ${spriteName} (${what}; 5-min load ${load}). The usual cause is memory use past the machine's limit; the last command was: ${command}`;
 }
 
 /**
@@ -59,8 +105,11 @@ export async function wakeLaunch(
  * against the run. Before failing a run whose runner is gone, the sprite's memory, biggest processes
  * and kernel kill lines are collected, logged and stored on the run; when the kernel logged a memory
  * kill since the run began, or the sprite has less than `lowMemoryMb` available, the run fails with
- * `runner_killed`, else `runner_lost`. An exec on a sprite exiting 137 probes its running runs at
- * once (`probeSprite`).
+ * `runner_killed`, else `runner_lost`. A sprite that booted, or whose pid 1 started, after the run's
+ * `run.started` and before the probe's first exec on it (each with `restartSince`'s margin) restarted
+ * under the runner, which fails the run as `sandbox_restarted` ahead of either; a boot caused by the
+ * launch's or the probe's own wake of a cold sprite is not one. An exec on a sprite exiting 137 probes
+ * its running runs at once (`probeSprite`).
  */
 export function createRunProber({
   db,
@@ -92,7 +141,7 @@ export function createRunProber({
   }
 
   // a run with no row is past failing; now then counts no kill line
-  function startedAt(runId: RunId): number {
+  function createdAt(runId: RunId): number {
     const row = db
       .select({ createdAt: runs.createdAt })
       .from(runs)
@@ -101,16 +150,21 @@ export function createRunProber({
     return row ? Date.parse(row.createdAt) : Date.now();
   }
 
-  /** Fails the run whose runner is gone; a sprite that is gone too skips the diagnostics, as there is nothing to read. */
+  /**
+   * Fails the run whose runner is gone; a sprite that is gone too skips the diagnostics, as there is
+   * nothing to read. `probeStartedAt` is when the probe set out to exec on the sprite (epoch ms).
+   */
   async function failGone(
     runId: RunId,
     spriteName: string,
     lastEventId: number,
     spriteIsThere: boolean,
+    probeStartedAt: number,
   ): Promise<void> {
     const diagnostics = spriteIsThere
-      ? await collectDiagnostics(sprites, spriteName, runId, startedAt(runId))
+      ? await collectDiagnostics(sprites, spriteName, runId, createdAt(runId))
       : undefined;
+    const now = Date.now();
     // a sprite that can't read its kernel log (dmesg is often closed to the sprite's user) still shows
     // memory exhaustion by what's left: a runner gone from a sprite below the launch floor was likely killed
     const killed =
@@ -118,10 +172,32 @@ export function createRunProber({
       (diagnostics.killLines.length > 0 ||
         (diagnostics.memory !== undefined &&
           diagnostics.memory.availableMb < lowMemoryMb));
-    const code = killed ? "runner_killed" : "runner_lost";
-    const error = killed
-      ? killedError(spriteName, diagnostics)
-      : `runner_lost: its runner is gone from sprite ${spriteName}`;
+    // a restart takes the runner with everything else, so it is named before a kill is guessed at
+    const runnerStarted = runnerStartedAt(db, runId);
+    const restart =
+      diagnostics &&
+      runnerStarted !== undefined &&
+      restartSince(diagnostics, {
+        runnerStartedAt: runnerStarted,
+        probeStartedAt,
+        now,
+      });
+    let code = "runner_lost";
+    let error = `runner_lost: its runner is gone from sprite ${spriteName}`;
+    if (restart && diagnostics) {
+      code = "sandbox_restarted";
+      error = restartedError(
+        spriteName,
+        restart,
+        now,
+        diagnostics,
+        lastBashCommand(db, runId),
+        [...sprites.secrets.values()],
+      );
+    } else if (killed) {
+      code = "runner_killed";
+      error = killedError(spriteName, diagnostics);
+    }
     const report =
       diagnostics &&
       `diagnostics of sprite ${spriteName}, collected when its runner was found gone:\n${diagnostics.text}`;
@@ -143,6 +219,8 @@ export function createRunProber({
     try {
       let alive: boolean;
       let gone = false;
+      // before the exec that wakes a cold-paused sprite, so the boot that wake causes falls after it
+      const probeStartedAt = Date.now();
       try {
         alive = await isRunnerAlive(sprites, spriteName, runId);
       } catch (err) {
@@ -160,7 +238,7 @@ export function createRunProber({
           nudgeDeliveries();
         }
       } else {
-        await failGone(runId, spriteName, lastEventId, !gone);
+        await failGone(runId, spriteName, lastEventId, !gone, probeStartedAt);
       }
     } catch (err) {
       log(`probing the runner of ${runId} on ${spriteName} failed: ${err}`);
