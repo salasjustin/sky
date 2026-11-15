@@ -18,7 +18,14 @@ import {
 } from "@sky/shared";
 import { eq } from "drizzle-orm";
 import { HttpResponse, http, ws } from "msw";
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  expect,
+  type MockInstance,
+  test,
+  vi,
+} from "vitest";
 import { server } from "../../../test/msw.js";
 import { DIFF, DIFF_MAX_BYTES } from "./agents.js";
 import { createApp } from "./app.js";
@@ -168,13 +175,16 @@ test("POST returns 202 with the agent on claude/<agentId> and a starting run", a
  * Launches a run in `envId` that, as its runner starts, was created `agoMs` earlier by a clock frozen
  * from the step before (the sprite hold), so the deadline's time left doesn't depend on how long the
  * launch took. The database stamps createdAt by its own clock, so the run's is rewritten to match.
+ * Only `Date.now` is stubbed: `vi.waitFor` advances a faked clock on each poll, and `sessionOpened`
+ * polls while the launch runs.
  */
 async function launchedCreatedAgo(envId: string, agoMs: number) {
   const now = Date.parse("2026-06-01T12:00:00.000Z");
+  let frozen: MockInstance<typeof Date.now> | undefined;
   wire.afterExec = (call) => {
     if (!/ curl .* PUT /.test(call)) return;
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(now);
+    frozen ??= vi.spyOn(Date, "now");
+    frozen.mockReturnValue(now);
     db.update(runs)
       .set({ createdAt: new Date(now - agoMs).toISOString() })
       .run();
@@ -184,7 +194,7 @@ async function launchedCreatedAgo(envId: string, agoMs: number) {
     await sessionOpened();
     return out;
   } finally {
-    vi.useRealTimers();
+    frozen?.mockRestore();
   }
 }
 
@@ -3057,6 +3067,12 @@ async function sweepGoneRun(
   report: string,
   began = { startedMs: 600_000, createdMs: 600_000 },
   tools = [bashCall("pnpm test:e2e --workers 8")],
+  /**
+   * Holds `Date` still for the sweep, at the first whole second after the run's setup, returned as `at`.
+   * The setup runs on the real clock: its wait for the runner's session moves a faked `Date` on by the
+   * poll interval, and a clock frozen before the setup would sit behind the run's own events.
+   */
+  freeze = false,
 ) {
   const envId = readyEnv();
   const { run, token } = await runningRun(envId);
@@ -3076,8 +3092,17 @@ async function sweepGoneRun(
   pgrepAnswers(1);
   diagnosticsAnswer(report);
   const { prober } = proberOver();
-  await prober.sweep(silentFor(config.runProbeMs + 1000));
-  return { run, sprite: spriteNameFor(envId) };
+  const at = Math.ceil(Date.now() / 1000) * 1000;
+  if (freeze) {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(at);
+  }
+  try {
+    await prober.sweep(silentFor(config.runProbeMs + 1000));
+  } finally {
+    if (freeze) vi.useRealTimers();
+  }
+  return { run, sprite: spriteNameFor(envId), at };
 }
 
 // a restart this long before the diagnostics falls well inside a run started 600 s ago, and well before its probe
@@ -3138,45 +3163,37 @@ test("a restart is named even when the sprite logged a kill, its memory being fi
   expect(runFailure(run.id)).toMatch(/^sandbox_restarted: /);
 });
 
-/** Runs `fn` with `Date` frozen at the current time, so no clock boundary can fall between the steps. */
-async function withNowFrozen<T>(fn: (now: number) => Promise<T>): Promise<T> {
-  vi.useFakeTimers({ toFake: ["Date"] });
-  try {
-    return await fn(Date.now());
-  } finally {
-    vi.useRealTimers();
-  }
-}
-
 /** A time as the message prints it, `agoSec` before `now`. */
 const printedAgo = (now: number, agoSec: number) =>
   `${new Date(now - agoSec * 1000).toISOString().slice(0, 19).replace("T", " ")} UTC`;
 
 test("a rebooted machine's restart time is its boot age before the diagnostics, not its init age", async () => {
-  const { error, now } = await withNowFrozen(async (now) => {
-    const { run } = await sweepGoneRun(
-      diagnosticsReport({ availableMb: 5_000, bootSec: 300, initSec: 200 }),
-    );
-    return { error: runFailure(run.id), now };
-  });
+  const { run, at } = await sweepGoneRun(
+    diagnosticsReport({ availableMb: 5_000, bootSec: 300, initSec: 200 }),
+    undefined,
+    undefined,
+    true,
+  );
+  const error = runFailure(run.id);
   expect(error).toMatch(
     new RegExp(
-      `^sandbox_restarted: the sandbox restarted at ${printedAgo(now, 300)} while`,
+      `^sandbox_restarted: the sandbox restarted at ${printedAgo(at, 300)} while`,
     ),
   );
   expect(error).toContain("the machine rebooted");
 });
 
 test("a processes restart's time is its init age before the diagnostics, not its boot age", async () => {
-  const { error, now } = await withNowFrozen(async (now) => {
-    const { run } = await sweepGoneRun(
-      diagnosticsReport({ availableMb: 5_000, bootSec: 24_000, initSec: 200 }),
-    );
-    return { error: runFailure(run.id), now };
-  });
+  const { run, at } = await sweepGoneRun(
+    diagnosticsReport({ availableMb: 5_000, bootSec: 24_000, initSec: 200 }),
+    undefined,
+    undefined,
+    true,
+  );
+  const error = runFailure(run.id);
   expect(error).toMatch(
     new RegExp(
-      `^sandbox_restarted: the sandbox restarted at ${printedAgo(now, 200)} while`,
+      `^sandbox_restarted: the sandbox restarted at ${printedAgo(at, 200)} while`,
     ),
   );
   expect(error).toContain("its processes restarted");
