@@ -1183,14 +1183,14 @@ const subagentStop: Step = hook("SubagentStop", {
 /** The SDK's text for a call it cancelled as a refusal would read (its interruption markers in sdk.mjs). */
 const REFUSAL_CANCEL =
   "The user doesn't want to take this action right now. STOP what you are doing and wait for the user to tell you how to proceed.";
-/** A tool result Claude's process hands back for `toolu_woken`, as an error. */
-const erroredResult = (...texts: string[]) => ({
+/** Tool results Claude's process hands back for `toolu_woken`, as errors, one per `content`. */
+const erroredResult = (...contents: unknown[]) => ({
   type: "user",
   session_id: "sess-new",
   parent_tool_use_id: null,
   message: {
     role: "user",
-    content: texts.map((content) => ({
+    content: contents.map((content) => ({
       type: "tool_result",
       tool_use_id: "toolu_woken",
       is_error: true,
@@ -1504,6 +1504,51 @@ test("a nested subagent stopping with no result after it restarts the hold, and 
   expect(outcome).toBe(0);
 });
 
+test("a task notification while the input is held open restarts the hold, and the run still ends when that hold expires", async () => {
+  const seen: boolean[] = [];
+  const warnings: string[] = [];
+  let warnedBeforeRestartedHoldEnds: number | undefined;
+  const { post } = recorder();
+  const outcome = await runSession(config, {
+    query: wakeProcess([
+      init,
+      backgroundTasks(1),
+      // the hold (30 ms) starts here, beside the next step's 20 ms beat, which ends first
+      success,
+      // the task list still shows the task, so no result follows the notification
+      async () => [
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "t0",
+          status: "completed",
+          output_file: "/tmp/t0.output",
+          summary: "claude -p /kru:reflect finished",
+          session_id: "sess-new",
+        },
+      ],
+      // this step's 20 ms beat starts with the restarted hold: it ends after the first hold's
+      // 30 ms (the notification came at least 20 ms in) and before the restarted one's
+      async () => {
+        warnedBeforeRestartedHoldEnds = holdWarnings(warnings).length;
+        return undefined;
+      },
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+    backgroundHoldMs: 30,
+  });
+  expect(warnedBeforeRestartedHoldEnds).toBe(0);
+  expect(seen).toEqual([true]);
+  expect(holdWarnings(warnings)).toEqual([
+    expect.stringContaining("1 background task(s) still running"),
+  ]);
+  expect(outcome).toBe(0);
+});
+
 test("a subagent stop and then a result with nothing unfinished close the input at that result, and no hold expires later", async () => {
   const seen: boolean[] = [];
   const warnings: string[] = [];
@@ -1573,6 +1618,14 @@ test.each([
     warned: 1,
     posted: 1,
   });
+});
+
+test("a cancel delivered as text blocks in a tool result after the input closed over a running subagent is reported the same way", async () => {
+  expect(
+    await closedOverSubagent(async () => [
+      erroredResult([{ type: "text", text: REFUSAL_CANCEL }]),
+    ]),
+  ).toEqual({ warned: 1, posted: 1 });
 });
 
 test("the runner's own denials after the input closed over a running subagent are not reported as a cancel", async () => {

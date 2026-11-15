@@ -1249,23 +1249,30 @@ const CANCELLED_CALL_PREFIXES = [
   "[Request interrupted: the session ended",
 ];
 
-/** A user message holding one of those markers, as an errored tool result or as text. */
+/**
+ * A user message holding one of those markers: as text, or as an errored tool result's content,
+ * which is a string or a list of blocks.
+ */
 function hasCancelledCall(content: unknown): boolean {
   const isCancel = (text: unknown) =>
     typeof text === "string" &&
     CANCELLED_CALL_PREFIXES.some((prefix) => text.startsWith(prefix));
+  const hasCancelText = (
+    blocks: ({ type?: unknown; text?: unknown } | null)[],
+  ) =>
+    blocks.some((block) => block?.type === "text" && isCancel(block.text));
   if (typeof content === "string") return isCancel(content);
   return (
     Array.isArray(content) &&
-    content.some((block) =>
-      isCancel(
-        block?.type === "text"
-          ? block.text
-          : block?.type === "tool_result" && block.is_error === true
-            ? block.content
-            : undefined,
-      ),
-    )
+    (hasCancelText(content) ||
+      content.some(
+        (block) =>
+          block?.type === "tool_result" &&
+          block.is_error === true &&
+          (Array.isArray(block.content)
+            ? hasCancelText(block.content)
+            : isCancel(block.content)),
+      ))
   );
 }
 
