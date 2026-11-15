@@ -110,9 +110,9 @@ test("an archive that is cut short, or isn't gzip, fails the walk", async () => 
   await expect(filesOf(chunked(cut))).rejects.toThrow(
     "the archive ends inside an entry",
   );
-  await expect(
-    filesOf(chunked(Buffer.from("not an archive"))),
-  ).rejects.toThrow("incorrect header check");
+  await expect(filesOf(chunked(Buffer.from("not an archive")))).rejects.toThrow(
+    "incorrect header check",
+  );
 });
 
 const MIB = 1024 * 1024;
