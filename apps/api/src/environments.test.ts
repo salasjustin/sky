@@ -2575,3 +2575,167 @@ test("an env whose base profile was removed from the config fails provisioning n
   });
   expect(wire.calls).toEqual([]);
 });
+
+/** Temp dirs a test made, removed after it whether it passed or not. */
+const tempDirs: string[] = [];
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Holds each exec whose command contains `marker` until the test releases that sprite's call; every
+ * other exec falls through to the Sprites fake. `inFlight` counts the held and the running, `most` its peak.
+ */
+function gatePulls(marker: string) {
+  const started: string[] = [];
+  const gates = new Map<string, () => void>();
+  let inFlight = 0;
+  let most = 0;
+  server.use(
+    http.post(
+      "https://api.sprites.dev/v1/sprites/:name/exec",
+      async ({ request, params }) => {
+        const cmd = new URL(request.url).searchParams.getAll("cmd").join(" ");
+        if (!cmd.includes(marker)) return;
+        const sprite = String(params.name);
+        started.push(sprite);
+        inFlight++;
+        most = Math.max(most, inFlight);
+        await new Promise<void>((resolve) => gates.set(sprite, resolve));
+        inFlight--;
+      },
+    ),
+  );
+  return {
+    started,
+    inFlight: () => inFlight,
+    most: () => most,
+    release: (sprite: string | undefined) => gates.get(sprite ?? "")?.(),
+  };
+}
+
+/**
+ * Creates one ready env per name, each with a connector secret, on an API that has a runner bundle,
+ * ready to be PATCHed together by `start`, so a test installs its gate first. `wrote` waits until
+ * every env has written the pull's env file, the step right before it asks for a connector slot.
+ */
+async function rebuildTogether(names: string[], base: string | null) {
+  const dir = mkdtempSync(join(tmpdir(), "sky-bundle-"));
+  tempDirs.push(dir);
+  const runnerBundlePath = join(dir, "runner.mjs");
+  writeFileSync(runnerBundlePath, "// runner");
+  app = createApp({
+    db,
+    config: testConfig({ runnerBundlePath, baseProfiles: profiles }),
+    sprites: new SpritesClient(spritesToken),
+    log: () => {},
+    nudgeDeliveries: () => {},
+  });
+  const ids: string[] = [];
+  for (const name of names) {
+    ids.push(await ready({ name, repo: `acme/${name}`, setup: "true" }));
+    const put = await app.request(
+      `/v1/environments/${ids.at(-1)}/secrets/GITHUB_CONNECTOR`,
+      {
+        method: "PUT",
+        headers: json,
+        body: JSON.stringify({ connector: "VPpb7x" }),
+      },
+    );
+    expect(put.status).toBe(200);
+  }
+  const start = async () => {
+    const patched = await Promise.all(
+      ids.map((id) =>
+        patch(id, {
+          setup: "true && true",
+          ...(base === null ? {} : { base }),
+        }),
+      ),
+    );
+    expect(patched.map((res) => res.status)).toEqual(ids.map(() => 202));
+  };
+  const sprites = ids.map(spriteNameFor);
+  const wrote = (file: string) =>
+    vi.waitFor(() => {
+      for (const sprite of sprites) {
+        expect(wire.calls).toContain(`write ${sprite} ${file}`);
+      }
+    });
+  return { ids, sprites, wrote, start };
+}
+
+// the repo pull and the store pull each hold a connector slot, so each is gated in turn
+const pulls = [
+  { kind: "repo", marker: "repo-pull", envFile: REPO_ENV_FILE, base: null },
+  {
+    kind: "store",
+    marker: "store-sync pull",
+    envFile: STORE_ENV_FILE,
+    base: "team",
+  },
+] as const;
+
+test.each(pulls)(
+  "environments rebuilt at once pull the $kind through the connector two at a time, and all still finish",
+  async ({ marker, envFile, base }) => {
+    const { ids, sprites, wrote, start } = await rebuildTogether(
+      ["a", "b", "c", "d"],
+      base,
+    );
+    const gate = gatePulls(marker);
+    await start();
+    await wrote(envFile);
+
+    await vi.waitFor(() => expect(gate.started).toHaveLength(2));
+    expect(gate.inFlight()).toBe(2);
+
+    gate.release(gate.started[0]);
+    await vi.waitFor(() => expect(gate.started).toHaveLength(3));
+    expect(gate.inFlight()).toBe(2);
+
+    gate.release(gate.started[1]);
+    await vi.waitFor(() => expect(gate.started).toHaveLength(4));
+    expect(gate.inFlight()).toBe(2);
+
+    gate.release(gate.started[2]);
+    gate.release(gate.started[3]);
+    const done = await Promise.all(ids.map((id) => settled(id)));
+
+    expect(done.map((env) => env.status)).toEqual(ids.map(() => "ready"));
+    expect([...gate.started].sort()).toEqual([...sprites].sort());
+    expect(gate.most()).toBe(2);
+  },
+);
+
+test.each(pulls)(
+  "a failed $kind pull frees its connector slot for the next environment waiting",
+  async ({ kind, marker, envFile, base }) => {
+    const { ids, wrote, start } = await rebuildTogether(["a", "b", "c"], base);
+    const gate = gatePulls(marker);
+    const exec = wire.exec;
+    wire.exec = (argv) =>
+      argv.join(" ").includes(marker)
+        ? { exitCode: 1, stderr: "pull failed" }
+        : exec(argv);
+    await start();
+    await wrote(envFile);
+
+    await vi.waitFor(() => expect(gate.started).toHaveLength(2));
+    gate.release(gate.started[0]);
+    await vi.waitFor(() => expect(gate.started).toHaveLength(3));
+    expect(gate.inFlight()).toBe(2);
+
+    gate.release(gate.started[1]);
+    gate.release(gate.started[2]);
+    const done = await Promise.all(ids.map((id) => settled(id)));
+
+    // a failed repo pull fails the env; a failed store pull is only logged
+    expect(done.map((env) => env.status)).toEqual(
+      ids.map(() => (kind === "repo" ? "failed" : "ready")),
+    );
+    expect(gate.most()).toBe(2);
+  },
+);

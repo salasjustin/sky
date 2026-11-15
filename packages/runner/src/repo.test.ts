@@ -15,11 +15,19 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
+import { createGzip, gzipSync } from "node:zlib";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import { DEFAULT_GATEWAY_URL, PublishError, publish } from "./publish.js";
-import { pullRepo, rebuildCommit, repoPullMain } from "./repo.js";
+import {
+  DEFAULT_GATEWAY_URL,
+  GatewayError,
+  gateway,
+  PublishError,
+  publish,
+} from "./publish.js";
+import { fetchCommit, pullRepo, rebuildCommit, repoPullMain } from "./repo.js";
 import { git as runnerGit } from "./store.js";
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
@@ -159,6 +167,26 @@ function fakeGitHub(base = REPO) {
             return { mode, type, sha, path };
           }),
       }),
+    ),
+    // GitHub's archive of a commit: the tree under `<owner>-<repo>-<sha>/`, gzipped
+    http.get(
+      `${base}/tarball/:ref`,
+      ({ params }) =>
+        new HttpResponse(
+          gzipSync(
+            execFileSync(
+              "git",
+              [
+                "archive",
+                "--format=tar",
+                `--prefix=acme-private-${String(params.ref).slice(0, 7)}/`,
+                String(params.ref),
+              ],
+              { cwd: remote, maxBuffer: 256 * 1024 * 1024 },
+            ),
+          ),
+          { headers: { "content-type": "application/x-gzip" } },
+        ),
     ),
     http.get(`${base}/git/blobs/:sha`, ({ params }) => {
       // a blob GitHub lacks is a 404, which is how publish learns to upload it
@@ -1741,6 +1769,17 @@ test("a re-run removes the index of a dead fetch and keeps that of one still run
   expect(kept.map((path) => existsSync(path))).toEqual([true, true]);
 });
 
+/** The archive and every blob answer 500, so a pull fails on the per-blob path it falls back to. */
+const gatewayDown = () =>
+  server.use(
+    http.get(`${REPO}/tarball/:ref`, () =>
+      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+    ),
+    http.get(`${REPO}/git/blobs/:sha`, () =>
+      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+    ),
+  );
+
 test("a pull that fails onto an existing checkout keeps it, and a later run finishes it", async () => {
   fakeGitHub();
   const dir = join(root, "repo");
@@ -1748,11 +1787,7 @@ test("a pull that fails onto an existing checkout keeps it, and a later run fini
   const tip = advanceTrunk((work) =>
     writeFileSync(join(work, "new.txt"), "n\n"),
   );
-  server.use(
-    http.get(`${REPO}/git/blobs/:sha`, () =>
-      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
-    ),
-  );
+  gatewayDown();
   await expect(pull(dir)).rejects.toThrow("returned 500");
   expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
   expect(git(dir, "status", "--porcelain")).toBe("");
@@ -1766,11 +1801,7 @@ test("a pull that fails onto an existing checkout keeps it, and a later run fini
 
 test("a pull that fails part-way removes the checkout it started, so the next run starts clean", async () => {
   fakeGitHub();
-  server.use(
-    http.get(`${REPO}/git/blobs/:sha`, () =>
-      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
-    ),
-  );
+  gatewayDown();
   const parent = join(root, "fresh");
   const dir = join(parent, "repo");
   await expect(pull(dir)).rejects.toThrow("returned 500");
@@ -1825,16 +1856,42 @@ test("a truncated tree fails the pull as too large, and leaves nothing behind", 
   expect(existsSync(join(root, "fresh"))).toBe(false);
 });
 
-test("a blob GitHub 404s mid-fetch fails the pull naming the status, and removes the checkout", async () => {
+test("an archive GitHub answers 500 for is named on one line, and every file is fetched by itself into an intact checkout", async () => {
   fakeGitHub();
   server.use(
-    http.get(`${REPO}/git/blobs/:sha`, () =>
-      HttpResponse.json({ message: "Not Found" }, { status: 404 }),
+    http.get(`${REPO}/tarball/:ref`, () =>
+      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
     ),
   );
-  const dir = join(root, "fresh/repo");
-  await expect(pull(dir)).rejects.toThrow("404");
-  expect(existsSync(join(root, "fresh"))).toBe(false);
+  const lines: string[] = [];
+  const calls = gatewayCalls();
+  const dir = join(root, "repo");
+  expect(
+    await pullRepo({
+      repo: "acme/private",
+      dir,
+      gatewayUrl: GATEWAY,
+      connectorId: CONNECTOR,
+      progress: (line) => lines.push(line),
+    }),
+  ).toEqual({ branch: "trunk", sha: headSha });
+  calls.stop();
+
+  const failed = lines.filter((line) => line.includes("archive"));
+  expect(failed).toContain(
+    `repo pull: the archive failed (GitHub gateway: GET /repos/acme/private/tarball/${headSha} returned 500: Server Error); fetching 4 blobs one by one`,
+  );
+  expect(lines.join("\n")).not.toContain(CONNECTOR);
+  expect(lines.join("\n")).not.toContain(GATEWAY);
+  expect(calls.urls.filter((url) => url.includes("/git/blobs/"))).toHaveLength(
+    4,
+  );
+  expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
+  expect(readFileSync(join(dir, "src/deep/a b.ts"), "utf8")).toBe(
+    "export {};\n",
+  );
+  expect(readlinkSync(join(dir, "link"))).toBe("README.md");
+  expect(git(dir, "status", "--porcelain")).toBe("");
 });
 
 test("a tree whose entries rebuild a different tree sha fails the pull, naming both, and removes the checkout", async () => {
@@ -2146,4 +2203,539 @@ test("a repo with no commits over git says it is empty, then the connector is tr
   const { io, sink } = sinks();
   await repoPullMain(["acme/private", join(root, "x")], anonEnv, sink);
   expect(io.err).toContain("acme/private is empty");
+});
+
+// the connector's hourly quota is shared, so a pull's gateway calls must not grow with the repo
+/** Commits `count` more files on trunk of the bare remote; returns the new tip. */
+const growRemote = (count: number) =>
+  advanceTrunk((work) => {
+    mkdirSync(join(work, "bulk"));
+    for (let i = 0; i < count; i++) {
+      writeFileSync(join(work, "bulk", `f${i}.txt`), `file ${i}\n`);
+    }
+  });
+
+const countedPull = async (dir: string) => {
+  const calls = gatewayCalls();
+  await pull(dir);
+  calls.stop();
+  return calls.urls.map((url) =>
+    url.slice(GATEWAY.length + CONNECTOR.length + 2),
+  );
+};
+
+test("a pull's gateway calls don't grow with the repo's file count: the repo, the ref, the commit, the tree and one archive", async () => {
+  fakeGitHub();
+  const small = await countedPull(join(root, "small"));
+  growRemote(150);
+  const large = await countedPull(join(root, "large"));
+
+  expect(small).toHaveLength(5);
+  expect(large).toHaveLength(small.length);
+  expect(large.filter((url) => url.includes("/blobs/"))).toEqual([]);
+  expect(large.filter((url) => url.includes("/tarball/"))).toHaveLength(1);
+  expect(readFileSync(join(root, "large/bulk/f149.txt"), "utf8")).toBe(
+    "file 149\n",
+  );
+  expect(git(join(root, "large"), "status", "--porcelain")).toBe("");
+});
+
+test("a file the archive carries differently from git's blob is fetched by itself, the rest still come from the archive", async () => {
+  fakeGitHub();
+  server.use(
+    http.get(`${REPO}/tarball/:ref`, ({ params }) => {
+      const ref = String(params.ref);
+      const archive = execFileSync(
+        "git",
+        ["archive", "--format=tar", "--prefix=acme-private-x/", ref],
+        { cwd: remote, maxBuffer: 64 * 1024 * 1024 },
+      );
+      // an export-subst'd README: same path, other bytes
+      const edited = Buffer.from(
+        archive.toString("latin1").replace("private\n", "PRIVATE\n"),
+        "latin1",
+      );
+      return new HttpResponse(gzipSync(edited));
+    }),
+  );
+  const calls = gatewayCalls();
+  const dir = join(root, "repo");
+  await pull(dir);
+  calls.stop();
+
+  const blobs = calls.urls.filter((url) => url.includes("/git/blobs/"));
+  expect(blobs).toHaveLength(1);
+  expect(readFileSync(join(dir, "README.md"), "utf8")).toBe("private\n");
+  expect(git(dir, "status", "--porcelain")).toBe("");
+});
+
+test("a stale clone that lacks many blobs gets them from one archive when it fetches the base to publish on", async () => {
+  const seen = fakeGitHub();
+  const { dir, tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const fresh = growRemote(40);
+  const calls = gatewayCalls();
+
+  await publishFrom(tree);
+  calls.stop();
+
+  expect(seen.commits[0]?.parents).toEqual([fresh]);
+  expect(calls.urls.filter((url) => url.includes("/tarball/"))).toHaveLength(1);
+  // the 40 base files aren't read one by one: the only blob call is publish's check of the agent's own
+  expect(calls.urls.filter((url) => url.includes("/git/blobs/"))).toHaveLength(
+    1,
+  );
+  expect(git(dir, "cat-file", "-t", fresh)).toBe("commit");
+});
+
+test("a file the tree names but the archive leaves out is fetched by itself, with its content intact", async () => {
+  fakeGitHub();
+  // an export-ignore'd README: absent from the archive, present in the tree
+  server.use(
+    http.get(
+      `${REPO}/tarball/:ref`,
+      ({ params }) =>
+        new HttpResponse(
+          gzipSync(
+            execFileSync(
+              "git",
+              [
+                "archive",
+                "--format=tar",
+                "--prefix=acme-private-x/",
+                String(params.ref),
+                "src",
+                "run.sh",
+                "link",
+              ],
+              { cwd: remote },
+            ),
+          ),
+        ),
+    ),
+  );
+  const calls = gatewayCalls();
+  const dir = join(root, "repo");
+  await pull(dir);
+  calls.stop();
+
+  expect(calls.urls.filter((url) => url.includes("/git/blobs/"))).toHaveLength(
+    1,
+  );
+  expect(readFileSync(join(dir, "README.md"), "utf8")).toBe("private\n");
+  expect(git(dir, "status", "--porcelain")).toBe("");
+});
+
+const NOW_S = 1_800_000_000;
+
+/** A gateway on the test's clock and sleeper, whose idle timers fire only when the test says. */
+const testGateway = () => {
+  const armed = new Set<() => void>();
+  const call = gateway({
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    owner: "acme",
+    repo: "private",
+    rateLimit: { now: () => NOW_S * 1000, sleep: async () => {} },
+    timeout: {
+      arm: (onIdle) => {
+        armed.add(onIdle);
+        return () => armed.delete(onIdle);
+      },
+    },
+  });
+  return {
+    call,
+    fireIdle: () => {
+      for (const onIdle of [...armed]) onIdle();
+    },
+  };
+};
+
+/** A clone at `headSha` that lacks the `count` new files of trunk's next commit, which is returned. */
+const cloneBehind = async (count: number) => {
+  const dir = join(root, "repo");
+  await pull(dir);
+  return { dir, tip: growRemote(count) };
+};
+
+const archiveCalls = (urls: string[]) =>
+  urls.filter((url) => url.includes("/tarball/"));
+const blobCalls = (urls: string[]) =>
+  urls.filter((url) => url.includes("/git/blobs/"));
+
+test.each([
+  { count: 19, archives: 0, blobs: 19 },
+  { count: 20, archives: 1, blobs: 0 },
+])(
+  "a commit fetch lacking $count blobs makes $archives archive calls and $blobs blob calls",
+  async ({ count, archives, blobs }) => {
+    fakeGitHub();
+    const { dir, tip } = await cloneBehind(count);
+    const calls = gatewayCalls();
+    await fetchCommit(runnerGit(dir), testGateway().call, tip);
+    calls.stop();
+
+    expect(archiveCalls(calls.urls)).toHaveLength(archives);
+    expect(blobCalls(calls.urls)).toHaveLength(blobs);
+    expect(git(dir, "cat-file", "-p", `${tip}:bulk/f${count - 1}.txt`)).toBe(
+      `file ${count - 1}`,
+    );
+  },
+);
+
+test("an archive whose bytes stop arriving is given up once the idle bound passes, and each blob is fetched by itself", async () => {
+  fakeGitHub();
+  const { dir, tip } = await cloneBehind(20);
+  let stalled: () => void = () => {};
+  const reached = new Promise<void>((resolve) => {
+    stalled = resolve;
+  });
+  server.use(
+    http.get(`${REPO}/tarball/:ref`, ({ params }) => {
+      const archive = gzipSync(
+        execFileSync(
+          "git",
+          ["archive", "--format=tar", "--prefix=x/", String(params.ref)],
+          { cwd: remote },
+        ),
+      );
+      return new HttpResponse(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(archive.subarray(0, 64)));
+            stalled();
+          },
+        }),
+      );
+    }),
+  );
+  const gw = testGateway();
+  const lines: string[] = [];
+  const calls = gatewayCalls();
+  const fetching = fetchCommit(runnerGit(dir), gw.call, tip, (line) =>
+    lines.push(line),
+  );
+  await reached;
+  gw.fireIdle();
+  await fetching;
+  calls.stop();
+
+  expect(lines).toContain(
+    `repo pull: the archive failed (GitHub gateway: GET /repos/acme/private/tarball/${tip} failed: no bytes arrived for 120 s); fetching 20 blobs one by one`,
+  );
+  expect(lines.join("\n")).not.toContain(CONNECTOR);
+  expect(lines.join("\n")).not.toContain(GATEWAY);
+  expect(blobCalls(calls.urls)).toHaveLength(20);
+  expect(git(dir, "cat-file", "-p", `${tip}:bulk/f19.txt`)).toBe("file 19");
+});
+
+test("an archive refused by a spent hourly limit fails the fetch as github_rate_limited, with no blob fetched one by one", async () => {
+  fakeGitHub();
+  const { dir, tip } = await cloneBehind(20);
+  const reset = NOW_S + 3000;
+  server.use(
+    http.get(`${REPO}/tarball/:ref`, () =>
+      HttpResponse.json(
+        { message: "API rate limit exceeded for user ID 1" },
+        {
+          status: 403,
+          headers: {
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(reset),
+          },
+        },
+      ),
+    ),
+  );
+  const lines: string[] = [];
+  const calls = gatewayCalls();
+  const error = await fetchCommit(
+    runnerGit(dir),
+    testGateway().call,
+    tip,
+    (line) => lines.push(line),
+  ).catch((e: unknown) => e);
+  calls.stop();
+
+  expect(error).toBeInstanceOf(GatewayError);
+  expect((error as GatewayError).rateLimited).toBe(true);
+  expect((error as Error).message).toBe(
+    `github_rate_limited: GitHub's hourly API limit is used up until ${new Date(reset * 1000).toISOString()} (GET /repos/acme/private/tarball/${tip})`,
+  );
+  expect(blobCalls(calls.urls)).toEqual([]);
+  expect(lines.filter((line) => line.includes("one by one"))).toEqual([]);
+});
+
+test("a blob write that fails while the archive is read fails the fetch with git's error, with no blob fetched one by one", async () => {
+  fakeGitHub();
+  const { dir, tip } = await cloneBehind(20);
+  const diskFull = new Error(
+    "git hash-object -w --stdin failed: error: unable to create temporary file: No space left on device",
+  );
+  const real = runnerGit(dir);
+  const full: typeof real = (args, options) =>
+    args.join(" ") === "hash-object -w --stdin"
+      ? Promise.reject(diskFull)
+      : real(args, options);
+  const lines: string[] = [];
+  const calls = gatewayCalls();
+  const error = await fetchCommit(full, testGateway().call, tip, (line) =>
+    lines.push(line),
+  ).catch((e: unknown) => e);
+  calls.stop();
+
+  expect(error).toBe(diskFull);
+  expect(archiveCalls(calls.urls)).toHaveLength(1);
+  expect(blobCalls(calls.urls)).toEqual([]);
+  expect(lines.filter((line) => line.includes("archive failed"))).toEqual([]);
+});
+
+/** A clock the test moves, whose idle timers fire only once it passes their deadline. */
+const clockedGateway = () => {
+  let now = 0;
+  const timers = new Set<{ at: number; fire: () => void }>();
+  const call = gateway({
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    owner: "acme",
+    repo: "private",
+    rateLimit: { now: () => NOW_S * 1000, sleep: async () => {} },
+    timeout: {
+      arm: (onIdle, ms) => {
+        const timer = { at: now + ms, fire: onIdle };
+        timers.add(timer);
+        return () => timers.delete(timer);
+      },
+    },
+  });
+  return {
+    call,
+    elapse: (ms: number) => {
+      now += ms;
+      for (const timer of [...timers]) {
+        if (timer.at <= now) {
+          timers.delete(timer);
+          timer.fire();
+        }
+      }
+    },
+  };
+};
+
+/** `bulk/f<from>.txt` to `bulk/f<to - 1>.txt` as GitHub's archive carries them, under its top directory. */
+const bulkEntries = (from: number, to: number) =>
+  Array.from({ length: to - from }, (_, k) => {
+    const body = Buffer.from(`file ${from + k}\n`);
+    const header = Buffer.alloc(512);
+    header.write(`acme-private-x/bulk/f${from + k}.txt`, 0);
+    header.write("0000644\0", 100);
+    header.write(`${body.length.toString(8).padStart(11, "0")}\0`, 124);
+    header.write("0", 156);
+    header.write("ustar\0" + "00", 257);
+    return Buffer.concat([header, body, Buffer.alloc(512 - body.length)]);
+  });
+
+const TAR_END = Buffer.alloc(1024);
+
+/**
+ * An archive body the test feeds in parts: each `send` is flushed whole, so the reader has it
+ * before the next part exists, and a part never sent is a download that has gone quiet.
+ */
+const archiveInParts = () => {
+  const gz = createGzip();
+  return {
+    body: Readable.toWeb(gz) as unknown as ReadableStream<Uint8Array>,
+    send: (bytes: Buffer) => {
+      gz.write(bytes);
+      gz.flush();
+    },
+    finish: (bytes: Buffer) => {
+      gz.end(bytes);
+    },
+    fail: (error: Error) => {
+      gz.destroy(error);
+    },
+  };
+};
+
+const servingArchive = (body: ReadableStream<Uint8Array>) =>
+  server.use(http.get(`${REPO}/tarball/:ref`, () => new HttpResponse(body)));
+
+/** `g` with a promise that settles once its `count`th blob has been written to the object store. */
+const afterBlobWrites = (g: ReturnType<typeof runnerGit>, count: number) => {
+  let writes = 0;
+  let reached: () => void = () => {};
+  const done = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  const counted: typeof g = async (args, options) => {
+    const result = await g(args, options);
+    if (args.join(" ") === "hash-object -w --stdin" && ++writes === count) {
+      reached();
+    }
+    return result;
+  };
+  return { counted, done };
+};
+
+const blobOf = (tip: string, index: number) =>
+  git(remote, "rev-parse", `${tip}:bulk/f${index}.txt`);
+
+test.each(["errors", "goes quiet"] as const)(
+  "an archive that %s after 8 of 20 files keeps those 8 blobs and fetches only the other 12 one by one",
+  async (how) => {
+    fakeGitHub();
+    const { dir, tip } = await cloneBehind(20);
+    const STORED = 8;
+    const archive = archiveInParts();
+    archive.send(Buffer.concat(bulkEntries(0, STORED)));
+    servingArchive(archive.body);
+    const writes = afterBlobWrites(runnerGit(dir), STORED);
+    const gw = testGateway();
+    const lines: string[] = [];
+    const calls = gatewayCalls();
+    const fetching = fetchCommit(writes.counted, gw.call, tip, (line) =>
+      lines.push(line),
+    );
+    fetching.catch(() => {});
+    await writes.done;
+    if (how === "errors") archive.fail(new Error("connection reset"));
+    else gw.fireIdle();
+    await fetching;
+    calls.stop();
+
+    expect(lines.join("\n")).toContain("fetching 12 blobs one by one");
+    expect(
+      blobCalls(calls.urls)
+        .map((url) => url.split("/").pop())
+        .sort(),
+    ).toEqual(
+      Array.from({ length: 12 }, (_, k) => blobOf(tip, STORED + k)).sort(),
+    );
+    for (let i = 0; i < 20; i++) {
+      expect(git(dir, "cat-file", "-p", `${tip}:bulk/f${i}.txt`)).toBe(
+        `file ${i}`,
+      );
+    }
+  },
+);
+
+test("a blob is in the object store while the archive is still arriving", async () => {
+  fakeGitHub();
+  const { dir, tip } = await cloneBehind(20);
+  const archive = archiveInParts();
+  archive.send(bulkEntries(0, 1)[0] as Buffer);
+  servingArchive(archive.body);
+  const writes = afterBlobWrites(runnerGit(dir), 1);
+  const calls = gatewayCalls();
+  const fetching = fetchCommit(writes.counted, testGateway().call, tip);
+  fetching.catch(() => {});
+
+  await writes.done;
+  // the archive has sent one file and nothing more; it is not complete, yet the file is stored
+  expect(git(dir, "cat-file", "-t", blobOf(tip, 0))).toBe("blob");
+
+  archive.finish(Buffer.concat([...bulkEntries(1, 20), TAR_END]));
+  await fetching;
+  calls.stop();
+  expect(blobCalls(calls.urls)).toEqual([]);
+  expect(git(dir, "cat-file", "-p", `${tip}:bulk/f19.txt`)).toBe("file 19");
+});
+
+test("each chunk that arrives restarts the idle bound, so an archive slow past it as a whole is still read", async () => {
+  fakeGitHub();
+  const { dir, tip } = await cloneBehind(20);
+  const archive = gzipSync(Buffer.concat([...bulkEntries(0, 20), TAR_END]));
+  const PIECE = 64;
+  const gw = clockedGateway();
+  let sent = 0;
+  server.use(
+    http.get(
+      `${REPO}/tarball/:ref`,
+      () =>
+        new HttpResponse(
+          new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              // the reader restarts the bound on the last piece once the loop has turned
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              if (sent * PIECE >= archive.length) {
+                controller.close();
+                return;
+              }
+              // each piece comes 100 s after the one before: inside the 120 s bound alone, past it summed
+              gw.elapse(100_000);
+              controller.enqueue(
+                new Uint8Array(archive.subarray(sent * PIECE, ++sent * PIECE)),
+              );
+            },
+          }),
+        ),
+    ),
+  );
+  const lines: string[] = [];
+  const calls = gatewayCalls();
+  await fetchCommit(runnerGit(dir), gw.call, tip, (line) => lines.push(line));
+  calls.stop();
+
+  expect(sent).toBeGreaterThan(2);
+  expect(lines.filter((line) => line.includes("archive failed"))).toEqual([]);
+  expect(blobCalls(calls.urls)).toEqual([]);
+  expect(git(dir, "cat-file", "-p", `${tip}:bulk/f19.txt`)).toBe("file 19");
+});
+
+test("an archive answered 200 with a body that isn't gzip is named on one line, and every blob is fetched by itself", async () => {
+  fakeGitHub();
+  const { dir, tip } = await cloneBehind(20);
+  server.use(
+    http.get(
+      `${REPO}/tarball/:ref`,
+      () => new HttpResponse("this is not a gzip archive at all\n"),
+    ),
+  );
+  const lines: string[] = [];
+  const calls = gatewayCalls();
+  await fetchCommit(runnerGit(dir), testGateway().call, tip, (line) =>
+    lines.push(line),
+  );
+  calls.stop();
+
+  expect(lines).toContain(
+    `repo pull: the archive failed (GitHub gateway: GET /repos/acme/private/tarball/${tip} answered with an archive that can't be read: incorrect header check); fetching 20 blobs one by one`,
+  );
+  expect(lines.join("\n")).not.toContain(CONNECTOR);
+  expect(lines.join("\n")).not.toContain(GATEWAY);
+  expect(blobCalls(calls.urls)).toHaveLength(20);
+  expect(git(dir, "cat-file", "-p", `${tip}:bulk/f19.txt`)).toBe("file 19");
+});
+
+test("a pull stopped by a spent hourly limit says when it ends, and no token appears in what it prints", async () => {
+  fakeGitHub();
+  const reset = Math.floor(Date.now() / 1000) + 3000;
+  server.use(
+    http.get(`${REPO}/git/commits/:sha`, () =>
+      HttpResponse.json(
+        { message: "API rate limit exceeded for user ID 1" },
+        {
+          status: 403,
+          headers: {
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(reset),
+          },
+        },
+      ),
+    ),
+  );
+  const { io, sink } = sinks();
+
+  expect(
+    await repoPullMain(["acme/private", join(root, "x")], mainEnv, sink),
+  ).toBe(1);
+
+  expect(io.err).toContain(
+    `repo pull: failed: github_rate_limited: GitHub's hourly API limit is used up until ${new Date(reset * 1000).toISOString()}`,
+  );
+  expect(io.err + io.out).not.toContain(CONNECTOR);
+  expect(io.err + io.out).not.toMatch(/authorization|bearer|ghp_|gho_/i);
 });

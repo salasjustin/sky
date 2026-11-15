@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { REPO_LOCK_WAIT_S, type RunnerEventPost } from "@sky/shared";
 import { HttpResponse, http } from "msw";
@@ -277,6 +278,23 @@ function fakeGitHub() {
             return { mode, type, sha, path };
           }),
       });
+    }),
+    http.get(`${REPO}/tarball/:ref`, ({ request, params }) => {
+      seen(request);
+      return new HttpResponse(
+        gzipSync(
+          execFileSync(
+            "git",
+            [
+              "archive",
+              "--format=tar",
+              "--prefix=acme-private-x/",
+              String(params.ref),
+            ],
+            { cwd: remote, maxBuffer: 256 * 1024 * 1024 },
+          ),
+        ),
+      );
     }),
     http.get(`${REPO}/git/blobs/:sha`, ({ request, params }) => {
       seen(request);

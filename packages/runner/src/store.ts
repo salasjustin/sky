@@ -36,8 +36,8 @@ const LOCK_WAIT_S = 600;
 const LOCK_TIMED_OUT = 75;
 const PUSH_ATTEMPTS = 4;
 // blob downloads in flight at once through the connector gateway during a pull
-const BLOB_FETCH_CONCURRENCY = 8;
-const PROGRESS_EVERY = 100;
+export const BLOB_FETCH_CONCURRENCY = 8;
+export const PROGRESS_EVERY = 100;
 // `git hash-object -t tree /dev/null`
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 // our lock stays out of the store, with whatever the layout keeps local to the sprite
@@ -292,7 +292,7 @@ async function pull(
 }
 
 /** The shas among `shas` the object store lacks, asked of one `cat-file` rather than one per sha. */
-async function missingObjects(
+export async function missingObjects(
   g: ReturnType<typeof git>,
   shas: string[],
 ): Promise<string[]> {
@@ -337,7 +337,7 @@ export async function fetchMissing(
  * Runs `task` over `items`, at most `limit` at once. After the first rejection no new task starts;
  * the running ones settle, then this rejects with that first error.
  */
-async function eachLimited<T>(
+export async function eachLimited<T>(
   items: readonly T[],
   limit: number,
   task: (item: T) => Promise<void>,
@@ -361,7 +361,7 @@ async function eachLimited<T>(
 }
 
 /** Writes the blob through `hash-object` so its sha is git's own, whatever GitHub said it was. */
-async function writeBlob(
+export async function writeBlob(
   g: ReturnType<typeof git>,
   content: Buffer,
 ): Promise<string> {

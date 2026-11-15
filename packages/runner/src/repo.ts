@@ -24,10 +24,14 @@ import {
   fetchMissing,
   git,
   messageOf,
+  missingObjects,
+  PROGRESS_EVERY,
   type Progress,
   remoteHead,
   type TreeItem,
+  writeBlob,
 } from "./store.js";
+import { walkTarball } from "./tarball.js";
 
 export const REPO_PULL_USAGE = "repo-pull <owner/repo> <dir>";
 
@@ -124,7 +128,7 @@ export function rebuildCommit(sha: string, commit: ApiCommit): string {
 
 /**
  * Materializes `repo`'s default branch in `dir` through the connector gateway, which carries REST
- * and no git transport: the branch's commit, its tree and every blob are fetched and written as git
+ * and no git transport: the branch's commit and tree are fetched, and the files come as one tarball, written as git
  * objects, so the checkout holds the same commit sha as GitHub, and `origin/HEAD` names it, which
  * is what a worktree branches from and what a publish takes as its parent. The commit is shallow:
  * its ancestors stay on GitHub. A failure removes what this run created; a checkout an earlier,
@@ -184,6 +188,7 @@ export async function pullRepo(options: {
     await writeCheckout(dir, options.repo, remote, commit, listing.tree, raw, {
       call,
       progress,
+      archiveFrom: 1,
     });
   } catch (error) {
     if (created) await rm(created, { recursive: true, force: true });
@@ -219,6 +224,95 @@ async function removeAbandonedIndexes(gitDir: string): Promise<void> {
   );
 }
 
+// a fetch that lacks fewer blobs than this asks for them one by one; more come as one archive
+const ARCHIVE_FROM = 20;
+
+/** The id git gives `bytes` as a blob. */
+const blobId = (bytes: Buffer) =>
+  createHash("sha1")
+    .update(`blob ${bytes.length}\0`)
+    .update(bytes)
+    .digest("hex");
+
+/**
+ * Makes every blob of `blobs` present in the repo `g` runs in. The ones it lacks come from one
+ * tarball of `sha`, whose gateway cost doesn't grow with the file count, when at least `archiveFrom`
+ * are missing. The archive is read as it downloads and each file is written to the object store in
+ * turn, so memory is the largest file, not the archive. A blob the archive leaves out or doesn't
+ * carry as git stores it (`export-ignore` drops the file, `export-subst` changes its bytes), or one
+ * past the walker's size cap, is fetched by itself.
+ * An archive that fails for any reason but a rate limit or a failed local write is given up where it
+ * stopped, said on one line, and every blob still missing is fetched by itself.
+ */
+async function fetchBlobs(
+  g: ReturnType<typeof git>,
+  call: ReturnType<typeof gateway>,
+  sha: string,
+  blobs: TreeItem[],
+  progress: Progress,
+  archiveFrom: number,
+): Promise<void> {
+  const missing = new Set(
+    await missingObjects(g, [...new Set(blobs.map((item) => item.sha))]),
+  );
+  if (missing.size === 0) return;
+  if (missing.size < archiveFrom) {
+    await fetchMissing(g, call, blobs, progress, "repo pull");
+    return;
+  }
+  progress(`repo pull: downloading ${missing.size} blobs as one archive`);
+  const wanted = new Map<string, TreeItem>(
+    blobs
+      .filter((item) => missing.has(item.sha))
+      .map((item) => [item.path, item]),
+  );
+  const total = missing.size;
+  let stored = 0;
+  const path = `/tarball/${sha}`;
+  // a local write that fails (a full volume) would fail every per-blob write too, so it is thrown as is
+  const local: { writeFailure?: { error: unknown } } = {};
+  try {
+    const archive = await call.stream(path);
+    await walkTarball(archive, {
+      wants: (name) => {
+        const item = wanted.get(name);
+        return item !== undefined && missing.has(item.sha);
+      },
+      file: async (name, bytes) => {
+        const item = wanted.get(name);
+        if (!item || !missing.has(item.sha) || blobId(bytes) !== item.sha) {
+          return;
+        }
+        const written = await writeBlob(g, bytes).catch((error: unknown) => {
+          local.writeFailure = { error };
+          throw error;
+        });
+        if (written !== item.sha) return;
+        missing.delete(item.sha);
+        stored++;
+        if (stored % PROGRESS_EVERY === 0) {
+          progress(`repo pull: stored ${stored}/${total} blobs`);
+        }
+      },
+    });
+  } catch (error) {
+    if (local.writeFailure?.error === error) throw error;
+    // per blob, a spent limit would only fail again, one call per blob
+    if (error instanceof GatewayError && error.rateLimited) throw error;
+    const named =
+      error instanceof GatewayError
+        ? error
+        : new GatewayError(
+            `GitHub gateway: ${call.where("GET", path)} answered with an archive that can't be read: ${messageOf(error)}`,
+          );
+    progress(
+      `repo pull: the archive failed (${whyFailed(named)}); fetching ${missing.size} blobs one by one`,
+    );
+  }
+  const rest = blobs.filter((item) => missing.has(item.sha));
+  if (rest.length > 0) await fetchMissing(g, call, rest, progress, "repo pull");
+}
+
 /**
  * Writes the commit, its tree and every blob into the repo `g` runs in as git objects, so
  * `remote.sha` resolves there; the checkout and refs are the caller's.
@@ -230,10 +324,21 @@ async function writeObjects(
   commit: ApiCommit,
   tree: TreeItem[],
   raw: string,
-  source: { call: ReturnType<typeof gateway>; progress: Progress },
+  source: {
+    call: ReturnType<typeof gateway>;
+    progress: Progress;
+    archiveFrom: number;
+  },
 ): Promise<void> {
   const blobs = tree.filter((item) => item.type === "blob");
-  await fetchMissing(g, source.call, blobs, source.progress, "repo pull");
+  await fetchBlobs(
+    g,
+    source.call,
+    sha,
+    blobs,
+    source.progress,
+    source.archiveFrom,
+  );
   // a submodule is a gitlink: a commit sha in the tree with nothing behind it here
   const entries = tree.filter(
     (item) => item.type === "blob" || item.type === "commit",
@@ -285,6 +390,7 @@ export async function fetchCommit(
   await writeObjects(g, gitDir, sha, commit, listing.tree, raw, {
     call,
     progress,
+    archiveFrom: ARCHIVE_FROM,
   });
   const here = async (parent: string) =>
     g(["cat-file", "-e", `${parent}^{commit}`]).then(
@@ -373,7 +479,11 @@ async function writeCheckout(
   commit: ApiCommit,
   tree: TreeItem[],
   raw: string,
-  source: { call: ReturnType<typeof gateway>; progress: Progress },
+  source: {
+    call: ReturnType<typeof gateway>;
+    progress: Progress;
+    archiveFrom: number;
+  },
 ): Promise<void> {
   const g = git(dir);
   await g(["init", "-q", "-b", remote.branch]);

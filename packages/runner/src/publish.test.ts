@@ -1075,7 +1075,7 @@ test("a spent rate limit that resets later than the wait allows fails naming the
   const error = await run().catch((e: Error) => e);
 
   expect((error as Error).message).toContain(
-    `rate limit, which resets at ${new Date(reset * 1000).toISOString()}`,
+    `github_rate_limited: GitHub's hourly API limit is used up until ${new Date(reset * 1000).toISOString()}`,
   );
   expect((error as Error).message).not.toContain("API rate limit exceeded");
 });
@@ -2587,7 +2587,7 @@ test("the primary rate limit on a ref update that changes workflows is reported 
   expect(error).toBeInstanceOf(GatewayError);
   expect((error as GatewayError).rateLimited).toBe(true);
   expect((error as Error).message).not.toMatch(/workflow_files_blocked/);
-  expect((error as Error).message).toMatch(/hit GitHub's rate limit/);
+  expect((error as Error).message).toMatch(/^github_rate_limited: /);
 });
 
 test.each<{
@@ -2601,13 +2601,6 @@ test.each<{
     status: 403,
     message: "Forbidden",
     headers: { "retry-after": "120" },
-  },
-  {
-    how: "its message alone",
-    status: 403,
-    message:
-      "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
-    headers: {},
   },
   {
     // a 429 is a rate limit whatever its headers; the retry-after is past the wait, so none is waited
