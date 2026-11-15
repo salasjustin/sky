@@ -1826,6 +1826,13 @@ test("a start branch is fetched through the connector once the anonymous fetch h
   expect(warnings.filter((w) => w.includes("anonymous git"))).toHaveLength(1);
 });
 
+// what the run's instructions say whether or not the refresh moved anything; none of these can be
+// satisfied by the older sentence naming `git fetch`, `git pull` and `git push`
+const BY_DESIGN =
+  "That is by design, not a fault to work around: the runner reaches GitHub for you.";
+const SYNC_COMMAND = `\`${process.execPath} ${process.argv[1]} sync\` when GitHub's default branch may have moved while you worked`;
+const NO_LOCAL_CHANGE = "It changes no local branch or worktree.";
+
 test("the run's prompt names the origin tip the refresh reached, with its short sha and UTC time, and says git has no credential by design", async () => {
   const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
   vi.useFakeTimers({ toFake: ["Date"] });
@@ -1838,23 +1845,58 @@ test("the run's prompt names the origin tip the refresh reached, with its short 
       `\`origin/trunk\` is at GitHub's tip as of the start-of-run refresh: ${tip.slice(0, 7)}, 2026-03-04 05:06 UTC.`,
     );
     expect(append).toContain("`git fetch`");
-    expect(append).toContain("That is by design");
-    expect(append).toContain(" sync`");
+    expect(append).toContain(BY_DESIGN);
+    expect(append).toContain(SYNC_COMMAND);
+    expect(append).toContain(NO_LOCAL_CHANGE);
   } finally {
     vi.useRealTimers();
   }
 });
 
-test("a run whose refresh failed claims no refreshed tip", async () => {
+test("the run's prompt renders the refresh time in UTC to the minute, whatever the machine's time zone", async () => {
+  vi.stubEnv("TZ", "Pacific/Auckland");
+  vi.useFakeTimers({ toFake: ["Date"] });
+  // 12:59 on 5 March in Auckland, one second short of midnight UTC
+  vi.setSystemTime(new Date("2026-03-04T23:59:59Z"));
+  try {
+    const { append } = await runOnce();
+
+    expect(append).toContain(", 2026-03-04 23:59 UTC.");
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+  }
+});
+
+test("a run whose refresh failed claims no refreshed tip, and still says git is by design unavailable and sync is allowed", async () => {
+  const origin = git(repoDir, "rev-parse", "origin/trunk");
   server.use(
     http.get(`${REPO}/git/ref/heads/trunk`, () =>
       HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
     ),
   );
 
-  const { append } = await runOnce();
+  const { append = "" } = await runOnce();
 
-  expect(append).not.toContain("is at GitHub's tip as of");
+  expect(append).not.toContain("GitHub's tip");
+  expect(append).not.toContain(" UTC");
+  expect(append).not.toContain(origin.slice(0, 7));
+  expect(append).toContain(BY_DESIGN);
+  expect(append).toContain(SYNC_COMMAND);
+});
+
+test("a run whose default branch was too far ahead to fetch claims no refreshed tip either", async () => {
+  const first = pushToGitHub("trunk", "new.txt", "0\n");
+  pushTo("trunk", emptyCommits(seed, 100, first));
+
+  const { append = "" } = await runOnce();
+
+  // the too-far note names the commit origin was left at, so only the claims are checked here
+  expect(append).toContain("too far to fetch");
+  expect(append).not.toContain("GitHub's tip");
+  expect(append).not.toContain(" UTC");
+  expect(append).toContain(BY_DESIGN);
+  expect(append).toContain(SYNC_COMMAND);
 });
 
 test("the run's prompt allows publish and sync in one sentence and says sync goes through the connector with a 100-commit limit", async () => {
@@ -1888,9 +1930,13 @@ test("the run's prompt names the tip of an origin that was already current witho
   expect(append).not.toMatch(/moved `origin\//);
 });
 
-const syncRun = async (cwd: string, env: NodeJS.ProcessEnv = ENV) => {
+const syncRun = async (
+  cwd: string,
+  env: NodeJS.ProcessEnv = ENV,
+  argv: string[] = [],
+) => {
   const io = { out: "", err: "" };
-  const code = await syncMain([], env, {
+  const code = await syncMain(argv, env, {
     cwd,
     stdout: (s) => {
       io.out += s;
@@ -1906,6 +1952,25 @@ test("sync moves origin's default branch to GitHub's new tip and prints it with 
   const { cwd } = await prepare();
   const head = git(cwd, "rev-parse", "HEAD");
   const old = git(repoDir, "rev-parse", "origin/trunk");
+  // a local trunk and another local branch, so "no local branch moved" has something to hold
+  git(repoDir, "update-ref", "refs/heads/trunk", old);
+  git(repoDir, "update-ref", "refs/heads/side", old);
+  writeFileSync(join(cwd, "scratch.txt"), "uncommitted\n");
+  const everythingButOrigin = () => ({
+    refs: git(
+      repoDir,
+      "for-each-ref",
+      "--format=%(refname) %(objectname)",
+    )
+      .split("\n")
+      .filter((line) => !/^refs\/remotes\/origin\/trunk |^refs\/sky\//.test(line)),
+    status: git(cwd, "status", "--porcelain"),
+    head: git(cwd, "rev-parse", "HEAD"),
+  });
+  const before = everythingButOrigin();
+  expect(before.refs).toContain(`refs/heads/trunk ${old}`);
+  expect(before.refs).toContain(`refs/heads/side ${old}`);
+  expect(before.status).toBe("?? scratch.txt");
   pushToGitHub("trunk", "one.txt", "1\n");
   const tip = pushToGitHub("trunk", "two.txt", "2\n");
 
@@ -1918,6 +1983,34 @@ test("sync moves origin's default branch to GitHub's new tip and prints it with 
   });
   expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(tip);
   expect(git(cwd, "rev-parse", "HEAD")).toBe(head);
+  expect(everythingButOrigin()).toEqual(before);
+});
+
+test("sync after exactly one new commit on GitHub says 1 commit ahead", async () => {
+  const { cwd } = await prepare();
+  const old = git(repoDir, "rev-parse", "origin/trunk");
+  const tip = pushToGitHub("trunk", "one.txt", "1\n");
+
+  expect(await syncRun(cwd)).toEqual({
+    code: 0,
+    out: `origin/trunk moved from ${old.slice(0, 7)} to GitHub's tip ${tip.slice(0, 7)}, 1 commit ahead. Your worktree and local trunk were not changed.\n`,
+    err: "",
+  });
+});
+
+test("sync with GitHub's default branch more than 100 commits ahead exits 1 saying why and leaves origin where it was", async () => {
+  const { cwd } = await prepare();
+  const old = git(repoDir, "rev-parse", "origin/trunk");
+  const first = pushToGitHub("trunk", "new.txt", "0\n");
+  const tip = emptyCommits(seed, 100, first);
+  pushTo("trunk", tip);
+
+  expect(await syncRun(cwd)).toEqual({
+    code: 1,
+    out: "",
+    err: `sky sync: GitHub's trunk is more than 100 commits ahead of what this sandbox has, too far to fetch, so \`origin/trunk\` was left at ${old.slice(0, 7)}; you are working from that commit, not GitHub's ${tip.slice(0, 7)}.\n`,
+  });
+  expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(old);
 });
 
 test("sync with no change says nothing moved", async () => {
@@ -1987,7 +2080,7 @@ test("sync --help and -h print the usage on stdout and exit 0, before any connec
   }
 });
 
-test("sync reports a failed refresh plainly, with no credential in it", async () => {
+test("sync relays the gateway's error plainly on stderr, exits 1 and prints nothing on stdout", async () => {
   const { cwd } = await prepare();
   const old = git(repoDir, "rev-parse", "origin/trunk");
   server.use(
@@ -1996,7 +2089,7 @@ test("sync reports a failed refresh plainly, with no credential in it", async ()
     ),
   );
 
-  const result = await syncRun(cwd, { ...ENV, GITHUB_TOKEN: "ghp_secret" });
+  const result = await syncRun(cwd);
 
   expect(result).toEqual({
     code: 1,
@@ -2006,11 +2099,30 @@ test("sync reports a failed refresh plainly, with no credential in it", async ()
   expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(old);
 });
 
-test("sync without a connector exits 2 saying what to set", async () => {
+test("sync without a connector exits 2 saying what to set, and asks GitHub for nothing", async () => {
   const { cwd } = await prepare();
+  requests = [];
 
   const result = await syncRun(cwd, {});
 
-  expect(result.code).toBe(2);
-  expect(result.err).toContain("GITHUB_CONNECTOR is not set");
+  expect(result).toEqual({
+    code: 2,
+    out: "",
+    err: "sky sync: GITHUB_CONNECTOR is not set; set a connector secret: sky secret set <env> GITHUB_CONNECTOR --connector=<connection id>\n",
+  });
+  expect(requests).toEqual([]);
+});
+
+test("sync with an argument other than --help exits 2 with the usage on stderr", async () => {
+  const { cwd } = await prepare();
+  requests = [];
+
+  const result = await syncRun(cwd, ENV, ["trunk"]);
+
+  expect(result).toEqual({
+    code: 2,
+    out: "",
+    err: "sky sync: takes no arguments\nusage: sync\n",
+  });
+  expect(requests).toEqual([]);
 });
