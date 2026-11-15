@@ -1218,6 +1218,20 @@ const backgroundAgentCall = assistant({
   name: "Agent",
   input: { run_in_background: true, prompt: "prove it" },
 });
+/** The SDK's answer to a background `Agent` call: launched, by the subagent's id (`AgentOutput` in sdk-tools.d.ts). */
+const agentLaunched = (agentId: string, toolUseId = "toolu_agent"): Step =>
+  hook("PostToolUse", {
+    tool_name: "Agent",
+    tool_use_id: toolUseId,
+    tool_input: { prompt: "prove it" },
+    tool_response: {
+      status: "async_launched",
+      agentId,
+      description: "prove it",
+      prompt: "prove it",
+      outputFile: `/tmp/${agentId}.output`,
+    },
+  });
 
 test("a result while a background subagent runs, which the task list doesn't show, keeps the prompt open and the woken turn's tool call runs", async () => {
   const seen: boolean[] = [];
@@ -1252,6 +1266,7 @@ test("a background Agent call whose subagent hasn't started yet counts as unfini
     query: wakeProcess([
       init,
       backgroundAgentCall,
+      agentLaunched("agent-1"),
       success,
       atIdle(seen),
       subagentStart,
@@ -1264,6 +1279,139 @@ test("a background Agent call whose subagent hasn't started yet counts as unfini
     awaitDecision: noDecision,
   });
   expect(seen).toEqual([false, true]);
+});
+
+test("a subagent that stopped before its launch result came leaves nothing unfinished", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      backgroundAgentCall,
+      subagentStart,
+      subagentStop,
+      agentLaunched("agent-1"),
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([true]);
+});
+
+test("a foreground Agent call's subagent starting and stopping beside a background launch leaves the background subagent counted", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      assistant(
+        {
+          type: "tool_use",
+          id: "toolu_fg",
+          name: "Agent",
+          input: { run_in_background: false, prompt: "look first" },
+        },
+        {
+          type: "tool_use",
+          id: "toolu_agent",
+          name: "Agent",
+          input: { prompt: "prove it" },
+        },
+      ),
+      hook("SubagentStart", { agent_id: "agent-fg", agent_type: "Explore" }),
+      hook("SubagentStop", {
+        agent_id: "agent-fg",
+        agent_type: "Explore",
+        last_assistant_message: "looked",
+      }),
+      hook("PostToolUse", {
+        tool_name: "Agent",
+        tool_use_id: "toolu_fg",
+        tool_input: { prompt: "look first" },
+        tool_response: {
+          status: "completed",
+          agentId: "agent-fg",
+          content: [{ type: "text", text: "looked" }],
+          prompt: "look first",
+        },
+      }),
+      agentLaunched("agent-1"),
+      success,
+      // the background subagent hasn't started: stdin must still be open
+      atIdle(seen),
+      subagentStart,
+      subagentStop,
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([false, true]);
+});
+
+test("a subagent started twice by one id, as a resume does, and stopped once leaves nothing unfinished", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  await runSession(config, {
+    query: wakeProcess([
+      init,
+      backgroundAgentCall,
+      agentLaunched("agent-1"),
+      subagentStart,
+      subagentStart,
+      subagentStop,
+      success,
+      atIdle(seen),
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([true]);
+});
+
+test("a background Agent call the gate denied launches nothing to wait for", async () => {
+  const seen: boolean[] = [];
+  const { post } = recorder();
+  let answers: unknown[] = [];
+  await runSession(
+    { ...config, approvalPolicy: ["Agent"] },
+    {
+      query: wakeProcess([
+        init,
+        backgroundAgentCall,
+        async (options: Options) => {
+          answers = await fire(options, "PreToolUse", {
+            tool_name: "Agent",
+            tool_use_id: "toolu_agent",
+            tool_input: { run_in_background: true, prompt: "prove it" },
+          });
+          return undefined;
+        },
+        success,
+        atIdle(seen),
+      ]),
+      post,
+      signal: new AbortController().signal,
+      awaitDecision: async () => ({
+        kind: "decided",
+        decision: { requestId: "req_x", decision: "deny" },
+      }),
+    },
+  );
+  expect(answers).toEqual([
+    expect.objectContaining({
+      hookSpecificOutput: expect.objectContaining({
+        permissionDecision: "deny",
+      }),
+    }),
+  ]);
+  expect(seen).toEqual([true]);
 });
 
 test("a subagent that stopped before the result leaves the prompt to close", async () => {

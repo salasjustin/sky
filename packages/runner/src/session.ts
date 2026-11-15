@@ -381,9 +381,11 @@ function sessionHooks(
     ) => Promise<SyncHookJSONOutput>;
     /** A tool call is running: it passed `gate`. */
     toolStarted: (toolUseId: string, toolName: string) => void;
-    toolEnded: (toolUseId: string, failed: boolean) => void;
+    toolEnded: (toolUseId: string) => void;
     /** A subagent started or stopped, by its agent id. */
     subagent: (agentId: string, running: boolean) => void;
+    /** An `Agent` call returned with its subagent launched in the background. */
+    subagentLaunched: (agentId: string) => void;
   },
 ): Options["hooks"] {
   const matcher = <E extends HookEvent>(
@@ -440,8 +442,10 @@ function sessionHooks(
       return output;
     }, gateTimeout),
     PostToolUse: matcher<"PostToolUse">((input) => {
-      on.toolEnded(input.tool_use_id, false);
+      on.toolEnded(input.tool_use_id);
       const response = input.tool_response;
+      const launched = launchedAgentId(input.tool_name, response);
+      if (launched) on.subagentLaunched(launched);
       on.event({
         type: "claude.PostToolUse",
         payload: {
@@ -458,7 +462,7 @@ function sessionHooks(
       });
     }),
     PostToolUseFailure: matcher<"PostToolUseFailure">((input) => {
-      on.toolEnded(input.tool_use_id, true);
+      on.toolEnded(input.tool_use_id);
       on.event({
         type: "claude.PostToolUseFailure",
         payload: {
@@ -971,23 +975,18 @@ export async function runSession(
     },
     gate,
     toolStarted: heartbeat.started,
-    toolEnded: (toolUseId, failed) => {
-      heartbeat.ended(toolUseId);
-      // a launch that failed starts no subagent to wait for
-      if (failed) launching.delete(toolUseId);
-    },
+    toolEnded: heartbeat.ended,
     subagent: (agentId, running) => {
-      if (running) {
-        subagents.add(agentId);
-        // the launch it answers is now tracked by its id
-        for (const id of launching) {
-          launching.delete(id);
-          break;
-        }
-      } else {
+      if (running) subagents.add(agentId);
+      else {
         subagents.delete(agentId);
+        stoppedSubagents.add(agentId);
         restartHold();
       }
+    },
+    // a subagent can stop before its launch's result is in, and must not be counted again then
+    subagentLaunched: (agentId) => {
+      if (!stoppedSubagents.has(agentId)) subagents.add(agentId);
     },
   });
   const input = promptInput(config.prompt);
@@ -995,19 +994,19 @@ export async function runSession(
   // are leaves the input open for the turn their notification wakes, for at most the hold
   let liveTasks = 0;
   // A background subagent wakes the session when it finishes, as a task does, but the task list
-  // can lack it (or already have dropped it) when its parent's `result` arrives; so the start and
-  // stop hooks count it by agent id, and a background `Agent` call counts from the assistant
-  // message that makes it until its subagent starts. Tasks the SDK flags `ambient` (watchers and
-  // housekeeping, never activity) stay out: they don't wake a turn, so holding for one would only
-  // keep a finished run open until the hold expires.
+  // can lack it (or already have dropped it) when its parent's `result` arrives; so it counts by
+  // agent id from its launch's result or its start hook, whichever comes first, until its stop
+  // hook. A turn's `result` can't precede its own tool results, so a launch is counted before the
+  // result it must hold. Tasks the SDK flags `ambient` (watchers and housekeeping, never activity)
+  // stay out: they don't wake a turn, so holding for one would only keep a finished run open until
+  // the hold expires.
   const subagents = new Set<string>();
-  const launching = new Set<string>();
-  const unfinishedWork = () => liveTasks + subagents.size + launching.size;
+  const stoppedSubagents = new Set<string>();
+  const unfinishedWork = () => liveTasks + subagents.size;
   const describeUnfinished = () =>
     [
       liveTasks > 0 && `${liveTasks} background task(s)`,
-      subagents.size + launching.size > 0 &&
-        `${subagents.size + launching.size} background subagent(s)`,
+      subagents.size > 0 && `${subagents.size} background subagent(s)`,
     ]
       .filter(Boolean)
       .join(" and ");
@@ -1097,8 +1096,6 @@ export async function runSession(
           toolUseIdsOf(message.message.content),
           message.agent_id ?? parent ?? undefined,
         );
-        for (const block of message.message.content)
-          if (isBackgroundAgentCall(block) && !parent) launching.add(block.id);
         // queued, not awaited: the post waits behind every hook event already queued, and a slow API must not hold the loop
         for (const text of textOf(message.message.content))
           void post(
@@ -1134,7 +1131,7 @@ export async function runSession(
         message.type === "user" &&
         inputClosed &&
         !cancelWarned &&
-        subagents.size + launching.size > 0 &&
+        subagents.size > 0 &&
         hasCancelledCall(message.message.content)
       ) {
         cancelWarned = true;
@@ -1218,17 +1215,22 @@ function textOf(content: AssistantContent): string[] {
   );
 }
 
-/** An `Agent` (or `Task`) call the main thread made to run in the background. */
-function isBackgroundAgentCall(
-  block: AssistantContent[number],
-): block is Extract<AssistantContent[number], { type: "tool_use" }> {
-  return (
-    block.type === "tool_use" &&
-    (block.name === "Agent" || block.name === "Task") &&
-    typeof block.input === "object" &&
-    block.input !== null &&
-    (block.input as Record<string, unknown>).run_in_background === true
-  );
+/**
+ * The subagent an `Agent` (or `Task`) call launched in the background, by the `agentId` of the
+ * SDK's `async_launched` output (`AgentOutput`); a foreground call answers `completed` instead.
+ */
+function launchedAgentId(
+  toolName: string,
+  response: unknown,
+): string | undefined {
+  if (toolName !== "Agent" && toolName !== "Task") return undefined;
+  const output = response as { status?: unknown; agentId?: unknown } | null;
+  // taken as the hooks' `agent_id`: the SDK's types call both the subagent's id, and nothing in
+  // its source (the CLI ships apart from it) ties one to the other
+  return output?.status === "async_launched" &&
+    typeof output.agentId === "string"
+    ? output.agentId
+    : undefined;
 }
 
 /** What the SDK answers a tool call it cancels, as a user refusal would read. */
