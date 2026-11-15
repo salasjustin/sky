@@ -18,7 +18,14 @@ import {
 } from "@sky/shared";
 import { eq } from "drizzle-orm";
 import { HttpResponse, http, ws } from "msw";
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  expect,
+  type MockInstance,
+  test,
+  vi,
+} from "vitest";
 import { server } from "../../../test/msw.js";
 import { DIFF, DIFF_MAX_BYTES } from "./agents.js";
 import { createApp } from "./app.js";
@@ -168,13 +175,16 @@ test("POST returns 202 with the agent on claude/<agentId> and a starting run", a
  * Launches a run in `envId` that, as its runner starts, was created `agoMs` earlier by a clock frozen
  * from the step before (the sprite hold), so the deadline's time left doesn't depend on how long the
  * launch took. The database stamps createdAt by its own clock, so the run's is rewritten to match.
+ * Only `Date.now` is stubbed: `vi.waitFor` advances a faked clock on each poll, and `sessionOpened`
+ * polls while the launch runs.
  */
 async function launchedCreatedAgo(envId: string, agoMs: number) {
   const now = Date.parse("2026-06-01T12:00:00.000Z");
+  let frozen: MockInstance<typeof Date.now> | undefined;
   wire.afterExec = (call) => {
     if (!/ curl .* PUT /.test(call)) return;
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(now);
+    frozen ??= vi.spyOn(Date, "now");
+    frozen.mockReturnValue(now);
     db.update(runs)
       .set({ createdAt: new Date(now - agoMs).toISOString() })
       .run();
@@ -184,7 +194,7 @@ async function launchedCreatedAgo(envId: string, agoMs: number) {
     await sessionOpened();
     return out;
   } finally {
-    vi.useRealTimers();
+    frozen?.mockRestore();
   }
 }
 
