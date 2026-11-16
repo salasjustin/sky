@@ -878,9 +878,10 @@ test("the profile's session variables reach the session, over the caller's env",
   });
 });
 
-test("with no profile, the session env holds the caller's env plus only host mode and the runner's git identity and config", async () => {
+test("with no profile, the session env holds the caller's env plus only host mode, kru's lead-hook switch and the runner's git identity and config", async () => {
   for (const name of [
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "KRU_NO_LEAD_GATE",
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
@@ -911,7 +912,23 @@ test("with no profile, the session env holds the caller's env plus only host mod
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_KEY_0",
     "GIT_CONFIG_VALUE_0",
+    "KRU_NO_LEAD_GATE",
   ]);
+});
+
+test("the Claude session has kru's lead-contract hook off, whatever the runner's env or the profile's session env set the switch to", async () => {
+  vi.stubEnv("KRU_NO_LEAD_GATE", "0");
+  const query = scripted([init, success]);
+  await runSession(
+    { ...config, sessionEnv: { KRU_NO_LEAD_GATE: "" } },
+    {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    },
+  );
+  expect(query.calls[0]?.options.env?.KRU_NO_LEAD_GATE).toBe("1");
 });
 
 test("with a GitHub connector in its env, the session is told to publish through the runner instead of git push or gh", async () => {
@@ -2066,7 +2083,7 @@ describe("the Claude credential of a run", () => {
         { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
       );
       expect(append).toMatch(
-        /Run each command that calls `claude` .*, as `CLAUDE_CODE_OAUTH_TOKEN="\$\(<'[^']+'\)" env -u ANTHROPIC_API_KEY -u .* CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 claude -p …`, even where the check leaves that prefix out\./,
+        /Run each command that calls `claude` .*, as `CLAUDE_CODE_OAUTH_TOKEN="\$\(<'[^']+'\)" env -u ANTHROPIC_API_KEY -u .* CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 KRU_NO_LEAD_GATE=1 claude -p …`, even where the check leaves that prefix out\./,
       );
     });
 
@@ -2345,6 +2362,18 @@ describe("the Claude credential of a run", () => {
       const env = { CLAUDE_CODE_OAUTH_TOKEN: "command-env-token" };
       const seen = run(command, "printenv CLAUDE_CODE_OAUTH_TOKEN", env);
       expect(seen).toBe(`${TOKEN}\n`);
+    });
+
+    test("the nested claude has kru's lead-contract hook off, whatever the command's env set the switch to", async () => {
+      const { prefix } = await loginOf("oauth");
+      for (const value of [undefined, "", "0"])
+        expect(
+          run(
+            nestedClaude(prefix),
+            "printenv KRU_NO_LEAD_GATE",
+            value === undefined ? {} : { KRU_NO_LEAD_GATE: value },
+          ),
+        ).toBe("1\n");
     });
 
     test("on a subscription run the nested claude gets the run's token, never the project's ANTHROPIC_API_KEY, and no other project variable", async () => {

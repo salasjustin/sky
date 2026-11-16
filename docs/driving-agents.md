@@ -105,6 +105,8 @@ sky deny    agt_… req_… --reason="not on production"
 
 Put the answer after `--`, so one starting with `-` (`- staging`, `-1`) isn't read as an option; options such as `--json` go before it. `approve` also takes `--reason=`, which is recorded with the decision and passed to the agent as a note.
 
+An approved held call runs. If Claude Code still turns it down because a hook on the sprite refuses it, the run gets a `runner.warning` event naming the tool, the call id and the refusal, so a call that never ran is not a silent one. kru's lead-contract hook is off in every run, so it never holds an approved call.
+
 These are safe to repeat. Sending exactly the same decision again succeeds like the first, so a bot that crashed after sending one can send it again. A different decision on a request already decided fails (exit 1): the first decision stands and the new one is not applied. A decision also fails when its run stopped or failed before anyone decided.
 
 After a decision the run continues; go back to step 2.

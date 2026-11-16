@@ -207,6 +207,8 @@ The error names the file and the key and never the value: `settings_redirect: .c
 
 Sky starts Claude, and a check's nested `claude`, with `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`, so Claude ignores the endpoint and credential `env` entries a settings file gains mid-run. In that mode Claude also ignores a login stored in its config dir, so on a subscription or pool run the nested command is given the run's token in its env. The check above covers what is on disk when the run starts.
 
+Sky also sets `KRU_NO_LEAD_GATE=1` for Claude and a check's nested `claude`, whatever an environment secret or base profile sets it to. A run's brief is its contract, so the kru plugin's lead-contract hook (`require-lead.sh`) would only block a held call a person approved; every other kru hook stays on. If Claude Code still turns down an approved call because another hook refuses it, the run posts a `runner.warning` naming the tool, the call id and the refusal.
+
 The same names (less `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`) are kept out of the Claude process's own env when they come from the environment's secrets or a base profile's session env. The commands the session runs get the project's values back, except `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` and `CLAUDE_CODE_OAUTH_SCOPES`, which reach neither Claude nor its commands.
 
 #### What a repo's hooks, MCP servers and commands can see

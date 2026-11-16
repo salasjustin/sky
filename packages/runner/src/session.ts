@@ -34,6 +34,7 @@ import {
   HOST_MANAGED,
   type NestedLogin,
   type NestedPrefix,
+  NO_LEAD_GATE,
   nestedLoginDir,
   ownDirectory,
   PROJECT_VARIABLES,
@@ -327,12 +328,12 @@ export function removeScratchNow(): void {
 // a check's nested `claude` runs without the project's key, auth token, gateway, provider switches and
 // proxies (`PROJECT_VARIABLES`), which commands get back from the command-env file: they would outrank
 // the run's login, or send its credential to the project's gateway. It is host-managed like the
-// session, whatever a command set. A subscription or pool run's token comes from
+// session, whatever a command set, and has kru's lead-contract hook off as the session does. A subscription or pool run's token comes from
 // `prepareNestedLogin`'s prefix: a shell assignment ahead of `env`, so the value is never an argument
 // of `env`. An API-key run has no prefix, and the prompt has its `claude` checks reported as not run
 export const nestedClaude = (login: NestedPrefix | undefined) => {
   const prefix = login ? `${login.assignment} ` : "";
-  return `${prefix}env ${PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ")} ${HOST_MANAGED}=1 claude -p …`;
+  return `${prefix}env ${PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ")} ${HOST_MANAGED}=1 ${NO_LEAD_GATE}=1 claude -p …`;
 };
 
 /**

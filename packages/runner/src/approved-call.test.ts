@@ -332,6 +332,37 @@ describe.skipIf(!claudeBinary)(
       expect(warnings(sent)).toEqual([]);
     }, 90_000);
 
+    test("with a lead-contract hook installed that refuses unless KRU_NO_LEAD_GATE is set, the approved call runs and Claude is not told to ask again", async () => {
+      // kru's require-lead.sh does this from the sprite's own settings: exit 2 until its switch is set
+      writeFileSync(
+        join(home, ".claude", "settings.json"),
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: "Bash",
+                hooks: [
+                  {
+                    type: "command",
+                    command:
+                      "[ -n \"$KRU_NO_LEAD_GATE\" ] || { echo 'load the lead contract, then take the action again' >&2; exit 2; }",
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+      const { sent, requests } = await heldRun(nestedCheck("echo RAN"), {
+        decision: "approve",
+      });
+      expect(types(sent)).toContain("claude.PostToolUse");
+      expect(warnings(sent)).toEqual([]);
+      expect(toolResultsIn(requests)).toEqual([
+        expect.objectContaining({ content: "RAN", is_error: false }),
+      ]);
+    }, 90_000);
+
     test("one a user settings hook blocks after the gate never runs, and the run posts Claude Code's refusal as a warning", async () => {
       // a plugin's gate does this from the sprite's own settings: a PreToolUse command hook exiting 2
       writeFileSync(
