@@ -1504,6 +1504,172 @@ test("an event the transition table forbids gets 409 and leaves the run as it wa
   expect((await getRun(agent.id, run.id)).body.status).toBe("starting");
 });
 
+/**
+ * Subscribes an admin webhook to run.started, run.waiting and run.finished, so each one stored
+ * enqueues a delivery.
+ */
+const hearRunEvents = () =>
+  db.$client
+    .prepare(
+      "insert into webhooks (id, url, event_types) values ('whk_runs', 'https://hooks.example.com/runs', '[\"run.started\",\"run.waiting\",\"run.finished\"]')",
+    )
+    .run();
+const deliveryCount = () =>
+  (
+    db.$client.prepare("select count(*) n from webhook_deliveries").get() as {
+      n: number;
+    }
+  ).n;
+
+test("a run.started repeated with the same session is answered as stored and writes nothing, so a retry of a stored start isn't a lost one", async () => {
+  hearRunEvents();
+  const { agent, run, token } = await runningRun();
+  const started = {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "sess-1" },
+  };
+  const first = await postEvent(token, started);
+  expect(first.status).toBe(201);
+  const { id } = (await first.json()) as { id: number };
+  expect(deliveryCount()).toBe(1);
+
+  const repeat = await postEvent(token, started);
+  expect(repeat.status).toBe(201);
+  expect(await repeat.json()).toEqual({ id });
+  expect(eventsOf(run.id).map((e) => e.type)).toEqual(["run.started"]);
+  expect(deliveryCount()).toBe(1);
+  expect((await getRun(agent.id, run.id)).body.status).toBe("running");
+  expect(
+    db.$client.prepare("select session_id, status from agents").get(),
+  ).toEqual({ session_id: "sess-1", status: "running" });
+});
+
+test("a run.started repeated while the run is waiting is answered as stored, and the open request stays open", async () => {
+  hearRunEvents();
+  const { agent, run, token } = await runningRun();
+  const started = {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "sess-1" },
+  };
+  const { id } = (await (await postEvent(token, started)).json()) as {
+    id: number;
+  };
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.waiting",
+    payload: {
+      request: { kind: "question", requestId: "req_1", prompt: "which?" },
+    },
+  });
+  const open = (await getRun(agent.id, run.id)).body.pendingRequest;
+  expect(open).not.toBeNull();
+
+  const repeat = await postEvent(token, started);
+  expect(repeat.status).toBe(201);
+  expect(await repeat.json()).toEqual({ id });
+  expect(eventsOf(run.id).map((e) => e.type)).toEqual([
+    "run.started",
+    "run.waiting",
+  ]);
+  expect(deliveryCount()).toBe(2);
+  const after = await getRun(agent.id, run.id);
+  expect(after.body.status).toBe("waiting");
+  expect(after.body.pendingRequest).toEqual(open);
+});
+
+test("a run.started repeated after the run ended gets 401 run_ended, not the stored answer", async () => {
+  hearRunEvents();
+  const { run, token } = await runningRun();
+  const started = {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "sess-1" },
+  };
+  expect((await postEvent(token, started)).status).toBe(201);
+  await postEvent(token, { runId: run.id, type: "run.stopped", payload: {} });
+
+  const repeat = await postEvent(token, started);
+  expect(repeat.status).toBe(401);
+  expect(await repeat.json()).toMatchObject({ error: { code: "run_ended" } });
+  expect(eventsOf(run.id).filter((e) => e.type === "run.started")).toHaveLength(
+    1,
+  );
+});
+
+test("a second run.started with another session gets 409 invalid_transition and writes nothing", async () => {
+  hearRunEvents();
+  const { agent, run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "sess-1" },
+  });
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "sess-2" },
+  });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({
+    error: { code: "invalid_transition" },
+  });
+  expect(eventsOf(run.id).map((e) => e.type)).toEqual(["run.started"]);
+  expect(deliveryCount()).toBe(1);
+  expect(
+    db.$client
+      .prepare("select session_id from agents where id = ?")
+      .get(agent.id),
+  ).toEqual({ session_id: "sess-1" });
+});
+
+test("a run.finished on a waiting run gets 409 invalid_transition and leaves the run waiting", async () => {
+  hearRunEvents();
+  const { agent, run, token } = await startedRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.waiting",
+    payload: {
+      request: { kind: "question", requestId: "req_1", prompt: "which?" },
+    },
+  });
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "run.finished",
+    payload: { summary: "skipped the answer", usage },
+  });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({
+    error: { code: "invalid_transition" },
+  });
+  expect(eventsOf(run.id).map((e) => e.type)).toEqual([
+    "run.started",
+    "run.waiting",
+  ]);
+  expect(deliveryCount()).toBe(2);
+  expect((await getRun(agent.id, run.id)).body.status).toBe("waiting");
+});
+
+test("a run.waiting for a run still starting gets 409 run_not_started, so the runner can name the lost start", async () => {
+  hearRunEvents();
+  const { agent, run, token } = await runningRun();
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "run.waiting",
+    payload: {
+      request: { kind: "question", requestId: "req_1", prompt: "which?" },
+    },
+  });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({
+    error: { code: "run_not_started" },
+  });
+  expect((await getRun(agent.id, run.id)).body.status).toBe("starting");
+  expect(eventsOf(run.id)).toEqual([]);
+  expect(deliveryCount()).toBe(0);
+});
+
 test("secrets a runner echoes are redacted before the event is stored", async () => {
   const { run, token } = await runningRun();
   await postEvent(token, {
