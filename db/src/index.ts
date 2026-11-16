@@ -133,7 +133,7 @@ function refuseIfNoRoom(
 
 /**
  * Applies pending migrations and returns their journal tags in order, `[]` when none were pending; call
- * once at boot, before serving. Refuses first, touching nothing, when the DB's filesystem can't hold
+ * once at boot, before serving. Refuses first, changing no data, when the DB's filesystem can't hold
  * the tables the pending migrations rebuild, rather than let SQLite fill the disk and roll back minutes later.
  */
 export function migrate(

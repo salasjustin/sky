@@ -49,8 +49,8 @@ const errorCode = (err: unknown) =>
  * `createRunProber`). The same sweep deletes run envVars past their TTL and `claude.*` and
  * `runner.heartbeat` events past 7 days. Webhook deliveries left pending resume at once.
  *
- * A migration that can't fit on the data volume fails the boot with a log line before the DB is
- * touched. Once migrated, the WAL is checkpointed and truncated, so a rebuild's pages don't sit on the
+ * A migration that can't fit on the data volume fails the boot with a log line before any data
+ * changes. Once migrated, the WAL is checkpointed and truncated, so a rebuild's pages don't sit on the
  * volume until the next restart; the boot logs the migrations it applied, or that none were pending.
  */
 export function boot(
