@@ -578,8 +578,8 @@ function gitSubject(message: string): string {
  * parents to the first commit that matches the worktree, by sha (HEAD, or an ancestor of it) or by
  * tree and subject together (HEAD's, or a commit's on its first-parent line since the default
  * branch), since `publish` recreates commits on GitHub under new shas with their trees and
- * messages. By tree alone, a revert would pass for the copy of the commit before the one it
- * reverts, and the copy of a commit for an empty commit made on it. `outside` is what the walk
+ * messages. By tree alone, a revert pushed there would be taken for the commit before the one it
+ * reverts, and the copy of a commit for an empty commit made on it here. `outside` is what the walk
  * passed, newest first, with its commit bodies; `match` is GitHub's commit they sit on and `local`
  * the commit it matches here, absent when the walk found none.
  */
