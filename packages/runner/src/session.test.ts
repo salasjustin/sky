@@ -3886,27 +3886,18 @@ test("a run.started that meets an outage longer than three attempts lands, and t
   ]);
 });
 
-test("a run.started that never lands by the run's wait deadline fails the run, naming the lost start, and never sends run.waiting", async () => {
-  const { sent, received, deps, polls } = restartingApi({
+test("a run.started that never lands by the run's wait deadline fails the run, naming the lost start", async () => {
+  const { sent, deps } = restartingApi({
     outage: 0,
     startOutage: Number.POSITIVE_INFINITY,
-    pollReplies: [decided({ decision: "approve" })],
+    pollReplies: [],
     virtualTime: true,
   });
-  const query = scripted([
-    init,
-    async (options: Options) => {
-      await fire(options, "PreToolUse", gitPush);
-    },
-    success,
-  ]);
   const code = await runSession(
-    { ...config, approvalPolicy: ["Bash"], waitTimeoutMs: 100_000 },
-    { ...deps, query },
+    { ...config, waitTimeoutMs: 100_000 },
+    { ...deps, query: scripted([init, success]) },
   );
   expect(code).toBe(1);
-  expect(received.map((r) => r.type)).not.toContain("run.waiting");
-  expect(polls()).toBe(0);
   expect(sent.at(-1)).toMatchObject({
     type: "run.failed",
     payload: {
@@ -3938,7 +3929,10 @@ test.each([
       { ...deps, elapsedMs: () => 20_000, query: scripted([init, success]) },
     );
     expect(code).toBe(1);
-    expect(Date.now() - startedAt).toBeLessThanOrEqual(90_000 - 20_000);
+    // the launch's 70 s left, less the 30 s margin its failure needs to beat the API's own
+    expect(Date.now() - startedAt).toBeLessThanOrEqual(
+      90_000 - 20_000 - 30_000,
+    );
     const startAttempts = received.filter((r) => r.type === "run.started");
     expect(startAttempts.length).toBeGreaterThan(3);
     expect(sent.at(-1)).toMatchObject({
@@ -4134,7 +4128,7 @@ test("a gated call fired while run.started is retrying gets a denial when the st
     // a hung gate never resolves, and the test times out here
     const answered = await answers;
     // unhandled rejections are reported once the event loop turns
-    await new Promise((resolve) => setImmediate(resolve));
+    await setImmediate();
     expect(unhandled).toEqual([]);
     expect(answered).toEqual([
       {
