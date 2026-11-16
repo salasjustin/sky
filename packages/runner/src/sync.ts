@@ -387,16 +387,63 @@ const commits = (n: number) => `${n} commit${n === 1 ? "" : "s"}`;
 
 /** Paths a stopped rebase or cherry-pick left unmerged. */
 async function unmerged(cwd: string): Promise<string[]> {
-  // one line per stage of each unmerged path: "<mode> <sha> <stage>\t<path>"
-  const out = await inTree(cwd, "ls-files", "--unmerged").catch(() => "");
+  // one entry per stage of each unmerged path: "<mode> <sha> <stage>\t<path>", NUL-ended, so a
+  // path comes as it is rather than in git's C quoting
+  const out = await inTree(cwd, "ls-files", "-z", "--unmerged").catch(
+    () => "",
+  );
   return [
     ...new Set(
       out
-        .split("\n")
+        .split("\0")
         .filter(Boolean)
-        .map((line) => line.slice(line.indexOf("\t") + 1)),
+        .map((entry) => entry.slice(entry.indexOf("\t") + 1)),
     ),
   ];
+}
+
+/** Paths from the repository for a note: each `quoted`, and at most `max` of them named. */
+const pathList = (paths: string[], max = 10) => {
+  const named = paths.slice(0, max).map((path) => quoted(path));
+  const more = paths.length - named.length;
+  return `${named.join(", ")}${more > 0 ? ` and ${more} more` : ""}`;
+};
+
+/**
+ * An operation git stopped mid-way in `cwd`, as what to tell the agent to do about it; undefined
+ * when there is none. Each detaches HEAD or holds state a sync would land in the middle of.
+ */
+async function inProgress(cwd: string): Promise<string | undefined> {
+  const rebasing = await rebaseInProgress(cwd);
+  if (rebasing !== undefined) {
+    return `a rebase${rebasing ? ` of ${rebasing}` : ""} is in progress in this worktree; run \`git rebase --abort\` (or finish it)`;
+  }
+  const stops: [string, string, string][] = [
+    ["rebase-apply/applying", "`git am`", "git am --abort"],
+    ["MERGE_HEAD", "a merge", "git merge --abort"],
+    ["CHERRY_PICK_HEAD", "a cherry-pick", "git cherry-pick --abort"],
+    ["REVERT_HEAD", "a revert", "git revert --abort"],
+    // a cherry-pick or revert series between commits: neither *_HEAD is left
+    [
+      "sequencer",
+      "a cherry-pick or revert",
+      "git cherry-pick --abort` or `git revert --abort",
+    ],
+    ["BISECT_LOG", "a bisect", "git bisect reset"],
+  ];
+  for (const [file, what, undo] of stops) {
+    const path = await inTree(
+      cwd,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      file,
+    );
+    if (existsSync(path)) {
+      return `${what} is in progress in this worktree; run \`${undo}\` (or finish it)`;
+    }
+  }
+  return undefined;
 }
 
 /** Whether a stopped `op` is in progress in `cwd`, so there is something to abort. */
@@ -492,7 +539,7 @@ async function rebaseOntoDefault(
     const stuck = await abortStopped(cwd, "rebase");
     return [
       conflicted.length > 0
-        ? `${behindBy}; rebasing onto it conflicted (in ${conflicted.join(", ")})${stuck || ", so the rebase was aborted and the worktree left as it was."}`
+        ? `${behindBy}; rebasing onto it conflicted (in ${pathList(conflicted)})${stuck || ", so the rebase was aborted and the worktree left as it was."}`
         : `${behindBy}; rebasing onto it failed (${gitSaid(error)})${stuck || ", so the worktree was left as it was."}`,
     ];
   }
@@ -650,7 +697,14 @@ export async function syncAgentBranch(options: {
   const oldest = outside.map(({ sha }) => sha).reverse();
   try {
     if (match.sha === head) {
-      await inTree(cwd, "merge", "--ff-only", "--quiet", tip);
+      await inTree(
+        cwd,
+        ...(await movingCommitsConfig(cwd)),
+        "merge",
+        "--ff-only",
+        "--quiet",
+        tip,
+      );
     } else {
       // HEAD's tree is the one they were made on, so they apply as they are; each keeps its author
       await inTree(
@@ -691,23 +745,27 @@ export async function syncAgentBranch(options: {
 }
 
 /**
- * `runner.mjs sync`'s half for the agent's own GitHub `branch`: brings the worktree onto GitHub's
- * head of it, with GitHub's shas, when that can't lose anything. Commits pushed from outside are
- * fast-forwarded in when the worktree has no unpublished commits, and the unpublished ones are
- * rebased onto them when it has some. It is refused, with nothing changed, for a worktree with
- * uncommitted changes, a rebase that conflicts or a branch too far ahead to fetch. Unlike
+ * `runner.mjs sync`'s half for the agent's own GitHub `branch`: brings the worktree, on
+ * `localBranch`, onto GitHub's head of it, with GitHub's shas, when that can't lose anything.
+ * Commits pushed from outside are fast-forwarded in when the worktree has no unpublished commits,
+ * and the unpublished ones are rebased onto them when it has some. When there are commits from
+ * outside and `localBranch` continues no GitHub branch yet, it is recorded as continuing `branch`,
+ * so `publish` only fast-forwards it from then on. It is refused, with the worktree and
+ * local branch left as they were, for a worktree with uncommitted changes, unpublished commits
+ * that include a merge, a rebase that conflicts or a branch too far ahead to fetch. Unlike
  * `syncAgentBranch`, which leaves the worktree's own shas and cherry-picks, the published commits
- * here are replaced by GitHub's, so `git log` and GitHub agree and the next `publish` fast-forwards.
- * `lines` is what to tell the agent; `ok` is false when the worktree was left as it was for a reason
- * it should act on. A branch GitHub doesn't have is left alone.
+ * here are replaced by GitHub's, so `git log` and GitHub agree. `lines` is what to tell the agent;
+ * `ok` is false when the worktree was left as it was for a reason it should act on, and `moved`
+ * true when the worktree was moved. A branch GitHub doesn't have is left alone.
  */
 export async function syncOwnBranch(options: {
   repoDir: string;
   cwd: string;
   call: Call;
   branch: string;
+  localBranch: string;
   defaultBranch: string;
-}): Promise<{ ok: boolean; lines: string[] }> {
+}): Promise<{ ok: boolean; lines: string[]; moved?: boolean }> {
   const { cwd, branch } = options;
   const call = cachingCommits(options.call);
   const tip = await remoteTip(call, branch).catch((error: unknown) => {
@@ -719,15 +777,6 @@ export async function syncOwnBranch(options: {
       ok: true,
       lines: [
         `${branch} isn't on GitHub yet, so there is nothing to bring in; your worktree was not touched.`,
-      ],
-    };
-  }
-  const stoppedRebase = await rebaseInProgress(cwd);
-  if (stoppedRebase !== undefined) {
-    return {
-      ok: false,
-      lines: [
-        `a rebase${stoppedRebase ? ` of ${stoppedRebase}` : ""} is in progress in this worktree; run \`git rebase --abort\` (or finish it), then sync again. Nothing was changed.`,
       ],
     };
   }
@@ -766,6 +815,34 @@ export async function syncOwnBranch(options: {
       "your worktree has uncommitted changes, so nothing was brought in; commit or stash them and sync again",
     );
   }
+  const subjectOf = (sha: string) =>
+    inTree(cwd, "log", "-1", "--format=%s", sha);
+  // a rebase drops a merge and replays what it merged one by one, as the branch's own commits. Any
+  // merge among the unpublished commits has one on their first-parent line that brought it in
+  const merges =
+    match.local === head
+      ? ""
+      : await inTree(
+          cwd,
+          "rev-list",
+          "--first-parent",
+          "--merges",
+          "--reverse",
+          `${match.local}..HEAD`,
+        );
+  const [merge] = merges.split("\n").filter(Boolean);
+  if (merge) {
+    const after = Number(
+      await inTree(cwd, "rev-list", "--count", `${merge}..HEAD`),
+    );
+    const redo =
+      after > 0
+        ? `, which drops the ${commits(after)} after it too; sync, merge again, and put ${after === 1 ? "it" : "them"} back with \`git cherry-pick ${short(merge)}..${short(head)}\``
+        : "; sync, then merge again";
+    return refuse(
+      `your unpublished commits include a merge, ${short(merge)} ${quoted(await subjectOf(merge))}, and rebasing them onto GitHub's commits would flatten it into the commits it merged, so nothing was brought in. Undo the merge with \`git reset --keep ${short(merge)}^\`${redo}`,
+    );
+  }
   try {
     await fetchBranch({
       repoDir: options.repoDir,
@@ -778,6 +855,15 @@ export async function syncOwnBranch(options: {
     if (error instanceof TooFarError) return refuse(messageOf(error));
     throw error;
   }
+  if (outside.length > 0) {
+    // the branch now holds commits someone else pushed: like a branch the agent continues, `publish`
+    // only fast-forwards it, so it never rebases them onto the base and force-updates them away. Set
+    // before the worktree moves, so a failure here leaves the worktree as it was
+    const key = `branch.${options.localBranch}.${REMOTE_BRANCH_KEY}`;
+    if (!(await inTree(cwd, "config", "--get", key).catch(() => ""))) {
+      await inTree(cwd, "config", key, branch);
+    }
+  }
 
   // the commits here after the one that matches GitHub's: never published
   const unpublished =
@@ -786,15 +872,14 @@ export async function syncOwnBranch(options: {
       : (await inTree(cwd, "rev-list", "--reverse", `${match.local}..HEAD`))
           .split("\n")
           .filter(Boolean);
-  const subjectOf = (sha: string) =>
-    inTree(cwd, "log", "-1", "--format=%s", sha);
   if (unpublished.length === 0) {
     try {
+      const hooksOff = await movingCommitsConfig(cwd);
       if (await isAncestor(cwd, head, tip)) {
-        await inTree(cwd, "merge", "--ff-only", "--quiet", tip);
+        await inTree(cwd, ...hooksOff, "merge", "--ff-only", "--quiet", tip);
       } else {
         // same tree as GitHub's commit it matches, so only the commits' shas change
-        await inTree(cwd, "reset", "--keep", "--quiet", tip);
+        await inTree(cwd, ...hooksOff, "reset", "--keep", "--quiet", tip);
       }
     } catch (error) {
       return refuse(`bringing it in failed (${gitSaid(error)})`);
@@ -815,7 +900,7 @@ export async function syncOwnBranch(options: {
       const stuck = await abortStopped(cwd, "rebase");
       const why =
         conflicted.length > 0
-          ? `rebasing your ${commits(unpublished.length)} onto it conflicted (in ${conflicted.join(", ")})`
+          ? `rebasing your ${commits(unpublished.length)} onto it conflicted (in ${pathList(conflicted)})`
           : `rebasing your ${commits(unpublished.length)} onto it failed (${gitSaid(error)})`;
       return {
         ok: false,
@@ -861,7 +946,7 @@ export async function syncOwnBranch(options: {
   lines.push(
     `Your worktree is now at ${short(await inTree(cwd, "rev-parse", "HEAD"))}.`,
   );
-  return { ok: true, lines };
+  return { ok: true, lines, moved: true };
 }
 
 /**
@@ -1000,13 +1085,20 @@ export const SYNC_LOCK_WAIT_S = 30;
 
 /**
  * The default branch half of `sync`: what `origin/<default>` did, as the line the agent reads.
+ * `worktreeMoved` is whether the branch half moved the worktree, which this half never does.
  */
-async function describeDefault(g: Git, synced: DefaultSync): Promise<string> {
+async function describeDefault(
+  g: Git,
+  synced: DefaultSync,
+  worktreeMoved: boolean,
+): Promise<string> {
   const name = synced.default;
   if (!synced.moved) {
     return `origin/${name} is already at GitHub's tip ${short(synced.sha)}; nothing moved.`;
   }
-  const unchanged = `Your worktree and local ${name} were not changed.`;
+  const unchanged = worktreeMoved
+    ? `Local ${name} was not changed.`
+    : `Your worktree and local ${name} were not changed.`;
   const tip = `GitHub's tip ${short(synced.sha)}`;
   if (!synced.previous) return `origin/${name} moved to ${tip}. ${unchanged}`;
   const from = short(synced.previous);
@@ -1119,7 +1211,7 @@ export async function syncMain(
       io.stderr(`sky sync: ${tooFarNote(synced)}\n`);
       code = 1;
     } else {
-      io.stdout(`${await describeDefault(g, synced)}\n`);
+      io.stdout(`${await describeDefault(g, synced, own.moved === true)}\n`);
     }
     for (const line of own.lines) {
       (own.ok ? io.stdout : io.stderr)(
@@ -1149,9 +1241,17 @@ async function syncWorktreeBranch(options: {
   env: NodeJS.ProcessEnv;
   defaultBranch: string;
   branch: string | undefined;
-}): Promise<{ ok: boolean; lines: string[] }> {
+}): Promise<{ ok: boolean; lines: string[]; moved?: boolean }> {
   const { repoDir, cwd, env } = options;
   try {
+    // a rebase or bisect detaches HEAD, so this is checked before the branch is read
+    const midway = await inProgress(cwd);
+    if (midway) {
+      return {
+        ok: false,
+        lines: [`${midway}, then sync again. Nothing was changed.`],
+      };
+    }
     const local = await inTree(
       cwd,
       "symbolic-ref",
@@ -1193,7 +1293,7 @@ async function syncWorktreeBranch(options: {
         ],
       };
     }
-    return await syncOwnBranch({ ...options, branch });
+    return await syncOwnBranch({ ...options, branch, localBranch: local });
   } catch (error) {
     return {
       ok: false,
