@@ -2256,12 +2256,7 @@ const REVIEW = (branch = "claude/agt_1") =>
 /** The GitHub branch the worktree at `cwd` continues, which `publish` reads; null when unset. */
 const continuedMark = (cwd: string) => {
   try {
-    return git(
-      cwd,
-      "config",
-      "--get",
-      "branch.claude/agt_1.sky-remote-branch",
-    );
+    return git(cwd, "config", "--get", "branch.claude/agt_1.sky-remote-branch");
   } catch {
     return null;
   }
