@@ -95,6 +95,11 @@ export const PROJECT_VARIABLES = [
 // mid-session edits included (code.claude.com/docs/en/env-vars)
 export const HOST_MANAGED = "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST";
 
+// a run's brief is its contract, so the kru plugin's lead-contract hook adds nothing in a run and
+// blocks a held call a person approved. Any non-empty value turns off that block and kru's two
+// session-start reminders, to load the lead contract and to run setup; kru's other hooks stay on
+export const NO_LEAD_GATE = "KRU_NO_LEAD_GATE";
+
 /**
  * The env of the Claude process itself, carrying exactly the chosen credential and sending it to the
  * Anthropic API. Claude Code prefers `ANTHROPIC_API_KEY` over the subscription token, so a project's
@@ -103,7 +108,9 @@ export const HOST_MANAGED = "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST";
  * chosen credential to the project's gateway or cloud, so those go too. Sky's key arrives as
  * `SKY_CLAUDE_API_KEY` so it never shares a name with the project's. The credential is read from
  * `runnerEnv`, the env the API launched the runner with, so a profile's session env merged into
- * `env` can't swap it. Host-managed mode is always on, whatever the project or profile set it to.
+ * `env` can't swap it. Host-managed mode and `NO_LEAD_GATE` are always on here, whatever the project
+ * or profile set them to. A settings file's `env` is written over this env, so the session pins
+ * `NO_LEAD_GATE` in its flag settings too (`sessionOptions`).
  */
 export function claudeProcessEnv(
   env: NodeJS.ProcessEnv,
@@ -125,6 +132,7 @@ export function claudeProcessEnv(
     out.CLAUDE_CODE_OAUTH_TOKEN = runnerEnv.CLAUDE_CODE_OAUTH_TOKEN;
   }
   out[HOST_MANAGED] = "1";
+  out[NO_LEAD_GATE] = "1";
   return out;
 }
 

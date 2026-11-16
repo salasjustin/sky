@@ -800,6 +800,23 @@ test("the session turns Claude Code's commit and pull request attribution off", 
   expect(settings).toEqual({
     attribution: { commit: "", pr: "" },
     ...PINNED_SETTINGS,
+    env: { KRU_NO_LEAD_GATE: "1" },
+  });
+});
+
+test("the session's flag settings turn kru's lead gate off, above any settings file's env", async () => {
+  // a settings file's `env` is written over the process env, and `""` would turn the gate back on;
+  // the flag layer outranks those files, so the pin there is what holds (the real-binary case is in
+  // approved-call.test.ts)
+  const query = scripted([init, success]);
+  await runSession(config, {
+    query,
+    post: recorder().post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(query.calls[0]?.options.settings).toMatchObject({
+    env: { KRU_NO_LEAD_GATE: "1" },
   });
 });
 
@@ -878,9 +895,10 @@ test("the profile's session variables reach the session, over the caller's env",
   });
 });
 
-test("with no profile, the session env holds the caller's env plus only host mode and the runner's git identity and config", async () => {
+test("with no profile, the session env holds the caller's env plus only host mode, kru's lead-hook switch and the runner's git identity and config", async () => {
   for (const name of [
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "KRU_NO_LEAD_GATE",
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
@@ -911,7 +929,23 @@ test("with no profile, the session env holds the caller's env plus only host mod
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_KEY_0",
     "GIT_CONFIG_VALUE_0",
+    "KRU_NO_LEAD_GATE",
   ]);
+});
+
+test("the Claude session has kru's lead-contract hook off, whatever the runner's env or the profile's session env set the switch to", async () => {
+  vi.stubEnv("KRU_NO_LEAD_GATE", "0");
+  const query = scripted([init, success]);
+  await runSession(
+    { ...config, sessionEnv: { KRU_NO_LEAD_GATE: "" } },
+    {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    },
+  );
+  expect(query.calls[0]?.options.env?.KRU_NO_LEAD_GATE).toBe("1");
 });
 
 test("with a GitHub connector in its env, the session is told to publish through the runner instead of git push or gh", async () => {
@@ -1021,7 +1055,7 @@ test("a check written as plain `claude -p` is still run with every project crede
     expect(append).toContain('- claude -p "/acme:review"');
     expect(append).not.toContain("as written");
     const instruction =
-      /`CLAUDE_CODE_OAUTH_TOKEN="\$\(<\S+\)" (env (?:-u \S+ )+(?:\S+=\S+ )*)claude -p …`, even where/;
+      /`CLAUDE_CODE_OAUTH_TOKEN="\$\(<\S+\)" (env (?:-u \S+ )+(?:\S+=\S+ )*)claude [^`]*-p …`, even where/;
     const prefix = instruction.exec(append)?.[1] ?? "";
     for (const name of [
       "ANTHROPIC_API_KEY",
@@ -1183,6 +1217,10 @@ const subagentStop: Step = hook("SubagentStop", {
 /** The SDK's text for a call it cancelled, which reads as a user's refusal (one of its interruption markers in sdk.mjs). */
 const REFUSAL_CANCEL =
   "The user doesn't want to take this action right now. STOP what you are doing and wait for the user to tell you how to proceed.";
+const SESSION_ENDED_CALL =
+  "[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown. Check whether it took effect before relying on it or running it again.]";
+const SESSION_ENDED_REQUEST =
+  "[Request interrupted: the session ended before this agent finished. Nobody asked it to stop.]";
 /** Tool results Claude's process hands back for `toolu_woken`, as errors, one per `content`. */
 const erroredResult = (...contents: unknown[]) => ({
   type: "user",
@@ -1609,10 +1647,7 @@ test("a woken turn's calls cancelled after the input closed over a running subag
   expect(ran).toEqual([]);
 });
 
-test.each([
-  "[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown. Check whether it took effect before relying on it or running it again.]",
-  "[Request interrupted: the session ended before this agent finished. Nobody asked it to stop.]",
-])(
+test.each([SESSION_ENDED_CALL, SESSION_ENDED_REQUEST])(
   "a call cancelled with the SDK's session-ended text %#, after the input closed over a running subagent, is reported the same way",
   async (ended) => {
     expect(await closedOverSubagent(wokenCall([], ended))).toEqual({
@@ -2066,7 +2101,7 @@ describe("the Claude credential of a run", () => {
         { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
       );
       expect(append).toMatch(
-        /Run each command that calls `claude` .*, as `CLAUDE_CODE_OAUTH_TOKEN="\$\(<'[^']+'\)" env -u ANTHROPIC_API_KEY -u .* CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 claude -p …`, even where the check leaves that prefix out\./,
+        /Run each command that calls `claude` .*, as `CLAUDE_CODE_OAUTH_TOKEN="\$\(<'[^']+'\)" env -u ANTHROPIC_API_KEY -u .* CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 KRU_NO_LEAD_GATE=1 claude --settings '\{"env":\{"KRU_NO_LEAD_GATE":"1"\}\}' -p …`, even where the check leaves that prefix out\./,
       );
     });
 
@@ -2312,16 +2347,18 @@ describe("the Claude credential of a run", () => {
         "run_1",
         join(root, "logins"),
       );
-    /** Runs the command in bash as a Bash command would, with `program` in place of `claude -p …`. */
+    /** Runs the command in bash as a Bash command would, with `program` in place of `claude … -p …`. */
     const run = (
       command: string,
       program: string,
       env: Record<string, string> = {},
-    ) =>
-      execFileSync("bash", ["-c", command.replace(/claude -p …$/, program)], {
+    ) => {
+      const shell = command.replace(/claude .*-p …$/, program);
+      return execFileSync("bash", ["-c", shell], {
         env: { PATH: process.env.PATH, ...env },
         encoding: "utf8",
       });
+    };
 
     test("the credential is assigned by the shell ahead of env, so neither the command nor env's argv holds it", async () => {
       const { prefix } = await loginOf("oauth");
@@ -2345,6 +2382,39 @@ describe("the Claude credential of a run", () => {
       const env = { CLAUDE_CODE_OAUTH_TOKEN: "command-env-token" };
       const seen = run(command, "printenv CLAUDE_CODE_OAUTH_TOKEN", env);
       expect(seen).toBe(`${TOKEN}\n`);
+    });
+
+    test("the nested claude has kru's lead-contract hook off, whatever the command's env set the switch to", async () => {
+      const { prefix } = await loginOf("oauth");
+      for (const value of [undefined, "", "0"])
+        expect(
+          run(
+            nestedClaude(prefix),
+            "printenv KRU_NO_LEAD_GATE",
+            value === undefined ? {} : { KRU_NO_LEAD_GATE: value },
+          ),
+        ).toBe("1\n");
+    });
+
+    test("the nested claude is handed flag settings that pin kru's lead gate off, as one shell word of JSON", async () => {
+      const { prefix } = await loginOf("oauth");
+      // a `claude` on PATH that prints each argument it was given on a line of its own
+      const bin = join(root, "fake-bin");
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(join(bin, "claude"), "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+      chmodSync(join(bin, "claude"), 0o755);
+      const command = nestedClaude(prefix).replace(/…$/, "check");
+      const out = execFileSync("bash", ["-c", command], {
+        env: { PATH: `${bin}:${process.env.PATH}` },
+        encoding: "utf8",
+      });
+      const argv = out.split("\n");
+      const at = argv.indexOf("--settings");
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect(JSON.parse(argv[at + 1] ?? "")).toEqual({
+        env: { KRU_NO_LEAD_GATE: "1" },
+      });
+      expect(argv.slice(-3)).toEqual(["-p", "check", ""]);
     });
 
     test("on a subscription run the nested claude gets the run's token, never the project's ANTHROPIC_API_KEY, and no other project variable", async () => {
@@ -2756,6 +2826,14 @@ const gitPush = {
   tool_input: { command: "git push origin main", description: "Push" },
   tool_use_id: "t1",
 };
+/** What the gate answers a call a person approved: an explicit allow, past Claude Code's own checks. */
+const approved = {
+  continue: true,
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse",
+    permissionDecision: "allow",
+  },
+};
 /** Fires PreToolUse for `gitPush` whatever the hook answers. */
 const firePush: Step = async (options) =>
   void (await fire(options, "PreToolUse", gitPush));
@@ -2775,7 +2853,7 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
     { ...deps, query },
   );
   expect(code).toBe(0);
-  expect(answers).toEqual([{ continue: true }]);
+  expect(answers).toEqual([approved]);
   const waiting = sent.find((e) => e.type === "run.waiting");
   expect(waiting).toEqual({
     runId: "run_1",
@@ -2801,6 +2879,123 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
     "run.waiting",
     "run.finished",
   ]);
+});
+
+test("an approval with a reason lets the tool run the same, and hands Claude the reason as a note", async () => {
+  const { deps } = api(decided({ decision: "approve", reason: "fine, once" }));
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(answers).toEqual([
+    {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+        additionalContext:
+          "The person who approved this tool call noted: fine, once",
+      },
+    },
+  ]);
+});
+
+test("an approved hold on Claude's question adds no allow, so canUseTool still takes the person's answer", async () => {
+  const { sent, deps } = api(
+    decided({ decision: "approve" }),
+    decided({ decision: "answer", answer: "SQLite" }),
+  );
+  let answers: unknown[] = [];
+  let permission: unknown;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", {
+        tool_name: "AskUserQuestion",
+        tool_input: { questions },
+        tool_use_id: "q1",
+      });
+      permission = await options.canUseTool?.(
+        "AskUserQuestion",
+        { questions },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "q1",
+          requestId: "perm_1",
+        },
+      );
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["AskUserQuestion"] },
+    { ...deps, query },
+  );
+  expect(answers).toEqual([{ continue: true }]);
+  expect(permission).toEqual({
+    behavior: "allow",
+    updatedInput: { questions, answers: { "Which database?": "SQLite" } },
+  });
+  expect(
+    sent.flatMap((e) =>
+      e.type === "run.waiting" ? [e.payload.request.kind] : [],
+    ),
+  ).toEqual(["approval", "question"]);
+});
+
+test("an approved hold on Claude's question with a reason hands Claude the note and still adds no allow", async () => {
+  const { deps } = api(
+    decided({ decision: "approve", reason: "ask away" }),
+    decided({ decision: "answer", answer: "SQLite" }),
+  );
+  let answers: unknown[] = [];
+  let permission: unknown;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", {
+        tool_name: "AskUserQuestion",
+        tool_input: { questions },
+        tool_use_id: "q1",
+      });
+      permission = await options.canUseTool?.(
+        "AskUserQuestion",
+        { questions },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "q1",
+          requestId: "perm_1",
+        },
+      );
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["AskUserQuestion"] },
+    { ...deps, query },
+  );
+  expect(answers).toEqual([
+    {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        additionalContext:
+          "The person who approved this tool call noted: ask away",
+      },
+    },
+  ]);
+  expect(permission).toEqual({
+    behavior: "allow",
+    updatedInput: { questions, answers: { "Which database?": "SQLite" } },
+  });
 });
 
 test("a read-only Bash command runs without an approval request even under a bare Bash policy", async () => {
@@ -2958,6 +3153,177 @@ test("a denial blocks the tool and hands Claude the reason", async () => {
       },
     },
   ]);
+});
+
+/** The tool result Claude Code sends back for call `id`: an error, as a refused or failed call's is. */
+const errorResult = (id: string, content: unknown) => ({
+  type: "user",
+  session_id: "sess-new",
+  parent_tool_use_id: null,
+  message: {
+    role: "user",
+    content: [
+      { type: "tool_result", tool_use_id: id, content, is_error: true },
+    ],
+  },
+});
+const pluginRefusal =
+  "PreToolUse:Bash hook error: [bash gate.sh]: load the lead contract first";
+
+test("an approved call Claude Code turns down after the gate, with no Post hook, is posted as a warning naming the tool, its id and Claude Code's message", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const warned: string[] = [];
+  const query = scripted([
+    init,
+    firePush,
+    errorResult("t1", pluginRefusal),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query, warn: (line) => warned.push(line) },
+  );
+  const message = `Claude Code turned down Bash call t1 after the runner let it through: ${pluginRefusal}`;
+  expect(sent.filter((e) => e.type === "runner.warning")).toEqual([
+    { runId: "run_1", type: "runner.warning", payload: { message } },
+  ]);
+  expect(warned).toEqual([`runner: ${message}`]);
+});
+
+test("an error result for a call that failed through PostToolUseFailure posts no warning", async () => {
+  const { sent, deps } = api();
+  const query = scripted([
+    init,
+    hook("PreToolUse", { ...gitPush, tool_input: { command: "false" } }),
+    hook("PostToolUseFailure", {
+      ...gitPush,
+      tool_input: { command: "false" },
+      error: "Exit code 1",
+    }),
+    errorResult("t1", "Exit code 1"),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(sent.map((e) => e.type)).toContain("claude.PostToolUseFailure");
+  expect(sent.map((e) => e.type)).not.toContain("runner.warning");
+});
+
+test("an error result for a call the gate denied posts no warning", async () => {
+  const { sent, deps } = api(decided({ decision: "deny", reason: "no" }));
+  const query = scripted([init, firePush, errorResult("t1", "no"), success]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(sent.map((e) => e.type)).toContain("run.waiting");
+  expect(sent.map((e) => e.type)).not.toContain("runner.warning");
+});
+
+test.each([
+  ["the SDK's refusal text", REFUSAL_CANCEL],
+  ["its session-ended text for a call", SESSION_ENDED_CALL],
+  ["its session-ended text for a request", SESSION_ENDED_REQUEST],
+  ["text blocks", [{ type: "text", text: REFUSAL_CANCEL }]],
+])(
+  "an approved call the SDK cancelled with %s posts no warning of any kind",
+  async (_name, content) => {
+    const { sent, deps } = api(decided({ decision: "approve" }));
+    const warned: string[] = [];
+    const query = scripted([
+      init,
+      firePush,
+      errorResult("t1", content),
+      success,
+    ]);
+    await runSession(
+      { ...config, approvalPolicy: ["Bash(git push:*)"] },
+      { ...deps, query, warn: (line) => warned.push(line) },
+    );
+    expect(sent.filter((e) => e.type === "runner.warning")).toEqual([]);
+    expect(warned).toEqual([]);
+  },
+);
+
+test.each([
+  [
+    "a streaming fallback discarded it",
+    "<tool_use_error>Error: Streaming fallback - tool execution discarded</tool_use_error>",
+  ],
+  [
+    "Claude ended the conversation",
+    "<tool_use_error>Cancelled: Claude ended the conversation</tool_use_error>",
+  ],
+  [
+    "Claude Code skipped it beside another call's denial",
+    "[Tool call skipped: the turn was stopped before this call ran, by the check whose denial is on another call in this batch. Nothing refused this call and it had no effects; re-run it if still needed.]",
+  ],
+])(
+  "an approved call Claude Code dropped because %s posts no warning of any kind",
+  async (_name, content) => {
+    const { sent, deps } = api(decided({ decision: "approve" }));
+    const warned: string[] = [];
+    const query = scripted([
+      init,
+      firePush,
+      errorResult("t1", content),
+      success,
+    ]);
+    await runSession(
+      { ...config, approvalPolicy: ["Bash(git push:*)"] },
+      { ...deps, query, warn: (line) => warned.push(line) },
+    );
+    expect(sent.filter((e) => e.type === "runner.warning")).toEqual([]);
+    expect(warned).toEqual([]);
+  },
+);
+
+test("a non-error tool result for an approved call with no Post hook posts no warning", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const warned: string[] = [];
+  const query = scripted([
+    init,
+    firePush,
+    {
+      ...errorResult("t1", pluginRefusal),
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "t1",
+            content: pluginRefusal,
+            is_error: false,
+          },
+        ],
+      },
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query, warn: (line) => warned.push(line) },
+  );
+  expect(sent.filter((e) => e.type === "runner.warning")).toEqual([]);
+  expect(warned).toEqual([]);
+});
+
+test("two error results for one approved call post one warning", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const query = scripted([
+    init,
+    firePush,
+    errorResult("t1", pluginRefusal),
+    errorResult("t1", pluginRefusal),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(sent.filter((e) => e.type === "runner.warning")).toHaveLength(1);
 });
 
 test("a call the policy doesn't hold never waits", async () => {
@@ -3199,7 +3565,7 @@ test("an API restart mid-approval is ridden out: the tool call is approved, and 
     { ...config, approvalPolicy: ["Bash"] },
     { ...deps, query },
   );
-  expect(answers).toEqual([{ continue: true }]);
+  expect(answers).toEqual([approved]);
   expect(code).toBe(0);
   expect(sent.map((e) => e.type)).toEqual([
     "run.started",
@@ -3665,7 +4031,7 @@ test("a run.waiting stored by the API whose response was lost is retried, answer
     },
   );
   expect(code).toBe(0);
-  expect(answers).toEqual([{ continue: true }]);
+  expect(answers).toEqual([approved]);
   expect(opened).toHaveLength(2);
   expect(new Set(opened).size).toBe(1);
   expect(polled).toEqual([opened[0]]);
@@ -4156,7 +4522,7 @@ test("a call held for approval is not beaten for until it is approved and runs",
       await pause(QUIET_MS)(options);
       beatsWhileHeld = beatsIn(posted);
       approve?.();
-      expect(await gated).toEqual([{ continue: true }]);
+      expect(await gated).toEqual([approved]);
     },
     until(() => expect(beatsIn(posted).length).toBeGreaterThanOrEqual(2)),
     hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
@@ -5028,12 +5394,44 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       };
     }[];
     expect(answer?.hookSpecificOutput.permissionDecision).toBe("allow");
+    // approved with no reason, so there is no note
+    expect(answer?.hookSpecificOutput).not.toHaveProperty("additionalContext");
     const copy = answer?.hookSpecificOutput.updatedInput.file_path ?? "";
     expect(copy.startsWith(`${scratch}/`)).toBe(true);
     expect(copy.endsWith("/elsewhere.log")).toBe(true);
     // the run ended, so the copy went with the scratch directory
     expect(existsSync(copy)).toBe(false);
     expect(sent.map((e) => e.type)).not.toContain("runner.warning");
+  });
+
+  test("an outside Read approved with a reason reads the copy and hands Claude the reason as a note", async () => {
+    const outside = join(root, "elsewhere.log");
+    writeFileSync(outside, "outside contents\n");
+    const { deps } = api(
+      decided({ decision: "approve", reason: "the log is fine to read" }),
+    );
+    let answers: unknown[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        answers = await fire(options, "PreToolUse", readOf(outside));
+      },
+      success,
+    ]);
+    await runSession(gated(), { ...deps, query });
+    const [answer] = answers as {
+      hookSpecificOutput: {
+        permissionDecision: string;
+        additionalContext?: string;
+        updatedInput: { file_path: string };
+      };
+    }[];
+    expect(answer?.hookSpecificOutput.permissionDecision).toBe("allow");
+    const copy = answer?.hookSpecificOutput.updatedInput.file_path ?? "";
+    expect(copy.endsWith("/elsewhere.log")).toBe(true);
+    expect(answer?.hookSpecificOutput.additionalContext).toBe(
+      "The person who approved this tool call noted: the log is fine to read",
+    );
   });
 
   test("an approved copy holds the file's contents while the run is live", async () => {

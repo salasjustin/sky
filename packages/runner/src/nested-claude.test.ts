@@ -130,8 +130,8 @@ async function runNested(
   const command = (
     hostManaged ? managed : managed.replace(` ${HOST_MANAGED}=1`, "")
   ).replace(
-    /claude -p …$/,
-    `ANTHROPIC_BASE_URL=${api.url} ${claudeBinary} -p "reply ok" </dev/null`,
+    /claude (.*)-p …$/,
+    `ANTHROPIC_BASE_URL=${api.url} ${claudeBinary} $1-p "reply ok" </dev/null`,
   );
   return await new Promise((resolve, reject) =>
     execFile(

@@ -56,6 +56,7 @@ test("a subscription run's process env keeps the token and no API key of any nam
     PATH: "/bin",
     CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
     CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1",
+    KRU_NO_LEAD_GATE: "1",
   });
 });
 
@@ -64,6 +65,7 @@ test("an API-key run's process env holds Sky's key as ANTHROPIC_API_KEY, and no 
     PATH: "/bin",
     ANTHROPIC_API_KEY: "sky-key",
     CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1",
+    KRU_NO_LEAD_GATE: "1",
   });
 });
 
@@ -77,11 +79,13 @@ test("the credential comes from the runner's own env, never from a session env m
     PATH: "/bin",
     CLAUDE_CODE_OAUTH_TOKEN: "subscription-token",
     CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1",
+    KRU_NO_LEAD_GATE: "1",
   });
   expect(claudeProcessEnv(merged, "api-key", runnerEnv)).toEqual({
     PATH: "/bin",
     ANTHROPIC_API_KEY: "sky-key",
     CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1",
+    KRU_NO_LEAD_GATE: "1",
   });
 });
 
@@ -517,3 +521,20 @@ describe("ownDirectory", () => {
     expect(() => ownDirectory(target())).toThrow(refusal());
   });
 });
+
+test.each(["oauth", "api-key"] as const)(
+  "a %s run's Claude has kru's lead-contract hook off, whatever the secrets or the profile set the switch to",
+  (auth) => {
+    for (const value of [undefined, "", "0"])
+      expect(
+        claudeProcessEnv(
+          {
+            ...runnerEnv,
+            ...(value !== undefined && { KRU_NO_LEAD_GATE: value }),
+          },
+          auth,
+          runnerEnv,
+        ).KRU_NO_LEAD_GATE,
+      ).toBe("1");
+  },
+);
