@@ -138,9 +138,10 @@ const pushTo = (branch: string, sha: string) =>
   git(seed, "push", "-q", remote, `${sha}:refs/heads/${branch}`);
 
 beforeEach(async () => {
-  // the fixtures' git and the runner's alike read no developer ~/.gitconfig (core.quotePath,
-  // merge.ff, rebase.rebaseMerges, hooks), so a run here matches a CI runner's
+  // the fixtures' git and the runner's alike read no developer ~/.gitconfig or system gitconfig
+  // (core.quotePath, merge.ff, rebase.rebaseMerges, hooks), so a run here matches a CI runner's
   vi.stubEnv("GIT_CONFIG_GLOBAL", "/dev/null");
+  vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
   root = mkdtempSync(join(tmpdir(), "runner-sync-"));
   remote = join(root, "remote.git");
   seed = join(root, "seed");
@@ -2252,9 +2253,24 @@ const TRUNK_CURRENT = () =>
 const REVIEW = (branch = "claude/agt_1") =>
   JSON.stringify(`edit review.txt on ${branch}`);
 
+/** The GitHub branch the worktree at `cwd` continues, which `publish` reads; null when unset. */
+const continuedMark = (cwd: string) => {
+  try {
+    return git(
+      cwd,
+      "config",
+      "--get",
+      "branch.claude/agt_1.sky-remote-branch",
+    );
+  } catch {
+    return null;
+  }
+};
+
 /**
- * What a refusal must leave as it was in the worktree at `cwd`: its commit, its local branch and
- * git's ORIG_HEAD. Takes the state now; the returned check compares it to the state then.
+ * What a refusal must leave as it was in the worktree at `cwd`: its commit, its local branch, its
+ * continued-branch mark and git's ORIG_HEAD. Takes the state now; the returned check compares it
+ * to the state then.
  */
 const untouched = (cwd: string) => {
   const origHead = join(
@@ -2264,6 +2280,7 @@ const untouched = (cwd: string) => {
   const read = () => ({
     head: git(cwd, "rev-parse", "HEAD"),
     branch: git(cwd, "rev-parse", "refs/heads/claude/agt_1"),
+    mark: continuedMark(cwd),
     origHead: existsSync(origHead) ? readFileSync(origHead, "utf8") : null,
   });
   const before = read();
@@ -2297,6 +2314,8 @@ test("sync fast-forwards a clean worktree to commits pushed to its branch mid-ru
   expect(git(cwd, "log", "--format=%H")).toBe(
     bare("log", "--format=%H", "claude/agt_1"),
   );
+  // commits from outside make the branch one publish only fast-forwards
+  expect(continuedMark(cwd)).toBe("claude/agt_1");
 });
 
 test("sync gives commits publish recreated GitHub's shas, so git log and GitHub agree", async () => {
@@ -2343,6 +2362,8 @@ test("sync with only publish's recreated shas and nothing pushed moves the workt
     err: "",
   });
   expect(git(cwd, "rev-parse", "HEAD")).toBe(recreated);
+  // nothing came from outside, so publish still rebases the branch onto the base
+  expect(continuedMark(cwd)).toBeNull();
 });
 
 test("sync rebases unpublished commits onto commits pushed to the branch, and the next publish fast-forwards", async () => {
@@ -2496,6 +2517,20 @@ test("sync says a worktree already has GitHub's head, with its unpublished commi
     err: "",
   });
   expect(git(cwd, "rev-parse", "HEAD")).toBe(local);
+  expect(continuedMark(cwd)).toBeNull();
+});
+
+test("sync --branch onto pushed commits keeps the branch the worktree already continues", async () => {
+  const { cwd } = await earlierRun();
+  publishAsIs(cwd, "other/name");
+  const outside = pushToGitHub("other/name", "review.txt", "fix\n");
+  git(cwd, "config", "branch.claude/agt_1.sky-remote-branch", "cont/x");
+
+  const result = await syncRun(cwd, ENV, ["--branch", "other/name"]);
+
+  expect(result.code).toBe(0);
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(outside);
+  expect(continuedMark(cwd)).toBe("cont/x");
 });
 
 test("sync --branch brings in the named GitHub branch, as publish --branch sends to it", async () => {
@@ -2665,6 +2700,7 @@ test("sync in a worktree stopped mid-rebase says to finish or abort the rebase, 
     env: { ...process.env, ...IDENTITY },
   });
   expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("HEAD");
+  const unchanged = untouched(cwd);
 
   const result = await syncRun(cwd);
 
@@ -2678,6 +2714,7 @@ test("sync in a worktree stopped mid-rebase says to finish or abort the rebase, 
   expect(
     existsSync(join(git(cwd, "rev-parse", "--git-dir"), "rebase-merge")),
   ).toBe(true);
+  unchanged();
 });
 
 test("sync quotes the paths a conflicting rebase names, as text from the repository", async () => {
