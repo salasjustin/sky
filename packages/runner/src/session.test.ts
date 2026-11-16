@@ -4099,6 +4099,60 @@ test("a gated call fired while run.started is still retrying sends run.waiting o
   ]);
 });
 
+test("a gated call fired while run.started is still retrying gets a full wait budget from when the start is stored", async () => {
+  const start = heldStart();
+  const { received, deps } = restartingApi({
+    outage: 0,
+    // with the virtual clock's fixed jitter, the eleventh backoff pause ends past 90 s
+    startOutage: 11,
+    pollReplies: [decided({ decision: "approve" })],
+    virtualTime: true,
+    holdStart: start.held,
+  });
+  const waitTimeoutMs = 100_000;
+  const startedAt = Date.now();
+  let startStoredAt: number | undefined;
+  const waitDeadlines: (number | undefined)[] = [];
+  const pollDeadlines: number[] = [];
+  let answers: Promise<unknown[]> = Promise.resolve([]);
+  const query = scripted([
+    async (options: Options) => {
+      answers = firePushWhileStarting(options, start.release);
+    },
+    init,
+    async () => void (await answers),
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"], waitTimeoutMs },
+    {
+      ...deps,
+      post: async (event, options) => {
+        if (event.type === "run.waiting") waitDeadlines.push(options?.deadline);
+        await deps.post(event, options);
+        // the clock is frozen between backoff pauses, so this is when the start was stored
+        if (event.type === "run.started") startStoredAt = Date.now();
+      },
+      awaitDecision: (requestId, signal, deadline) => {
+        pollDeadlines.push(deadline);
+        return deps.awaitDecision(requestId, signal, deadline);
+      },
+      query,
+    },
+  );
+  expect(code).toBe(0);
+  expect(await answers).toEqual([approved]);
+  expect(startStoredAt).toBeDefined();
+  const storedAt = startStoredAt ?? 0;
+  expect(storedAt - startedAt).toBeGreaterThan(0.75 * waitTimeoutMs);
+  expect(received.filter((r) => r.type === "run.waiting")).toEqual([
+    { type: "run.waiting", stored: true },
+  ]);
+  // none of the time the start spent retrying comes out of the person's window
+  expect(waitDeadlines).toEqual([storedAt + waitTimeoutMs]);
+  expect(pollDeadlines).toEqual([storedAt + waitTimeoutMs]);
+});
+
 test("a gated call fired while run.started is retrying gets a denial when the start is lost, and nothing is sent for it or left unhandled", async () => {
   const start = heldStart();
   const { sent, received, deps, polls } = restartingApi({

@@ -568,7 +568,8 @@ export const repoLockWaitS = (launchDeadlineMs: number, elapsedMs: number) =>
 /**
  * Milliseconds the run's `run.started` retries for: the wait budget, cut to the launch's time left
  * less `elapsedMs` and `LAUNCH_MARGIN_MS`, since the API fails a run still starting at its launch
- * deadline. At least one full attempt.
+ * deadline. Measured from when the post is queued, so time behind earlier posts counts against it;
+ * at least one attempt's worth.
  */
 const startBudgetMs = (config: Config, elapsedMs: number) =>
   Math.max(
@@ -713,8 +714,6 @@ export async function runSession(
   ): Promise<Decision | undefined> => {
     if (abortController.signal.aborted || signal.aborted) return undefined;
     const requestId: RequestId = `req_${randomUUID().replaceAll("-", "")}`;
-    // one budget for opening the request and polling it
-    const deadline = Date.now() + config.waitTimeoutMs;
     const stop = AbortSignal.any([abortController.signal, signal]);
     const runEnded = () => {
       endedByApi("run ended while waiting");
@@ -723,6 +722,9 @@ export async function runSession(
     try {
       // the queue alone doesn't hold this back: a start that never lands rejects, and the queue moves on
       await startLanded;
+      // one budget for opening the request and polling it, from when the start is stored, so a
+      // start still retrying takes none of the person's window
+      const deadline = Date.now() + config.waitTimeoutMs;
       await post(
         {
           type: "run.waiting",
@@ -1181,8 +1183,8 @@ export async function runSession(
           {
             deadline: Date.now() + startBudgetMs(config, launchElapsedMs()),
             // a later stop cuts the attempt in flight: a starting run can go straight to failed or
-            // stopped. A run already stopped here, its credential exposed, still gets one short
-            // attempt, so the API keeps the session a follow-up resumes.
+            // stopped. A run already stopped here (its credential exposed, say) still gets one
+            // short attempt, so the API keeps the session a follow-up resumes.
             ...(abortController.signal.aborted
               ? { giveUp: abortController.signal }
               : { signal: abortController.signal }),

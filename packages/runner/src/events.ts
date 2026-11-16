@@ -18,7 +18,10 @@ const PROGRESS_ATTEMPTS = 3;
 export type PostEvent = (
   event: RunnerEventPost,
   options?: {
-    /** Epoch ms the retries stop at; `run.waiting` passes the run's wait budget, `run.started` the start's. */
+    /**
+     * Epoch ms the retries stop at; `run.waiting` passes its wait's deadline,
+     * `run.started` the start's.
+     */
     deadline?: number;
     /** A stop: the post rejects with its reason at once. */
     signal?: AbortSignal;
@@ -34,8 +37,8 @@ export type PostEvent = (
  * final. A `run.waiting` that doesn't land rejects, since the run can't wait on a request the API
  * never stored. A `run.started` that doesn't land rejects too: without it the run stays `starting`,
  * and has no session to resume. Either rejects with a `RunEndedError` when the API has already
- * ended the run. Every other event is dropped with one line on `warn`: losing it must not take down the run that
- * produced it.
+ * ended the run. Every other event is dropped with one line on `warn`: losing it must not take
+ * down the run that produced it.
  */
 export function createPoster(
   options: RetryTiming & {
