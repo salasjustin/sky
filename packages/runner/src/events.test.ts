@@ -323,6 +323,48 @@ test("a run.waiting the API refuses for good rejects at once", async () => {
   expect(calls).toBe(1);
 });
 
+test("a run.waiting answered run_not_started rejects at once, naming the start the API never stored", async () => {
+  let calls = 0;
+  server.use(
+    http.post(url, () => {
+      calls++;
+      return HttpResponse.json(
+        { error: { code: "run_not_started", message: "starting" } },
+        { status: 409 },
+      );
+    }),
+  );
+  const post = createPoster({ ...options, warn: () => {} });
+  await expect(
+    post(endingEvent("run.waiting"), { deadline: Date.now() + 60_000 }),
+  ).rejects.toThrow(/run_not_started.*run\.started was never stored/);
+  expect(calls).toBe(1);
+});
+
+test("a run.started rides out more than three failed attempts until its deadline, then rejects naming the lost start", async () => {
+  const clock = virtualClock();
+  let calls = 0;
+  server.use(
+    http.post(url, () => {
+      calls++;
+      return new HttpResponse(null, { status: 503 });
+    }),
+  );
+  const post = createPoster({ ...options, ...timing(clock), warn: () => {} });
+  await expect(
+    post(
+      {
+        runId: "run_1",
+        type: "run.started",
+        payload: { sessionId: "sess" },
+      },
+      { deadline: 90_000 },
+    ),
+  ).rejects.toThrow(/run\.started was never recorded.*HTTP 503.*lost/);
+  expect(clock.time).toBe(90_000);
+  expect(calls).toBeGreaterThan(3);
+});
+
 test("a run.waiting for a run the API already ended rejects with RunEndedError at once", async () => {
   let calls = 0;
   server.use(

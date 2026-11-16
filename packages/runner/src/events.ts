@@ -17,7 +17,7 @@ const PROGRESS_ATTEMPTS = 3;
 export type PostEvent = (
   event: RunnerEventPost,
   options?: {
-    /** Epoch ms the retries stop at; `run.waiting` passes its wait's deadline. */
+    /** Epoch ms the retries stop at; `run.waiting` and `run.started` pass the run's wait budget. */
     deadline?: number;
     /** A stop: the post rejects with its reason at once. */
     signal?: AbortSignal;
@@ -31,8 +31,9 @@ export type PostEvent = (
 /**
  * Posts an event, retrying a dropped connection, a timeout, a 5xx, 408 or 429; any other 4xx is
  * final. A `run.waiting` that doesn't land rejects, since the run can't wait on a request the API
- * never stored, and rejects with a `RunEndedError` when the API has already ended the run. Every
- * other event is dropped with one line on `warn`: losing it must not take down the run that
+ * never stored, and rejects with a `RunEndedError` when the API has already ended the run. A
+ * `run.started` that doesn't land rejects too: without it the run stays `starting`, and has no
+ * session to resume. Every other event is dropped with one line on `warn`: losing it must not take down the run that
  * produced it.
  */
 export function createPoster(
@@ -47,6 +48,8 @@ export function createPoster(
   return async (event, { deadline, signal, giveUp, maxAttempts } = {}) => {
     const body = JSON.stringify(RunnerEventPost.parse(event));
     const waiting = event.type === "run.waiting";
+    // a start must be stored, so it is retried to its deadline like a wait
+    const mustLand = waiting || event.type === "run.started";
     let landed: "stored" | "run_ended" | undefined;
     try {
       landed = await retry<"stored" | "run_ended">(
@@ -71,6 +74,14 @@ export function createPoster(
             errorCode(text) === "request_open"
           )
             return { done: "stored" };
+          if (
+            waiting &&
+            res.status === 409 &&
+            errorCode(text) === "run_not_started"
+          )
+            return {
+              fail: "HTTP 409 run_not_started: the run's run.started was never stored",
+            };
           if (waiting && res.status === 401 && errorCode(text) === "run_ended")
             return { done: "run_ended" };
           const failure = `HTTP ${res.status}`;
@@ -84,7 +95,7 @@ export function createPoster(
           now,
           deadline: deadline ?? now() + RIDE_OUT_MS,
           attemptTimeoutMs: giveUp?.aborted ? GIVEN_UP_TIMEOUT_MS : TIMEOUT_MS,
-          ...(!waiting &&
+          ...(!mustLand &&
             !RIDES_OUT.has(event.type) && { maxAttempts: PROGRESS_ATTEMPTS }),
           ...(maxAttempts !== undefined && { maxAttempts }),
           signal,
@@ -97,6 +108,10 @@ export function createPoster(
       if (event.type === "run.waiting")
         throw new Error(
           `run.waiting for request ${event.payload.request.requestId} not recorded ${failure}`,
+        );
+      if (event.type === "run.started")
+        throw new Error(
+          `run.started was never recorded ${failure}: the start of the run was lost`,
         );
       options.warn(`runner: dropped ${event.type} ${failure}`);
     }

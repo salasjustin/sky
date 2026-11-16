@@ -1504,6 +1504,22 @@ test("an event the transition table forbids gets 409 and leaves the run as it wa
   expect((await getRun(agent.id, run.id)).body.status).toBe("starting");
 });
 
+test("a run.waiting for a run still starting gets 409 run_not_started, so the runner can name the lost start", async () => {
+  const { agent, run, token } = await runningRun();
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "run.waiting",
+    payload: {
+      request: { kind: "question", requestId: "req_1", prompt: "which?" },
+    },
+  });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({
+    error: { code: "run_not_started" },
+  });
+  expect((await getRun(agent.id, run.id)).body.status).toBe("starting");
+});
+
 test("secrets a runner echoes are redacted before the event is stored", async () => {
   const { run, token } = await runningRun();
   await postEvent(token, {

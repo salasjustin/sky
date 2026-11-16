@@ -601,6 +601,8 @@ export async function runSession(
     queue = posted.catch(() => {});
     return posted;
   };
+  // the run's `run.started` post: a gated call's `run.waiting` waits for it to be stored
+  let startLanded: Promise<void> = Promise.resolve();
   let ended = false;
   const end = async (event: RunnerEvent) => {
     if (ended) return;
@@ -704,6 +706,8 @@ export async function runSession(
       return undefined;
     };
     try {
+      // the queue alone doesn't hold this back: a start that never lands rejects, and the queue moves on
+      await startLanded;
       await post(
         {
           type: "run.waiting",
@@ -1154,10 +1158,17 @@ export async function runSession(
         const exposed = deps.seal.check();
         if (exposed)
           stopSession(`credential_exposed: ${exposed}; the run was stopped.`);
-        await post({
-          type: "run.started",
-          payload: { sessionId: message.session_id },
-        });
+        startLanded = post(
+          {
+            type: "run.started",
+            payload: { sessionId: message.session_id },
+          },
+          {
+            deadline: Date.now() + config.waitTimeoutMs,
+            giveUp: abortController.signal,
+          },
+        );
+        await startLanded;
       } else if (message.type === "assistant") {
         const parent = message.parent_tool_use_id;
         // a subagent's responses interleave with the main thread's, so each agent's turns are its own;
