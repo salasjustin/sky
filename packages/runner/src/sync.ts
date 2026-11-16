@@ -560,12 +560,28 @@ const isAncestor = (cwd: string, sha: string, of: string) =>
   );
 
 /**
+ * The subject git's `%s` gives a commit `message`: its first paragraph past any blank lines, each
+ * line's trailing spaces and tabs dropped, the lines joined by single spaces.
+ */
+function gitSubject(message: string): string {
+  const paragraph: string[] = [];
+  for (const raw of message.split("\n")) {
+    const line = raw.replace(/[\t\r ]+$/, "");
+    if (line) paragraph.push(line);
+    else if (paragraph.length > 0) break;
+  }
+  return paragraph.join(" ");
+}
+
+/**
  * Where GitHub's `tip` of the agent's branch sits against the worktree's HEAD: walks the tip's first
  * parents to the first commit that matches the worktree, by sha (HEAD, or an ancestor of it) or by
- * tree (HEAD's, or one on its first-parent line since the default branch), since `publish` recreates
- * commits on GitHub under new shas. `outside` is what the walk passed, newest first, with its
- * commit bodies; `match` is GitHub's commit they sit on and `local` the commit it matches here,
- * absent when the walk found none.
+ * tree and subject together (HEAD's, or a commit's on its first-parent line since the default
+ * branch), since `publish` recreates commits on GitHub under new shas with their trees and
+ * messages. By tree alone, a revert would pass for the copy of the commit before the one it
+ * reverts, and the copy of a commit for an empty commit made on it. `outside` is what the walk
+ * passed, newest first, with its commit bodies; `match` is GitHub's commit they sit on and `local`
+ * the commit it matches here, absent when the walk found none.
  */
 async function locateOnGitHub(options: {
   cwd: string;
@@ -582,27 +598,30 @@ async function locateOnGitHub(options: {
   if (tip === head)
     return { head, outside: [], match: { sha: tip, local: tip } };
 
-  const headTree = await inTree(cwd, "rev-parse", "HEAD^{tree}");
   const base = await inTree(
     cwd,
     "merge-base",
     `refs/remotes/origin/${options.defaultBranch}`,
     "HEAD",
   ).catch(() => "");
-  const trees = new Map<string, string>();
+  const format = "--format=%H %T %s";
   const line = await inTree(
     cwd,
     "log",
     "--first-parent",
-    "--format=%H %T",
+    format,
     "HEAD",
     ...(base ? [`^${base}`] : []),
   );
-  for (const entry of line.split("\n").filter(Boolean)) {
-    const [sha = "", tree = ""] = entry.split(" ");
-    if (!trees.has(tree)) trees.set(tree, sha);
+  // HEAD's own, which the line above lacks when HEAD is the base
+  const own = await inTree(cwd, "log", "-1", format, "HEAD");
+  // newest first, so each tree and subject keeps its newest commit
+  const byTreeAndSubject = new Map<string, string>();
+  for (const entry of [...line.split("\n"), own].filter(Boolean)) {
+    const [sha = "", tree = "", ...subject] = entry.split(" ");
+    const key = `${tree} ${subject.join(" ")}`;
+    if (!byTreeAndSubject.has(key)) byTreeAndSubject.set(key, sha);
   }
-  trees.set(headTree, head);
 
   const outside: { sha: string; commit: ApiCommit }[] = [];
   let match: { sha: string; local: string } | undefined;
@@ -616,7 +635,9 @@ async function locateOnGitHub(options: {
       "GET",
       `/git/commits/${at}`,
     );
-    const local = trees.get(commit.tree.sha);
+    const local = byTreeAndSubject.get(
+      `${commit.tree.sha} ${gitSubject(commit.message)}`,
+    );
     if (local) {
       match = { sha: at, local };
       break;

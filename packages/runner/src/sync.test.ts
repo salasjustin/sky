@@ -472,13 +472,28 @@ test("a branch published under SKY_PUBLISH_BRANCH is synced from there and never
 });
 
 /**
+ * The worktree's commit `agent <file>` as `publish` recreates it on seed's checkout: same tree and
+ * message, another sha. Another committer makes it another sha even in the second the worktree's
+ * was made.
+ */
+const recreate = (file: string, content: string) => {
+  writeFileSync(join(seed, file), content);
+  git(seed, "add", "--all");
+  execFileSync("git", ["commit", "-qm", `agent ${file}`], {
+    cwd: seed,
+    env: { ...process.env, ...IDENTITY, GIT_COMMITTER_NAME: "Sky Publish" },
+  });
+  return git(seed, "rev-parse", "HEAD");
+};
+
+/**
  * `claude/agt_1` on GitHub as `publish` leaves it: the worktree's change recreated on the default
  * branch through the git data API, same tree, another sha.
  */
 const publishRecreated = (file = "agent.txt", content = "agent work\n") => {
   git(seed, "fetch", "-q", remote, `+refs/heads/*:refs/remotes/gh/*`);
   git(seed, "checkout", "-q", "-B", "claude/agt_1", "gh/trunk");
-  const sha = commitIn(seed, file, content, `agent ${file}, recreated`);
+  const sha = recreate(file, content);
   git(seed, "push", "-q", remote, "claude/agt_1:refs/heads/claude/agt_1");
   return sha;
 };
@@ -2805,6 +2820,67 @@ test("sync rebases an unpublished commit onto GitHub's pushed commits when the p
   );
   expect(git(cwd, "log", "--format=%H")).not.toContain(sha);
   expect(git(cwd, "status", "--porcelain")).toBe("");
+});
+
+/**
+ * The worktree's two commits recreated on GitHub, the second then reverted there: the revert has
+ * the tree of the worktree's first commit.
+ */
+const revertPushed = async () => {
+  const { cwd, sha } = await earlierRun();
+  const two = commitIn(cwd, "more.txt", "more\n", "agent more.txt");
+  publishRecreated();
+  const twoCopy = recreate("more.txt", "more\n");
+  git(seed, "revert", "--no-edit", "HEAD");
+  git(seed, "push", "-q", remote, "claude/agt_1:refs/heads/claude/agt_1");
+  const revert = bare("rev-parse", "claude/agt_1");
+  expect(bare("rev-parse", `${revert}^{tree}`)).toBe(
+    git(cwd, "rev-parse", `${sha}^{tree}`),
+  );
+  return { cwd, two, twoCopy, revert };
+};
+const REVERT = JSON.stringify('Revert "agent more.txt"');
+
+test("sync brings in a revert pushed onto the published commits, rather than replaying the commit it reverts", async () => {
+  const { cwd, twoCopy, revert } = await revertPushed();
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 0,
+    out: said(
+      TRUNK_CURRENT(),
+      `claude/agt_1 on GitHub is at ${sevenOf(revert)}.`,
+      `Brought in 1 commit: ${sevenOf(revert)} ${REVERT}.`,
+      "Your published commits now carry GitHub's shas, so `git log` and GitHub agree.",
+      `Your worktree is now at ${sevenOf(revert)}.`,
+    ),
+    err: "",
+  });
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(revert);
+  expect(git(cwd, "rev-parse", "HEAD^")).toBe(twoCopy);
+  expect(git(cwd, "log", "--format=%H")).toBe(
+    bare("log", "--format=%H", "claude/agt_1"),
+  );
+  expect(existsSync(join(cwd, "more.txt"))).toBe(false);
+  expect(git(cwd, "status", "--porcelain")).toBe("");
+  expect(
+    git(repoDir, "config", "--get", "branch.claude/agt_1.sky-remote-branch"),
+  ).toBe("claude/agt_1");
+});
+
+test("the start of a run cherry-picks a revert pushed onto the published commits", async () => {
+  const { cwd, two, revert } = await revertPushed();
+
+  const { notes } = await prepare();
+
+  expect(git(cwd, "rev-parse", "HEAD^")).toBe(two);
+  expect(git(cwd, "log", "-1", "--format=%s")).toBe('Revert "agent more.txt"');
+  expect(existsSync(join(cwd, "more.txt"))).toBe(false);
+  expect(git(cwd, "status", "--porcelain")).toBe("");
+  expect(notes).toEqual([
+    `1 commit pushed to \`claude/agt_1\` from outside this sandbox was brought into your worktree: ${sevenOf(revert)} ${REVERT}.`,
+  ]);
 });
 
 test("sync rebasing several unpublished commits says where each one went, oldest first", async () => {
