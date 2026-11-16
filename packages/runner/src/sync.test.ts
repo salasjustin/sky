@@ -1905,6 +1905,9 @@ test("the run's prompt names the origin tip the refresh reached, with its short 
     expect(append).toContain(SYNC_OWN_BRANCH);
     expect(append).toContain("rebased onto them");
     expect(append).toContain(
+      "a git operation is stopped mid-way, GitHub's branch is too far ahead to fetch, or none of its recent commits matches your worktree;",
+    );
+    expect(append).toContain(
       "your worktree and local branch are then left as they were, though GitHub's copy of the branch may already have been fetched.",
     );
     expect(append).not.toContain("changing nothing");
