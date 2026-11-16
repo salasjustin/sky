@@ -1361,7 +1361,8 @@ test("a set of 51 live tasks is posted as its first 50", async () => {
   const [event] = await postedTaskEvents([
     taskSet(...ids.map((id): [string, string] => [id, "local_bash"])),
   ]);
-  const { tasks } = event?.payload as { tasks: { taskId: string }[] };
+  if (!event) throw new Error("no background-task event was posted");
+  const { tasks } = event.payload as { tasks: { taskId: string }[] };
   expect(tasks.map((t) => t.taskId)).toEqual(ids.slice(0, 50));
 });
 
