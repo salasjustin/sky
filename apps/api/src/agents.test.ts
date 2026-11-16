@@ -1542,6 +1542,59 @@ test("a run.started repeated with the same session is answered as stored and wri
   ).toEqual({ session_id: "sess-1", status: "running" });
 });
 
+test("a run.started repeated while the run is waiting is answered as stored, and the open request stays open", async () => {
+  hearRunEvents();
+  const { agent, run, token } = await runningRun();
+  const started = {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "sess-1" },
+  };
+  const { id } = (await (await postEvent(token, started)).json()) as {
+    id: number;
+  };
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.waiting",
+    payload: {
+      request: { kind: "question", requestId: "req_1", prompt: "which?" },
+    },
+  });
+  const open = (await getRun(agent.id, run.id)).body.pendingRequest;
+  expect(open).not.toBeNull();
+
+  const repeat = await postEvent(token, started);
+  expect(repeat.status).toBe(201);
+  expect(await repeat.json()).toEqual({ id });
+  expect(eventsOf(run.id).map((e) => e.type)).toEqual([
+    "run.started",
+    "run.waiting",
+  ]);
+  expect(deliveryCount()).toBe(2);
+  const after = await getRun(agent.id, run.id);
+  expect(after.body.status).toBe("waiting");
+  expect(after.body.pendingRequest).toEqual(open);
+});
+
+test("a run.started repeated after the run ended gets 401 run_ended, not the stored answer", async () => {
+  hearRunEvents();
+  const { run, token } = await runningRun();
+  const started = {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "sess-1" },
+  };
+  expect((await postEvent(token, started)).status).toBe(201);
+  await postEvent(token, { runId: run.id, type: "run.stopped", payload: {} });
+
+  const repeat = await postEvent(token, started);
+  expect(repeat.status).toBe(401);
+  expect(await repeat.json()).toMatchObject({ error: { code: "run_ended" } });
+  expect(
+    eventsOf(run.id).filter((e) => e.type === "run.started"),
+  ).toHaveLength(1);
+});
+
 test("a second run.started with another session gets 409 invalid_transition and writes nothing", async () => {
   hearRunEvents();
   const { agent, run, token } = await runningRun();

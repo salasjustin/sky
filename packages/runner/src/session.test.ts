@@ -3893,11 +3893,15 @@ test("a run.started that never lands by the run's wait deadline fails the run, n
     pollReplies: [],
     virtualTime: true,
   });
+  const startedAt = Date.now();
   const code = await runSession(
     { ...config, waitTimeoutMs: 100_000 },
     { ...deps, query: scripted([init, success]) },
   );
   expect(code).toBe(1);
+  // the launch has 900 s left, so only the wait budget can stop the retries at 100 s: each pause
+  // is clamped to the deadline, so the virtual clock ends on it exactly
+  expect(Date.now() - startedAt).toBe(100_000);
   expect(sent.at(-1)).toMatchObject({
     type: "run.failed",
     payload: {
@@ -3929,10 +3933,9 @@ test.each([
       { ...deps, elapsedMs: () => 20_000, query: scripted([init, success]) },
     );
     expect(code).toBe(1);
-    // the launch's 70 s left, less the 30 s margin its failure needs to beat the API's own
-    expect(Date.now() - startedAt).toBeLessThanOrEqual(
-      90_000 - 20_000 - 30_000,
-    );
+    // the launch's 70 s left, less the 30 s margin its failure needs to beat the API's own; each
+    // pause is clamped to the deadline, so the virtual clock ends on it exactly
+    expect(Date.now() - startedAt).toBe(90_000 - 20_000 - 30_000);
     const startAttempts = received.filter((r) => r.type === "run.started");
     expect(startAttempts.length).toBeGreaterThan(3);
     expect(sent.at(-1)).toMatchObject({
@@ -3943,6 +3946,25 @@ test.each([
     });
   },
 );
+
+test("a run.started whose launch is already past its deadline still gets one attempt's worth of retries", async () => {
+  const { received, deps } = restartingApi({
+    outage: 0,
+    startOutage: Number.POSITIVE_INFINITY,
+    pollReplies: [],
+    virtualTime: true,
+  });
+  const startedAt = Date.now();
+  const code = await runSession(
+    { ...config, launchDeadlineMs: 90_000, waitTimeoutMs: 600_000 },
+    { ...deps, elapsedMs: () => 100_000, query: scripted([init, success]) },
+  );
+  expect(code).toBe(1);
+  // the launch's time left is negative; the start still retries for ATTEMPT_TIMEOUT_MS
+  expect(Date.now() - startedAt).toBe(10_000);
+  const startAttempts = received.filter((r) => r.type === "run.started");
+  expect(startAttempts.length).toBeGreaterThan(1);
+});
 
 test("a lost run.started stops the session, so a hook event queued behind it gets one attempt, not its ride-out", async () => {
   const start = heldStart();
@@ -4010,9 +4032,12 @@ test("a run the API ended before its run.started landed stops the session and po
   expect(tried).toEqual(["run.started"]);
 });
 
-test("a stop during the run.started retry cuts its attempt in flight and fails the run with the stop's reason", async () => {
+// the timeout is the assertion that the stop cuts the attempt: left to the poster's own 10 s
+// per-attempt timeout, the hung attempt would end, and the run would fail the same way, after 10 s
+test("a stop during the run.started retry cuts its attempt in flight and fails the run with the stop's reason", {
+  timeout: 8_000,
+}, async () => {
   const timing = virtualTiming();
-  const startedAt = Date.now();
   const controller = new AbortController();
   const stored: RunnerEventPost[] = [];
   let startAttempts = 0;
@@ -4047,7 +4072,6 @@ test("a stop during the run.started retry cuts its attempt in flight and fails t
     },
   );
   expect(code).toBe(1);
-  expect(Date.now() - startedAt).toBeLessThan(60_000);
   expect(stored).toEqual([
     {
       runId: "run_1",
@@ -5805,6 +5829,45 @@ describe("keeping the run's Claude credential from the repo's processes", () => 
     expect(posted.posted.map((event) => event.type)).not.toContain(
       "run.finished",
     );
+  });
+
+  test("a run stopped for an exposed credential still posts run.started once, unretried, then run.failed", async () => {
+    const received: string[] = [];
+    const failed: RunnerEventPost[] = [];
+    server.use(
+      http.post("https://api.test/internal/events", async ({ request }) => {
+        const event = (await request.json()) as RunnerEventPost;
+        received.push(event.type);
+        // retryable, so a post that kept trying would come back for more
+        if (event.type === "run.started")
+          return new HttpResponse(null, { status: 503 });
+        failed.push(event);
+        return HttpResponse.json({ id: "evt_1" }, { status: 201 });
+      }),
+    );
+    const code = await runSession(config, {
+      query: scripted([init, success]),
+      post: createPoster({
+        apiBaseUrl: "https://api.test",
+        agentToken: "agent-secret",
+        warn: () => {},
+        sleep: async () => {},
+      }),
+      awaitDecision: noDecision,
+      signal: new AbortController().signal,
+      seal: sealed({
+        check: () => "the kernel lets the repo's commands read it",
+      }),
+    });
+    expect(code).toBe(1);
+    expect(received).toEqual(["run.started", "run.failed"]);
+    expect(failed[0]).toMatchObject({
+      type: "run.failed",
+      payload: {
+        error:
+          "credential_exposed: the kernel lets the repo's commands read it; the run was stopped.",
+      },
+    });
   });
 
   test("a seal that vouches for Claude leaves the run as it was", async () => {
