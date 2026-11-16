@@ -1593,9 +1593,9 @@ test("a run.started repeated after the run ended gets 401 run_ended, not the sto
   const repeat = await postEvent(token, started);
   expect(repeat.status).toBe(401);
   expect(await repeat.json()).toMatchObject({ error: { code: "run_ended" } });
-  expect(
-    eventsOf(run.id).filter((e) => e.type === "run.started"),
-  ).toHaveLength(1);
+  expect(eventsOf(run.id).filter((e) => e.type === "run.started")).toHaveLength(
+    1,
+  );
 });
 
 test("a second run.started with another session gets 409 invalid_transition and writes nothing", async () => {
