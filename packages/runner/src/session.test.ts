@@ -3981,9 +3981,9 @@ test("a lost run.started stops the session, so a hook event queued behind it get
   });
   // refused every time, it would ride out its full retries without the stop; the hook was parked
   // behind the start before the start could answer, so the one attempt is the stop's cut
-  expect(
-    received.filter((r) => r.type === "claude.PreToolUse"),
-  ).toHaveLength(1);
+  expect(received.filter((r) => r.type === "claude.PreToolUse")).toHaveLength(
+    1,
+  );
   expect(Date.now() - startedAt).toBeLessThanOrEqual(100_000);
 });
 

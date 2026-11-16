@@ -83,11 +83,7 @@ export function createPoster(
             return {
               fail: "HTTP 409 run_not_started: the run's run.started was never stored",
             };
-          if (
-            mustLand &&
-            res.status === 401 &&
-            errorCode(text) === "run_ended"
-          )
+          if (mustLand && res.status === 401 && errorCode(text) === "run_ended")
             return { done: "run_ended" };
           const failure = `HTTP ${res.status}`;
           return isTransient(res.status)
