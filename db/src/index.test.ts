@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   type AgentId,
   AgentStatus,
@@ -21,7 +21,7 @@ import {
 } from "@sky/shared";
 import { migrate as drizzleMigrate } from "drizzle-orm/better-sqlite3/migrator";
 import { getTableConfig } from "drizzle-orm/sqlite-core";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   agents,
   type Db,
@@ -40,10 +40,24 @@ import {
   webhooks,
 } from "./index.js";
 
+// the default free-space reader calls statfsSync on the test machine's temp dir; stub it so no test
+// depends on how much disk the runner has
+const { statfsSync } = vi.hoisted(() => ({ statfsSync: vi.fn() }));
+vi.mock(import("node:fs"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  statfsSync,
+}));
+
+const AMPLE_BLOCKS = 2 ** 30;
+const BLOCK_SIZE = 4096;
+
 let dir: string;
 let path: string;
 let db: Db;
 beforeEach(() => {
+  statfsSync
+    .mockReset()
+    .mockReturnValue({ bavail: AMPLE_BLOCKS, bsize: BLOCK_SIZE });
   dir = mkdtempSync(join(tmpdir(), "sky-db-"));
   path = join(dir, "sky.db");
   db = openDb(path);
@@ -1425,7 +1439,34 @@ test("migrate doesn't look at free space when nothing is pending, or on a new fi
   expect(() => migrate(db, noRoom)).not.toThrow();
 });
 
-test("migrate reads the real free space of the volume by default", () => {
+test("migrate by default reads the free space of the directory holding the file, as available blocks times block size", () => {
+  staleFile();
+  const bavail = 1500;
+  const bsize = 4096;
+  statfsSync.mockReturnValue({ bavail, bsize });
+
+  let message = "";
+  try {
+    migrate(db);
+  } catch (err) {
+    message = err instanceof Error ? err.message : String(err);
+  }
+
+  expect(message).toContain(`but ${mb(bavail * bsize)} is free`);
+  expect(statfsSync).toHaveBeenCalledWith(dirname(path));
+});
+
+test("migrate by default has room on a volume with ample space", () => {
   staleFile();
   expect(() => migrate(db)).not.toThrow();
+  expect(statfsSync).toHaveBeenCalledWith(dirname(path));
+});
+
+test("a tracked file with no recorded migrations counts every migration as pending", () => {
+  migrate(db);
+  run("delete from __drizzle_migrations");
+
+  expect(() => migrate(db, { freeBytes: () => 0 })).toThrow(
+    /not enough free disk space/,
+  );
 });
