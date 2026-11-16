@@ -3785,7 +3785,7 @@ function restartingApi(options: {
       ...timing,
     }),
     signal: new AbortController().signal,
-    // the launch's time left bounds the start's retries; without this it hangs on the worker's uptime
+    // the launch's time left bounds the start's retries; without this it reads the worker's uptime
     elapsedMs: () => 0,
   };
   return { sent, received, deps, polls: () => polls };
@@ -3979,7 +3979,7 @@ test("a lost run.started stops the session, so a hook event queued behind it get
       error: expect.stringMatching(/run\.started was never recorded.*lost/),
     },
   });
-  // refused every time, it would ride out 120 s of attempts without the stop; the hook was parked
+  // refused every time, it would ride out its full retries without the stop; the hook was parked
   // behind the start before the start could answer, so the one attempt is the stop's cut
   expect(
     received.filter((r) => r.type === "claude.PreToolUse"),

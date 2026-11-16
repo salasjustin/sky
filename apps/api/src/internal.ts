@@ -289,13 +289,13 @@ export function internalRoutes(
         case "ended":
           return apiError(c, 401, "run_ended", "the run has ended");
         case "illegal":
-          // the runner tells a start the API never stored from a real illegal move
+          // its own code, so the runner can tell a lost run.started from a real illegal move
           if (outcome.from === "starting" && outcome.to === "waiting")
             return apiError(
               c,
               409,
               "run_not_started",
-              "the run is still starting: its run.started was never stored",
+              "the run is still starting: no run.started has been stored for it",
             );
           return apiError(
             c,
