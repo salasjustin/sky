@@ -1162,6 +1162,127 @@ test("an ambient background task (a watcher) does not hold the prompt open", asy
   expect(seen).toEqual([true]);
 });
 
+const taskNotification = (
+  task_id: string,
+  overrides: Record<string, unknown> = {},
+) => ({
+  type: "system",
+  subtype: "task_notification",
+  task_id,
+  status: "completed",
+  output_file: "/tmp/out",
+  summary: 'Background command "review" completed',
+  session_id: "sess-new",
+  ...overrides,
+});
+
+const taskEvents = (posted: RunnerEventPost[]) =>
+  posted.filter(
+    (e) =>
+      e.type === "claude.TaskNotification" ||
+      e.type === "claude.BackgroundTasksChanged",
+  );
+
+test("a task_notification is posted with its task id, the type its task was listed with, status and summary, and a hold in effect is kept", async () => {
+  const seen: boolean[] = [];
+  const { posted, post } = recorder();
+  const outcome = await runSession(config, {
+    query: claudeProcess(
+      [
+        init,
+        backgroundTasks(1),
+        success,
+        () => {},
+        taskNotification("t0"),
+        backgroundTasks(0),
+        success,
+      ],
+      (inputEnded) => seen.push(inputEnded),
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([false, true]);
+  expect(outcome).toBe(0);
+  expect(taskEvents(posted).map((e) => [e.type, e.payload])).toEqual([
+    [
+      "claude.BackgroundTasksChanged",
+      { tasks: [{ taskId: "t0", taskType: "local_bash", ambient: false }] },
+    ],
+    [
+      "claude.TaskNotification",
+      {
+        taskId: "t0",
+        taskType: "local_bash",
+        status: "completed",
+        summary: 'Background command "review" completed',
+        ambient: false,
+      },
+    ],
+    ["claude.BackgroundTasksChanged", { tasks: [] }],
+  ]);
+});
+
+test("a task_notification's summary is sent whole up to RUNNER_TEXT_MAX and cut there, for the API to redact before it trims", async () => {
+  const secret = "sk-ant-0123456789abcdef";
+  const { posted, post } = recorder();
+  await runSession(config, {
+    query: claudeProcess(
+      [
+        init,
+        taskNotification("t9", {
+          status: "failed",
+          reason: "worker_restart",
+          summary: `${secret} ${"y".repeat(RUNNER_TEXT_MAX)}`,
+        }),
+        success,
+      ],
+      () => {},
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  const [event] = taskEvents(posted);
+  expect(event?.type).toBe("claude.TaskNotification");
+  const payload = event?.payload as { summary: string; status: string };
+  expect(payload.status).toBe("failed");
+  expect(payload.summary).toHaveLength(RUNNER_TEXT_MAX);
+  // the secret is still whole: redacting it is the API's, which sees the full text
+  expect(payload.summary.startsWith(secret)).toBe(true);
+});
+
+test("background_tasks_changed is posted only when the set changes", async () => {
+  const { posted, post } = recorder();
+  await runSession(config, {
+    query: claudeProcess(
+      [
+        init,
+        backgroundTasks(0),
+        backgroundTasks(1, true),
+        backgroundTasks(1, true),
+        backgroundTasks(2),
+        backgroundTasks(2),
+        success,
+      ],
+      () => {},
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(taskEvents(posted).map((e) => e.payload)).toEqual([
+    { tasks: [{ taskId: "t0", taskType: "local_bash", ambient: true }] },
+    {
+      tasks: [
+        { taskId: "t0", taskType: "local_bash", ambient: false },
+        { taskId: "t1", taskType: "local_bash", ambient: false },
+      ],
+    },
+  ]);
+});
+
 type WokenTurn = (
   options: Options,
   inputEnded: boolean,

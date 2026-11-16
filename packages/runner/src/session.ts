@@ -19,6 +19,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AskUserQuestionInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools";
 import {
+  BACKGROUND_TASKS_MAX,
   type Decision,
   type PendingRequest,
   type RequestId,
@@ -1060,6 +1061,9 @@ export async function runSession(
   // background tasks still running, such as a nested `claude -p`: a `result` that arrives while any
   // are leaves the input open for the turn their notification wakes, for at most the hold
   let liveTasks = 0;
+  // the background tasks the SDK has reported, and the last set posted
+  const taskTypes = new Map<string, { type: string; ambient: boolean }>();
+  let postedTasks = "[]";
   // A background subagent wakes the session when it finishes, as a task does, but the task list
   // can lack it (or already have dropped it) when its parent's `result` arrives; so it counts by
   // agent id from its launch's result or its start hook, whichever comes first, until its stop
@@ -1180,6 +1184,32 @@ export async function runSession(
         // turn, so holding for one would only keep a finished run open until the hold expires
         const live = message.tasks.filter((task) => !task.ambient);
         liveTasks = live.length;
+        // a notification names no task type, and its task may already be gone from the set, so
+        // every task seen is kept
+        for (const task of message.tasks)
+          taskTypes.set(task.task_id, {
+            type: task.task_type,
+            ambient: task.ambient === true,
+          });
+        const tasks = message.tasks.map((task) => ({
+          taskId: task.task_id,
+          taskType: task.task_type,
+          ambient: task.ambient === true,
+        }));
+        // posted only when the set changed, so a timeline shows what was running when a turn ended
+        const key = JSON.stringify(
+          tasks.map((t) => [t.taskId, t.taskType, t.ambient]).sort(),
+        );
+        if (key !== postedTasks) {
+          postedTasks = key;
+          void post(
+            {
+              type: "claude.BackgroundTasksChanged",
+              payload: { tasks: tasks.slice(0, BACKGROUND_TASKS_MAX) },
+            },
+            progress,
+          ).catch(() => {});
+        }
         heartbeat.setBackground(
           live.map((task) => ({
             taskId: task.task_id,
@@ -1190,6 +1220,23 @@ export async function runSession(
         message.type === "system" &&
         message.subtype === "task_notification"
       ) {
+        // a record of what the notice said, nothing more: the hold below is decided as before
+        const known = taskTypes.get(message.task_id);
+        const ambient = message.ambient ?? known?.ambient;
+        void post(
+          {
+            type: "claude.TaskNotification",
+            payload: {
+              taskId: message.task_id,
+              ...(known && { taskType: known.type }),
+              status: message.status,
+              summary: bound(message.summary),
+              ...(message.reason && { reason: message.reason }),
+              ...(ambient !== undefined && { ambient }),
+            },
+          },
+          progress,
+        ).catch(() => {});
         restartHold();
       } else if (message.type === "result") {
         result = message;

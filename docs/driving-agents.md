@@ -95,6 +95,8 @@ pnpm db:migrate --env production
 
 With `--json` it prints the run, whose `pendingRequest` is `null` or the request.
 
+A run's event feed (`GET /v1/stream`, `wait_for_events`, webhooks) shows why a turn ended with work still going: `claude.BackgroundTasksChanged` lists the background tasks running (`taskId`, `taskType`, `ambient`) each time that set changes, and `claude.TaskNotification` carries each ended task's `status` and `summary`, redacted and cut like other event text. `sky inbox` and `sky status` print the run's request and result, not its events.
+
 ## 4. Answer, approve or deny
 
 ```

@@ -307,6 +307,8 @@ const claudeTypes = [
   "claude.SubagentStop",
   "claude.TaskCreated",
   "claude.TaskCompleted",
+  "claude.TaskNotification",
+  "claude.BackgroundTasksChanged",
   "claude.Notification",
   "claude.PreCompact",
   "claude.FileChanged",
@@ -369,6 +371,23 @@ const claudePosts = [
       taskId: "1",
       taskSubject: "add tests",
       taskDescription: "cover the parser",
+    },
+  },
+  {
+    type: "claude.TaskNotification",
+    payload: {
+      taskId: "bash_1",
+      taskType: "local_bash",
+      status: "stopped",
+      summary: 'Background command "review" was stopped',
+      reason: "worker_restart",
+      ambient: false,
+    },
+  },
+  {
+    type: "claude.BackgroundTasksChanged",
+    payload: {
+      tasks: [{ taskId: "mon_1", taskType: "monitor", ambient: true }],
     },
   },
   {

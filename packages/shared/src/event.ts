@@ -60,6 +60,8 @@ export const EventType = z.enum([
   "claude.SubagentStop",
   "claude.TaskCreated",
   "claude.TaskCompleted",
+  "claude.TaskNotification",
+  "claude.BackgroundTasksChanged",
   "claude.Notification",
   "claude.PreCompact",
   "claude.FileChanged",
@@ -120,9 +122,12 @@ export const EVENT_TEXT_MAX = 4_096;
 export const truncationMarker = (omitted: number) =>
   `\n…[truncated ${omitted} chars]`;
 
+/** Most tasks one `claude.BackgroundTasksChanged` lists; the runner sends the first ones when more are live. */
+export const BACKGROUND_TASKS_MAX = 50;
+
 /**
  * Claude Code hook inputs (Agent SDK `<Name>HookInput`), camelCased, minus per-session plumbing;
- * `claude.Message` is assistant text from the message stream.
+ * `claude.Message`, `claude.TaskNotification` and `claude.BackgroundTasksChanged` come from the message stream.
  * `subagentId` is the SDK's `agent_id` — `agentId` is the sky agent on the envelope.
  */
 const claudePayloads = (textMax: number) => {
@@ -162,6 +167,27 @@ const claudePayloads = (textMax: number) => {
     }),
     "claude.TaskCreated": z.object(task),
     "claude.TaskCompleted": z.object(task),
+    /** a background task (a shell, a monitor, a subagent) ended; `taskType` is as its last `claude.BackgroundTasksChanged` named it */
+    "claude.TaskNotification": z.object({
+      taskId: z.string().min(1).max(256),
+      taskType: z.string().min(1).max(256).optional(),
+      status: z.enum(["completed", "failed", "stopped"]),
+      summary: text,
+      reason: z.string().min(1).max(256).optional(),
+      ambient: z.boolean().optional(),
+    }),
+    /** every background task live after a change; `ambient` ones (watchers) don't wake a turn */
+    "claude.BackgroundTasksChanged": z.object({
+      tasks: z
+        .array(
+          z.object({
+            taskId: z.string().min(1).max(256),
+            taskType: z.string().min(1).max(256),
+            ambient: z.boolean(),
+          }),
+        )
+        .max(BACKGROUND_TASKS_MAX),
+    }),
     "claude.Notification": z.object({
       message: text,
       title: text.optional(),
@@ -254,6 +280,8 @@ export const RunnerEventPost = z.discriminatedUnion("type", [
   posted("claude.SubagentStop"),
   posted("claude.TaskCreated"),
   posted("claude.TaskCompleted"),
+  posted("claude.TaskNotification"),
+  posted("claude.BackgroundTasksChanged"),
   posted("claude.Notification"),
   posted("claude.PreCompact"),
   posted("claude.FileChanged"),
@@ -290,6 +318,8 @@ export const Event = z.discriminatedUnion("type", [
   stored("claude.SubagentStop"),
   stored("claude.TaskCreated"),
   stored("claude.TaskCompleted"),
+  stored("claude.TaskNotification"),
+  stored("claude.BackgroundTasksChanged"),
   stored("claude.Notification"),
   stored("claude.PreCompact"),
   stored("claude.FileChanged"),

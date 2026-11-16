@@ -1165,6 +1165,20 @@ test.each([
   ["claude.SubagentStop", { subagentId: "sa_1", agentType: "Explore" }],
   ["claude.TaskCreated", task],
   ["claude.TaskCompleted", task],
+  [
+    "claude.TaskNotification",
+    {
+      taskId: "t1",
+      taskType: "local_bash",
+      status: "completed",
+      summary: 'Background command "review" completed',
+      ambient: false,
+    },
+  ],
+  [
+    "claude.BackgroundTasksChanged",
+    { tasks: [{ taskId: "t1", taskType: "monitor", ambient: true }] },
+  ],
   ["claude.Notification", { message: "idle", notificationType: "idle_prompt" }],
   ["claude.PreCompact", { trigger: "auto", customInstructions: null }],
   ["claude.FileChanged", { filePath: "src/a.ts", event: "change" }],
@@ -1187,6 +1201,29 @@ test.each([
     expect((await getRun(agent.id, run.id)).body.status).toBe("running");
   },
 );
+
+test("a claude.TaskNotification's summary is redacted of a registered secret and trimmed to EVENT_TEXT_MAX with the marker", async () => {
+  const { run, token } = await startedRun();
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "claude.TaskNotification",
+    payload: {
+      taskId: "t1",
+      status: "failed",
+      summary: `exit 1 with ${config.spritesToken} ${"x".repeat(EVENT_TEXT_MAX)}`,
+    },
+  });
+  expect(res.status).toBe(201);
+  const row = db.$client
+    .prepare(
+      "select payload from events where type = 'claude.TaskNotification'",
+    )
+    .get() as { payload: string };
+  const { summary } = JSON.parse(row.payload) as { summary: string };
+  expect(summary).not.toContain(config.spritesToken);
+  expect(summary).toContain("[redacted]");
+  expect(summary).toMatch(/…\[truncated \d+ chars\]$/);
+});
 
 const startedRun = async () => {
   const ids = await runningRun();
