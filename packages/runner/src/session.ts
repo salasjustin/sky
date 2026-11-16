@@ -888,8 +888,20 @@ export async function runSession(
       },
       signal,
     );
-    // approve adds nothing: an explicit allow would also skip canUseTool, which answers AskUserQuestion
-    if (decision?.decision === "approve") return { continue: true };
+    if (decision?.decision === "approve")
+      // Claude's question gets no allow: one would skip canUseTool, which takes the person's answer
+      return input.tool_name === "AskUserQuestion"
+        ? { continue: true }
+        : {
+            continue: true,
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse",
+              permissionDecision: "allow",
+              ...(decision.reason && {
+                additionalContext: `The person who approved this tool call noted: ${decision.reason}`,
+              }),
+            },
+          };
     if (decision === undefined) return waitEnded();
     return {
       continue: true,
@@ -967,6 +979,28 @@ export async function runSession(
       ).catch(() => {}),
     intervalMs: deps.heartbeatMs,
   });
+  // calls the gate let through, by tool use id, until a Post hook says how they ended
+  const letThrough = new Map<string, string>();
+  /**
+   * A call the gate let through whose error result comes back with no Post hook never ran: Claude
+   * Code turned it down after the gate, as a plugin's or a settings file's own PreToolUse hook does.
+   */
+  const reportRefusals = (content: unknown) => {
+    for (const { toolUseId, text } of errorResultsOf(content)) {
+      const toolName = letThrough.get(toolUseId);
+      if (toolName === undefined) continue;
+      letThrough.delete(toolUseId);
+      if (CANCELLED_CALL_PREFIXES.some((prefix) => text.startsWith(prefix)))
+        continue;
+      const message = bound(
+        `Claude Code turned down ${toolName} call ${toolUseId} after the runner let it through: ${text}`,
+      );
+      warn(`runner: ${message}`);
+      void post({ type: "runner.warning", payload: { message } }).catch(
+        () => {},
+      );
+    }
+  };
   const hooks = sessionHooks(gateTimeoutS(config.waitTimeoutMs), {
     // a failed post must not fail the tool call that triggered it
     event: (event) => void post(event, progress).catch(() => {}),
@@ -974,8 +1008,14 @@ export async function runSession(
       stopMessage = lastMessage || stopMessage;
     },
     gate,
-    toolStarted: heartbeat.started,
-    toolEnded: heartbeat.ended,
+    toolStarted: (toolUseId, toolName) => {
+      letThrough.set(toolUseId, toolName);
+      heartbeat.started(toolUseId, toolName);
+    },
+    toolEnded: (toolUseId) => {
+      letThrough.delete(toolUseId);
+      heartbeat.ended(toolUseId);
+    },
     subagent: (agentId, running) => {
       if (running) subagents.add(agentId);
       else {
@@ -1075,6 +1115,7 @@ export async function runSession(
       ),
     });
     for await (const message of stream) {
+      if (message.type === "user") reportRefusals(message.message.content);
       if (message.type === "system" && message.subtype === "init" && !started) {
         started = true;
         sessionId = message.session_id;
@@ -1274,6 +1315,27 @@ function hasCancelledCall(content: unknown): boolean {
             : isCancel(block.content)),
       ))
   );
+}
+
+/** A user message's errored tool results, each with its content as text. */
+function errorResultsOf(
+  content: unknown,
+): { toolUseId: string; text: string }[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((block) => {
+    if (block?.type !== "tool_result" || block.is_error !== true) return [];
+    if (typeof block.tool_use_id !== "string") return [];
+    const text = Array.isArray(block.content)
+      ? block.content
+          .flatMap((part: { type?: unknown; text?: unknown } | null) =>
+            part?.type === "text" && typeof part.text === "string"
+              ? [part.text]
+              : [],
+          )
+          .join("\n")
+      : String(block.content ?? "");
+    return [{ toolUseId: block.tool_use_id, text }];
+  });
 }
 
 function toolUseIdsOf(content: AssistantContent): string[] {

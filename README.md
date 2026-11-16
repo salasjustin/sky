@@ -152,6 +152,8 @@ sky approve <agent> <requestId>   # or deny --reason=…, or answer -- <text>
 sky status <agent>    # status, summary, error and compare link
 ```
 
+A deny's `--reason` is what the agent is told. `approve` takes one too: it is recorded with the decision and passed to the agent as a note.
+
 [Driving agents](docs/driving-agents.md) walks a bot through an agent end to end: start, wait, answer or approve, follow up, read the result, archive.
 
 ### Claude credentials

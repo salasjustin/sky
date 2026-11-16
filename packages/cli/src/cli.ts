@@ -141,7 +141,9 @@ const help = (io: Io) => `Usage:
       Decide a pending request. Options go before --, and everything after
       it is the answer, even text starting with '-'. Repeating the same
       decision exits 0; a request already decided differently exits 1 and
-      the earlier decision stands.
+      the earlier decision stands. A deny's --reason is what the agent is
+      told; an approve's is recorded with the decision and passed to the
+      agent as a note.
 
 Options:
   --url=<url>            API URL

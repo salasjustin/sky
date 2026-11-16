@@ -2756,6 +2756,14 @@ const gitPush = {
   tool_input: { command: "git push origin main", description: "Push" },
   tool_use_id: "t1",
 };
+/** What the gate answers a call a person approved: an explicit allow, past Claude Code's own checks. */
+const approved = {
+  continue: true,
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse",
+    permissionDecision: "allow",
+  },
+};
 /** Fires PreToolUse for `gitPush` whatever the hook answers. */
 const firePush: Step = async (options) =>
   void (await fire(options, "PreToolUse", gitPush));
@@ -2775,7 +2783,7 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
     { ...deps, query },
   );
   expect(code).toBe(0);
-  expect(answers).toEqual([{ continue: true }]);
+  expect(answers).toEqual([approved]);
   const waiting = sent.find((e) => e.type === "run.waiting");
   expect(waiting).toEqual({
     runId: "run_1",
@@ -2801,6 +2809,76 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
     "run.waiting",
     "run.finished",
   ]);
+});
+
+test("an approval with a reason lets the tool run the same, and hands Claude the reason as a note", async () => {
+  const { deps } = api(decided({ decision: "approve", reason: "fine, once" }));
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(answers).toEqual([
+    {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+        additionalContext:
+          "The person who approved this tool call noted: fine, once",
+      },
+    },
+  ]);
+});
+
+test("an approved hold on Claude's question adds no allow, so canUseTool still takes the person's answer", async () => {
+  const { sent, deps } = api(
+    decided({ decision: "approve" }),
+    decided({ decision: "answer", answer: "SQLite" }),
+  );
+  let answers: unknown[] = [];
+  let permission: unknown;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", {
+        tool_name: "AskUserQuestion",
+        tool_input: { questions },
+        tool_use_id: "q1",
+      });
+      permission = await options.canUseTool?.(
+        "AskUserQuestion",
+        { questions },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "q1",
+          requestId: "perm_1",
+        },
+      );
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["AskUserQuestion"] },
+    { ...deps, query },
+  );
+  expect(answers).toEqual([{ continue: true }]);
+  expect(permission).toEqual({
+    behavior: "allow",
+    updatedInput: { questions, answers: { "Which database?": "SQLite" } },
+  });
+  expect(
+    sent.flatMap((e) =>
+      e.type === "run.waiting" ? [e.payload.request.kind] : [],
+    ),
+  ).toEqual(["approval", "question"]);
 });
 
 test("a read-only Bash command runs without an approval request even under a bare Bash policy", async () => {
@@ -2958,6 +3036,67 @@ test("a denial blocks the tool and hands Claude the reason", async () => {
       },
     },
   ]);
+});
+
+/** The tool result Claude Code sends back for call `id`: an error, as a refused or failed call's is. */
+const errorResult = (id: string, content: string) => ({
+  type: "user",
+  session_id: "sess-new",
+  parent_tool_use_id: null,
+  message: {
+    role: "user",
+    content: [
+      { type: "tool_result", tool_use_id: id, content, is_error: true },
+    ],
+  },
+});
+const pluginRefusal =
+  "PreToolUse:Bash hook error: [bash gate.sh]: load the lead contract first";
+
+test("an approved call Claude Code turns down after the gate, with no Post hook, is posted as a warning naming the tool, its id and Claude Code's message", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const warned: string[] = [];
+  const query = scripted([
+    init,
+    firePush,
+    errorResult("t1", pluginRefusal),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query, warn: (line) => warned.push(line) },
+  );
+  const message = `Claude Code turned down Bash call t1 after the runner let it through: ${pluginRefusal}`;
+  expect(sent.filter((e) => e.type === "runner.warning")).toEqual([
+    { runId: "run_1", type: "runner.warning", payload: { message } },
+  ]);
+  expect(warned).toEqual([`runner: ${message}`]);
+});
+
+test("an error result for a call that failed through PostToolUseFailure, or that the gate denied, posts no warning", async () => {
+  const { sent, deps } = api(decided({ decision: "deny", reason: "no" }));
+  const query = scripted([
+    init,
+    hook("PreToolUse", { ...gitPush, tool_input: { command: "false" } }),
+    hook("PostToolUseFailure", {
+      ...gitPush,
+      tool_input: { command: "false" },
+      error: "Exit code 1",
+    }),
+    errorResult("t1", "Exit code 1"),
+    async (options: Options) =>
+      void (await fire(options, "PreToolUse", {
+        ...gitPush,
+        tool_use_id: "t2",
+      })),
+    errorResult("t2", "no"),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(sent.map((e) => e.type)).not.toContain("runner.warning");
 });
 
 test("a call the policy doesn't hold never waits", async () => {
@@ -3199,7 +3338,7 @@ test("an API restart mid-approval is ridden out: the tool call is approved, and 
     { ...config, approvalPolicy: ["Bash"] },
     { ...deps, query },
   );
-  expect(answers).toEqual([{ continue: true }]);
+  expect(answers).toEqual([approved]);
   expect(code).toBe(0);
   expect(sent.map((e) => e.type)).toEqual([
     "run.started",
@@ -3665,7 +3804,7 @@ test("a run.waiting stored by the API whose response was lost is retried, answer
     },
   );
   expect(code).toBe(0);
-  expect(answers).toEqual([{ continue: true }]);
+  expect(answers).toEqual([approved]);
   expect(opened).toHaveLength(2);
   expect(new Set(opened).size).toBe(1);
   expect(polled).toEqual([opened[0]]);
@@ -4156,7 +4295,7 @@ test("a call held for approval is not beaten for until it is approved and runs",
       await pause(QUIET_MS)(options);
       beatsWhileHeld = beatsIn(posted);
       approve?.();
-      expect(await gated).toEqual([{ continue: true }]);
+      expect(await gated).toEqual([approved]);
     },
     until(() => expect(beatsIn(posted).length).toBeGreaterThanOrEqual(2)),
     hook("PostToolUse", { ...bash("t1"), tool_response: "ok" }),
