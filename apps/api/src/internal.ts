@@ -1,5 +1,5 @@
 import { zValidator } from "@hono/zod-validator";
-import { agents, type Db, runRequests, runs } from "@sky/db";
+import { agents, type Db, events, runRequests, runs } from "@sky/db";
 import {
   canTransition,
   EVENT_TEXT_MAX,
@@ -12,7 +12,7 @@ import {
   type RunStatus,
   truncationMarker,
 } from "@sky/shared";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { isAgentTokenFor, mintAgentToken } from "./agent-token.js";
 import {
@@ -147,6 +147,31 @@ function challengedEarlier(tx: Tx, runId: RunId | null): boolean {
   return false;
 }
 
+/**
+ * The id of `run`'s stored `run.started` when a `run.started` for `sessionId` repeats it: the run is
+ * past `starting` and its agent holds that session. Undefined for any other start.
+ */
+function repeatedStartOf(
+  tx: Tx,
+  run: typeof runs.$inferSelect,
+  sessionId: string,
+): number | undefined {
+  if (run.status === "starting") return undefined;
+  const agent = tx
+    .select({ sessionId: agents.sessionId })
+    .from(agents)
+    .where(eq(agents.id, run.agentId))
+    .get();
+  if (agent?.sessionId !== sessionId) return undefined;
+  return tx
+    .select({ id: events.id })
+    .from(events)
+    .where(and(eq(events.runId, run.id), eq(events.type, "run.started")))
+    .orderBy(desc(events.id))
+    .limit(1)
+    .get()?.id;
+}
+
 /** `longPollMs`: how long the decision long-poll waits before answering pending. */
 export function internalRoutes(
   longPollMs: number,
@@ -174,6 +199,11 @@ export function internalRoutes(
           if (auth.kind !== "authorized") return auth;
           const { run } = auth;
           if (!isActive(run.status)) return { kind: "ended" } as const;
+          // a runner retries a start whose answer it lost; the retry gets the stored answer, not a 409
+          if (event.type === "run.started") {
+            const id = repeatedStartOf(tx, run, event.payload.sessionId);
+            if (id !== undefined) return { kind: "repeat", id } as const;
+          }
           if (event.type === "run.waiting" && openRequestOf(tx, run.id)) {
             return { kind: "request_open" } as const;
           }
@@ -280,6 +310,8 @@ export function internalRoutes(
             "request_open",
             "the run already has an open request",
           );
+        case "repeat":
+          return c.json({ id: outcome.id }, 201);
       }
       // after the commit, so the dispatcher sees the rows; never awaited, so delivery can't slow the runner
       if (outcome.enqueued > 0) c.var.nudgeDeliveries();
