@@ -767,14 +767,15 @@ export async function syncAgentBranch(options: {
  * Commits pushed from outside are fast-forwarded in when the worktree has no unpublished commits,
  * and the unpublished ones are rebased onto them when it has some. When there are commits from
  * outside and `localBranch` continues no GitHub branch yet, it is recorded as continuing `branch`,
- * so `publish` only fast-forwards it from then on. It is refused, with the worktree and local
- * branch left as they were, for a GitHub history that matches nothing here, a worktree with
- * uncommitted changes, unpublished commits that include a merge, a rebase that conflicts or a
- * branch too far ahead to fetch. Unlike `syncAgentBranch`, which leaves the worktree's own shas
- * and cherry-picks, the published commits here are replaced by GitHub's, so `git log` and GitHub
- * agree. `lines` is what to tell the agent; `ok` is false when the worktree was left as it was for
- * a reason it should act on, and `moved` true when the worktree was moved. A branch GitHub doesn't
- * have is left alone.
+ * so `publish` only fast-forwards it from then on. It is refused, with the worktree, the local
+ * branch, that record and git's ORIG_HEAD left as they were, for a GitHub history that matches
+ * nothing here, a worktree with uncommitted changes, unpublished commits that include a merge, a
+ * branch too far ahead to fetch, a fast-forward or reset git refuses, or a rebase that conflicts
+ * or fails; a rebase whose abort fails too is left mid-way, as the note says. Unlike
+ * `syncAgentBranch`, which leaves the worktree's own shas and cherry-picks, the published commits
+ * here are replaced by GitHub's, so `git log` and GitHub agree. `lines` is what to tell the agent;
+ * `ok` is false when the worktree was left as it was for a reason it should act on, and `moved`
+ * true when the worktree was moved. A branch GitHub doesn't have is left alone.
  */
 export async function syncOwnBranch(options: {
   repoDir: string;
@@ -873,15 +874,38 @@ export async function syncOwnBranch(options: {
     if (error instanceof TooFarError) return refuse(messageOf(error));
     throw error;
   }
+  const key = `branch.${options.localBranch}.${REMOTE_BRANCH_KEY}`;
+  let marked = false;
   if (outside.length > 0) {
     // the branch now holds commits someone else pushed: like a branch the agent continues, `publish`
     // only fast-forwards it, so it never rebases them onto the base and force-updates them away. Set
     // before the worktree moves, so a failure here leaves the worktree as it was
-    const key = `branch.${options.localBranch}.${REMOTE_BRANCH_KEY}`;
     if (!(await inTree(cwd, "config", "--get", key).catch(() => ""))) {
       await inTree(cwd, "config", key, branch);
+      marked = true;
     }
   }
+  // a refusal below unsets what this sync set, and puts back the ORIG_HEAD that a failed
+  // `merge --ff-only` or an aborted rebase leaves at HEAD
+  const unmark = async () => {
+    if (marked) await inTree(cwd, "config", "--unset", key).catch(() => {});
+  };
+  const origHead = await inTree(
+    cwd,
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    "ORIG_HEAD",
+  ).catch(() => "");
+  const restoreOrigHead = () =>
+    inTree(
+      cwd,
+      // update-ref runs the repo's reference-transaction hook
+      "-c",
+      "core.hooksPath=/dev/null",
+      "update-ref",
+      ...(origHead ? ["ORIG_HEAD", origHead] : ["-d", "ORIG_HEAD"]),
+    ).catch(() => "");
 
   // the commits here after the one that matches GitHub's: never published
   const unpublished =
@@ -901,6 +925,8 @@ export async function syncOwnBranch(options: {
         await inTree(cwd, ...hooksOff, "reset", "--keep", "--quiet", tip);
       }
     } catch (error) {
+      await unmark();
+      await restoreOrigHead();
       return refuse(`bringing it in failed (${gitSaid(error)})`);
     }
   } else {
@@ -917,6 +943,9 @@ export async function syncOwnBranch(options: {
     } catch (error) {
       const conflicted = await unmerged(cwd);
       const stuck = await abortStopped(cwd, "rebase");
+      await unmark();
+      // left mid-rebase, ORIG_HEAD is the rebase's own: the commit it started from, the way back
+      if (!stuck) await restoreOrigHead();
       const why =
         conflicted.length > 0
           ? `rebasing your ${commits(unpublished.length)} onto it conflicted (in ${pathList(conflicted)})`

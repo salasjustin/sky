@@ -2405,12 +2405,13 @@ test("sync refuses a dirty worktree and changes nothing", async () => {
 });
 
 test("sync refuses a rebase that conflicts, aborts it and leaves the worktree as it was", async () => {
-  const { cwd } = await earlierRun("shared.txt", "agent\n");
+  const { cwd, sha } = await earlierRun("shared.txt", "agent\n");
   publishAsIs(cwd);
   const outside = pushToGitHub("claude/agt_1", "shared.txt", "theirs\n");
   const mine = commitIn(cwd, "shared.txt", "mine\n", "mine edits shared");
-  // git's own rebase writes ORIG_HEAD, so only the commit and the branch are held fixed here
   const branchBefore = git(cwd, "rev-parse", "refs/heads/claude/agt_1");
+  // somewhere other than HEAD, where the rebase sync tries would leave it
+  git(cwd, "update-ref", "ORIG_HEAD", sha);
 
   const result = await syncRun(cwd);
 
@@ -2427,6 +2428,32 @@ test("sync refuses a rebase that conflicts, aborts it and leaves the worktree as
   expect(
     existsSync(join(git(cwd, "rev-parse", "--git-dir"), "rebase-merge")),
   ).toBe(false);
+  expect(git(cwd, "rev-parse", "ORIG_HEAD")).toBe(sha);
+  // publish still rebases the branch onto the base, as before the sync
+  expect(git(repoDir, "config", "--list")).not.toContain("sky-remote-branch");
+});
+
+test("sync refuses a fast-forward git won't make over an untracked file, and leaves the branch, ORIG_HEAD and publish's target as they were", async () => {
+  const { cwd, sha } = await earlierRun();
+  publishAsIs(cwd);
+  const outside = pushToGitHub("claude/agt_1", "review.txt", "fix\n");
+  // untracked files don't make a worktree dirty, but the fast-forward would overwrite this one
+  writeFileSync(join(cwd, "review.txt"), "mine\n");
+  git(cwd, "update-ref", "ORIG_HEAD", `${sha}^`);
+  const unchanged = untouched(cwd);
+
+  const result = await syncRun(cwd);
+
+  expect(result.code).toBe(1);
+  expect(result.out).toBe(`${TRUNK_CURRENT()}\n`);
+  expect(result.err).toMatch(
+    new RegExp(
+      `^sky sync: claude/agt_1 on GitHub is at ${sevenOf(outside)}; bringing it in failed \\(".*review\\.txt.*"\\)\\. Your worktree \\(at ${sevenOf(sha)}\\) was not changed\\.\n$`,
+    ),
+  );
+  unchanged();
+  expect(readFileSync(join(cwd, "review.txt"), "utf8")).toBe("mine\n");
+  expect(git(repoDir, "config", "--list")).not.toContain("sky-remote-branch");
 });
 
 test("sync leaves a branch that was never published alone and says so", async () => {
