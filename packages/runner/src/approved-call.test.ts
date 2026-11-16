@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -228,6 +229,14 @@ async function heldRun(
         env: {
           ...rest.env,
           HOME: home,
+          // a relocated config dir on the host would win over HOME and bring the host's own
+          // settings, plugins and hooks into the session; the rest are host credentials or backends
+          CLAUDE_CONFIG_DIR: join(home, ".claude"),
+          ANTHROPIC_API_KEY: undefined,
+          ANTHROPIC_AUTH_TOKEN: undefined,
+          CLAUDE_CODE_USE_BEDROCK: undefined,
+          CLAUDE_CODE_USE_VERTEX: undefined,
+          CLAUDE_CODE_USE_FOUNDRY: undefined,
           ANTHROPIC_BASE_URL: apiUrl,
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
           DISABLE_AUTOUPDATER: "1",
@@ -333,7 +342,9 @@ describe.skipIf(!claudeBinary)(
     }, 90_000);
 
     test("with a lead-contract hook installed that refuses unless KRU_NO_LEAD_GATE is set, the approved call runs and Claude is not told to ask again", async () => {
-      // kru's require-lead.sh does this from the sprite's own settings: exit 2 until its switch is set
+      // kru's require-lead.sh does this from the sprite's own settings: exit 2 until its switch is set.
+      // The hook records the switch it saw, so a hook that never loaded can't pass for one that did.
+      const marker = join(root, "lead-hook-saw");
       writeFileSync(
         join(home, ".claude", "settings.json"),
         JSON.stringify({
@@ -344,8 +355,7 @@ describe.skipIf(!claudeBinary)(
                 hooks: [
                   {
                     type: "command",
-                    command:
-                      "[ -n \"$KRU_NO_LEAD_GATE\" ] || { echo 'load the lead contract, then take the action again' >&2; exit 2; }",
+                    command: `printf %s "$KRU_NO_LEAD_GATE" > '${marker}'; [ -n "$KRU_NO_LEAD_GATE" ] || { echo 'load the lead contract, then take the action again' >&2; exit 2; }`,
                   },
                 ],
               },
@@ -356,6 +366,7 @@ describe.skipIf(!claudeBinary)(
       const { sent, requests } = await heldRun(nestedCheck("echo RAN"), {
         decision: "approve",
       });
+      expect(readFileSync(marker, "utf8")).not.toBe("");
       expect(types(sent)).toContain("claude.PostToolUse");
       expect(warnings(sent)).toEqual([]);
       expect(toolResultsIn(requests)).toEqual([

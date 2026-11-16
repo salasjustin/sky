@@ -1200,6 +1200,10 @@ const subagentStop: Step = hook("SubagentStop", {
 /** The SDK's text for a call it cancelled, which reads as a user's refusal (one of its interruption markers in sdk.mjs). */
 const REFUSAL_CANCEL =
   "The user doesn't want to take this action right now. STOP what you are doing and wait for the user to tell you how to proceed.";
+const SESSION_ENDED_CALL =
+  "[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown. Check whether it took effect before relying on it or running it again.]";
+const SESSION_ENDED_REQUEST =
+  "[Request interrupted: the session ended before this agent finished. Nobody asked it to stop.]";
 /** Tool results Claude's process hands back for `toolu_woken`, as errors, one per `content`. */
 const erroredResult = (...contents: unknown[]) => ({
   type: "user",
@@ -1626,10 +1630,7 @@ test("a woken turn's calls cancelled after the input closed over a running subag
   expect(ran).toEqual([]);
 });
 
-test.each([
-  "[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown. Check whether it took effect before relying on it or running it again.]",
-  "[Request interrupted: the session ended before this agent finished. Nobody asked it to stop.]",
-])(
+test.each([SESSION_ENDED_CALL, SESSION_ENDED_REQUEST])(
   "a call cancelled with the SDK's session-ended text %#, after the input closed over a running subagent, is reported the same way",
   async (ended) => {
     expect(await closedOverSubagent(wokenCall([], ended))).toEqual({
@@ -3068,7 +3069,7 @@ test("a denial blocks the tool and hands Claude the reason", async () => {
 });
 
 /** The tool result Claude Code sends back for call `id`: an error, as a refused or failed call's is. */
-const errorResult = (id: string, content: string) => ({
+const errorResult = (id: string, content: unknown) => ({
   type: "user",
   session_id: "sess-new",
   parent_tool_use_id: null,
@@ -3102,8 +3103,8 @@ test("an approved call Claude Code turns down after the gate, with no Post hook,
   expect(warned).toEqual([`runner: ${message}`]);
 });
 
-test("an error result for a call that failed through PostToolUseFailure, or that the gate denied, posts no warning", async () => {
-  const { sent, deps } = api(decided({ decision: "deny", reason: "no" }));
+test("an error result for a call that failed through PostToolUseFailure posts no warning", async () => {
+  const { sent, deps } = api();
   const query = scripted([
     init,
     hook("PreToolUse", { ...gitPush, tool_input: { command: "false" } }),
@@ -3113,19 +3114,96 @@ test("an error result for a call that failed through PostToolUseFailure, or that
       error: "Exit code 1",
     }),
     errorResult("t1", "Exit code 1"),
-    async (options: Options) =>
-      void (await fire(options, "PreToolUse", {
-        ...gitPush,
-        tool_use_id: "t2",
-      })),
-    errorResult("t2", "no"),
     success,
   ]);
   await runSession(
     { ...config, approvalPolicy: ["Bash(git push:*)"] },
     { ...deps, query },
   );
+  expect(sent.map((e) => e.type)).toContain("claude.PostToolUseFailure");
   expect(sent.map((e) => e.type)).not.toContain("runner.warning");
+});
+
+test("an error result for a call the gate denied posts no warning", async () => {
+  const { sent, deps } = api(decided({ decision: "deny", reason: "no" }));
+  const query = scripted([init, firePush, errorResult("t1", "no"), success]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(sent.map((e) => e.type)).toContain("run.waiting");
+  expect(sent.map((e) => e.type)).not.toContain("runner.warning");
+});
+
+test.each([
+  ["the SDK's refusal text", REFUSAL_CANCEL],
+  ["its session-ended text for a call", SESSION_ENDED_CALL],
+  ["its session-ended text for a request", SESSION_ENDED_REQUEST],
+  ["text blocks", [{ type: "text", text: REFUSAL_CANCEL }]],
+])(
+  "an approved call the SDK cancelled with %s posts no warning of any kind",
+  async (_name, content) => {
+    const { sent, deps } = api(decided({ decision: "approve" }));
+    const warned: string[] = [];
+    const query = scripted([
+      init,
+      firePush,
+      errorResult("t1", content),
+      success,
+    ]);
+    await runSession(
+      { ...config, approvalPolicy: ["Bash(git push:*)"] },
+      { ...deps, query, warn: (line) => warned.push(line) },
+    );
+    expect(sent.filter((e) => e.type === "runner.warning")).toEqual([]);
+    expect(warned).toEqual([]);
+  },
+);
+
+test("a non-error tool result for an approved call with no Post hook posts no warning", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const warned: string[] = [];
+  const query = scripted([
+    init,
+    firePush,
+    {
+      ...errorResult("t1", pluginRefusal),
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "t1",
+            content: pluginRefusal,
+            is_error: false,
+          },
+        ],
+      },
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query, warn: (line) => warned.push(line) },
+  );
+  expect(sent.filter((e) => e.type === "runner.warning")).toEqual([]);
+  expect(warned).toEqual([]);
+});
+
+test("two error results for one approved call post one warning", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const query = scripted([
+    init,
+    firePush,
+    errorResult("t1", pluginRefusal),
+    errorResult("t1", pluginRefusal),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(sent.filter((e) => e.type === "runner.warning")).toHaveLength(1);
 });
 
 test("a call the policy doesn't hold never waits", async () => {
