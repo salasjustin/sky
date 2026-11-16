@@ -167,7 +167,7 @@ const claudePayloads = (textMax: number) => {
     }),
     "claude.TaskCreated": z.object(task),
     "claude.TaskCompleted": z.object(task),
-    /** a background task (a shell, a monitor, a subagent) ended; `taskType` is as its last `claude.BackgroundTasksChanged` named it */
+    /** a background task (a shell, a monitor, a subagent) ended; `taskType` is the type the runner last saw listed for it, absent when it never was, and may not appear in any posted `claude.BackgroundTasksChanged` since that list is capped */
     "claude.TaskNotification": z.object({
       taskId: z.string().min(1).max(256),
       taskType: z.string().min(1).max(256).optional(),
@@ -176,7 +176,7 @@ const claudePayloads = (textMax: number) => {
       reason: z.string().min(1).max(256).optional(),
       ambient: z.boolean().optional(),
     }),
-    /** every background task live after a change; `ambient` ones (watchers) don't wake a turn */
+    /** the background tasks live after a change, at most `BACKGROUND_TASKS_MAX` of them; `ambient` ones (watchers) don't wake a turn */
     "claude.BackgroundTasksChanged": z.object({
       tasks: z
         .array(
