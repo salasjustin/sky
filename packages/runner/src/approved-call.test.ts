@@ -152,7 +152,10 @@ const toolResultsIn = (requests: Body[]) =>
     ),
   );
 
-/** The command a check's nested `claude` runs, as the prompt gives it, with `tail` in place of `claude … -p …`. */
+/**
+ * The command a check's nested `claude` runs, as the prompt gives it, with `tail` in place of
+ * `claude … -p …`.
+ */
 const nestedCheck = (tail: string) => (system: string) => {
   const prefix = /as `([^`]*?)claude [^`]*-p …`/.exec(system)?.[1];
   if (!prefix) throw new Error("the prompt names no nested claude command");
