@@ -389,9 +389,7 @@ const commits = (n: number) => `${n} commit${n === 1 ? "" : "s"}`;
 async function unmerged(cwd: string): Promise<string[]> {
   // one entry per stage of each unmerged path: "<mode> <sha> <stage>\t<path>", NUL-ended, so a
   // path comes as it is rather than in git's C quoting
-  const out = await inTree(cwd, "ls-files", "-z", "--unmerged").catch(
-    () => "",
-  );
+  const out = await inTree(cwd, "ls-files", "-z", "--unmerged").catch(() => "");
   return [
     ...new Set(
       out

@@ -2877,7 +2877,10 @@ const CHOICES: Choice[] = [
     env: "env/x",
     expected: "env/x",
   },
-  { name: "the worktree's own with nothing else set", expected: "claude/agt_1" },
+  {
+    name: "the worktree's own with nothing else set",
+    expected: "claude/agt_1",
+  },
 ];
 
 test.each(CHOICES)(
