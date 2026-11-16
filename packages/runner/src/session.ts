@@ -1220,7 +1220,7 @@ export async function runSession(
         message.type === "system" &&
         message.subtype === "task_notification"
       ) {
-        // a record of what the notice said, nothing more: the hold below is decided as before
+        // a record of what the notice said, nothing more: the hold below doesn't read it
         const known = taskTypes.get(message.task_id);
         const ambient = message.ambient ?? known?.ambient;
         void post(

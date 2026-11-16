@@ -456,7 +456,7 @@ What an agent does arrives as events, each with `agentId`, `environmentId` (the 
 | `claude.BackgroundTasksChanged`                                        | the set of background tasks changed: each one's `taskId`, `taskType` and whether it is `ambient` (a watcher that wakes no turn) |
 | `claude.Notification`, `claude.PreCompact`, `claude.FileChanged`       | Claude Code's notifications, context compaction, watched-file changes                                                           |
 
-A run that goes quiet while background tasks run is explained by `claude.BackgroundTasksChanged` (what was running) and `claude.TaskNotification` (what each task's end notice said; it only records the notice, and the run still waits for its tasks as before). The `claude.*` names are Claude Code's own hook names, except those two and `claude.Message`, which come from Claude's message stream. Each text field is redacted (registered secrets and tokens) and then cut to 4,096 characters (`runner.warning` included). `claude.*` and `runner.heartbeat` events are kept for 7 days; `run.*` and `runner.warning` events are kept.
+A run that goes quiet while background tasks run is explained by `claude.BackgroundTasksChanged` (what was running) and `claude.TaskNotification` (what each task's end notice said; recording a notice doesn't change how long the run waits for its tasks). The `claude.*` names are Claude Code's own hook names, except those two and `claude.Message`, which come from Claude's message stream. Each text field is redacted (registered secrets and tokens) and then cut to 4,096 characters (`runner.warning` included). `claude.*` and `runner.heartbeat` events are kept for 7 days; `run.*` and `runner.warning` events are kept.
 
 Three ways to receive them:
 
