@@ -829,10 +829,25 @@ test("publish never force-updates a continued branch, even one the agent rewrote
   await expect(
     publish({ cwd, gatewayUrl: GATEWAY, connectorId: CONNECTOR, title: "t" }),
   ).rejects.toThrow(
-    `feature/login on GitHub is at ${tip}, which this branch doesn't build on (as after an amend or rebase here, or a push there); a branch this agent continues is only ever fast-forwarded, so nothing was sent. Put your work back on top of it: \`git reset --soft ${tip}\` and \`git commit\` keep your files as they are in a new commit on it (when git doesn't know ${tip}, it was pushed during this run, and the next run brings it in), then publish again`,
+    `feature/login on GitHub is at ${tip}, which this branch doesn't build on (as after a push there, or an amend or rebase here); a branch this agent continues is only ever fast-forwarded, so nothing was sent. If someone pushed there, run \`node /opt/sky/runner.mjs sync\` to bring what was pushed to feature/login into this worktree (your unpublished commits are rebased onto it), then publish again. If you amended or rebased commits that were already published, put your work back on top of it instead: \`git reset --soft ${tip}\` and \`git commit\` keep your files as they are in a new commit on it, then publish again`,
   );
   expect(sent.commits).toEqual([]);
   expect(sent.refs).toEqual([]);
+});
+
+test("publish refusing a push git has never seen points to sync alone, not to a reset", async () => {
+  pushToGitHub("feature/login", "login.txt", "1\n");
+  const { cwd } = await prepare({ startBranch: "feature/login" });
+  commitIn(cwd, "mine.txt", "mine\n", "mine");
+  // pushed mid-run: this clone has not fetched it
+  const pushed = pushToGitHub("feature/login", "login.txt", "2\n");
+  githubWrites();
+
+  await expect(
+    publish({ cwd, gatewayUrl: GATEWAY, connectorId: CONNECTOR, title: "t" }),
+  ).rejects.toThrow(
+    `feature/login on GitHub is at ${pushed}, which this branch doesn't build on (as after a push there, or an amend or rebase here); a branch this agent continues is only ever fast-forwarded, so nothing was sent. Someone pushed there since this worktree last fetched: run \`node /opt/sky/runner.mjs sync\` to bring what was pushed to feature/login into this worktree (your unpublished commits are rebased onto it), then publish again`,
+  );
 });
 
 /** A whole run on the sandbox, with a scripted session; what it posted and the prompt it gave Claude. */
@@ -1850,7 +1865,9 @@ test("a start branch is fetched through the connector once the anonymous fetch h
 const BY_DESIGN =
   "That is by design, not a fault to work around: the runner reaches GitHub for you.";
 const SYNC_COMMAND = `\`${process.execPath} ${process.argv[1]} sync\` when GitHub's default branch may have moved while you worked`;
-const NO_LOCAL_CHANGE = "It changes no local branch or worktree.";
+const NO_LOCAL_CHANGE = "That refresh changes no local branch.";
+const SYNC_OWN_BRANCH =
+  "Run the same `sync` when the user says they pushed to your branch, or when `publish` refuses because GitHub's branch moved.";
 
 test("the run's prompt names the origin tip the refresh reached, with its short sha and UTC time, and says git has no credential by design", async () => {
   const tip = pushToGitHub("trunk", "new.txt", "from outside\n");
@@ -1867,6 +1884,8 @@ test("the run's prompt names the origin tip the refresh reached, with its short 
     expect(append).toContain(BY_DESIGN);
     expect(append).toContain(SYNC_COMMAND);
     expect(append).toContain(NO_LOCAL_CHANGE);
+    expect(append).toContain(SYNC_OWN_BRANCH);
+    expect(append).toContain("rebased onto them");
   } finally {
     vi.useRealTimers();
   }
@@ -2006,7 +2025,7 @@ test("sync moves origin's default branch to GitHub's new tip and prints it with 
 
   expect(result).toEqual({
     code: 0,
-    out: `origin/trunk moved from ${old.slice(0, 7)} to GitHub's tip ${tip.slice(0, 7)}, 2 commits ahead. Your worktree and local trunk were not changed.\n`,
+    out: `origin/trunk moved from ${old.slice(0, 7)} to GitHub's tip ${tip.slice(0, 7)}, 2 commits ahead. Your worktree and local trunk were not changed.\n${NOT_PUBLISHED}`,
     err: "",
   });
   expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(tip);
@@ -2021,7 +2040,7 @@ test("sync after exactly one new commit on GitHub says 1 commit ahead", async ()
 
   expect(await syncRun(cwd)).toEqual({
     code: 0,
-    out: `origin/trunk moved from ${old.slice(0, 7)} to GitHub's tip ${tip.slice(0, 7)}, 1 commit ahead. Your worktree and local trunk were not changed.\n`,
+    out: `origin/trunk moved from ${old.slice(0, 7)} to GitHub's tip ${tip.slice(0, 7)}, 1 commit ahead. Your worktree and local trunk were not changed.\n${NOT_PUBLISHED}`,
     err: "",
   });
 });
@@ -2035,7 +2054,7 @@ test("sync with GitHub's default branch more than 100 commits ahead exits 1 sayi
 
   expect(await syncRun(cwd)).toEqual({
     code: 1,
-    out: "",
+    out: NOT_PUBLISHED,
     err: `sky sync: GitHub's trunk is more than 100 commits ahead of what this sandbox has, too far to fetch, so \`origin/trunk\` was left at ${old.slice(0, 7)}; you are working from that commit, not GitHub's ${tip.slice(0, 7)}.\n`,
   });
   expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(old);
@@ -2047,7 +2066,7 @@ test("sync with no change says nothing moved", async () => {
 
   expect(await syncRun(cwd)).toEqual({
     code: 0,
-    out: `origin/trunk is already at GitHub's tip ${tip.slice(0, 7)}; nothing moved.\n`,
+    out: `origin/trunk is already at GitHub's tip ${tip.slice(0, 7)}; nothing moved.\n${NOT_PUBLISHED}`,
     err: "",
   });
 });
@@ -2063,7 +2082,7 @@ test("sync after GitHub moved its default branch back says how many commits GitH
 
   expect(result).toEqual({
     code: 0,
-    out: `origin/trunk moved back from ${c.slice(0, 7)} to GitHub's tip ${a.slice(0, 7)}: GitHub's trunk dropped 2 commits. Your worktree and local trunk were not changed.\n`,
+    out: `origin/trunk moved back from ${c.slice(0, 7)} to GitHub's tip ${a.slice(0, 7)}: GitHub's trunk dropped 2 commits. Your worktree and local trunk were not changed.\n${NOT_PUBLISHED}`,
     err: "",
   });
   expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(a);
@@ -2082,7 +2101,7 @@ test("sync after GitHub rewrote its default branch says how many commits were ad
 
   expect(result).toEqual({
     code: 0,
-    out: `origin/trunk moved from ${b.slice(0, 7)} to GitHub's tip ${d.slice(0, 7)}: GitHub's trunk was rewritten, with 2 commits added and 1 commit dropped. Your worktree and local trunk were not changed.\n`,
+    out: `origin/trunk moved from ${b.slice(0, 7)} to GitHub's tip ${d.slice(0, 7)}: GitHub's trunk was rewritten, with 2 commits added and 1 commit dropped. Your worktree and local trunk were not changed.\n${NOT_PUBLISHED}`,
     err: "",
   });
   expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(d);
@@ -2106,7 +2125,7 @@ test("sync --help and -h print the usage on stdout and exit 0, before any connec
     );
     expect({ code, ...io }).toEqual({
       code: 0,
-      out: "usage: sync\n",
+      out: "usage: sync [--branch <name>]\n",
       err: "",
     });
   }
@@ -2194,7 +2213,318 @@ test("sync with an argument other than --help exits 2 with the usage on stderr",
   expect(result).toEqual({
     code: 2,
     out: "",
-    err: "sky sync: takes no arguments\nusage: sync\n",
+    err: "sky sync: takes no arguments but --branch <name>\nusage: sync [--branch <name>]\n",
   });
   expect(requests).toEqual([]);
+});
+
+const NOT_PUBLISHED =
+  "claude/agt_1 isn't on GitHub yet, so there is nothing to bring in; your worktree was not touched.\n";
+const sevenOf = (sha: string) => sha.slice(0, 7);
+const said = (...lines: string[]) => lines.map((line) => `${line}\n`).join("");
+const TRUNK_CURRENT = () =>
+  `origin/trunk is already at GitHub's tip ${sevenOf(git(repoDir, "rev-parse", "origin/trunk"))}; nothing moved.`;
+const REVIEW = (branch = "claude/agt_1") =>
+  JSON.stringify(`edit review.txt on ${branch}`);
+
+test("sync fast-forwards a clean worktree to commits pushed to its branch mid-run, with GitHub's shas", async () => {
+  const { cwd, sha } = await earlierRun();
+  publishAsIs(cwd);
+  const first = pushToGitHub("claude/agt_1", "review.txt", "fix 1\n");
+  const second = pushToGitHub("claude/agt_1", "review.txt", "fix 2\n");
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 0,
+    out: said(
+      TRUNK_CURRENT(),
+      `claude/agt_1 on GitHub is at ${sevenOf(second)}.`,
+      `Brought in 2 commits: ${sevenOf(first)} ${REVIEW()}; ${sevenOf(second)} ${REVIEW()}.`,
+      `Your worktree is now at ${sevenOf(second)}.`,
+    ),
+    err: "",
+  });
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(second);
+  expect(git(cwd, "rev-parse", "HEAD~2")).toBe(sha);
+  expect(git(cwd, "status", "--porcelain")).toBe("");
+  expect(git(repoDir, "rev-parse", "refs/remotes/origin/claude/agt_1")).toBe(
+    second,
+  );
+  expect(git(cwd, "log", "--format=%H")).toBe(
+    bare("log", "--format=%H", "claude/agt_1"),
+  );
+});
+
+test("sync gives commits publish recreated GitHub's shas, so git log and GitHub agree", async () => {
+  const { cwd, sha } = await earlierRun();
+  const recreated = publishRecreated();
+  const outside = pushToGitHub("claude/agt_1", "review.txt", "fix\n");
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 0,
+    out: said(
+      TRUNK_CURRENT(),
+      `claude/agt_1 on GitHub is at ${sevenOf(outside)}.`,
+      `Brought in 1 commit: ${sevenOf(outside)} ${REVIEW()}.`,
+      "Your published commits now carry GitHub's shas, so `git log` and GitHub agree.",
+      `Your worktree is now at ${sevenOf(outside)}.`,
+    ),
+    err: "",
+  });
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(outside);
+  expect(git(cwd, "rev-parse", "HEAD^")).toBe(recreated);
+  expect(git(cwd, "log", "--format=%H")).toBe(
+    bare("log", "--format=%H", "claude/agt_1"),
+  );
+  expect(git(cwd, "log", "--format=%H")).not.toContain(sha);
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+});
+
+test("sync with only publish's recreated shas and nothing pushed moves the worktree onto GitHub's commits", async () => {
+  const { cwd } = await earlierRun();
+  const recreated = publishRecreated();
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 0,
+    out: said(
+      TRUNK_CURRENT(),
+      `claude/agt_1 on GitHub is at ${sevenOf(recreated)}.`,
+      "Your published commits now carry GitHub's shas, so `git log` and GitHub agree.",
+      `Your worktree is now at ${sevenOf(recreated)}.`,
+    ),
+    err: "",
+  });
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(recreated);
+});
+
+test("sync rebases unpublished commits onto commits pushed to the branch, and the next publish fast-forwards", async () => {
+  pushToGitHub("feature/login", "login.txt", "1\n");
+  const { cwd } = await prepare({ startBranch: "feature/login" });
+  const mine = commitIn(cwd, "mine.txt", "mine\n", "mine");
+  const pushed = pushToGitHub("feature/login", "login.txt", "2\n");
+
+  const result = await syncRun(cwd);
+
+  const rebased = git(cwd, "rev-parse", "HEAD");
+  expect(rebased).not.toBe(mine);
+  expect(result).toEqual({
+    code: 0,
+    out: said(
+      TRUNK_CURRENT(),
+      `feature/login on GitHub is at ${sevenOf(pushed)}.`,
+      `Brought in 1 commit: ${sevenOf(pushed)} ${REVIEW("feature/login").replace("review.txt", "login.txt")}.`,
+      `Rebased 1 commit onto it: ${sevenOf(mine)} → ${sevenOf(rebased)} "mine".`,
+      `Your worktree is now at ${sevenOf(rebased)}.`,
+    ),
+    err: "",
+  });
+  expect(git(cwd, "rev-parse", "HEAD^")).toBe(pushed);
+  expect(git(cwd, "status", "--porcelain")).toBe("");
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+
+  const sent = githubWrites();
+  const published = await publish({
+    cwd,
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    title: "Finish login",
+  });
+  expect(published).toMatchObject({ branch: "feature/login" });
+  expect(sent.commits.map((c) => c.parents)).toEqual([[pushed]]);
+  expect(sent.refs).toEqual([
+    `PATCH heads/feature/login {"sha":"${"d".repeat(40)}","force":false}`,
+  ]);
+});
+
+test("sync refuses a dirty worktree and changes nothing", async () => {
+  const { cwd, sha } = await earlierRun();
+  publishAsIs(cwd);
+  const outside = pushToGitHub("claude/agt_1", "review.txt", "fix\n");
+  writeFileSync(join(cwd, "agent.txt"), "half-done edit\n");
+  requests = [];
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 1,
+    out: `${TRUNK_CURRENT()}\n`,
+    err: `sky sync: claude/agt_1 on GitHub is at ${sevenOf(outside)}; your worktree has uncommitted changes, so nothing was brought in; commit or stash them and sync again. Your worktree (at ${sevenOf(sha)}) was not changed.\n`,
+  });
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(sha);
+  expect(git(cwd, "status", "--porcelain")).toBe("M agent.txt");
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+  // refused before anything was fetched
+  expect(requests.filter((r) => /\/git\/(trees|blobs)\//.test(r))).toEqual([]);
+});
+
+test("sync refuses a rebase that conflicts, aborts it and leaves the worktree as it was", async () => {
+  const { cwd } = await earlierRun("shared.txt", "agent\n");
+  publishAsIs(cwd);
+  const outside = pushToGitHub("claude/agt_1", "shared.txt", "theirs\n");
+  const mine = commitIn(cwd, "shared.txt", "mine\n", "mine edits shared");
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 1,
+    out: `${TRUNK_CURRENT()}\n`,
+    err: `sky sync: claude/agt_1 on GitHub is at ${sevenOf(outside)}; rebasing your 1 commit onto it conflicted (in shared.txt), so the rebase was aborted and your worktree (at ${sevenOf(mine)}) was left as it was.\n`,
+  });
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(mine);
+  expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+  expect(git(cwd, "status", "--porcelain")).toBe("");
+  expect(readFileSync(join(cwd, "shared.txt"), "utf8")).toBe("mine\n");
+  expect(
+    existsSync(join(git(cwd, "rev-parse", "--git-dir"), "rebase-merge")),
+  ).toBe(false);
+});
+
+test("sync leaves a branch that was never published alone and says so", async () => {
+  const { cwd, sha } = await earlierRun();
+  requests = [];
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 0,
+    out: `${TRUNK_CURRENT()}\n${NOT_PUBLISHED}`,
+    err: "",
+  });
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(sha);
+  // the default branch's tip, then the branch's lookup and the probe of the repo behind its 404
+  expect(requests).toEqual([
+    "GET /git/ref/heads/trunk",
+    "GET /git/ref/heads/claude/agt_1",
+    "GET ",
+  ]);
+});
+
+test("sync says a worktree already has GitHub's head, with its unpublished commits on top, and moves nothing", async () => {
+  const { cwd } = await earlierRun();
+  publishAsIs(cwd);
+  const local = commitIn(cwd, "more.txt", "more\n", "agent more");
+  const tip = bare("rev-parse", "claude/agt_1");
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 0,
+    out: said(
+      TRUNK_CURRENT(),
+      `claude/agt_1 on GitHub is at ${sevenOf(tip)}, and your worktree already has it with 1 commit on top that aren't published; nothing to bring in.`,
+    ),
+    err: "",
+  });
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(local);
+});
+
+test("sync --branch brings in the named GitHub branch, as publish --branch sends to it", async () => {
+  const { cwd, sha } = await earlierRun();
+  publishAsIs(cwd, "other/name");
+  const outside = pushToGitHub("other/name", "review.txt", "fix\n");
+
+  const result = await syncRun(cwd, ENV, ["--branch", "other/name"]);
+
+  expect(result.code).toBe(0);
+  expect(result.out).toContain(
+    `other/name on GitHub is at ${sevenOf(outside)}.`,
+  );
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(outside);
+  expect(git(cwd, "rev-parse", "HEAD^")).toBe(sha);
+  expect(requests).not.toContain("GET /git/ref/heads/claude/agt_1");
+
+  // the same, spelled with an equals sign
+  const again = pushToGitHub("other/name", "review.txt", "fix 2\n");
+  expect((await syncRun(cwd, ENV, ["--branch=other/name"])).code).toBe(0);
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(again);
+});
+
+test("sync follows SKY_PUBLISH_BRANCH to the branch publish sends to", async () => {
+  const { cwd, sha } = await earlierRun();
+  publishAsIs(cwd, "from/env");
+  const outside = pushToGitHub("from/env", "review.txt", "fix\n");
+
+  const result = await syncRun(cwd, { ...ENV, SKY_PUBLISH_BRANCH: "from/env" });
+
+  expect(result.code).toBe(0);
+  expect(result.out).toContain(`from/env on GitHub is at ${sevenOf(outside)}.`);
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(outside);
+  expect(git(cwd, "rev-parse", "HEAD^")).toBe(sha);
+});
+
+test("sync --branch needs a branch name, and one that is a branch name", async () => {
+  const { cwd } = await earlierRun();
+
+  expect((await syncRun(cwd, ENV, ["--branch"])).code).toBe(2);
+  const bad = await syncRun(cwd, ENV, ["--branch", "refs/heads/x"]);
+  expect(bad).toMatchObject({
+    code: 1,
+    err: expect.stringContaining("refs/heads/x is not a valid branch name"),
+  });
+  const onDefault = await syncRun(cwd, ENV, ["--branch", "trunk"]);
+  expect(onDefault).toMatchObject({
+    code: 1,
+    err: expect.stringContaining("trunk is the default branch"),
+  });
+});
+
+test("sync reports both the default branch moving and commits pushed to the branch", async () => {
+  const { cwd } = await earlierRun();
+  publishAsIs(cwd);
+  const old = git(repoDir, "rev-parse", "origin/trunk");
+  const trunk = pushToGitHub("trunk", "new.txt", "trunk moved\n");
+  const outside = pushToGitHub("claude/agt_1", "review.txt", "fix\n");
+
+  const result = await syncRun(cwd);
+
+  expect(result.out).toBe(
+    said(
+      `origin/trunk moved from ${sevenOf(old)} to GitHub's tip ${sevenOf(trunk)}, 1 commit ahead. Your worktree and local trunk were not changed.`,
+      `claude/agt_1 on GitHub is at ${sevenOf(outside)}.`,
+      `Brought in 1 commit: ${sevenOf(outside)} ${REVIEW()}.`,
+      `Your worktree is now at ${sevenOf(outside)}.`,
+    ),
+  );
+  expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(trunk);
+});
+
+/** A worktree publish recreated on GitHub, with two commits pushed there since; the requests of `act`, by kind. */
+const costOf = async (act: (cwd: string) => Promise<unknown>) => {
+  const { cwd } = await earlierRun();
+  publishRecreated();
+  pushToGitHub("claude/agt_1", "review.txt", "fix 1\n");
+  pushToGitHub("claude/agt_1", "review.txt", "fix 2\n");
+  requests = [];
+  await act(cwd);
+  const kinds = new Map<string, number>();
+  for (const request of requests) {
+    const kind = request.replace(/[0-9a-f]{40}/g, "<sha>");
+    kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
+  }
+  return Object.fromEntries([...kinds].sort());
+};
+
+test("the start of a run bringing in two pushed commits makes these connector calls", async () => {
+  expect(await costOf(() => prepare())).toEqual({
+    "GET /git/blobs/<sha>": 2,
+    "GET /git/commits/<sha>": 6,
+    "GET /git/ref/heads/claude/agt_1": 1,
+    "GET /git/ref/heads/trunk": 1,
+    "GET /git/trees/<sha>?recursive=1": 3,
+  });
+});
+
+test("sync bringing in the same two pushed commits makes no more connector calls than that", async () => {
+  expect(await costOf((cwd) => syncRun(cwd))).toEqual({
+    "GET /git/blobs/<sha>": 2,
+    "GET /git/commits/<sha>": 3,
+    "GET /git/ref/heads/claude/agt_1": 1,
+    "GET /git/ref/heads/trunk": 1,
+    "GET /git/trees/<sha>?recursive=1": 3,
+  });
 });

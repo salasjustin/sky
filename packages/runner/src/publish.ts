@@ -946,8 +946,18 @@ export async function publish(options: {
     // a continued branch is someone's pull request: its head is theirs even when it sits in this
     // branch's reflog, as the head the worktree was made from always does
     if (at === -1 && continued && remoteBranch === continued) {
+      const syncIt = `run \`node /opt/sky/runner.mjs sync\` to bring what was pushed to ${remoteBranch} into this worktree (your unpublished commits are rebased onto it), then publish again`;
+      // a commit git doesn't know can only have been pushed since the last fetch
+      const known = await git(cwd, "cat-file", "-e", `${remote}^{commit}`).then(
+        () => true,
+        () => false,
+      );
       throw new PublishError(
-        `${remoteBranch} on GitHub is at ${remote}, which this branch doesn't build on (as after an amend or rebase here, or a push there); a branch this agent continues is only ever fast-forwarded, so nothing was sent. Put your work back on top of it: \`git reset --soft ${remote}\` and \`git commit\` keep your files as they are in a new commit on it (when git doesn't know ${remote}, it was pushed during this run, and the next run brings it in), then publish again`,
+        `${remoteBranch} on GitHub is at ${remote}, which this branch doesn't build on (as after a push there, or an amend or rebase here); a branch this agent continues is only ever fast-forwarded, so nothing was sent. ${
+          known
+            ? `If someone pushed there, ${syncIt}. If you amended or rebased commits that were already published, put your work back on top of it instead: \`git reset --soft ${remote}\` and \`git commit\` keep your files as they are in a new commit on it, then publish again`
+            : `Someone pushed there since this worktree last fetched: ${syncIt}`
+        }`,
       );
     }
     // the replay goes onto the base, so a fast-forward from a head that is neither this branch's

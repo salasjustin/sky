@@ -77,7 +77,6 @@ import {
   DEFAULT_MAX_COMMITS,
   prepareWorktree,
   type Refreshed,
-  SYNC_USAGE,
 } from "./sync.js";
 import { commitAll, diffRollup, headSha } from "./worktree.js";
 
@@ -285,7 +284,8 @@ const publishInstructions = (refreshed?: Refreshed) =>
         ]
       : []),
     `Run \`${process.execPath} ${process.argv[1]}\` only for its \`publish\` and \`sync\` commands. Its other subcommands are the Sky API's, and run with no subcommand it refuses, since only the Sky API starts a run.`,
-    `Run \`${process.execPath} ${process.argv[1]} ${SYNC_USAGE}\` when GitHub's default branch may have moved while you worked: it refreshes \`origin/<default>\` through the connector and prints the new tip and how many commits GitHub's branch gained or dropped. If GitHub is more than ${DEFAULT_MAX_COMMITS} commits ahead it stops and leaves \`origin/<default>\` where it was. It changes no local branch or worktree.`,
+    `Run \`${process.execPath} ${process.argv[1]} sync\` when GitHub's default branch may have moved while you worked: it refreshes \`origin/<default>\` through the connector and prints the new tip and how many commits GitHub's branch gained or dropped. If GitHub is more than ${DEFAULT_MAX_COMMITS} commits ahead it stops and leaves \`origin/<default>\` where it was. That refresh changes no local branch.`,
+    "Run the same `sync` when the user says they pushed to your branch, or when `publish` refuses because GitHub's branch moved. It also brings the GitHub branch `publish` sends to into your worktree: commits pushed there are fast-forwarded in, with GitHub's shas, and any commits of yours not yet published are rebased onto them. It prints what it brought in and rebased. It refuses, changing nothing, when the worktree has uncommitted changes (commit or stash them first) or the rebase conflicts. `--branch <name>` names the GitHub branch when you publish with `--branch`. Then publish again.",
     "To publish your branch and open a pull request, commit your work, then run",
     `\`${process.execPath} ${process.argv[1]} ${PUBLISH_USAGE}\``,
     "instead of `git push` or `gh pr create`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and prints its URL. Run it again after more commits to update the same pull request.",

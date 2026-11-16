@@ -515,29 +515,27 @@ const isAncestor = (cwd: string, sha: string, of: string) =>
   );
 
 /**
- * Brings commits pushed to the agent's GitHub `branch` from outside the sandbox into its existing
- * worktree, when that can't lose anything: the worktree is clean, everything in it is published,
- * and the outside commits sit on top, merges among them only where they fast-forward. GitHub's
- * history is classified before any body is fetched: walking the tip's first parents to the first commit that matches the worktree, by sha
- * (HEAD, or an ancestor of it) or by tree (HEAD's, or one on its first-parent line since the
- * default branch), since `publish` recreates commits on GitHub under new shas. Anything else is
- * left as it is, with a note. `published` is whether GitHub has the branch at all.
+ * Where GitHub's `tip` of the agent's branch sits against the worktree's HEAD: walks the tip's first
+ * parents to the first commit that matches the worktree, by sha (HEAD, or an ancestor of it) or by
+ * tree (HEAD's, or one on its first-parent line since the default branch), since `publish` recreates
+ * commits on GitHub under new shas. `outside` is what the walk passed, newest first, with its
+ * commit bodies; `match` is GitHub's commit they sit on and `local` the commit it matches here,
+ * absent when the walk found none.
  */
-export async function syncAgentBranch(options: {
-  repoDir: string;
+async function locateOnGitHub(options: {
   cwd: string;
   call: Call;
-  branch: string;
+  tip: string;
   defaultBranch: string;
-}): Promise<{ published: boolean; notes: string[] }> {
-  const { cwd, call, branch } = options;
-  const tip = await remoteTip(call, branch).catch((error: unknown) => {
-    if (error instanceof BranchNotFoundError) return null;
-    throw error;
-  });
-  if (tip === null) return { published: false, notes: [] };
+}): Promise<{
+  head: string;
+  outside: { sha: string; commit: ApiCommit }[];
+  match: { sha: string; local: string } | undefined;
+}> {
+  const { cwd, call, tip } = options;
   const head = await inTree(cwd, "rev-parse", "HEAD");
-  if (tip === head) return { published: true, notes: [] };
+  if (tip === head)
+    return { head, outside: [], match: { sha: tip, local: tip } };
 
   const headTree = await inTree(cwd, "rev-parse", "HEAD^{tree}");
   const base = await inTree(
@@ -561,7 +559,6 @@ export async function syncAgentBranch(options: {
   }
   trees.set(headTree, head);
 
-  // newest first; `match` is GitHub's commit the outside ones sit on, `local` the commit it matches here
   const outside: { sha: string; commit: ApiCommit }[] = [];
   let match: { sha: string; local: string } | undefined;
   let at: string | undefined = tip;
@@ -582,6 +579,32 @@ export async function syncAgentBranch(options: {
     outside.push({ sha: at, commit });
     at = commit.parents[0]?.sha;
   }
+  return { head, outside, match };
+}
+
+/**
+ * Brings commits pushed to the agent's GitHub `branch` from outside the sandbox into its existing
+ * worktree, when that can't lose anything: the worktree is clean, everything in it is published,
+ * and the outside commits sit on top, merges among them only where they fast-forward. GitHub's
+ * history is classified before any body is fetched: walking the tip's first parents to the first commit that matches the worktree, by sha
+ * (HEAD, or an ancestor of it) or by tree (HEAD's, or one on its first-parent line since the
+ * default branch), since `publish` recreates commits on GitHub under new shas. Anything else is
+ * left as it is, with a note. `published` is whether GitHub has the branch at all.
+ */
+export async function syncAgentBranch(options: {
+  repoDir: string;
+  cwd: string;
+  call: Call;
+  branch: string;
+  defaultBranch: string;
+}): Promise<{ published: boolean; notes: string[] }> {
+  const { cwd, call, branch } = options;
+  const tip = await remoteTip(call, branch).catch((error: unknown) => {
+    if (error instanceof BranchNotFoundError) return null;
+    throw error;
+  });
+  if (tip === null) return { published: false, notes: [] };
+  const { head, outside, match } = await locateOnGitHub({ ...options, tip });
   if (match && outside.length === 0) return { published: true, notes: [] };
 
   const pushed = `${commits(outside.length)} pushed from outside this sandbox`;
@@ -665,6 +688,180 @@ export async function syncAgentBranch(options: {
       `${pushed.replace(" pushed", ` pushed to \`${branch}\``)} ${outside.length === 1 ? "was" : "were"} brought into your worktree: ${list}.`,
     ],
   };
+}
+
+/**
+ * `runner.mjs sync`'s half for the agent's own GitHub `branch`: brings the worktree onto GitHub's
+ * head of it, with GitHub's shas, when that can't lose anything. Commits pushed from outside are
+ * fast-forwarded in when the worktree has no unpublished commits, and the unpublished ones are
+ * rebased onto them when it has some. It is refused, with nothing changed, for a worktree with
+ * uncommitted changes, a rebase that conflicts or a branch too far ahead to fetch. Unlike
+ * `syncAgentBranch`, which leaves the worktree's own shas and cherry-picks, the published commits
+ * here are replaced by GitHub's, so `git log` and GitHub agree and the next `publish` fast-forwards.
+ * `lines` is what to tell the agent; `ok` is false when the worktree was left as it was for a reason
+ * it should act on. A branch GitHub doesn't have is left alone.
+ */
+export async function syncOwnBranch(options: {
+  repoDir: string;
+  cwd: string;
+  call: Call;
+  branch: string;
+  defaultBranch: string;
+}): Promise<{ ok: boolean; lines: string[] }> {
+  const { cwd, branch } = options;
+  const call = cachingCommits(options.call);
+  const tip = await remoteTip(call, branch).catch((error: unknown) => {
+    if (error instanceof BranchNotFoundError) return null;
+    throw error;
+  });
+  if (tip === null) {
+    return {
+      ok: true,
+      lines: [
+        `${branch} isn't on GitHub yet, so there is nothing to bring in; your worktree was not touched.`,
+      ],
+    };
+  }
+  const stoppedRebase = await rebaseInProgress(cwd);
+  if (stoppedRebase !== undefined) {
+    return {
+      ok: false,
+      lines: [
+        `a rebase${stoppedRebase ? ` of ${stoppedRebase}` : ""} is in progress in this worktree; run \`git rebase --abort\` (or finish it), then sync again. Nothing was changed.`,
+      ],
+    };
+  }
+  const { head, outside, match } = await locateOnGitHub({
+    cwd,
+    call,
+    tip,
+    defaultBranch: options.defaultBranch,
+  });
+  const at = `${branch} on GitHub is at ${short(tip)}`;
+  const refuse = (why: string) => ({
+    ok: false,
+    lines: [
+      `${at}; ${why}. Your worktree (at ${short(head)}) was not changed.`,
+    ],
+  });
+  if (!match) {
+    return refuse(
+      `none of the ${commits(outside.length)} seen walking back from it matches this worktree, so it can't be told what is new`,
+    );
+  }
+  // GitHub's head is HEAD or under it, and nothing is on top of it from outside
+  if (outside.length === 0 && match.sha === match.local) {
+    const ahead = Number(
+      await inTree(cwd, "rev-list", "--count", `${tip}..HEAD`),
+    );
+    return {
+      ok: true,
+      lines: [
+        `${at}, and your worktree already has it${ahead > 0 ? ` with ${commits(ahead)} on top that aren't published` : ""}; nothing to bring in.`,
+      ],
+    };
+  }
+  if (await isDirty(cwd)) {
+    return refuse(
+      "your worktree has uncommitted changes, so nothing was brought in; commit or stash them and sync again",
+    );
+  }
+  try {
+    await fetchBranch({
+      repoDir: options.repoDir,
+      call,
+      branch,
+      tip,
+      connected: [head],
+    });
+  } catch (error) {
+    if (error instanceof TooFarError) return refuse(messageOf(error));
+    throw error;
+  }
+
+  // the commits here after the one that matches GitHub's: never published
+  const unpublished =
+    match.local === head
+      ? []
+      : (await inTree(cwd, "rev-list", "--reverse", `${match.local}..HEAD`))
+          .split("\n")
+          .filter(Boolean);
+  const subjectOf = (sha: string) =>
+    inTree(cwd, "log", "-1", "--format=%s", sha);
+  if (unpublished.length === 0) {
+    try {
+      if (await isAncestor(cwd, head, tip)) {
+        await inTree(cwd, "merge", "--ff-only", "--quiet", tip);
+      } else {
+        // same tree as GitHub's commit it matches, so only the commits' shas change
+        await inTree(cwd, "reset", "--keep", "--quiet", tip);
+      }
+    } catch (error) {
+      return refuse(`bringing it in failed (${gitSaid(error)})`);
+    }
+  } else {
+    try {
+      await inTree(
+        cwd,
+        ...(await movingCommitsConfig(cwd)),
+        "rebase",
+        "--quiet",
+        "--onto",
+        tip,
+        match.local,
+      );
+    } catch (error) {
+      const conflicted = await unmerged(cwd);
+      const stuck = await abortStopped(cwd, "rebase");
+      const why =
+        conflicted.length > 0
+          ? `rebasing your ${commits(unpublished.length)} onto it conflicted (in ${conflicted.join(", ")})`
+          : `rebasing your ${commits(unpublished.length)} onto it failed (${gitSaid(error)})`;
+      return {
+        ok: false,
+        lines: [
+          `${at}; ${why}${stuck || `, so the rebase was aborted and your worktree (at ${short(head)}) was left as it was.`}`,
+        ],
+      };
+    }
+  }
+
+  const lines = [`${at}.`];
+  if (outside.length > 0) {
+    const list = outside
+      .map(
+        ({ sha, commit }) =>
+          `${short(sha)} ${quoted(commit.message.split("\n")[0] ?? "")}`,
+      )
+      .reverse()
+      .join("; ");
+    lines.push(`Brought in ${commits(outside.length)}: ${list}.`);
+  }
+  if (match.sha !== match.local) {
+    lines.push(
+      "Your published commits now carry GitHub's shas, so `git log` and GitHub agree.",
+    );
+  }
+  if (unpublished.length > 0) {
+    const moved = (await inTree(cwd, "rev-list", "--reverse", `${tip}..HEAD`))
+      .split("\n")
+      .filter(Boolean);
+    // git drops a commit whose change GitHub already has, so the two lists may differ in length
+    const list = await Promise.all(
+      moved.map(async (sha, i) => {
+        const from = moved.length === unpublished.length ? unpublished[i] : "";
+        return `${from ? `${short(from)} → ` : ""}${short(sha)} ${quoted(await subjectOf(sha))}`;
+      }),
+    );
+    const dropped = unpublished.length - moved.length;
+    lines.push(
+      `Rebased ${commits(unpublished.length)} onto it${list.length > 0 ? `: ${list.join("; ")}` : ""}${dropped > 0 ? `; ${commits(dropped)} dropped because GitHub already has the change` : ""}.`,
+    );
+  }
+  lines.push(
+    `Your worktree is now at ${short(await inTree(cwd, "rev-parse", "HEAD"))}.`,
+  );
+  return { ok: true, lines };
 }
 
 /**
@@ -796,16 +993,66 @@ export async function branchCheckMain(
   }
 }
 
-export const SYNC_USAGE = "sync";
+export const SYNC_USAGE = "sync [--branch <name>]";
 
 /** Seconds `sync` waits for the repo lock: short, so the agent hears "busy" before its shell times out. */
 export const SYNC_LOCK_WAIT_S = 30;
 
 /**
- * `runner.mjs sync`, run by the agent from its worktree: brings `origin/<default>` to GitHub's tip
- * again, for a default branch that moved while the run worked. Prints what it did on stdout and
- * returns the exit status: 0 for `--help` or a tip refreshed or already current, 2 for a usage or
- * config error, 1 for anything else. It moves no local branch and touches no worktree.
+ * The default branch half of `sync`: what `origin/<default>` did, as the line the agent reads.
+ */
+async function describeDefault(g: Git, synced: DefaultSync): Promise<string> {
+  const name = synced.default;
+  if (!synced.moved) {
+    return `origin/${name} is already at GitHub's tip ${short(synced.sha)}; nothing moved.`;
+  }
+  const unchanged = `Your worktree and local ${name} were not changed.`;
+  const tip = `GitHub's tip ${short(synced.sha)}`;
+  if (!synced.previous) return `origin/${name} moved to ${tip}. ${unchanged}`;
+  const from = short(synced.previous);
+  // left: only in the old tip (dropped by GitHub); right: only in the new one
+  const [dropped = 0, added = 0] = (
+    await g([
+      "rev-list",
+      "--left-right",
+      "--count",
+      `${synced.previous}...${synced.sha}`,
+    ])
+  )
+    .split(/\s+/)
+    .map(Number);
+  if (dropped === 0) {
+    return `origin/${name} moved from ${from} to ${tip}, ${commits(added)} ahead. ${unchanged}`;
+  }
+  if (added === 0) {
+    return `origin/${name} moved back from ${from} to ${tip}: GitHub's ${name} dropped ${commits(dropped)}. ${unchanged}`;
+  }
+  return `origin/${name} moved from ${from} to ${tip}: GitHub's ${name} was rewritten, with ${commits(added)} added and ${commits(dropped)} dropped. ${unchanged}`;
+}
+
+/** The GitHub branch flag of `sync`, `--branch <name>` or `--branch=<name>`; undefined for a bad argv. */
+function syncArgs(argv: string[]): { branch?: string } | undefined {
+  if (argv.length === 0) return {};
+  const [first = "", second, ...rest] = argv;
+  if (first.startsWith("--branch=") && second === undefined) {
+    const branch = first.slice("--branch=".length);
+    return branch ? { branch } : undefined;
+  }
+  if (first === "--branch" && second && rest.length === 0) {
+    return { branch: second };
+  }
+  return undefined;
+}
+
+/**
+ * `runner.mjs sync`, run by the agent from its worktree. Brings `origin/<default>` to GitHub's tip
+ * again, for a default branch that moved while the run worked, and then the worktree onto GitHub's
+ * head of the branch `publish` targets (`--branch`, the branch the agent continues,
+ * `SKY_PUBLISH_BRANCH`, or the worktree's own), for commits pushed to it mid-run (`syncOwnBranch`).
+ * The default branch's refresh moves no local branch and touches no worktree. Prints what it did on
+ * stdout and returns the exit status: 0 for `--help` or everything refreshed or already current,
+ * 2 for a usage or config error, 1 for a refresh that couldn't be done or a worktree left as it was
+ * for a reason the agent should act on, with the reason on stderr.
  */
 export async function syncMain(
   argv: string[],
@@ -817,8 +1064,11 @@ export async function syncMain(
     io.stdout(`usage: ${SYNC_USAGE}\n`);
     return 0;
   }
-  if (argv.length > 0) {
-    io.stderr(`sky sync: takes no arguments\nusage: ${SYNC_USAGE}\n`);
+  const args = syncArgs(argv);
+  if (!args) {
+    io.stderr(
+      `sky sync: takes no arguments but --branch <name>\nusage: ${SYNC_USAGE}\n`,
+    );
     return 2;
   }
   const connectorId = env[CONNECTOR_ENV];
@@ -847,54 +1097,36 @@ export async function syncMain(
       owner,
       repo,
     });
-    const synced = await withRepoLock(
+    // both halves write the shared repo, so they hold the lock together
+    const { synced, own } = await withRepoLock(
       repoDir,
-      () => syncDefaultBranch({ repoDir, call }),
+      async () => {
+        const synced = await syncDefaultBranch({ repoDir, call });
+        const own = await syncWorktreeBranch({
+          repoDir,
+          cwd: io.cwd,
+          call,
+          env,
+          defaultBranch: synced.default,
+          branch: args.branch,
+        });
+        return { synced, own };
+      },
       deps.lockWaitS ?? SYNC_LOCK_WAIT_S,
     );
-    const name = synced.default;
+    let code = 0;
     if (synced.tooFar) {
       io.stderr(`sky sync: ${tooFarNote(synced)}\n`);
-      return 1;
-    }
-    if (!synced.moved) {
-      io.stdout(
-        `origin/${name} is already at GitHub's tip ${short(synced.sha)}; nothing moved.\n`,
-      );
-      return 0;
-    }
-    const unchanged = `Your worktree and local ${name} were not changed.`;
-    const tip = `GitHub's tip ${short(synced.sha)}`;
-    if (!synced.previous) {
-      io.stdout(`origin/${name} moved to ${tip}. ${unchanged}\n`);
-      return 0;
-    }
-    const from = short(synced.previous);
-    // left: only in the old tip (dropped by GitHub); right: only in the new one
-    const [dropped = 0, added = 0] = (
-      await g([
-        "rev-list",
-        "--left-right",
-        "--count",
-        `${synced.previous}...${synced.sha}`,
-      ])
-    )
-      .split(/\s+/)
-      .map(Number);
-    if (dropped === 0) {
-      io.stdout(
-        `origin/${name} moved from ${from} to ${tip}, ${commits(added)} ahead. ${unchanged}\n`,
-      );
-    } else if (added === 0) {
-      io.stdout(
-        `origin/${name} moved back from ${from} to ${tip}: GitHub's ${name} dropped ${commits(dropped)}. ${unchanged}\n`,
-      );
+      code = 1;
     } else {
-      io.stdout(
-        `origin/${name} moved from ${from} to ${tip}: GitHub's ${name} was rewritten, with ${commits(added)} added and ${commits(dropped)} dropped. ${unchanged}\n`,
+      io.stdout(`${await describeDefault(g, synced)}\n`);
+    }
+    for (const line of own.lines) {
+      (own.ok ? io.stdout : io.stderr)(
+        own.ok ? `${line}\n` : `sky sync: ${line}\n`,
       );
     }
-    return 0;
+    return own.ok ? code : 1;
   } catch (error) {
     io.stderr(
       error instanceof RepoLockBusyError
@@ -902,6 +1134,71 @@ export async function syncMain(
         : `sky sync: ${messageOf(error)}\n`,
     );
     return 1;
+  }
+}
+
+/**
+ * `syncOwnBranch` for the worktree at `cwd`, on the GitHub branch `branch` names or else the one
+ * `publish` would send it to. A failure is reported as a refusal, so the default branch's result
+ * already gained still reaches the agent.
+ */
+async function syncWorktreeBranch(options: {
+  repoDir: string;
+  cwd: string;
+  call: Call;
+  env: NodeJS.ProcessEnv;
+  defaultBranch: string;
+  branch: string | undefined;
+}): Promise<{ ok: boolean; lines: string[] }> {
+  const { repoDir, cwd, env } = options;
+  try {
+    const local = await inTree(
+      cwd,
+      "symbolic-ref",
+      "--quiet",
+      "--short",
+      "HEAD",
+    ).catch(() => "");
+    if (!local) {
+      return {
+        ok: false,
+        lines: [
+          "HEAD is detached in this worktree, so its GitHub branch can't be told; check out your branch and sync again. Nothing was changed.",
+        ],
+      };
+    }
+    const branch =
+      options.branch ?? (await publishedBranch(git(repoDir), local, env));
+    const valid =
+      !branch.startsWith("-") &&
+      branch !== "HEAD" &&
+      !/^(refs|origin)\//.test(branch) &&
+      (await inTree(cwd, "check-ref-format", `refs/heads/${branch}`).then(
+        () => true,
+        () => false,
+      ));
+    if (!valid) {
+      return {
+        ok: false,
+        lines: [
+          `${branch} is not a valid branch name; see \`git check-ref-format\`. Nothing was changed.`,
+        ],
+      };
+    }
+    if (branch === options.defaultBranch) {
+      return {
+        ok: false,
+        lines: [
+          `${branch} is the default branch, which \`publish\` never sends to; name your own branch with --branch. Nothing was changed.`,
+        ],
+      };
+    }
+    return await syncOwnBranch({ ...options, branch });
+  } catch (error) {
+    return {
+      ok: false,
+      lines: [`bringing in the branch's commits failed: ${messageOf(error)}`],
+    };
   }
 }
 
