@@ -4032,8 +4032,8 @@ test("a run the API ended before its run.started landed stops the session and po
   expect(tried).toEqual(["run.started"]);
 });
 
-// the timeout is the assertion that the stop cuts the attempt: left to the poster's own 10 s
-// per-attempt timeout, the hung attempt would end, and the run would fail the same way, after 10 s
+// the timeout is the assertion that the stop cuts the attempt: the poster's own per-attempt
+// timeout would end the hung attempt too, and fail the run the same way, but only after 10 s
 test("a stop during the run.started retry cuts its attempt in flight and fails the run with the stop's reason", {
   timeout: 8_000,
 }, async () => {
@@ -4048,8 +4048,7 @@ test("a stop during the run.started retry cuts its attempt in flight and fails t
         if (++startAttempts === 1)
           return new HttpResponse(null, { status: 503 });
         controller.abort("SIGTERM");
-        // only the stop ends this attempt: left to the poster's per-attempt timeout, it outlasts
-        // Vitest's default test timeout
+        // only the stop ends this attempt inside the test's timeout
         await delay("infinite");
       }
       stored.push(event);

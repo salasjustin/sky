@@ -148,8 +148,8 @@ function challengedEarlier(tx: Tx, runId: RunId | null): boolean {
 }
 
 /**
- * The id of `run`'s stored `run.started` when a `run.started` for `sessionId` repeats it: the run is
- * past `starting` and its agent holds that session. Undefined for any other start.
+ * The id of `run`'s stored `run.started` when a `run.started` for `sessionId` repeats it: the run
+ * is past `starting` and its agent holds that session. Undefined for any other start.
  */
 function repeatedStartOf(
   tx: Tx,
@@ -199,7 +199,8 @@ export function internalRoutes(
           if (auth.kind !== "authorized") return auth;
           const { run } = auth;
           if (!isActive(run.status)) return { kind: "ended" } as const;
-          // a runner retries a start whose answer it lost; the retry gets the stored answer, not a 409
+          // a runner retries a start whose answer it lost; the retry gets the stored answer, not
+          // a 409
           if (event.type === "run.started") {
             const id = repeatedStartOf(tx, run, event.payload.sessionId);
             if (id !== undefined) return { kind: "repeat", id } as const;

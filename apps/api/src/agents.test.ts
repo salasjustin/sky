@@ -1504,7 +1504,10 @@ test("an event the transition table forbids gets 409 and leaves the run as it wa
   expect((await getRun(agent.id, run.id)).body.status).toBe("starting");
 });
 
-/** Subscribes an admin webhook to run.started, run.waiting and run.finished, so each one stored enqueues a delivery. */
+/**
+ * Subscribes an admin webhook to run.started, run.waiting and run.finished, so each one stored
+ * enqueues a delivery.
+ */
 const hearRunEvents = () =>
   db.$client
     .prepare(

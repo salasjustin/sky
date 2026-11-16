@@ -551,7 +551,10 @@ function sessionHooks(
   };
 }
 
-/** How long before the launch's deadline the runner stops waiting for the repo lock or the start to land, so its failure is posted before the API's. */
+/**
+ * How long before the launch's deadline the runner stops waiting for the repo lock or the start to
+ * land, so its failure is posted before the API's.
+ */
 const LAUNCH_MARGIN_MS = 30_000;
 
 /**
@@ -720,7 +723,8 @@ export async function runSession(
       return undefined;
     };
     try {
-      // the queue alone doesn't hold this back: a start that never lands rejects, and the queue moves on
+      // the queue alone doesn't hold this back: a start that never lands rejects, and the queue
+      // moves on
       await startLanded;
       // one budget for opening the request and polling it, from when the start is stored, so a
       // start still retrying takes none of the person's window

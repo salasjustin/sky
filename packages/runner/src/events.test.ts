@@ -323,7 +323,10 @@ test("a run.waiting the API refuses for good rejects at once", async () => {
   expect(calls).toBe(1);
 });
 
-/** Answers every post with `status` and the API's error body for `code`; returns the count of posts it saw. */
+/**
+ * Answers every post with `status` and the API's error body for `code`; returns the count of
+ * posts it saw.
+ */
 function answersWith(status: number, code: string) {
   const seen = { calls: 0 };
   server.use(
