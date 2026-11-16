@@ -1202,28 +1202,84 @@ test.each([
   },
 );
 
-test("a claude.TaskNotification's summary is redacted of a registered secret and trimmed to EVENT_TEXT_MAX with the marker", async () => {
+test("a claude.TaskNotification's summary is redacted whole before it is trimmed, and kept to EVENT_TEXT_MAX with the marker", async () => {
   const { run, token } = await startedRun();
+  const secret = config.webhookSigningKey;
+  const at = EVENT_TEXT_MAX - 16;
+  // the secret straddles the cut: trimming first would leave a 16-char stub of it
+  const summary = `${"a".repeat(at)}${secret}`.padEnd(EVENT_TEXT_MAX + 50, "b");
   const res = await postEvent(token, {
     runId: run.id,
     type: "claude.TaskNotification",
-    payload: {
-      taskId: "t1",
-      status: "failed",
-      summary: `exit 1 with ${config.spritesToken} ${"x".repeat(EVENT_TEXT_MAX)}`,
-    },
+    payload: { taskId: "t1", status: "failed", summary },
   });
   expect(res.status).toBe(201);
-  const row = db.$client
-    .prepare(
-      "select payload from events where type = 'claude.TaskNotification'",
-    )
-    .get() as { payload: string };
-  const { summary } = JSON.parse(row.payload) as { summary: string };
-  expect(summary).not.toContain(config.spritesToken);
-  expect(summary).toContain("[redacted]");
-  expect(summary).toMatch(/…\[truncated \d+ chars\]$/);
+  const [row] = eventsOf(run.id).filter(
+    (e) => e.type === "claude.TaskNotification",
+  );
+  const stored = (JSON.parse(row?.payload ?? "") as { summary: string })
+    .summary;
+  const redacted = summary.replace(secret, "[redacted]");
+  expect(stored).not.toContain(secret.slice(0, 8));
+  expect(stored).toBe(
+    redacted.slice(0, EVENT_TEXT_MAX) +
+      truncationMarker(redacted.length - EVENT_TEXT_MAX),
+  );
 });
+
+test.each([
+  [
+    "claude.TaskNotification",
+    (a: string, b: string) => ({
+      taskId: `id ${a}`,
+      taskType: `type ${b}`,
+      status: "failed",
+      summary: "boom",
+      reason: `why ${a}`,
+    }),
+    {
+      taskId: "id [redacted]",
+      taskType: "type [redacted]",
+      status: "failed",
+      summary: "boom",
+      reason: "why [redacted]",
+    },
+  ],
+  [
+    "claude.BackgroundTasksChanged",
+    (a: string, b: string) => ({
+      tasks: [
+        { taskId: "plain", taskType: "monitor", ambient: true },
+        { taskId: `id ${a}`, taskType: `type ${b}`, ambient: false },
+      ],
+    }),
+    {
+      tasks: [
+        { taskId: "plain", taskType: "monitor", ambient: true },
+        {
+          taskId: "id [redacted]",
+          taskType: "type [redacted]",
+          ambient: false,
+        },
+      ],
+    },
+  ],
+])(
+  "a registered secret in the short fields of a %s is redacted from the stored row",
+  async (type, payloadOf, expected) => {
+    const { run, token } = await startedRun();
+    const res = await postEvent(token, {
+      runId: run.id,
+      type,
+      payload: payloadOf(config.webhookSigningKey, config.spritesToken),
+    });
+    expect(res.status).toBe(201);
+    const [row] = eventsOf(run.id).filter((e) => e.type === type);
+    expect(row?.payload).not.toContain(config.webhookSigningKey);
+    expect(row?.payload).not.toContain(config.spritesToken);
+    expect(JSON.parse(row?.payload ?? "")).toEqual(expected);
+  },
+);
 
 const startedRun = async () => {
   const ids = await runningRun();
