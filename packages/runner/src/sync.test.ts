@@ -18,7 +18,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { gateway, publish as publishRun } from "./publish.js";
 import { pullRepo } from "./repo.js";
-import { withRepoLock } from "./repo-lock.js";
+import { RepoLockBusyError, withRepoLock } from "./repo-lock.js";
 import type { QueryFn } from "./session.js";
 import * as sync from "./sync.js";
 import { hermeticRunSession as runSessionRaw } from "./testing/hermetic-run.js";
@@ -2234,6 +2234,24 @@ const TRUNK_CURRENT = () =>
 const REVIEW = (branch = "claude/agt_1") =>
   JSON.stringify(`edit review.txt on ${branch}`);
 
+/**
+ * What a refusal must leave as it was in the worktree at `cwd`: its commit, its local branch and
+ * git's ORIG_HEAD. Takes the state now; the returned check compares it to the state then.
+ */
+const untouched = (cwd: string) => {
+  const origHead = join(
+    git(cwd, "rev-parse", "--absolute-git-dir"),
+    "ORIG_HEAD",
+  );
+  const read = () => ({
+    head: git(cwd, "rev-parse", "HEAD"),
+    branch: git(cwd, "rev-parse", "refs/heads/claude/agt_1"),
+    origHead: existsSync(origHead) ? readFileSync(origHead, "utf8") : null,
+  });
+  const before = read();
+  return () => expect(read()).toEqual(before);
+};
+
 test("sync fast-forwards a clean worktree to commits pushed to its branch mid-run, with GitHub's shas", async () => {
   const { cwd, sha } = await earlierRun();
   publishAsIs(cwd);
@@ -2354,6 +2372,7 @@ test("sync refuses a dirty worktree and changes nothing", async () => {
   const outside = pushToGitHub("claude/agt_1", "review.txt", "fix\n");
   writeFileSync(join(cwd, "agent.txt"), "half-done edit\n");
   requests = [];
+  const unchanged = untouched(cwd);
 
   const result = await syncRun(cwd);
 
@@ -2365,6 +2384,7 @@ test("sync refuses a dirty worktree and changes nothing", async () => {
   expect(git(cwd, "rev-parse", "HEAD")).toBe(sha);
   expect(git(cwd, "status", "--porcelain")).toBe("M agent.txt");
   expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+  unchanged();
   // refused before anything was fetched
   expect(requests.filter((r) => /\/git\/(trees|blobs)\//.test(r))).toEqual([]);
 });
@@ -2374,6 +2394,8 @@ test("sync refuses a rebase that conflicts, aborts it and leaves the worktree as
   publishAsIs(cwd);
   const outside = pushToGitHub("claude/agt_1", "shared.txt", "theirs\n");
   const mine = commitIn(cwd, "shared.txt", "mine\n", "mine edits shared");
+  // git's own rebase writes ORIG_HEAD, so only the commit and the branch are held fixed here
+  const branchBefore = git(cwd, "rev-parse", "refs/heads/claude/agt_1");
 
   const result = await syncRun(cwd);
 
@@ -2383,6 +2405,7 @@ test("sync refuses a rebase that conflicts, aborts it and leaves the worktree as
     err: `sky sync: claude/agt_1 on GitHub is at ${sevenOf(outside)}; rebasing your 1 commit onto it conflicted (in "shared.txt"), so the rebase was aborted and your worktree (at ${sevenOf(mine)}) was left as it was.\n`,
   });
   expect(git(cwd, "rev-parse", "HEAD")).toBe(mine);
+  expect(git(cwd, "rev-parse", "refs/heads/claude/agt_1")).toBe(branchBefore);
   expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
   expect(git(cwd, "status", "--porcelain")).toBe("");
   expect(readFileSync(join(cwd, "shared.txt"), "utf8")).toBe("mine\n");
@@ -2547,6 +2570,7 @@ test("sync refuses unpublished commits that include a merge, which a rebase woul
   const after = commitIn(cwd, "after.txt", "after\n", "after the merge");
   const outside = pushToGitHub("claude/agt_1", "review.txt", "fix\n");
   requests = [];
+  const unchanged = untouched(cwd);
 
   const result = await syncRun(cwd);
 
@@ -2559,6 +2583,7 @@ test("sync refuses unpublished commits that include a merge, which a rebase woul
   expect(git(cwd, "rev-parse", "HEAD^")).toBe(merge);
   expect(git(cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
   expect(git(cwd, "status", "--porcelain")).toBe("");
+  unchanged();
   // refused before anything was fetched
   expect(requests.filter((r) => /\/git\/(trees|blobs)\//.test(r))).toEqual([]);
 });
@@ -2672,4 +2697,303 @@ test("sync moving the worktree onto GitHub's recreated commits runs none of the 
 
   expect(git(cwd, "rev-parse", "HEAD")).toBe(recreated);
   expect(existsSync(ran)).toBe(false);
+});
+
+/**
+ * `n` commits on top of `from`, each a different tree (one file rewritten each time), by one
+ * `git fast-import`; unlike `emptyCommits`, none matches a worktree's tree. Returns the tip.
+ */
+const editCommits = (repo: string, n: number, from: string) => {
+  const ref = `refs/tmp/chain-${chains++}`;
+  const stream = Array.from({ length: n }, (_, i) => {
+    const message = `e${i + 1}`;
+    const content = String(i + 1);
+    return [
+      `commit ${ref}`,
+      `mark :${i + 1}`,
+      `committer Ada L <ada@example.com> ${1_700_000_000 + i} +0000`,
+      `data ${message.length}`,
+      message,
+      `from ${i === 0 ? from : `:${i}`}`,
+      "M 644 inline pushed.txt",
+      `data ${content.length}`,
+      content,
+      "",
+    ].join("\n");
+  }).join("\n");
+  execFileSync("git", ["fast-import", "--quiet"], { cwd: repo, input: stream });
+  return git(repo, "rev-parse", ref);
+};
+
+/** `branch` on GitHub with `n` commits of different trees on top of what it has. */
+const pushEdits = (branch: string, n: number) => {
+  git(seed, "fetch", "-q", remote, "+refs/heads/*:refs/remotes/gh/*");
+  const tip = editCommits(seed, n, git(seed, "rev-parse", `gh/${branch}`));
+  pushTo(branch, tip);
+  return tip;
+};
+
+const treesOrBlobs = (all: string[]) =>
+  all.filter((r) => /\/git\/(trees|blobs)\//.test(r));
+
+test("sync refuses a branch whose walk back passes 101 commits without reaching the worktree, fetching no tree or blob", async () => {
+  const { cwd, sha } = await earlierRun();
+  publishAsIs(cwd);
+  const tip = pushEdits("claude/agt_1", 150);
+  requests = [];
+  const unchanged = untouched(cwd);
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 1,
+    out: `${TRUNK_CURRENT()}\n`,
+    err: `sky sync: claude/agt_1 on GitHub is at ${sevenOf(tip)}; none of the 101 commits seen walking back from it matches this worktree, so it can't be told what is new. Your worktree (at ${sevenOf(sha)}) was not changed.\n`,
+  });
+  expect(
+    requests.filter((r) => r.startsWith("GET /git/commits/")),
+  ).toHaveLength(101);
+  expect(treesOrBlobs(requests)).toEqual([]);
+  unchanged();
+}, 60_000);
+
+test("sync refuses a branch more than 100 commits past anything here, naming the cap, before any tree or blob is fetched", async () => {
+  const { cwd, sha } = await earlierRun();
+  // the worktree's commit recreated on GitHub, so what lies between is more than the walk takes
+  publishRecreated();
+  const tip = pushEdits("claude/agt_1", 100);
+  requests = [];
+  const unchanged = untouched(cwd);
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 1,
+    out: `${TRUNK_CURRENT()}\n`,
+    err: `sky sync: claude/agt_1 on GitHub is at ${sevenOf(tip)}; claude/agt_1 on GitHub is more than 100 commits past anything this clone has. Your worktree (at ${sevenOf(sha)}) was not changed.\n`,
+  });
+  expect(treesOrBlobs(requests)).toEqual([]);
+  unchanged();
+}, 60_000);
+
+test("sync rebases an unpublished commit onto GitHub's pushed commits when the published ones were recreated there under other shas", async () => {
+  const { cwd, sha } = await earlierRun();
+  const recreated = publishRecreated();
+  const mine = commitIn(cwd, "mine.txt", "mine\n", "mine");
+  const outside = pushToGitHub("claude/agt_1", "review.txt", "fix\n");
+
+  const result = await syncRun(cwd);
+
+  const rebased = git(cwd, "rev-parse", "HEAD");
+  expect(result).toEqual({
+    code: 0,
+    out: said(
+      TRUNK_CURRENT(),
+      `claude/agt_1 on GitHub is at ${sevenOf(outside)}.`,
+      `Brought in 1 commit: ${sevenOf(outside)} ${REVIEW()}.`,
+      "Your published commits now carry GitHub's shas, so `git log` and GitHub agree.",
+      `Rebased 1 commit onto it: ${sevenOf(mine)} → ${sevenOf(rebased)} "mine".`,
+      `Your worktree is now at ${sevenOf(rebased)}.`,
+    ),
+    err: "",
+  });
+  // GitHub's history under the rebased commit, with none of the shas it replaced
+  expect(git(cwd, "rev-parse", "HEAD^")).toBe(outside);
+  expect(git(cwd, "rev-parse", "HEAD~2")).toBe(recreated);
+  expect(git(cwd, "log", "--format=%H", "HEAD^")).toBe(
+    bare("log", "--format=%H", "claude/agt_1"),
+  );
+  expect(git(cwd, "log", "--format=%H")).not.toContain(sha);
+  expect(git(cwd, "status", "--porcelain")).toBe("");
+});
+
+test("sync rebasing several unpublished commits says where each one went, oldest first", async () => {
+  const { cwd } = await earlierRun();
+  publishAsIs(cwd);
+  const one = commitIn(cwd, "one.txt", "1\n", "agent one");
+  const two = commitIn(cwd, "two.txt", "2\n", "agent two");
+  const three = commitIn(cwd, "three.txt", "3\n", "agent three");
+  const outside = pushToGitHub("claude/agt_1", "review.txt", "fix\n");
+
+  const result = await syncRun(cwd);
+
+  const [one2 = "", two2 = "", three2 = ""] = git(
+    cwd,
+    "rev-list",
+    "--reverse",
+    `${outside}..HEAD`,
+  ).split("\n");
+  expect(new Set([one, two, three, one2, two2, three2]).size).toBe(6);
+  expect(three2).toBe(git(cwd, "rev-parse", "HEAD"));
+  expect(git(cwd, "rev-parse", `${one2}^`)).toBe(outside);
+  expect(result).toEqual({
+    code: 0,
+    out: said(
+      TRUNK_CURRENT(),
+      `claude/agt_1 on GitHub is at ${sevenOf(outside)}.`,
+      `Brought in 1 commit: ${sevenOf(outside)} ${REVIEW()}.`,
+      `Rebased 3 commits onto it: ${sevenOf(one)} → ${sevenOf(one2)} "agent one"; ${sevenOf(two)} → ${sevenOf(two2)} "agent two"; ${sevenOf(three)} → ${sevenOf(three2)} "agent three".`,
+      `Your worktree is now at ${sevenOf(three2)}.`,
+    ),
+    err: "",
+  });
+});
+
+type Choice = {
+  name: string;
+  flag?: string;
+  continued?: string;
+  env?: string;
+  expected: string;
+};
+const CHOICES: Choice[] = [
+  {
+    name: "--branch over a continued branch and the environment",
+    flag: "flag/x",
+    continued: "cont/x",
+    env: "env/x",
+    expected: "flag/x",
+  },
+  {
+    name: "--branch over the environment",
+    flag: "flag/x",
+    env: "env/x",
+    expected: "flag/x",
+  },
+  {
+    name: "--branch over a continued branch",
+    flag: "flag/x",
+    continued: "cont/x",
+    expected: "flag/x",
+  },
+  {
+    name: "a continued branch over the environment",
+    continued: "cont/x",
+    env: "env/x",
+    expected: "cont/x",
+  },
+  {
+    name: "the environment over the worktree's own",
+    env: "env/x",
+    expected: "env/x",
+  },
+  { name: "the worktree's own with nothing else set", expected: "claude/agt_1" },
+];
+
+test.each(CHOICES)(
+  "sync and publish pick the same GitHub branch: $name",
+  async ({ flag, continued, env, expected }) => {
+    const { cwd } = await earlierRun();
+    if (continued !== undefined) {
+      git(cwd, "config", "branch.claude/agt_1.sky-remote-branch", continued);
+    }
+
+    const synced = await syncRun(
+      cwd,
+      { ...ENV, ...(env !== undefined && { SKY_PUBLISH_BRANCH: env }) },
+      flag === undefined ? [] : ["--branch", flag],
+    );
+    const sent = githubWrites();
+    await publish({
+      cwd,
+      gatewayUrl: GATEWAY,
+      connectorId: CONNECTOR,
+      title: "t",
+      ...(flag !== undefined && { branch: flag }),
+      ...(env !== undefined && { defaultBranch: env }),
+    });
+
+    // none of them is on GitHub: sync names the one it looked for, publish creates the one it chose
+    expect(synced.out).toContain(`${expected} isn't on GitHub yet`);
+    expect(sent.refs).toHaveLength(1);
+    expect(sent.refs[0]).toContain(`"ref":"refs/heads/${expected}"`);
+  },
+);
+
+/** Whether the shared repo's lock can be taken now: "busy" when something holds it for a second. */
+const lockState = () =>
+  withRepoLock(repoDir, async () => "free", 1).catch((error: unknown) => {
+    if (error instanceof RepoLockBusyError) return "busy";
+    throw error;
+  });
+
+test("sync holds the repo lock while it looks up GitHub's branch and fetches it, and lets go after", async () => {
+  const { cwd } = await earlierRun();
+  publishAsIs(cwd);
+  pushToGitHub("claude/agt_1", "review.txt", "fix\n");
+  const atLookup: string[] = [];
+  const atFetch: string[] = [];
+  // a resolver that returns nothing hands the request to fakeGitHub's, which answers it
+  server.use(
+    http.get(`${REPO}/git/ref/heads/claude/agt_1`, async () => {
+      atLookup.push(await lockState());
+    }),
+    http.get(`${REPO}/git/trees/:sha`, async () => {
+      atFetch.push(await lockState());
+    }),
+  );
+
+  expect((await syncRun(cwd)).code).toBe(0);
+
+  expect(atLookup).toEqual(["busy"]);
+  expect(atFetch.length).toBeGreaterThan(0);
+  expect(new Set(atFetch)).toEqual(new Set(["busy"]));
+  expect(await lockState()).toBe("free");
+}, 60_000);
+
+test("publish after sync moved the worktree onto GitHub's recreated commits fast-forwards from them", async () => {
+  const { cwd } = await earlierRun();
+  const recreated = publishRecreated();
+  expect((await syncRun(cwd)).code).toBe(0);
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(recreated);
+  commitIn(cwd, "more.txt", "more\n", "agent more");
+  const sent = githubWrites();
+
+  await publish({
+    cwd,
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    title: "More",
+  });
+
+  expect(sent.commits.map((c) => c.parents)).toEqual([[recreated]]);
+  expect(sent.refs).toEqual([
+    `PATCH heads/claude/agt_1 {"sha":"${"d".repeat(40)}","force":false}`,
+  ]);
+});
+
+test("sync in a detached HEAD says to check out the branch, and changes nothing", async () => {
+  const { cwd } = await earlierRun();
+  git(cwd, "checkout", "-q", "--detach");
+  const unchanged = untouched(cwd);
+
+  const result = await syncRun(cwd);
+
+  expect(result).toEqual({
+    code: 1,
+    out: `${TRUNK_CURRENT()}\n`,
+    err: "sky sync: HEAD is detached in this worktree, so its GitHub branch can't be told; check out your branch and sync again. Nothing was changed.\n",
+  });
+  expect(requests).toEqual(["GET /git/ref/heads/trunk"]);
+  unchanged();
+});
+
+test("sync whose lookup of the branch fails other than by a 404 reports it, keeps the default branch's result and changes nothing", async () => {
+  const { cwd } = await earlierRun();
+  server.use(
+    http.get(
+      `${REPO}/git/ref/heads/claude/agt_1`,
+      () => new HttpResponse(null, { status: 500 }),
+    ),
+  );
+  const unchanged = untouched(cwd);
+
+  const result = await syncRun(cwd);
+
+  expect(result.code).toBe(1);
+  expect(result.out).toBe(`${TRUNK_CURRENT()}\n`);
+  expect(result.err).toContain(
+    "sky sync: bringing in the branch's commits failed: GitHub gateway: GET /repos/acme/private/git/ref/heads/claude/agt_1 returned 500",
+  );
+  unchanged();
 });
