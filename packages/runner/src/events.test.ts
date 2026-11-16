@@ -323,22 +323,58 @@ test("a run.waiting the API refuses for good rejects at once", async () => {
   expect(calls).toBe(1);
 });
 
-test("a run.waiting answered run_not_started rejects at once, naming the start the API never stored", async () => {
-  let calls = 0;
+/** Answers every post with `status` and the API's error body for `code`; returns the count of posts it saw. */
+function answersWith(status: number, code: string) {
+  const seen = { calls: 0 };
   server.use(
     http.post(url, () => {
-      calls++;
-      return HttpResponse.json(
-        { error: { code: "run_not_started", message: "starting" } },
-        { status: 409 },
-      );
+      seen.calls++;
+      return HttpResponse.json({ error: { code, message: code } }, { status });
     }),
   );
-  const post = createPoster({ ...options, warn: () => {} });
+  return seen;
+}
+
+test("a run.waiting answered run_not_started rejects at once, naming the start the API never stored", async () => {
+  const clock = virtualClock();
+  const seen = answersWith(409, "run_not_started");
+  const post = createPoster({ ...options, ...timing(clock), warn: () => {} });
   await expect(
-    post(endingEvent("run.waiting"), { deadline: Date.now() + 60_000 }),
+    post(endingEvent("run.waiting"), { deadline: 60_000 }),
   ).rejects.toThrow(/run_not_started.*run\.started was never stored/);
-  expect(calls).toBe(1);
+  expect(seen.calls).toBe(1);
+  expect(clock.slept).toEqual([]);
+});
+
+test("a run.waiting answered 409 invalid_transition fails with the final HTTP status, not the lost-start message", async () => {
+  const clock = virtualClock();
+  const seen = answersWith(409, "invalid_transition");
+  const post = createPoster({ ...options, ...timing(clock), warn: () => {} });
+  const failure = await post(endingEvent("run.waiting"), {
+    deadline: 60_000,
+  }).catch((error: unknown) => error);
+  expect(failure).toBeInstanceOf(Error);
+  const { message } = failure as Error;
+  expect(message).toMatch(/run\.waiting.*after 1 attempts: HTTP 409/);
+  expect(message).not.toMatch(/run_not_started/);
+  expect(seen.calls).toBe(1);
+});
+
+test("a claude.Message answered 409 run_not_started is dropped with a warning, not rejected", async () => {
+  const clock = virtualClock();
+  const seen = answersWith(409, "run_not_started");
+  const warnings: string[] = [];
+  const post = createPoster({
+    ...options,
+    ...timing(clock),
+    warn: (m) => warnings.push(m),
+  });
+  await expect(
+    post({ runId: "run_1", type: "claude.Message", payload: { text: "hi" } }),
+  ).resolves.toBeUndefined();
+  expect(seen.calls).toBe(1);
+  expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toMatch(/dropped claude\.Message.*HTTP 409/);
 });
 
 test("a run.started rides out more than three failed attempts until its deadline, then rejects naming the lost start", async () => {
@@ -361,8 +397,36 @@ test("a run.started rides out more than three failed attempts until its deadline
       { deadline: 90_000 },
     ),
   ).rejects.toThrow(/run\.started was never recorded.*HTTP 503.*lost/);
-  expect(clock.time).toBe(90_000);
+  // past the three attempts a progress event gets, and never past the deadline
   expect(calls).toBeGreaterThan(3);
+  expect(clock.time).toBeLessThanOrEqual(90_000);
+});
+
+test("a claude.Message against the same 503 server stops at its three attempts, well inside the deadline", async () => {
+  const clock = virtualClock();
+  let calls = 0;
+  server.use(
+    http.post(url, () => {
+      calls++;
+      return new HttpResponse(null, { status: 503 });
+    }),
+  );
+  const warnings: string[] = [];
+  const post = createPoster({
+    ...options,
+    ...timing(clock),
+    warn: (m) => warnings.push(m),
+  });
+  await expect(
+    post(
+      { runId: "run_1", type: "claude.Message", payload: { text: "hi" } },
+      { deadline: 90_000 },
+    ),
+  ).resolves.toBeUndefined();
+  expect(calls).toBe(3);
+  expect(clock.time).toBeLessThan(90_000);
+  expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toMatch(/after 3 attempts: HTTP 503/);
 });
 
 test("a run.waiting for a run the API already ended rejects with RunEndedError at once", async () => {

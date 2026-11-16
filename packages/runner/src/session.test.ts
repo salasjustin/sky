@@ -3714,6 +3714,8 @@ function restartingApi(options: {
   pollReplies: DecisionReply[];
   refuse?: (event: RunnerEventPost) => boolean;
   virtualTime?: boolean;
+  /** Every attempt at `run.started` waits for this before the API answers it. */
+  holdStart?: Promise<void>;
 }) {
   const timing = options.virtualTime
     ? virtualTiming()
@@ -3734,9 +3736,12 @@ function restartingApi(options: {
   server.use(
     http.post("https://api.test/internal/events", async ({ request }) => {
       const event = (await request.json()) as RunnerEventPost;
-      if (options.refuse?.(event))
+      if (options.refuse?.(event)) {
+        received.push({ type: event.type, stored: false });
         return new HttpResponse(null, { status: 503 });
+      }
       if (event.type === "run.started") {
+        await options.holdStart;
         if (startFailures++ < (options.startOutage ?? 0)) {
           received.push({ type: event.type, stored: false });
           return failure();
@@ -3784,6 +3789,32 @@ function restartingApi(options: {
     elapsedMs: () => 0,
   };
   return { sent, received, deps, polls: () => polls };
+}
+
+/** A `run.started` the API holds back until `release` is called. */
+function heldStart() {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { held, release };
+}
+
+/**
+ * Fires the gated `gitPush` hook from a timer, then calls `release` from the next one. A timer runs
+ * after the microtasks that hand `init` to the loop, so the hook starts while `run.started` is
+ * posting and parks behind it with microtask hops alone; the next timer runs after those, so the
+ * start cannot answer before the hook is waiting on it.
+ */
+function firePushWhileStarting(options: Options, release: () => void) {
+  const answers = new Promise<unknown[]>((resolve, reject) => {
+    setTimeout(
+      () => void fire(options, "PreToolUse", gitPush).then(resolve, reject),
+      0,
+    );
+  });
+  setTimeout(release, 0);
+  return answers;
 }
 
 const dropped: DecisionReply = () => HttpResponse.error();
@@ -3920,22 +3951,19 @@ test.each([
 );
 
 test("a lost run.started stops the session, so a hook event queued behind it gets one attempt, not its ride-out", async () => {
-  const { sent, deps } = restartingApi({
+  const start = heldStart();
+  const { sent, received, deps } = restartingApi({
     outage: 0,
     startOutage: Number.POSITIVE_INFINITY,
     pollReplies: [],
     refuse: (event) => event.type === "claude.PreToolUse",
     virtualTime: true,
+    holdStart: start.held,
   });
   const startedAt = Date.now();
   const query = scripted([
-    // a timer runs after the microtasks that hand init to the loop, so the hook's event queues
-    // behind the run.started it posts
     async (options: Options) => {
-      setTimeout(
-        () => void fire(options, "PreToolUse", gitPush).catch(() => {}),
-        0,
-      );
+      void firePushWhileStarting(options, start.release);
     },
     init,
     success,
@@ -3951,7 +3979,11 @@ test("a lost run.started stops the session, so a hook event queued behind it get
       error: expect.stringMatching(/run\.started was never recorded.*lost/),
     },
   });
-  // the start's own budget, with none of claude.PreToolUse's ride-out after it
+  // refused every time, it would ride out 120 s of attempts without the stop; the hook was parked
+  // behind the start before the start could answer, so the one attempt is the stop's cut
+  expect(
+    received.filter((r) => r.type === "claude.PreToolUse"),
+  ).toHaveLength(1);
   expect(Date.now() - startedAt).toBeLessThanOrEqual(100_000);
 });
 
@@ -4031,30 +4063,105 @@ test("a stop during the run.started retry cuts its attempt in flight and fails t
   ]);
 });
 
-test("run.waiting is not sent before run.started is stored", async () => {
-  const { received, deps } = restartingApi({
+test("a gated call fired while run.started is still retrying sends run.waiting only once the start is stored", async () => {
+  const start = heldStart();
+  const { sent, received, deps } = restartingApi({
     outage: 0,
     startOutage: 5,
     pollReplies: [decided({ decision: "approve" })],
     virtualTime: true,
+    holdStart: start.held,
   });
+  let answers: Promise<unknown[]> = Promise.resolve([]);
   const query = scripted([
-    init,
     async (options: Options) => {
-      await fire(options, "PreToolUse", gitPush);
+      answers = firePushWhileStarting(options, start.release);
     },
+    init,
+    // the loop gets here once the start has landed; the hook has been parked behind it since init
+    async () => void (await answers),
     success,
   ]);
-  await runSession(
+  const code = await runSession(
     { ...config, approvalPolicy: ["Bash"], waitTimeoutMs: 600_000 },
     { ...deps, query },
   );
-  const startStored = received.findIndex(
+  expect(code).toBe(0);
+  expect(await answers).toEqual([approved]);
+  const storedStart = received.findIndex(
     (r) => r.type === "run.started" && r.stored,
   );
-  const firstWait = received.findIndex((r) => r.type === "run.waiting");
-  expect(startStored).toBeGreaterThan(-1);
-  expect(firstWait).toBeGreaterThan(startStored);
+  expect(received.filter((r) => r.type === "run.started")).toHaveLength(6);
+  expect(storedStart).toBeGreaterThan(-1);
+  // nothing for the gated call reached the API while the start was still failing
+  expect(
+    received.slice(0, storedStart).filter((r) => r.type !== "run.started"),
+  ).toEqual([]);
+  expect(sent.map((e) => e.type)).toEqual([
+    "run.started",
+    "claude.PreToolUse",
+    "run.waiting",
+    "run.finished",
+  ]);
+});
+
+test("a gated call fired while run.started is retrying gets a denial when the start is lost, and nothing is sent for it or left unhandled", async () => {
+  const start = heldStart();
+  const { sent, received, deps, polls } = restartingApi({
+    outage: 0,
+    startOutage: Number.POSITIVE_INFINITY,
+    pollReplies: [decided({ decision: "approve" })],
+    virtualTime: true,
+    holdStart: start.held,
+  });
+  let answers: Promise<unknown[]> = Promise.resolve([]);
+  const query = scripted([
+    async (options: Options) => {
+      answers = firePushWhileStarting(options, start.release);
+    },
+    init,
+    success,
+  ]);
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => void unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const code = await runSession(
+      { ...config, approvalPolicy: ["Bash"], waitTimeoutMs: 100_000 },
+      { ...deps, query },
+    );
+    expect(code).toBe(1);
+    // a hung gate never resolves, and the test times out here
+    const answered = await answers;
+    // unhandled rejections are reported once the event loop turns
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(unhandled).toEqual([]);
+    expect(answered).toEqual([
+      {
+        continue: false,
+        stopReason: expect.stringMatching(
+          /^The run is ending: run\.started was never recorded.*lost\.$/,
+        ),
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: expect.stringMatching(
+            /run\.started was never recorded/,
+          ),
+        },
+      },
+    ]);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  expect(received.filter((r) => r.type === "run.waiting")).toEqual([]);
+  expect(polls()).toBe(0);
+  expect(sent.at(-1)).toMatchObject({
+    type: "run.failed",
+    payload: {
+      error: expect.stringMatching(/run\.started was never recorded.*lost/),
+    },
+  });
 });
 
 test("a stop cuts a claude.PreToolUse retry short, so run.failed goes out without waiting out its budget", async () => {
