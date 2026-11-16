@@ -126,7 +126,7 @@ function refuseIfNoRoom(
   const free = freeBytes(sqlite.name);
   if (free < needed) {
     throw new Error(
-      `not enough free disk space to migrate ${sqlite.name}: ${pending.map((m) => m.tag).join(", ")} need ${mb(needed)} (${mb(rebuilt)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
+      `not enough free disk space to migrate ${sqlite.name}: applying ${pending.map((m) => m.tag).join(", ")} needs ${mb(needed)} (${mb(rebuilt)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
     );
   }
 }

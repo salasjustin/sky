@@ -116,7 +116,7 @@ test("booting refuses and logs the bytes needed and free when a migration can't 
   ).toThrow(/not enough free disk space/);
   expect(lines).toHaveLength(1);
   expect(lines[0]).toMatch(
-    /^boot failed: not enough free disk space to migrate .*sky\.db: needs \d+ bytes .*, only 1 bytes free/,
+    /^boot failed: not enough free disk space to migrate .*sky\.db: applying \S+ needs \d+\.\d MB \(.*\) but 0\.0 MB is free; /,
   );
 });
 
