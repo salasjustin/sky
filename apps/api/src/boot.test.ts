@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import type { Server } from "node:http";
 import { type AddressInfo, connect } from "node:net";
 import { tmpdir } from "node:os";
@@ -57,6 +57,36 @@ test("booting on an empty data dir creates sky.db with the schema migrated", asy
     .get();
   expect(table).toEqual({ name: "environments" });
   expect((await b.app.request("/healthz")).status).toBe(200);
+});
+
+test("booting checkpoints and truncates the WAL the migrations wrote, and logs its size before and after", () => {
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
+  const line = lines.find((l) => l.includes("checkpointed the WAL"));
+  const [, before, after] =
+    line?.match(/(\d+) bytes before, (\d+) after/) ?? [];
+  expect(Number(before)).toBeGreaterThan(0);
+  expect(after).toBe("0");
+  expect(statSync(join(dir, "sky.db-wal")).size).toBe(0);
+});
+
+test("booting refuses and logs the bytes needed and free when a migration can't fit, leaving the file closed", () => {
+  const lines: string[] = [];
+  const b = booted();
+  b.db.$client.exec(
+    "delete from __drizzle_migrations where created_at = (select max(created_at) from __drizzle_migrations)",
+  );
+  b.stopSweeping();
+  b.stopDelivering();
+  b.db.$client.close();
+
+  expect(() =>
+    boot(config(), (l) => lines.push(l), { freeBytes: () => 1 }),
+  ).toThrow(/not enough free disk space/);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toMatch(
+    /^boot failed: not enough free disk space to migrate .*sky\.db: needs \d+ bytes .*, only 1 bytes free/,
+  );
 });
 
 test("shutdown closes the server before the DB", async () => {

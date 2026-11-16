@@ -1,7 +1,8 @@
 import { setMaxListeners } from "node:events";
+import { statSync } from "node:fs";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
-import { type Db, migrate, openDb } from "@sky/db";
+import { type Db, type MigrateOptions, migrate, openDb } from "@sky/db";
 import type { RunId } from "@sky/shared";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
@@ -22,6 +23,14 @@ import { SPRITES_TIMEOUT_MS, type SpriteOps } from "./sprites.js";
 
 const SWEEP_EVERY_MS = 60_000;
 
+const walBytes = (dbPath: string) => {
+  try {
+    return statSync(`${dbPath}-wal`).size;
+  } catch {
+    return 0;
+  }
+};
+
 /**
  * Opens and migrates the one DB handle the app reuses for its lifetime, fails provisioning a previous
  * process left unfinished, and fails silent runs and abandoned waits now and every minute after. Runs
@@ -31,10 +40,30 @@ const SWEEP_EVERY_MS = 60_000;
  * looked for on its sprite, also unawaited (see
  * `createRunProber`). The same sweep deletes run envVars past their TTL and `claude.*` and
  * `runner.heartbeat` events past 7 days. Webhook deliveries left pending resume at once.
+ *
+ * A migration that can't fit on the data volume fails the boot with a log line before the DB is
+ * touched. Once migrated, the WAL is checkpointed and truncated, so a rebuild's pages don't sit on the
+ * volume until the next restart.
  */
-export function boot(config: Config, log: (line: string) => void) {
-  const db = openDb(join(config.dataDir, "sky.db"));
-  migrate(db);
+export function boot(
+  config: Config,
+  log: (line: string) => void,
+  migrateOptions?: MigrateOptions,
+) {
+  const dbPath = join(config.dataDir, "sky.db");
+  const db = openDb(dbPath);
+  try {
+    migrate(db, migrateOptions);
+  } catch (err) {
+    log(`boot failed: ${err instanceof Error ? err.message : err}`);
+    db.$client.close();
+    throw err;
+  }
+  const walBefore = walBytes(dbPath);
+  db.$client.pragma("wal_checkpoint(TRUNCATE)");
+  log(
+    `checkpointed the WAL after migrating: ${walBefore} bytes before, ${walBytes(dbPath)} after`,
+  );
   failInterruptedProvisioning(db);
   const dispatcher = createDispatcher({
     db,

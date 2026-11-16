@@ -12,7 +12,6 @@ import {
   AgentStatus,
   type EnvironmentId,
   EnvironmentStatus,
-  EventType,
   type RequestId,
   type RunId,
   type RunRollup,
@@ -20,11 +19,15 @@ import {
   type WebhookId,
 } from "@sky/shared";
 import { migrate as drizzleMigrate } from "drizzle-orm/better-sqlite3/migrator";
+import { getTableConfig } from "drizzle-orm/sqlite-core";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import {
   agents,
   type Db,
   deliveryStatuses,
+  events,
+  JOURNAL_SIZE_LIMIT,
+  MIGRATION_MARGIN_BYTES,
   migrate,
   openDb,
   requestKinds,
@@ -77,6 +80,13 @@ test("openDb sets WAL, foreign keys and a busy timeout on the connection", () =>
   expect(pragma("journal_mode")).toBe("wal");
   expect(pragma("foreign_keys")).toBe(1);
   expect(pragma("busy_timeout")).toBe(5000);
+});
+
+test("openDb caps the WAL file a checkpoint leaves behind at 64 MB", () => {
+  expect(JOURNAL_SIZE_LIMIT).toBe(64 * 1024 * 1024);
+  expect(db.$client.pragma("journal_size_limit", { simple: true })).toBe(
+    JOURNAL_SIZE_LIMIT,
+  );
 });
 
 const TABLES = [
@@ -142,32 +152,30 @@ test("status and type columns accept exactly the shared enums", () => {
   accepts("update environments set status = ?", EnvironmentStatus.options);
   accepts("update agents set status = ?", AgentStatus.options);
   accepts("update runs set status = ?", RunStatus.options);
-  accepts(
-    "insert into events (run_id, ts, type, payload) values ('run_1', '2026-10-29T12:00:00Z', ?, '{}')",
-    EventType.options,
-  );
 });
 
-test("events take claude.* hook types and run.resumed, and reject the retired run.progress", () => {
+// the API validates an event's type against the shared EventType before inserting, so the table
+// holds no list of its own: a new event type must never need a migration (a rebuild copies every row)
+test("an event of a type no schema has listed inserts with no migration", () => {
   migrate(db);
   seedRun();
-  expect(insertEvent("claude.PostToolUse")).toBeGreaterThan(0);
-  expect(insertEvent("run.resumed")).toBeGreaterThan(0);
-  expect(() => insertEvent("run.progress")).toThrow(/CHECK constraint failed/);
-  expect(() => insertEvent("claude.CwdChanged")).toThrow(
-    /CHECK constraint failed/,
-  );
+  const id = insertEvent("claude.SomeFutureHook");
+  expect(id).toBeGreaterThan(0);
+  expect(insertEvent("run.progress")).toBeGreaterThan(id);
 });
 
-test("events take run.probed, runner.warning and runner.heartbeat, and still reject an unknown type", () => {
+test("no schema puts a type list back on events", () => {
   migrate(db);
-  seedRun();
-  expect(insertEvent("run.probed")).toBeGreaterThan(0);
-  expect(insertEvent("runner.warning")).toBeGreaterThan(0);
-  expect(insertEvent("runner.heartbeat")).toBeGreaterThan(0);
-  expect(() => insertEvent("runner.error")).toThrow(
-    /CHECK constraint failed: events_type/,
-  );
+  const sql = db.$client
+    .prepare("select sql from sqlite_schema where name = 'events'")
+    .pluck()
+    .get() as string;
+  expect(sql).not.toMatch(/events_type/);
+  expect(sql).not.toMatch(/"type"\s+in\s*\(/i);
+  expect(getTableConfig(events).checks.map((c) => c.name)).toEqual([
+    "events_ts",
+    "events_payload",
+  ]);
 });
 
 test("foreign keys are enforced after migrate", () => {
@@ -1167,4 +1175,149 @@ test("migrating a populated 0015 file keeps a sealed webhook's columns byte for 
   expect(
     db.$client.prepare("select webhook_id from webhook_deliveries").all(),
   ).toEqual([{ webhook_id: "whk_sky" }]);
+});
+
+test("migrating a populated 0017 file keeps every event, id, index and remaining CHECK, drops the type list, and never reuses a deleted tail id", () => {
+  migrateThrough("0017_plain_ultimatum");
+  seedDelivery();
+  insertDelivery();
+  run(
+    "insert into events (run_id, ts, type, payload) values ('run_1', '2026-10-29T12:00:01.000Z', 'claude.Message', ?)",
+    JSON.stringify({ text: "hi", n: 2 }),
+  );
+  const tail = insertEvent("runner.heartbeat");
+  run("delete from events where id = ?", tail);
+  expect(() => insertEvent("run.brand_new")).toThrow(
+    /CHECK constraint failed: events_type/,
+  );
+  const eventsBefore = db.$client
+    .prepare("select * from events order by id")
+    .all();
+  const deliveriesBefore = db.$client
+    .prepare("select * from webhook_deliveries order by id")
+    .all();
+  const seq = () =>
+    db.$client
+      .prepare("select seq from sqlite_sequence where name = 'events'")
+      .pluck()
+      .get();
+  const seqBefore = seq();
+  expect(seqBefore).toBe(tail);
+
+  migrate(db);
+
+  expect(eventsBefore).toHaveLength(2);
+  expect(db.$client.prepare("select * from events order by id").all()).toEqual(
+    eventsBefore,
+  );
+  expect(
+    db.$client.prepare("select * from webhook_deliveries order by id").all(),
+  ).toEqual(deliveriesBefore);
+  expect(seq()).toBe(seqBefore);
+  expect(
+    db.$client
+      .prepare(
+        "select name from sqlite_schema where type = 'index' and tbl_name = 'events' and sql is not null order by name",
+      )
+      .pluck()
+      .all(),
+  ).toEqual(["events_claude_ts", "events_heartbeat_ts", "events_run_id_id"]);
+  expect(
+    planOf(
+      "select id from events where type glob 'claude.*' and ts < ?",
+      PRUNE_CUTOFF,
+    ),
+  ).toMatch(/INDEX events_claude_ts/);
+  expect(
+    planOf(
+      "select id from events where type = 'runner.heartbeat' and ts < ?",
+      PRUNE_CUTOFF,
+    ),
+  ).toMatch(/INDEX events_heartbeat_ts/);
+  expect(() =>
+    run("update events set ts = '2026-10-29 12:00:00' where id = 1"),
+  ).toThrow(/CHECK constraint failed: events_ts/);
+  expect(() => run("update events set payload = '[]' where id = 1")).toThrow(
+    /CHECK constraint failed: events_payload/,
+  );
+  expect(() =>
+    run(
+      "insert into events (run_id, ts, type, payload) values ('run_missing', '2026-10-29T12:00:00.000Z', 'run.started', '{}')",
+    ),
+  ).toThrow(/FOREIGN KEY constraint failed/);
+  expect(insertEvent("run.brand_new")).toBe(tail + 1);
+});
+
+// a populated file as the previous release left it, ready to migrate
+const staleFile = () => {
+  migrateThrough("0017_plain_ultimatum");
+  seedRun();
+  for (let i = 0; i < 50; i++) insertEvent();
+};
+
+const tables = () =>
+  db.$client.prepare("select name, sql from sqlite_schema order by name").all();
+
+test("migrate refuses, naming the bytes needed and free, when the volume can't hold a rewrite, and leaves the file untouched", () => {
+  staleFile();
+  const before = tables();
+  const pragma = (name: string) =>
+    db.$client.pragma(name, { simple: true }) as number;
+  const pageSize = pragma("page_size");
+  const live = (pragma("page_count") - pragma("freelist_count")) * pageSize;
+  const growth = Math.max(0, live - pragma("freelist_count") * pageSize);
+  const needed = live + growth + MIGRATION_MARGIN_BYTES;
+
+  expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
+    `not enough free disk space to migrate ${path}: needs ${needed} bytes (${live} of live data in the WAL, ${growth} of file growth and a ${MIGRATION_MARGIN_BYTES} margin), only ${needed - 1} bytes free`,
+  );
+  expect(tables()).toEqual(before);
+  expect(count("events")).toBe(50);
+});
+
+test("migrate counts free pages as room already in the file, so they shrink what it needs", () => {
+  staleFile();
+  run("create table filler (x text)");
+  run(
+    "insert into filler select hex(randomblob(2000)) from (with recursive n(i) as (select 1 union all select i + 1 from n where i < 500) select i from n)",
+  );
+  run("drop table filler");
+  const free = db.$client.pragma("freelist_count", { simple: true }) as number;
+  expect(free).toBeGreaterThan(100);
+  const pageSize = db.$client.pragma("page_size", { simple: true }) as number;
+  const pages = db.$client.pragma("page_count", { simple: true }) as number;
+  const live = (pages - free) * pageSize;
+  // the free pages absorb part of the copy, so the file grows by less than the live data
+  const needed =
+    live + Math.max(0, live - free * pageSize) + MIGRATION_MARGIN_BYTES;
+
+  expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
+    /not enough free disk space/,
+  );
+  expect(() => migrate(db, { freeBytes: () => needed })).not.toThrow();
+});
+
+test("migrate passes when the volume has the room, and asks about the volume holding the file", () => {
+  staleFile();
+  const asked: string[] = [];
+  migrate(db, {
+    freeBytes: (p) => {
+      asked.push(p);
+      return Number.MAX_SAFE_INTEGER;
+    },
+  });
+  expect(asked).toEqual([path]);
+  expect(count("events")).toBe(50);
+  expect(insertEvent("run.brand_new")).toBeGreaterThan(50);
+});
+
+test("migrate doesn't look at free space when nothing is pending, or on a new file", () => {
+  const noRoom = { freeBytes: () => 0 };
+  expect(() => migrate(db, noRoom)).not.toThrow();
+  expect(() => migrate(db, noRoom)).not.toThrow();
+});
+
+test("migrate reads the real free space of the volume by default", () => {
+  staleFile();
+  expect(() => migrate(db)).not.toThrow();
 });
