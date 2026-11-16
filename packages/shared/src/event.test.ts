@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import {
+  BACKGROUND_TASKS_MAX,
   Decision,
   EVENT_TEXT_MAX,
   Event,
@@ -307,6 +308,8 @@ const claudeTypes = [
   "claude.SubagentStop",
   "claude.TaskCreated",
   "claude.TaskCompleted",
+  "claude.TaskNotification",
+  "claude.BackgroundTasksChanged",
   "claude.Notification",
   "claude.PreCompact",
   "claude.FileChanged",
@@ -372,6 +375,23 @@ const claudePosts = [
     },
   },
   {
+    type: "claude.TaskNotification",
+    payload: {
+      taskId: "bash_1",
+      taskType: "local_bash",
+      status: "stopped",
+      summary: 'Background command "review" was stopped',
+      reason: "worker_restart",
+      ambient: false,
+    },
+  },
+  {
+    type: "claude.BackgroundTasksChanged",
+    payload: {
+      tasks: [{ taskId: "mon_1", taskType: "monitor", ambient: true }],
+    },
+  },
+  {
     type: "claude.Notification",
     payload: {
       message: "Claude needs your permission to use Bash",
@@ -398,6 +418,89 @@ test("every claude.* type has a realistic payload the runner can post and the AP
     expect(RunnerEventPost.parse(body)).toEqual(body);
     expect(Event.parse({ ...meta, ...post })).toEqual({ ...meta, ...post });
   }
+});
+
+const parsesAs = (type: string, payload: unknown) =>
+  RunnerEventPost.safeParse({ runId: "run_1", type, payload }).success;
+
+const backgroundTask = { taskId: "mon_1", taskType: "monitor", ambient: true };
+const tasksOf = (n: number) => ({
+  tasks: Array.from({ length: n }, () => backgroundTask),
+});
+
+test("claude.BackgroundTasksChanged lists at most BACKGROUND_TASKS_MAX tasks", () => {
+  expect(BACKGROUND_TASKS_MAX).toBe(50);
+  expect(parsesAs("claude.BackgroundTasksChanged", tasksOf(0))).toBe(true);
+  expect(
+    parsesAs("claude.BackgroundTasksChanged", tasksOf(BACKGROUND_TASKS_MAX)),
+  ).toBe(true);
+  expect(
+    parsesAs(
+      "claude.BackgroundTasksChanged",
+      tasksOf(BACKGROUND_TASKS_MAX + 1),
+    ),
+  ).toBe(false);
+});
+
+test.each([
+  [
+    "claude.TaskNotification",
+    "taskId",
+    (v: string) => ({ taskId: v, status: "completed", summary: "s" }),
+  ],
+  [
+    "claude.TaskNotification",
+    "taskType",
+    (v: string) => ({
+      taskId: "t",
+      taskType: v,
+      status: "completed",
+      summary: "s",
+    }),
+  ],
+  [
+    "claude.TaskNotification",
+    "reason",
+    (v: string) => ({
+      taskId: "t",
+      status: "stopped",
+      summary: "s",
+      reason: v,
+    }),
+  ],
+  [
+    "claude.BackgroundTasksChanged",
+    "tasks[].taskId",
+    (v: string) => ({ tasks: [{ ...backgroundTask, taskId: v }] }),
+  ],
+  [
+    "claude.BackgroundTasksChanged",
+    "tasks[].taskType",
+    (v: string) => ({ tasks: [{ ...backgroundTask, taskType: v }] }),
+  ],
+])("%s.%s takes 1 to 256 characters", (type, _field, payloadOf) => {
+  expect(parsesAs(type, payloadOf("x".repeat(256)))).toBe(true);
+  expect(parsesAs(type, payloadOf("x"))).toBe(true);
+  expect(parsesAs(type, payloadOf("x".repeat(257)))).toBe(false);
+  expect(parsesAs(type, payloadOf(""))).toBe(false);
+});
+
+test("claude.TaskNotification takes only the three ending statuses, and needs nothing but taskId, status and summary", () => {
+  const minimal = { taskId: "t1", status: "completed", summary: "done" };
+  expect(parsesAs("claude.TaskNotification", minimal)).toBe(true);
+  for (const status of ["completed", "failed", "stopped"]) {
+    expect(parsesAs("claude.TaskNotification", { ...minimal, status })).toBe(
+      true,
+    );
+  }
+  for (const status of ["running", "killed", "", "COMPLETED"]) {
+    expect(parsesAs("claude.TaskNotification", { ...minimal, status })).toBe(
+      false,
+    );
+  }
+  expect(
+    parsesAs("claude.TaskNotification", { taskId: "t1", status: "failed" }),
+  ).toBe(false);
 });
 
 test("a subagent is named by subagentId, never agentId, which is the sky agent", () => {

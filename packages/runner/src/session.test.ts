@@ -28,7 +28,7 @@ import type {
   Options,
   SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { RUNNER_TEXT_MAX, type RunnerEventPost } from "@sky/shared";
+import { RUNNER_TEXT_MAX, RunnerEventPost } from "@sky/shared";
 import { delay, HttpResponse, http } from "msw";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -1161,6 +1161,242 @@ test("an ambient background task (a watcher) does not hold the prompt open", asy
   });
   expect(seen).toEqual([true]);
 });
+
+const taskNotification = (
+  task_id: string,
+  overrides: Record<string, unknown> = {},
+) => ({
+  type: "system",
+  subtype: "task_notification",
+  task_id,
+  status: "completed",
+  output_file: "/tmp/out",
+  summary: 'Background command "review" completed',
+  session_id: "sess-new",
+  ...overrides,
+});
+
+/** The task events posted, each parsed with the schema the API applies, so one it would reject fails the test. */
+const taskEvents = (posted: RunnerEventPost[]) =>
+  posted
+    .filter(
+      (e) =>
+        e.type === "claude.TaskNotification" ||
+        e.type === "claude.BackgroundTasksChanged",
+    )
+    .map((e) => RunnerEventPost.parse(e));
+
+/** A background-task set of the given (id, type) pairs, none ambient. */
+const taskSet = (...tasks: Array<[id: string, type: string]>) => ({
+  ...backgroundTasks(0),
+  tasks: tasks.map(([task_id, task_type]) => ({
+    task_id,
+    task_type,
+    description: "a task",
+  })),
+});
+
+/** Runs a script that ends with nothing live, and returns the task events it posted. */
+async function postedTaskEvents(script: unknown[]) {
+  const { posted, post } = recorder();
+  await runSession(config, {
+    query: claudeProcess(
+      [init, ...script, backgroundTasks(0), success],
+      () => {},
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  return taskEvents(posted);
+}
+
+test("a task_notification is posted with its task id, the type its task was listed with, status and summary, and a hold in effect is kept", async () => {
+  const seen: boolean[] = [];
+  const { posted, post } = recorder();
+  const outcome = await runSession(config, {
+    query: claudeProcess(
+      [
+        init,
+        backgroundTasks(1),
+        success,
+        () => {},
+        taskNotification("t0"),
+        // a beat after the notification: an input it closed early would show here
+        () => {},
+        backgroundTasks(0),
+        success,
+      ],
+      (inputEnded) => seen.push(inputEnded),
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(seen).toEqual([false, false, true]);
+  expect(outcome).toBe(0);
+  expect(taskEvents(posted).map((e) => [e.type, e.payload])).toEqual([
+    [
+      "claude.BackgroundTasksChanged",
+      { tasks: [{ taskId: "t0", taskType: "local_bash", ambient: false }] },
+    ],
+    [
+      "claude.TaskNotification",
+      {
+        taskId: "t0",
+        taskType: "local_bash",
+        status: "completed",
+        summary: 'Background command "review" completed',
+        ambient: false,
+      },
+    ],
+    ["claude.BackgroundTasksChanged", { tasks: [] }],
+  ]);
+});
+
+test("a task_notification's summary is sent whole up to RUNNER_TEXT_MAX and cut there, for the API to redact before it trims", async () => {
+  const secret = "sk-ant-0123456789abcdef";
+  const { posted, post } = recorder();
+  await runSession(config, {
+    query: claudeProcess(
+      [
+        init,
+        taskNotification("t9", {
+          status: "failed",
+          reason: "worker_restart",
+          summary: `${secret} ${"y".repeat(RUNNER_TEXT_MAX)}`,
+        }),
+        success,
+      ],
+      () => {},
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  const [event] = taskEvents(posted);
+  expect(event?.type).toBe("claude.TaskNotification");
+  const payload = event?.payload as { summary: string; status: string };
+  expect(payload.status).toBe("failed");
+  expect(payload.summary).toHaveLength(RUNNER_TEXT_MAX);
+  // the secret is still whole: redacting it is the API's, which sees the full text
+  expect(payload.summary.startsWith(secret)).toBe(true);
+});
+
+test("background_tasks_changed is posted only when the set changes", async () => {
+  const { posted, post } = recorder();
+  await runSession(config, {
+    query: claudeProcess(
+      [
+        init,
+        backgroundTasks(0),
+        backgroundTasks(1, true),
+        backgroundTasks(1, true),
+        backgroundTasks(2),
+        backgroundTasks(2),
+        // nothing live at the end, so the run ends by its own result, not the process's give-up
+        backgroundTasks(0),
+        success,
+      ],
+      () => {},
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(taskEvents(posted).map((e) => e.payload)).toEqual([
+    { tasks: [{ taskId: "t0", taskType: "local_bash", ambient: true }] },
+    {
+      tasks: [
+        { taskId: "t0", taskType: "local_bash", ambient: false },
+        { taskId: "t1", taskType: "local_bash", ambient: false },
+      ],
+    },
+    { tasks: [] },
+  ]);
+});
+
+test("a task turning from ambient to live is posted, though its id and type are the same", async () => {
+  const events = await postedTaskEvents([
+    backgroundTasks(1, true),
+    backgroundTasks(1),
+  ]);
+  expect(events.map((e) => e.payload)).toEqual([
+    { tasks: [{ taskId: "t0", taskType: "local_bash", ambient: true }] },
+    { tasks: [{ taskId: "t0", taskType: "local_bash", ambient: false }] },
+    { tasks: [] },
+  ]);
+});
+
+test("a task whose type changes is posted, though its id and ambient flag are the same", async () => {
+  const events = await postedTaskEvents([
+    taskSet(["t0", "local_bash"]),
+    taskSet(["t0", "local_agent"]),
+  ]);
+  expect(events.map((e) => e.payload)).toEqual([
+    { tasks: [{ taskId: "t0", taskType: "local_bash", ambient: false }] },
+    { tasks: [{ taskId: "t0", taskType: "local_agent", ambient: false }] },
+    { tasks: [] },
+  ]);
+});
+
+test("the same tasks listed in a different order are not posted again", async () => {
+  const events = await postedTaskEvents([
+    taskSet(["a", "local_bash"], ["b", "local_agent"]),
+    taskSet(["b", "local_agent"], ["a", "local_bash"]),
+  ]);
+  expect(events.map((e) => e.payload)).toEqual([
+    {
+      tasks: [
+        { taskId: "a", taskType: "local_bash", ambient: false },
+        { taskId: "b", taskType: "local_agent", ambient: false },
+      ],
+    },
+    { tasks: [] },
+  ]);
+});
+
+test("a set of 51 live tasks is posted as its first 50", async () => {
+  const ids = Array.from({ length: 51 }, (_, i) => `t${i}`);
+  const [event] = await postedTaskEvents([
+    taskSet(...ids.map((id): [string, string] => [id, "local_bash"])),
+  ]);
+  if (!event) throw new Error("no background-task event was posted");
+  const { tasks } = event.payload as { tasks: { taskId: string }[] };
+  expect(tasks.map((t) => t.taskId)).toEqual(ids.slice(0, 50));
+});
+
+test("a task_notification for a task never listed is posted with its reason and no task type or ambient flag", async () => {
+  const events = await postedTaskEvents([
+    taskNotification("ghost", { status: "failed", reason: "worker_restart" }),
+  ]);
+  expect(events.map((e) => [e.type, e.payload])).toEqual([
+    [
+      "claude.TaskNotification",
+      {
+        taskId: "ghost",
+        status: "failed",
+        summary: 'Background command "review" completed',
+        reason: "worker_restart",
+      },
+    ],
+  ]);
+});
+
+test.each([
+  { listed: false, notified: true },
+  { listed: true, notified: false },
+])(
+  "a task_notification's own ambient ($notified) wins over the listed one ($listed)",
+  async ({ listed, notified }) => {
+    const events = await postedTaskEvents([
+      backgroundTasks(1, listed),
+      taskNotification("t0", { ambient: notified }),
+    ]);
+    const notice = events.find((e) => e.type === "claude.TaskNotification");
+    expect(notice?.payload).toMatchObject({ taskId: "t0", ambient: notified });
+  },
+);
 
 type WokenTurn = (
   options: Options,

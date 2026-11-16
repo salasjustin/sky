@@ -259,7 +259,7 @@ export const events = sqliteTable(
       sql`${c(t.type)} in ('run.started', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped', 'run.resumed',
         'run.probed', 'runner.warning', 'runner.heartbeat',
         'claude.PreToolUse', 'claude.PostToolUse', 'claude.PostToolUseFailure', 'claude.SubagentStart', 'claude.SubagentStop',
-        'claude.TaskCreated', 'claude.TaskCompleted', 'claude.Notification', 'claude.PreCompact', 'claude.FileChanged', 'claude.Message')`,
+        'claude.TaskCreated', 'claude.TaskCompleted', 'claude.TaskNotification', 'claude.BackgroundTasksChanged', 'claude.Notification', 'claude.PreCompact', 'claude.FileChanged', 'claude.Message')`,
     ),
     check("events_ts", isoUtc(t.ts)),
     check("events_payload", sql`json_type(${c(t.payload)}) = 'object'`),

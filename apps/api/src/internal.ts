@@ -51,6 +51,8 @@ const statusAfter: Record<EventType, RunStatus | null> = {
   "claude.SubagentStop": null,
   "claude.TaskCreated": null,
   "claude.TaskCompleted": null,
+  "claude.TaskNotification": null,
+  "claude.BackgroundTasksChanged": null,
   "claude.Notification": null,
   "claude.PreCompact": null,
   "claude.FileChanged": null,

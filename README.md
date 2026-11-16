@@ -440,21 +440,23 @@ Runs on one sprite share its repo, so a run's worktree setup takes the repo lock
 
 What an agent does arrives as events, each with `agentId`, `environmentId` (the environment the agent belongs to) and `runId`:
 
-| event                                                                  | when                                                                  |
-| ---------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `run.started`, `run.finished`, `run.failed`, `run.stopped`             | the run's lifecycle                                                   |
-| `run.waiting`                                                          | the agent needs an `answer` or an approval                            |
-| `run.resumed`                                                          | a question was answered or a tool call approved or denied             |
-| `run.probed`                                                           | a silent run's runner was checked on its sprite and found alive       |
-| `runner.warning`                                                       | the runner hit a problem that didn't end the run, with its message    |
-| `runner.heartbeat`                                                     | a tool call is still running: its name and how long, about every 60 s |
-| `claude.Message`                                                       | Claude, or a subagent (with `parentToolUseId`), wrote a message       |
-| `claude.PreToolUse`, `claude.PostToolUse`, `claude.PostToolUseFailure` | a tool call starts, finishes or fails, with its input and output      |
-| `claude.SubagentStart`, `claude.SubagentStop`                          | a subagent starts or finishes                                         |
-| `claude.TaskCreated`, `claude.TaskCompleted`                           | a todo item is added or finished                                      |
-| `claude.Notification`, `claude.PreCompact`, `claude.FileChanged`       | Claude Code's notifications, context compaction, watched-file changes |
+| event                                                                  | when                                                                                                                            |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `run.started`, `run.finished`, `run.failed`, `run.stopped`             | the run's lifecycle                                                                                                             |
+| `run.waiting`                                                          | the agent needs an `answer` or an approval                                                                                      |
+| `run.resumed`                                                          | a question was answered or a tool call approved or denied                                                                       |
+| `run.probed`                                                           | a silent run's runner was checked on its sprite and found alive                                                                 |
+| `runner.warning`                                                       | the runner hit a problem that didn't end the run, with its message                                                              |
+| `runner.heartbeat`                                                     | a tool call is still running: its name and how long, about every 60 s                                                           |
+| `claude.Message`                                                       | Claude, or a subagent (with `parentToolUseId`), wrote a message                                                                 |
+| `claude.PreToolUse`, `claude.PostToolUse`, `claude.PostToolUseFailure` | a tool call starts, finishes or fails, with its input and output                                                                |
+| `claude.SubagentStart`, `claude.SubagentStop`                          | a subagent starts or finishes                                                                                                   |
+| `claude.TaskCreated`, `claude.TaskCompleted`                           | a todo item is added or finished                                                                                                |
+| `claude.TaskNotification`                                              | a background task (a shell, monitor or subagent) ended: its `taskId`, `taskType` when known, `status` and `summary`             |
+| `claude.BackgroundTasksChanged`                                        | the set of background tasks changed: each one's `taskId`, `taskType` and whether it is `ambient` (a watcher that wakes no turn) |
+| `claude.Notification`, `claude.PreCompact`, `claude.FileChanged`       | Claude Code's notifications, context compaction, watched-file changes                                                           |
 
-The `claude.*` names are Claude Code's own hook names. Each text field is redacted (registered secrets and tokens) and then cut to 4,096 characters (`runner.warning` included). `claude.*` and `runner.heartbeat` events are kept for 7 days; `run.*` and `runner.warning` events are kept.
+A run that goes quiet while background tasks run is explained by `claude.BackgroundTasksChanged` (what was running) and `claude.TaskNotification` (what each task's end notice said; recording a notice doesn't change how long the run waits for its tasks). The `claude.*` names are Claude Code's own hook names, except those two and `claude.Message`, which come from Claude's message stream. Each text field is redacted (registered secrets and tokens) and then cut to 4,096 characters (`runner.warning` included). `claude.*` and `runner.heartbeat` events are kept for 7 days; `run.*` and `runner.warning` events are kept.
 
 Three ways to receive them:
 
