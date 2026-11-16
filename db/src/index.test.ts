@@ -3,6 +3,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1258,43 +1259,150 @@ const staleFile = () => {
 const tables = () =>
   db.$client.prepare("select name, sql from sqlite_schema order by name").all();
 
-test("migrate refuses, naming the bytes needed and free, when the volume can't hold a rewrite, and leaves the file untouched", () => {
+// bytes on disk of a table and its indexes, as a rebuild copies them
+const bytesOf = (table: string) =>
+  db.$client
+    .prepare(
+      "select coalesce(sum(pgsize), 0) from dbstat where name in (select name from sqlite_schema where tbl_name = ?)",
+    )
+    .pluck()
+    .get(table) as number;
+
+const freePageBytes = () =>
+  (db.$client.pragma("freelist_count", { simple: true }) as number) *
+  (db.$client.pragma("page_size", { simple: true }) as number);
+
+// rebuilds of `copied` bytes in one transaction: all of it in the WAL, plus what the free pages can't absorb
+const neededFor = (copied: number) =>
+  copied + Math.max(0, copied - freePageBytes()) + MIGRATION_MARGIN_BYTES;
+
+const insertEvents = (n: number) =>
+  run(
+    "insert into events (run_id, ts, type, payload) select 'run_1', '2026-10-29T12:00:00.000Z', 'run.started', json_object('t', hex(randomblob(1500))) from (with recursive n(i) as (select 1 union all select i + 1 from n where i < ?) select i from n)",
+    n,
+  );
+
+const filler = (rows: number) => {
+  run("create table filler (x text)");
+  run(
+    "insert into filler select hex(randomblob(2000)) from (with recursive n(i) as (select 1 union all select i + 1 from n where i < ?) select i from n)",
+    rows,
+  );
+};
+
+const mb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+
+const journalTags = () =>
+  (
+    JSON.parse(
+      readFileSync(
+        new URL("../drizzle/meta/_journal.json", import.meta.url),
+        "utf8",
+      ),
+    ) as { entries: { tag: string }[] }
+  ).entries.map((e) => e.tag);
+
+test("migrate refuses when the volume can't hold the rebuild, and leaves the file untouched", () => {
   staleFile();
   const before = tables();
-  const pragma = (name: string) =>
-    db.$client.pragma(name, { simple: true }) as number;
-  const pageSize = pragma("page_size");
-  const live = (pragma("page_count") - pragma("freelist_count")) * pageSize;
-  const growth = Math.max(0, live - pragma("freelist_count") * pageSize);
-  const needed = live + growth + MIGRATION_MARGIN_BYTES;
+  const needed = neededFor(bytesOf("events"));
 
   expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
-    `not enough free disk space to migrate ${path}: needs ${needed} bytes (${live} of live data in the WAL, ${growth} of file growth and a ${MIGRATION_MARGIN_BYTES} margin), only ${needed - 1} bytes free`,
+    /not enough free disk space/,
   );
   expect(tables()).toEqual(before);
   expect(count("events")).toBe(50);
 });
 
-test("migrate counts free pages as room already in the file, so they shrink what it needs", () => {
-  staleFile();
-  run("create table filler (x text)");
-  run(
-    "insert into filler select hex(randomblob(2000)) from (with recursive n(i) as (select 1 union all select i + 1 from n where i < 500) select i from n)",
+test("the refusal names the pending migrations, the sizes in MB and the fix, on one line", () => {
+  migrateThrough("0016_silly_jetstream");
+  seedRun();
+  insertEvents(200);
+  const events = bytesOf("events");
+  const growth = Math.max(0, 2 * events - freePageBytes());
+  const needed = neededFor(2 * events);
+  const free = needed - 1;
+
+  let message = "";
+  try {
+    migrate(db, { freeBytes: () => free });
+  } catch (err) {
+    message = err instanceof Error ? err.message : String(err);
+  }
+  expect(message).toBe(
+    `not enough free disk space to migrate ${path}: 0017_plain_ultimatum, 0018_mute_triathlon need ${mb(needed)} (${mb(2 * events)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
   );
-  run("drop table filler");
-  const free = db.$client.pragma("freelist_count", { simple: true }) as number;
-  expect(free).toBeGreaterThan(100);
-  const pageSize = db.$client.pragma("page_size", { simple: true }) as number;
-  const pages = db.$client.pragma("page_count", { simple: true }) as number;
-  const live = (pages - free) * pageSize;
-  // the free pages absorb part of the copy, so the file grows by less than the live data
-  const needed =
-    live + Math.max(0, live - free * pageSize) + MIGRATION_MARGIN_BYTES;
+});
+
+test("two pending rebuilds of one table are charged twice, since drizzle runs them in one transaction", () => {
+  migrateThrough("0016_silly_jetstream");
+  seedRun();
+  insertEvents(200);
+  const needed = neededFor(2 * bytesOf("events"));
 
   expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
     /not enough free disk space/,
   );
   expect(() => migrate(db, { freeBytes: () => needed })).not.toThrow();
+  expect(count("events")).toBe(200);
+});
+
+test("migrate counts free pages as room already in the file, so they shrink what it needs", () => {
+  staleFile();
+  insertEvents(400);
+  filler(150);
+  run("drop table filler");
+  const events = bytesOf("events");
+  // part of the copy, not all of it, fits in the free pages
+  expect(freePageBytes()).toBeGreaterThan(0);
+  expect(freePageBytes()).toBeLessThan(events);
+  const needed = neededFor(events);
+  expect(needed).toBeLessThan(2 * events + MIGRATION_MARGIN_BYTES);
+
+  expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
+    /not enough free disk space/,
+  );
+  expect(() => migrate(db, { freeBytes: () => needed })).not.toThrow();
+});
+
+test("live data in tables no pending migration rebuilds isn't charged", () => {
+  staleFile();
+  filler(2000);
+  const events = bytesOf("events");
+  expect(bytesOf("filler")).toBeGreaterThan(10 * events);
+  const needed = neededFor(events);
+
+  expect(() => migrate(db, { freeBytes: () => needed })).not.toThrow();
+  expect(count("filler")).toBe(2000);
+});
+
+test("migrate checkpoints a leftover WAL before reading free space, so its bytes count as free", () => {
+  staleFile();
+  const walSize = () => statSync(`${path}-wal`).size;
+  expect(walSize()).toBeGreaterThan(0);
+  let walWhenAsked = -1;
+
+  migrate(db, {
+    freeBytes: () => {
+      walWhenAsked = walSize();
+      return Number.MAX_SAFE_INTEGER;
+    },
+  });
+  expect(walWhenAsked).toBe(0);
+});
+
+test("migrate returns the tags it applied, in order, and nothing on a second call", () => {
+  const noRoom = { freeBytes: () => 0 };
+  expect(migrate(db, noRoom)).toEqual(journalTags());
+  expect(migrate(db, noRoom)).toEqual([]);
+});
+
+test("migrate on an older file returns only the migrations that were pending", () => {
+  migrateThrough("0016_silly_jetstream");
+  const tags = journalTags();
+  expect(migrate(db, { freeBytes: () => Number.MAX_SAFE_INTEGER })).toEqual(
+    tags.slice(tags.indexOf("0016_silly_jetstream") + 1),
+  );
 });
 
 test("migrate passes when the volume has the room, and asks about the volume holding the file", () => {
