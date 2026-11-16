@@ -2220,7 +2220,7 @@ test("sync with an argument other than --help exits 2 with the usage on stderr",
   expect(result).toEqual({
     code: 2,
     out: "",
-    err: "sky sync: takes no arguments but --branch <name>\nusage: sync [--branch <name>]\n",
+    err: "sky sync: takes no arguments other than --branch <name>\nusage: sync [--branch <name>]\n",
   });
   expect(requests).toEqual([]);
 });
@@ -2446,7 +2446,7 @@ test("sync says a worktree already has GitHub's head, with its unpublished commi
     code: 0,
     out: said(
       TRUNK_CURRENT(),
-      `claude/agt_1 on GitHub is at ${sevenOf(tip)}, and your worktree already has it with 1 commit on top that aren't published; nothing to bring in.`,
+      `claude/agt_1 on GitHub is at ${sevenOf(tip)}, and your worktree already has it with 1 commit on top not yet published; nothing to bring in.`,
     ),
     err: "",
   });
@@ -2748,7 +2748,7 @@ test("sync refuses a branch whose walk back passes 101 commits without reaching 
   expect(result).toEqual({
     code: 1,
     out: `${TRUNK_CURRENT()}\n`,
-    err: `sky sync: claude/agt_1 on GitHub is at ${sevenOf(tip)}; none of the 101 commits seen walking back from it matches this worktree, so it can't be told what is new. Your worktree (at ${sevenOf(sha)}) was not changed.\n`,
+    err: `sky sync: claude/agt_1 on GitHub is at ${sevenOf(tip)}; none of the 101 commits seen walking back from it matches this worktree, so sync can't tell what is new. Your worktree (at ${sevenOf(sha)}) was not changed.\n`,
   });
   expect(
     requests.filter((r) => r.startsWith("GET /git/commits/")),
@@ -2972,7 +2972,7 @@ test("sync in a detached HEAD says to check out the branch, and changes nothing"
   expect(result).toEqual({
     code: 1,
     out: `${TRUNK_CURRENT()}\n`,
-    err: "sky sync: HEAD is detached in this worktree, so its GitHub branch can't be told; check out your branch and sync again. Nothing was changed.\n",
+    err: "sky sync: HEAD is detached in this worktree, so sync can't tell which GitHub branch it publishes to; check out your branch and sync again. Nothing was changed.\n",
   });
   expect(requests).toEqual(["GET /git/ref/heads/trunk"]);
   unchanged();

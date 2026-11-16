@@ -633,10 +633,8 @@ async function locateOnGitHub(options: {
  * Brings commits pushed to the agent's GitHub `branch` from outside the sandbox into its existing
  * worktree, when that can't lose anything: the worktree is clean, everything in it is published,
  * and the outside commits sit on top, merges among them only where they fast-forward. GitHub's
- * history is classified before any body is fetched: walking the tip's first parents to the first commit that matches the worktree, by sha
- * (HEAD, or an ancestor of it) or by tree (HEAD's, or one on its first-parent line since the
- * default branch), since `publish` recreates commits on GitHub under new shas. Anything else is
- * left as it is, with a note. `published` is whether GitHub has the branch at all.
+ * history is classified by `locateOnGitHub` before any body is fetched. Anything else is left as
+ * it is, with a note. `published` is whether GitHub has the branch at all.
  */
 export async function syncAgentBranch(options: {
   repoDir: string;
@@ -750,13 +748,14 @@ export async function syncAgentBranch(options: {
  * Commits pushed from outside are fast-forwarded in when the worktree has no unpublished commits,
  * and the unpublished ones are rebased onto them when it has some. When there are commits from
  * outside and `localBranch` continues no GitHub branch yet, it is recorded as continuing `branch`,
- * so `publish` only fast-forwards it from then on. It is refused, with the worktree and
- * local branch left as they were, for a worktree with uncommitted changes, unpublished commits
- * that include a merge, a rebase that conflicts or a branch too far ahead to fetch. Unlike
- * `syncAgentBranch`, which leaves the worktree's own shas and cherry-picks, the published commits
- * here are replaced by GitHub's, so `git log` and GitHub agree. `lines` is what to tell the agent;
- * `ok` is false when the worktree was left as it was for a reason it should act on, and `moved`
- * true when the worktree was moved. A branch GitHub doesn't have is left alone.
+ * so `publish` only fast-forwards it from then on. It is refused, with the worktree and local
+ * branch left as they were, for a GitHub history that matches nothing here, a worktree with
+ * uncommitted changes, unpublished commits that include a merge, a rebase that conflicts or a
+ * branch too far ahead to fetch. Unlike `syncAgentBranch`, which leaves the worktree's own shas
+ * and cherry-picks, the published commits here are replaced by GitHub's, so `git log` and GitHub
+ * agree. `lines` is what to tell the agent; `ok` is false when the worktree was left as it was for
+ * a reason it should act on, and `moved` true when the worktree was moved. A branch GitHub doesn't
+ * have is left alone.
  */
 export async function syncOwnBranch(options: {
   repoDir: string;
@@ -795,7 +794,7 @@ export async function syncOwnBranch(options: {
   });
   if (!match) {
     return refuse(
-      `none of the ${commits(outside.length)} seen walking back from it matches this worktree, so it can't be told what is new`,
+      `none of the ${commits(outside.length)} seen walking back from it matches this worktree, so sync can't tell what is new`,
     );
   }
   // GitHub's head is HEAD or under it, and nothing is on top of it from outside
@@ -806,7 +805,7 @@ export async function syncOwnBranch(options: {
     return {
       ok: true,
       lines: [
-        `${at}, and your worktree already has it${ahead > 0 ? ` with ${commits(ahead)} on top that aren't published` : ""}; nothing to bring in.`,
+        `${at}, and your worktree already has it${ahead > 0 ? ` with ${commits(ahead)} on top not yet published` : ""}; nothing to bring in.`,
       ],
     };
   }
@@ -878,7 +877,8 @@ export async function syncOwnBranch(options: {
       if (await isAncestor(cwd, head, tip)) {
         await inTree(cwd, ...hooksOff, "merge", "--ff-only", "--quiet", tip);
       } else {
-        // same tree as GitHub's commit it matches, so only the commits' shas change
+        // HEAD has the tree of the GitHub commit it matches, so this keeps its work and adds only
+        // what was pushed on top
         await inTree(cwd, ...hooksOff, "reset", "--keep", "--quiet", tip);
       }
     } catch (error) {
@@ -1159,7 +1159,7 @@ export async function syncMain(
   const args = syncArgs(argv);
   if (!args) {
     io.stderr(
-      `sky sync: takes no arguments but --branch <name>\nusage: ${SYNC_USAGE}\n`,
+      `sky sync: takes no arguments other than --branch <name>\nusage: ${SYNC_USAGE}\n`,
     );
     return 2;
   }
@@ -1263,7 +1263,7 @@ async function syncWorktreeBranch(options: {
       return {
         ok: false,
         lines: [
-          "HEAD is detached in this worktree, so its GitHub branch can't be told; check out your branch and sync again. Nothing was changed.",
+          "HEAD is detached in this worktree, so sync can't tell which GitHub branch it publishes to; check out your branch and sync again. Nothing was changed.",
         ],
       };
     }
@@ -1289,7 +1289,7 @@ async function syncWorktreeBranch(options: {
       return {
         ok: false,
         lines: [
-          `${branch} is the default branch, which \`publish\` never sends to; name your own branch with --branch. Nothing was changed.`,
+          `${branch} is the default branch, which \`publish\` never sends to; name your own branch with \`--branch\`. Nothing was changed.`,
         ],
       };
     }
