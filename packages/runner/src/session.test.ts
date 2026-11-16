@@ -800,6 +800,23 @@ test("the session turns Claude Code's commit and pull request attribution off", 
   expect(settings).toEqual({
     attribution: { commit: "", pr: "" },
     ...PINNED_SETTINGS,
+    env: { KRU_NO_LEAD_GATE: "1" },
+  });
+});
+
+test("the session's flag settings turn kru's lead gate off, above any settings file's env", async () => {
+  // a settings file's `env` is written over the process env, and `""` would turn the gate back on;
+  // the flag layer outranks those files, so the pin there is what holds (the real-binary case is in
+  // approved-call.test.ts)
+  const query = scripted([init, success]);
+  await runSession(config, {
+    query,
+    post: recorder().post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(query.calls[0]?.options.settings).toMatchObject({
+    env: { KRU_NO_LEAD_GATE: "1" },
   });
 });
 
@@ -1038,7 +1055,7 @@ test("a check written as plain `claude -p` is still run with every project crede
     expect(append).toContain('- claude -p "/acme:review"');
     expect(append).not.toContain("as written");
     const instruction =
-      /`CLAUDE_CODE_OAUTH_TOKEN="\$\(<\S+\)" (env (?:-u \S+ )+(?:\S+=\S+ )*)claude -p …`, even where/;
+      /`CLAUDE_CODE_OAUTH_TOKEN="\$\(<\S+\)" (env (?:-u \S+ )+(?:\S+=\S+ )*)claude [^`]*-p …`, even where/;
     const prefix = instruction.exec(append)?.[1] ?? "";
     for (const name of [
       "ANTHROPIC_API_KEY",
@@ -2084,7 +2101,7 @@ describe("the Claude credential of a run", () => {
         { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
       );
       expect(append).toMatch(
-        /Run each command that calls `claude` .*, as `CLAUDE_CODE_OAUTH_TOKEN="\$\(<'[^']+'\)" env -u ANTHROPIC_API_KEY -u .* CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 KRU_NO_LEAD_GATE=1 claude -p …`, even where the check leaves that prefix out\./,
+        /Run each command that calls `claude` .*, as `CLAUDE_CODE_OAUTH_TOKEN="\$\(<'[^']+'\)" env -u ANTHROPIC_API_KEY -u .* CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 KRU_NO_LEAD_GATE=1 claude --settings '\{"env":\{"KRU_NO_LEAD_GATE":"1"\}\}' -p …`, even where the check leaves that prefix out\./,
       );
     });
 
@@ -2330,16 +2347,18 @@ describe("the Claude credential of a run", () => {
         "run_1",
         join(root, "logins"),
       );
-    /** Runs the command in bash as a Bash command would, with `program` in place of `claude -p …`. */
+    /** Runs the command in bash as a Bash command would, with `program` in place of `claude … -p …`. */
     const run = (
       command: string,
       program: string,
       env: Record<string, string> = {},
-    ) =>
-      execFileSync("bash", ["-c", command.replace(/claude -p …$/, program)], {
+    ) => {
+      const shell = command.replace(/claude .*-p …$/, program);
+      return execFileSync("bash", ["-c", shell], {
         env: { PATH: process.env.PATH, ...env },
         encoding: "utf8",
       });
+    };
 
     test("the credential is assigned by the shell ahead of env, so neither the command nor env's argv holds it", async () => {
       const { prefix } = await loginOf("oauth");
@@ -2375,6 +2394,27 @@ describe("the Claude credential of a run", () => {
             value === undefined ? {} : { KRU_NO_LEAD_GATE: value },
           ),
         ).toBe("1\n");
+    });
+
+    test("the nested claude is handed flag settings that pin kru's lead gate off, as one shell word of JSON", async () => {
+      const { prefix } = await loginOf("oauth");
+      // a `claude` on PATH that prints each argument it was given on a line of its own
+      const bin = join(root, "fake-bin");
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(join(bin, "claude"), "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+      chmodSync(join(bin, "claude"), 0o755);
+      const command = nestedClaude(prefix).replace(/…$/, "check");
+      const out = execFileSync("bash", ["-c", command], {
+        env: { PATH: `${bin}:${process.env.PATH}` },
+        encoding: "utf8",
+      });
+      const argv = out.split("\n");
+      const at = argv.indexOf("--settings");
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect(JSON.parse(argv[at + 1] ?? "")).toEqual({
+        env: { KRU_NO_LEAD_GATE: "1" },
+      });
+      expect(argv.slice(-3)).toEqual(["-p", "check", ""]);
     });
 
     test("on a subscription run the nested claude gets the run's token, never the project's ANTHROPIC_API_KEY, and no other project variable", async () => {
@@ -2911,6 +2951,53 @@ test("an approved hold on Claude's question adds no allow, so canUseTool still t
   ).toEqual(["approval", "question"]);
 });
 
+test("an approved hold on Claude's question with a reason hands Claude the note and still adds no allow", async () => {
+  const { deps } = api(
+    decided({ decision: "approve", reason: "ask away" }),
+    decided({ decision: "answer", answer: "SQLite" }),
+  );
+  let answers: unknown[] = [];
+  let permission: unknown;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", {
+        tool_name: "AskUserQuestion",
+        tool_input: { questions },
+        tool_use_id: "q1",
+      });
+      permission = await options.canUseTool?.(
+        "AskUserQuestion",
+        { questions },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "q1",
+          requestId: "perm_1",
+        },
+      );
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["AskUserQuestion"] },
+    { ...deps, query },
+  );
+  expect(answers).toEqual([
+    {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        additionalContext:
+          "The person who approved this tool call noted: ask away",
+      },
+    },
+  ]);
+  expect(permission).toEqual({
+    behavior: "allow",
+    updatedInput: { questions, answers: { "Which database?": "SQLite" } },
+  });
+});
+
 test("a read-only Bash command runs without an approval request even under a bare Bash policy", async () => {
   const { sent, deps } = api();
   let answers: unknown[] = [];
@@ -3142,6 +3229,39 @@ test.each([
   ["text blocks", [{ type: "text", text: REFUSAL_CANCEL }]],
 ])(
   "an approved call the SDK cancelled with %s posts no warning of any kind",
+  async (_name, content) => {
+    const { sent, deps } = api(decided({ decision: "approve" }));
+    const warned: string[] = [];
+    const query = scripted([
+      init,
+      firePush,
+      errorResult("t1", content),
+      success,
+    ]);
+    await runSession(
+      { ...config, approvalPolicy: ["Bash(git push:*)"] },
+      { ...deps, query, warn: (line) => warned.push(line) },
+    );
+    expect(sent.filter((e) => e.type === "runner.warning")).toEqual([]);
+    expect(warned).toEqual([]);
+  },
+);
+
+test.each([
+  [
+    "a streaming fallback discarded it",
+    "<tool_use_error>Error: Streaming fallback - tool execution discarded</tool_use_error>",
+  ],
+  [
+    "Claude ended the conversation",
+    "<tool_use_error>Cancelled: Claude ended the conversation</tool_use_error>",
+  ],
+  [
+    "Claude Code skipped it beside another call's denial",
+    "[Tool call skipped: the turn was stopped before this call ran, by the check whose denial is on another call in this batch. Nothing refused this call and it had no effects; re-run it if still needed.]",
+  ],
+])(
+  "an approved call Claude Code dropped because %s posts no warning of any kind",
   async (_name, content) => {
     const { sent, deps } = api(decided({ decision: "approve" }));
     const warned: string[] = [];
@@ -5274,12 +5394,44 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       };
     }[];
     expect(answer?.hookSpecificOutput.permissionDecision).toBe("allow");
+    // approved with no reason, so there is no note
+    expect(answer?.hookSpecificOutput).not.toHaveProperty("additionalContext");
     const copy = answer?.hookSpecificOutput.updatedInput.file_path ?? "";
     expect(copy.startsWith(`${scratch}/`)).toBe(true);
     expect(copy.endsWith("/elsewhere.log")).toBe(true);
     // the run ended, so the copy went with the scratch directory
     expect(existsSync(copy)).toBe(false);
     expect(sent.map((e) => e.type)).not.toContain("runner.warning");
+  });
+
+  test("an outside Read approved with a reason reads the copy and hands Claude the reason as a note", async () => {
+    const outside = join(root, "elsewhere.log");
+    writeFileSync(outside, "outside contents\n");
+    const { deps } = api(
+      decided({ decision: "approve", reason: "the log is fine to read" }),
+    );
+    let answers: unknown[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        answers = await fire(options, "PreToolUse", readOf(outside));
+      },
+      success,
+    ]);
+    await runSession(gated(), { ...deps, query });
+    const [answer] = answers as {
+      hookSpecificOutput: {
+        permissionDecision: string;
+        additionalContext?: string;
+        updatedInput: { file_path: string };
+      };
+    }[];
+    expect(answer?.hookSpecificOutput.permissionDecision).toBe("allow");
+    const copy = answer?.hookSpecificOutput.updatedInput.file_path ?? "";
+    expect(copy.endsWith("/elsewhere.log")).toBe(true);
+    expect(answer?.hookSpecificOutput.additionalContext).toBe(
+      "The person who approved this tool call noted: the log is fine to read",
+    );
   });
 
   test("an approved copy holds the file's contents while the run is live", async () => {

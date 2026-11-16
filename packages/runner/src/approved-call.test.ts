@@ -152,9 +152,9 @@ const toolResultsIn = (requests: Body[]) =>
     ),
   );
 
-/** The command a check's nested `claude` runs, as the prompt gives it, with `tail` in place of `claude -p …`. */
+/** The command a check's nested `claude` runs, as the prompt gives it, with `tail` in place of `claude … -p …`. */
 const nestedCheck = (tail: string) => (system: string) => {
-  const prefix = /as `([^`]*)claude -p …`/.exec(system)?.[1];
+  const prefix = /as `([^`]*?)claude [^`]*-p …`/.exec(system)?.[1];
   if (!prefix) throw new Error("the prompt names no nested claude command");
   return `${prefix}${tail}`;
 };
@@ -293,6 +293,25 @@ async function heldRun(
   }
 }
 
+/**
+ * A PreToolUse hook that does what kru's require-lead.sh does from the sprite's own settings: exit 2
+ * until its switch is set. It records the switch it saw at `marker`, so a hook that never loaded
+ * can't pass for one that did.
+ */
+const leadHook = (marker: string) => ({
+  PreToolUse: [
+    {
+      matcher: "Bash",
+      hooks: [
+        {
+          type: "command",
+          command: `printf %s "$KRU_NO_LEAD_GATE" > '${marker}'; [ -n "$KRU_NO_LEAD_GATE" ] || { echo 'load the lead contract, then take the action again' >&2; exit 2; }`,
+        },
+      ],
+    },
+  ],
+});
+
 const types = (sent: RunnerEventPost[]) => sent.map((e) => e.type);
 const warnings = (sent: RunnerEventPost[]) =>
   sent.flatMap((e) => (e.type === "runner.warning" ? [e.payload.message] : []));
@@ -342,27 +361,51 @@ describe.skipIf(!claudeBinary)(
     }, 90_000);
 
     test("with a lead-contract hook installed that refuses unless KRU_NO_LEAD_GATE is set, the approved call runs and Claude is not told to ask again", async () => {
-      // kru's require-lead.sh does this from the sprite's own settings: exit 2 until its switch is set.
-      // The hook records the switch it saw, so a hook that never loaded can't pass for one that did.
       const marker = join(root, "lead-hook-saw");
       writeFileSync(
         join(home, ".claude", "settings.json"),
-        JSON.stringify({
-          hooks: {
-            PreToolUse: [
-              {
-                matcher: "Bash",
-                hooks: [
-                  {
-                    type: "command",
-                    command: `printf %s "$KRU_NO_LEAD_GATE" > '${marker}'; [ -n "$KRU_NO_LEAD_GATE" ] || { echo 'load the lead contract, then take the action again' >&2; exit 2; }`,
-                  },
-                ],
-              },
-            ],
-          },
-        }),
+        JSON.stringify({ hooks: leadHook(marker) }),
       );
+      const { sent, requests } = await heldRun(nestedCheck("echo RAN"), {
+        decision: "approve",
+      });
+      expect(readFileSync(marker, "utf8")).not.toBe("");
+      expect(types(sent)).toContain("claude.PostToolUse");
+      expect(warnings(sent)).toEqual([]);
+      expect(toolResultsIn(requests)).toEqual([
+        expect.objectContaining({ content: "RAN", is_error: false }),
+      ]);
+    }, 90_000);
+
+    test("with user and project settings files whose env sets KRU_NO_LEAD_GATE empty, the lead-contract hook still sees it set and the approved call runs", async () => {
+      // a settings file's `env` is written over the env the runner passed; only the session's flag
+      // settings outrank it
+      const marker = join(root, "lead-hook-saw");
+      const unset = { env: { KRU_NO_LEAD_GATE: "" } };
+      writeFileSync(
+        join(home, ".claude", "settings.json"),
+        JSON.stringify({ ...unset, hooks: leadHook(marker) }),
+      );
+      // the worktree is cut from origin/HEAD, so the project file is committed there and fetched
+      const origin = join(root, "origin");
+      mkdirSync(join(origin, ".claude"));
+      writeFileSync(
+        join(origin, ".claude", "settings.json"),
+        JSON.stringify(unset),
+      );
+      execFileSync("git", ["-C", origin, "add", "."]);
+      execFileSync("git", [
+        "-C",
+        origin,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "project settings",
+      ]);
+      execFileSync("git", ["-C", join(root, "repo"), "fetch", "-q", "origin"]);
       const { sent, requests } = await heldRun(nestedCheck("echo RAN"), {
         decision: "approve",
       });

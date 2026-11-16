@@ -193,6 +193,11 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
   : never;
 
+// flag settings (the SDK's `settings`, the CLI's `--settings`), which outrank the user, project and
+// local settings files: an `env` entry in one of those replaces the process env's value, and `""`
+// would turn the switch back off
+const LEAD_GATE_OFF = { env: { [NO_LEAD_GATE]: "1" } };
+
 /** Every Agent SDK option a run passes is assembled here; exported for the credential-scope probe. */
 export function sessionOptions(
   config: Config,
@@ -231,10 +236,12 @@ export function sessionOptions(
     env: claudeProcessEnv(sessionEnvOf(config), config.claudeAuth, runnerEnv),
     ...(spawn && { spawnClaudeCodeProcess: spawn }),
     // Claude Code's own commit trailer and pull request footer are off, for hosting that rejects them;
-    // the credential helpers are pinned to none above every settings file, the ones written mid-run included
+    // the credential helpers and kru's lead-gate switch are pinned above every settings file, the ones
+    // written mid-run included
     settings: {
       attribution: { commit: "", pr: "" },
       ...PINNED_SETTINGS,
+      ...LEAD_GATE_OFF,
       ...(commandEnvHooks && { hooks: commandEnvHooks }),
     },
     systemPrompt: {
@@ -328,12 +335,15 @@ export function removeScratchNow(): void {
 // a check's nested `claude` runs without the project's key, auth token, gateway, provider switches and
 // proxies (`PROJECT_VARIABLES`), which commands get back from the command-env file: they would outrank
 // the run's login, or send its credential to the project's gateway. It is host-managed like the
-// session, whatever a command set, and has kru's lead-contract hook off as the session does. A subscription or pool run's token comes from
-// `prepareNestedLogin`'s prefix: a shell assignment ahead of `env`, so the value is never an argument
-// of `env`. An API-key run has no prefix, and the prompt has its `claude` checks reported as not run
+// session, whatever a command set, and has `NO_LEAD_GATE` on as the session does, in its env and its
+// flag settings: kru's lead-contract block and its two session-start reminders are off. A
+// subscription or pool run's token comes from `prepareNestedLogin`'s prefix: a shell assignment
+// ahead of `env`, so the value is never an argument of `env`. An API-key run has no prefix, and the
+// prompt has its `claude` checks reported as not run
 export const nestedClaude = (login: NestedPrefix | undefined) => {
   const prefix = login ? `${login.assignment} ` : "";
-  return `${prefix}env ${PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ")} ${HOST_MANAGED}=1 ${NO_LEAD_GATE}=1 claude -p …`;
+  // single-quoted for the shell: the JSON holds no single quote
+  return `${prefix}env ${PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ")} ${HOST_MANAGED}=1 ${NO_LEAD_GATE}=1 claude --settings '${JSON.stringify(LEAD_GATE_OFF)}' -p …`;
 };
 
 /**
@@ -757,6 +767,11 @@ export async function runSession(
   const visibleReason = (decision: Decision | undefined) =>
     (decision?.decision === "deny" && decision.reason) ||
     "The user denied this tool call.";
+  /** An approve's reason as the note Claude gets beside the call's result; none without a reason. */
+  const approvalNote = (reason: string | undefined) =>
+    reason
+      ? `The person who approved this tool call noted: ${reason}`
+      : undefined;
 
   /**
    * Decides a Read, Grep or Glob of a path outside the worktree and the scratch directory: the env's
@@ -819,11 +834,14 @@ export async function runSession(
         return declined("the run has no scratch directory to copy it into.");
       try {
         const copy = await stageRead(read, scratch, ++staged, refusedReads());
+        const note =
+          decision === "unasked" ? undefined : approvalNote(decision.reason);
         return {
           continue: true,
           hookSpecificOutput: {
             hookEventName: "PreToolUse",
             permissionDecision: "allow",
+            ...(note && { additionalContext: note }),
             updatedInput: {
               ...(input.tool_input as object),
               [read.field]: copy,
@@ -889,20 +907,28 @@ export async function runSession(
       },
       signal,
     );
-    if (decision?.decision === "approve")
+    if (decision?.decision === "approve") {
+      const note = approvalNote(decision.reason);
       // Claude's question gets no allow: one would skip canUseTool, which takes the person's answer
-      return input.tool_name === "AskUserQuestion"
-        ? { continue: true }
-        : {
-            continue: true,
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
-              permissionDecision: "allow",
-              ...(decision.reason && {
-                additionalContext: `The person who approved this tool call noted: ${decision.reason}`,
-              }),
-            },
-          };
+      if (input.tool_name === "AskUserQuestion")
+        return note
+          ? {
+              continue: true,
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                additionalContext: note,
+              },
+            }
+          : { continue: true };
+      return {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          ...(note && { additionalContext: note }),
+        },
+      };
+    }
     if (decision === undefined) return waitEnded();
     return {
       continue: true,
@@ -984,15 +1010,15 @@ export async function runSession(
   const letThrough = new Map<string, string>();
   /**
    * A call the gate let through whose error result comes back with no Post hook never ran: Claude
-   * Code turned it down after the gate, as a plugin's or a settings file's own PreToolUse hook does.
+   * Code turned it down after the gate, as a plugin's or a settings file's own PreToolUse hook does,
+   * unless its text is one `wasNotRefused` knows.
    */
   const reportRefusals = (content: unknown) => {
     for (const { toolUseId, text } of errorResultsOf(content)) {
       const toolName = letThrough.get(toolUseId);
       if (toolName === undefined) continue;
       letThrough.delete(toolUseId);
-      if (CANCELLED_CALL_PREFIXES.some((prefix) => text.startsWith(prefix)))
-        continue;
+      if (wasNotRefused(text)) continue;
       const message = bound(
         `Claude Code turned down ${toolName} call ${toolUseId} after the runner let it through: ${text}`,
       );
@@ -1317,6 +1343,23 @@ function hasCancelledCall(content: unknown): boolean {
       ))
   );
 }
+
+/**
+ * How an error result for a call no hook or rule refused begins: the SDK's cancel markers, then
+ * Claude Code's own for a call an API stream's fallback discarded and one cut off as Claude ended
+ * the conversation. A list apart from `CANCELLED_CALL_PREFIXES`, which also decides whether a woken
+ * turn was cancelled.
+ */
+const NOT_REFUSED_PREFIXES = [
+  ...CANCELLED_CALL_PREFIXES,
+  "<tool_use_error>Error: Streaming fallback - tool execution discarded",
+  "<tool_use_error>Cancelled: Claude ended the conversation",
+];
+
+/** Whether an error result is one no hook or rule refused; Claude Code's skipped calls say so. */
+const wasNotRefused = (text: string) =>
+  text.includes("Nothing refused") ||
+  NOT_REFUSED_PREFIXES.some((prefix) => text.startsWith(prefix));
 
 /** A user message's errored tool results, each with its content as text. */
 function errorResultsOf(
