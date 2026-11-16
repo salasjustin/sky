@@ -3,16 +3,16 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   type AgentId,
   AgentStatus,
   type EnvironmentId,
   EnvironmentStatus,
-  EventType,
   type RequestId,
   type RunId,
   type RunRollup,
@@ -20,11 +20,15 @@ import {
   type WebhookId,
 } from "@sky/shared";
 import { migrate as drizzleMigrate } from "drizzle-orm/better-sqlite3/migrator";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { getTableConfig } from "drizzle-orm/sqlite-core";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   agents,
   type Db,
   deliveryStatuses,
+  events,
+  JOURNAL_SIZE_LIMIT,
+  MIGRATION_MARGIN_BYTES,
   migrate,
   openDb,
   requestKinds,
@@ -36,10 +40,24 @@ import {
   webhooks,
 } from "./index.js";
 
+// the default free-space reader calls statfsSync on the test machine's temp dir; stub it so no test
+// depends on how much disk the runner has
+const { statfsSync } = vi.hoisted(() => ({ statfsSync: vi.fn() }));
+vi.mock(import("node:fs"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  statfsSync,
+}));
+
+const AMPLE_BLOCKS = 2 ** 30;
+const BLOCK_SIZE = 4096;
+
 let dir: string;
 let path: string;
 let db: Db;
 beforeEach(() => {
+  statfsSync
+    .mockReset()
+    .mockReturnValue({ bavail: AMPLE_BLOCKS, bsize: BLOCK_SIZE });
   dir = mkdtempSync(join(tmpdir(), "sky-db-"));
   path = join(dir, "sky.db");
   db = openDb(path);
@@ -77,6 +95,13 @@ test("openDb sets WAL, foreign keys and a busy timeout on the connection", () =>
   expect(pragma("journal_mode")).toBe("wal");
   expect(pragma("foreign_keys")).toBe(1);
   expect(pragma("busy_timeout")).toBe(5000);
+});
+
+test("openDb caps the WAL file a checkpoint leaves behind at 64 MB", () => {
+  expect(JOURNAL_SIZE_LIMIT).toBe(64 * 1024 * 1024);
+  expect(db.$client.pragma("journal_size_limit", { simple: true })).toBe(
+    JOURNAL_SIZE_LIMIT,
+  );
 });
 
 const TABLES = [
@@ -142,32 +167,30 @@ test("status and type columns accept exactly the shared enums", () => {
   accepts("update environments set status = ?", EnvironmentStatus.options);
   accepts("update agents set status = ?", AgentStatus.options);
   accepts("update runs set status = ?", RunStatus.options);
-  accepts(
-    "insert into events (run_id, ts, type, payload) values ('run_1', '2026-10-29T12:00:00Z', ?, '{}')",
-    EventType.options,
-  );
 });
 
-test("events take claude.* hook types and run.resumed, and reject the retired run.progress", () => {
+// the API validates an event's type against the shared EventType before inserting, so the table
+// holds no list of its own: a new event type must never need a migration (a rebuild copies every row)
+test("an event of a type no schema has listed inserts with no migration", () => {
   migrate(db);
   seedRun();
-  expect(insertEvent("claude.PostToolUse")).toBeGreaterThan(0);
-  expect(insertEvent("run.resumed")).toBeGreaterThan(0);
-  expect(() => insertEvent("run.progress")).toThrow(/CHECK constraint failed/);
-  expect(() => insertEvent("claude.CwdChanged")).toThrow(
-    /CHECK constraint failed/,
-  );
+  const id = insertEvent("claude.SomeFutureHook");
+  expect(id).toBeGreaterThan(0);
+  expect(insertEvent("run.progress")).toBeGreaterThan(id);
 });
 
-test("events take run.probed, runner.warning and runner.heartbeat, and still reject an unknown type", () => {
+test("no schema puts a type list back on events", () => {
   migrate(db);
-  seedRun();
-  expect(insertEvent("run.probed")).toBeGreaterThan(0);
-  expect(insertEvent("runner.warning")).toBeGreaterThan(0);
-  expect(insertEvent("runner.heartbeat")).toBeGreaterThan(0);
-  expect(() => insertEvent("runner.error")).toThrow(
-    /CHECK constraint failed: events_type/,
-  );
+  const sql = db.$client
+    .prepare("select sql from sqlite_schema where name = 'events'")
+    .pluck()
+    .get() as string;
+  expect(sql).not.toMatch(/events_type/);
+  expect(sql).not.toMatch(/"type"\s+in\s*\(/i);
+  expect(getTableConfig(events).checks.map((c) => c.name)).toEqual([
+    "events_ts",
+    "events_payload",
+  ]);
 });
 
 test("foreign keys are enforced after migrate", () => {
@@ -1167,4 +1190,283 @@ test("migrating a populated 0015 file keeps a sealed webhook's columns byte for 
   expect(
     db.$client.prepare("select webhook_id from webhook_deliveries").all(),
   ).toEqual([{ webhook_id: "whk_sky" }]);
+});
+
+test("migrating a populated 0017 file keeps every event, id, index and remaining CHECK, drops the type list, and never reuses a deleted tail id", () => {
+  migrateThrough("0017_plain_ultimatum");
+  seedDelivery();
+  insertDelivery();
+  run(
+    "insert into events (run_id, ts, type, payload) values ('run_1', '2026-10-29T12:00:01.000Z', 'claude.Message', ?)",
+    JSON.stringify({ text: "hi", n: 2 }),
+  );
+  const tail = insertEvent("runner.heartbeat");
+  run("delete from events where id = ?", tail);
+  expect(() => insertEvent("run.brand_new")).toThrow(
+    /CHECK constraint failed: events_type/,
+  );
+  const eventsBefore = db.$client
+    .prepare("select * from events order by id")
+    .all();
+  const deliveriesBefore = db.$client
+    .prepare("select * from webhook_deliveries order by id")
+    .all();
+  const seq = () =>
+    db.$client
+      .prepare("select seq from sqlite_sequence where name = 'events'")
+      .pluck()
+      .get();
+  const seqBefore = seq();
+  expect(seqBefore).toBe(tail);
+
+  migrate(db);
+
+  expect(eventsBefore).toHaveLength(2);
+  expect(db.$client.prepare("select * from events order by id").all()).toEqual(
+    eventsBefore,
+  );
+  expect(
+    db.$client.prepare("select * from webhook_deliveries order by id").all(),
+  ).toEqual(deliveriesBefore);
+  expect(seq()).toBe(seqBefore);
+  expect(
+    db.$client
+      .prepare(
+        "select name from sqlite_schema where type = 'index' and tbl_name = 'events' and sql is not null order by name",
+      )
+      .pluck()
+      .all(),
+  ).toEqual(["events_claude_ts", "events_heartbeat_ts", "events_run_id_id"]);
+  expect(
+    planOf(
+      "select id from events where type glob 'claude.*' and ts < ?",
+      PRUNE_CUTOFF,
+    ),
+  ).toMatch(/INDEX events_claude_ts/);
+  expect(
+    planOf(
+      "select id from events where type = 'runner.heartbeat' and ts < ?",
+      PRUNE_CUTOFF,
+    ),
+  ).toMatch(/INDEX events_heartbeat_ts/);
+  expect(() =>
+    run("update events set ts = '2026-10-29 12:00:00' where id = 1"),
+  ).toThrow(/CHECK constraint failed: events_ts/);
+  expect(() => run("update events set payload = '[]' where id = 1")).toThrow(
+    /CHECK constraint failed: events_payload/,
+  );
+  expect(() =>
+    run(
+      "insert into events (run_id, ts, type, payload) values ('run_missing', '2026-10-29T12:00:00.000Z', 'run.started', '{}')",
+    ),
+  ).toThrow(/FOREIGN KEY constraint failed/);
+  expect(insertEvent("run.brand_new")).toBe(tail + 1);
+});
+
+// a populated file as the previous release left it, ready to migrate
+const staleFile = () => {
+  migrateThrough("0017_plain_ultimatum");
+  seedRun();
+  for (let i = 0; i < 50; i++) insertEvent();
+};
+
+const tables = () =>
+  db.$client.prepare("select name, sql from sqlite_schema order by name").all();
+
+// bytes on disk of a table and its indexes, as a rebuild copies them
+const bytesOf = (table: string) =>
+  db.$client
+    .prepare(
+      "select coalesce(sum(pgsize), 0) from dbstat where name in (select name from sqlite_schema where tbl_name = ?)",
+    )
+    .pluck()
+    .get(table) as number;
+
+const freePageBytes = () =>
+  (db.$client.pragma("freelist_count", { simple: true }) as number) *
+  (db.$client.pragma("page_size", { simple: true }) as number);
+
+// rebuilds of `copied` bytes in one transaction: all of it in the WAL, plus what the free pages can't absorb
+const neededFor = (copied: number) =>
+  copied + Math.max(0, copied - freePageBytes()) + MIGRATION_MARGIN_BYTES;
+
+const insertEvents = (n: number) =>
+  run(
+    "insert into events (run_id, ts, type, payload) select 'run_1', '2026-10-29T12:00:00.000Z', 'run.started', json_object('t', hex(randomblob(1500))) from (with recursive n(i) as (select 1 union all select i + 1 from n where i < ?) select i from n)",
+    n,
+  );
+
+const filler = (rows: number) => {
+  run("create table filler (x text)");
+  run(
+    "insert into filler select hex(randomblob(2000)) from (with recursive n(i) as (select 1 union all select i + 1 from n where i < ?) select i from n)",
+    rows,
+  );
+};
+
+const mb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+
+const journalTags = () =>
+  (
+    JSON.parse(
+      readFileSync(
+        new URL("../drizzle/meta/_journal.json", import.meta.url),
+        "utf8",
+      ),
+    ) as { entries: { tag: string }[] }
+  ).entries.map((e) => e.tag);
+
+test("migrate refuses when the volume can't hold the rebuild, and leaves the file untouched", () => {
+  staleFile();
+  const before = tables();
+  const needed = neededFor(bytesOf("events"));
+
+  expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
+    /not enough free disk space/,
+  );
+  expect(tables()).toEqual(before);
+  expect(count("events")).toBe(50);
+});
+
+test("the refusal names the pending migrations, the sizes in MB and the fix, on one line", () => {
+  migrateThrough("0016_silly_jetstream");
+  seedRun();
+  insertEvents(200);
+  const events = bytesOf("events");
+  const growth = Math.max(0, 2 * events - freePageBytes());
+  const needed = neededFor(2 * events);
+  const free = needed - 1;
+
+  let message = "";
+  try {
+    migrate(db, { freeBytes: () => free });
+  } catch (err) {
+    message = err instanceof Error ? err.message : String(err);
+  }
+  expect(message).toBe(
+    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon needs ${mb(needed)} (${mb(2 * events)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
+  );
+});
+
+test("two pending rebuilds of one table are charged twice, since drizzle runs them in one transaction", () => {
+  migrateThrough("0016_silly_jetstream");
+  seedRun();
+  insertEvents(200);
+  const needed = neededFor(2 * bytesOf("events"));
+
+  expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
+    /not enough free disk space/,
+  );
+  expect(() => migrate(db, { freeBytes: () => needed })).not.toThrow();
+  expect(count("events")).toBe(200);
+});
+
+test("migrate counts free pages as room already in the file, so they shrink what it needs", () => {
+  staleFile();
+  insertEvents(400);
+  filler(150);
+  run("drop table filler");
+  const events = bytesOf("events");
+  // part of the copy, not all of it, fits in the free pages
+  expect(freePageBytes()).toBeGreaterThan(0);
+  expect(freePageBytes()).toBeLessThan(events);
+  const needed = neededFor(events);
+  expect(needed).toBeLessThan(2 * events + MIGRATION_MARGIN_BYTES);
+
+  expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
+    /not enough free disk space/,
+  );
+  expect(() => migrate(db, { freeBytes: () => needed })).not.toThrow();
+});
+
+test("live data in tables no pending migration rebuilds isn't charged", () => {
+  staleFile();
+  filler(2000);
+  const events = bytesOf("events");
+  expect(bytesOf("filler")).toBeGreaterThan(10 * events);
+  const needed = neededFor(events);
+
+  expect(() => migrate(db, { freeBytes: () => needed })).not.toThrow();
+  expect(count("filler")).toBe(2000);
+});
+
+test("migrate checkpoints a leftover WAL before reading free space, so its bytes count as free", () => {
+  staleFile();
+  const walSize = () => statSync(`${path}-wal`).size;
+  expect(walSize()).toBeGreaterThan(0);
+  let walWhenAsked = -1;
+
+  migrate(db, {
+    freeBytes: () => {
+      walWhenAsked = walSize();
+      return Number.MAX_SAFE_INTEGER;
+    },
+  });
+  expect(walWhenAsked).toBe(0);
+});
+
+test("migrate returns the tags it applied, in order, and nothing on a second call", () => {
+  const noRoom = { freeBytes: () => 0 };
+  expect(migrate(db, noRoom)).toEqual(journalTags());
+  expect(migrate(db, noRoom)).toEqual([]);
+});
+
+test("migrate on an older file returns only the migrations that were pending", () => {
+  migrateThrough("0016_silly_jetstream");
+  const tags = journalTags();
+  expect(migrate(db, { freeBytes: () => Number.MAX_SAFE_INTEGER })).toEqual(
+    tags.slice(tags.indexOf("0016_silly_jetstream") + 1),
+  );
+});
+
+test("migrate passes when the volume has the room, and asks about the volume holding the file", () => {
+  staleFile();
+  const asked: string[] = [];
+  migrate(db, {
+    freeBytes: (p) => {
+      asked.push(p);
+      return Number.MAX_SAFE_INTEGER;
+    },
+  });
+  expect(asked).toEqual([path]);
+  expect(count("events")).toBe(50);
+  expect(insertEvent("run.brand_new")).toBeGreaterThan(50);
+});
+
+test("migrate doesn't look at free space when nothing is pending, or on a new file", () => {
+  const noRoom = { freeBytes: () => 0 };
+  expect(() => migrate(db, noRoom)).not.toThrow();
+  expect(() => migrate(db, noRoom)).not.toThrow();
+});
+
+test("migrate by default reads the free space of the directory holding the file, as available blocks times block size", () => {
+  staleFile();
+  const bavail = 1500;
+  const bsize = 4096;
+  statfsSync.mockReturnValue({ bavail, bsize });
+
+  let message = "";
+  try {
+    migrate(db);
+  } catch (err) {
+    message = err instanceof Error ? err.message : String(err);
+  }
+
+  expect(message).toContain(`but ${mb(bavail * bsize)} is free`);
+  expect(statfsSync).toHaveBeenCalledWith(dirname(path));
+});
+
+test("migrate by default has room on a volume with ample space", () => {
+  staleFile();
+  expect(() => migrate(db)).not.toThrow();
+  expect(statfsSync).toHaveBeenCalledWith(dirname(path));
+});
+
+test("a tracked file with no recorded migrations counts every migration as pending", () => {
+  migrate(db);
+  run("delete from __drizzle_migrations");
+
+  expect(() => migrate(db, { freeBytes: () => 0 })).toThrow(
+    /not enough free disk space/,
+  );
 });

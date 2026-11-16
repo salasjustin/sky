@@ -254,13 +254,9 @@ export const events = sqliteTable(
     index("events_heartbeat_ts")
       .on(t.ts)
       .where(sql`${c(t.type)} = 'runner.heartbeat'`),
-    check(
-      "events_type",
-      sql`${c(t.type)} in ('run.started', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped', 'run.resumed',
-        'run.probed', 'runner.warning', 'runner.heartbeat',
-        'claude.PreToolUse', 'claude.PostToolUse', 'claude.PostToolUseFailure', 'claude.SubagentStart', 'claude.SubagentStop',
-        'claude.TaskCreated', 'claude.TaskCompleted', 'claude.TaskNotification', 'claude.BackgroundTasksChanged', 'claude.Notification', 'claude.PreCompact', 'claude.FileChanged', 'claude.Message')`,
-    ),
+    // No CHECK on `type`: the API validates every event against the shared `EventType` schema before it
+    // inserts, and a type list here meant rebuilding this table (a copy of every row, ~2x the file on disk)
+    // at boot for each new event type. Never put one back.
     check("events_ts", isoUtc(t.ts)),
     check("events_payload", sql`json_type(${c(t.payload)}) = 'object'`),
   ],

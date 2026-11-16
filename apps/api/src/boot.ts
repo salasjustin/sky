@@ -1,7 +1,8 @@
 import { setMaxListeners } from "node:events";
+import { statSync } from "node:fs";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
-import { type Db, migrate, openDb } from "@sky/db";
+import { type Db, type MigrateOptions, migrate, openDb } from "@sky/db";
 import type { RunId } from "@sky/shared";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
@@ -22,6 +23,22 @@ import { SPRITES_TIMEOUT_MS, type SpriteOps } from "./sprites.js";
 
 const SWEEP_EVERY_MS = 60_000;
 
+const walBytes = (dbPath: string) => {
+  try {
+    return statSync(`${dbPath}-wal`).size;
+  } catch {
+    return 0;
+  }
+};
+
+const walMb = (dbPath: string) =>
+  `${(walBytes(dbPath) / 1_048_576).toFixed(1)} MB`;
+
+const errorCode = (err: unknown) =>
+  err instanceof Error && "code" in err && typeof err.code === "string"
+    ? ` (${err.code})`
+    : "";
+
 /**
  * Opens and migrates the one DB handle the app reuses for its lifetime, fails provisioning a previous
  * process left unfinished, and fails silent runs and abandoned waits now and every minute after. Runs
@@ -31,10 +48,41 @@ const SWEEP_EVERY_MS = 60_000;
  * looked for on its sprite, also unawaited (see
  * `createRunProber`). The same sweep deletes run envVars past their TTL and `claude.*` and
  * `runner.heartbeat` events past 7 days. Webhook deliveries left pending resume at once.
+ *
+ * A migration that can't fit on the data volume fails the boot with a log line before any data
+ * changes. Once migrated, the WAL is checkpointed and truncated, so a rebuild's pages don't sit on the
+ * volume until the next restart; the boot logs the migrations it applied, or that none were pending.
  */
-export function boot(config: Config, log: (line: string) => void) {
-  const db = openDb(join(config.dataDir, "sky.db"));
-  migrate(db);
+export function boot(
+  config: Config,
+  log: (line: string) => void,
+  migrateOptions?: MigrateOptions,
+) {
+  const dbPath = join(config.dataDir, "sky.db");
+  const db = openDb(dbPath);
+  let applied: string[];
+  try {
+    applied = migrate(db, migrateOptions);
+  } catch (err) {
+    log(
+      `boot failed: ${err instanceof Error ? err.message : err}${errorCode(err)}`,
+    );
+    db.$client.close();
+    throw err;
+  }
+  const walBefore = walMb(dbPath);
+  // the row's first column is 1 when another connection kept the checkpoint from finishing, and then the
+  // WAL is left untruncated; the other columns are page counts
+  const busy = db.$client.pragma("wal_checkpoint(TRUNCATE)", { simple: true });
+  const blocked = Number(busy) !== 0;
+  const checkpoint = blocked
+    ? "the WAL checkpoint was blocked by another connection"
+    : "checkpointed the WAL";
+  log(
+    applied.length > 0
+      ? `migrated ${applied.join(", ")}; ${checkpoint}: ${walBefore} before, ${walMb(dbPath)} after`
+      : `no migrations pending${blocked ? `; ${checkpoint}` : ""}`,
+  );
   failInterruptedProvisioning(db);
   const dispatcher = createDispatcher({
     db,
