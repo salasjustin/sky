@@ -1,7 +1,8 @@
 import { type RunId, RunnerEventPost } from "@sky/shared";
 import { isTransient, RetryError, type RetryTiming, retry } from "./retry.js";
 
-const TIMEOUT_MS = 10_000;
+/** The timeout on each attempt at a post. */
+export const ATTEMPT_TIMEOUT_MS = 10_000;
 /** The timeout on the one attempt an event queued behind a stop gets: each holds up the ending event. */
 const GIVEN_UP_TIMEOUT_MS = 2_000;
 /**
@@ -17,7 +18,7 @@ const PROGRESS_ATTEMPTS = 3;
 export type PostEvent = (
   event: RunnerEventPost,
   options?: {
-    /** Epoch ms the retries stop at; `run.waiting` and `run.started` pass the run's wait budget. */
+    /** Epoch ms the retries stop at; `run.waiting` passes the run's wait budget, `run.started` the start's. */
     deadline?: number;
     /** A stop: the post rejects with its reason at once. */
     signal?: AbortSignal;
@@ -31,9 +32,9 @@ export type PostEvent = (
 /**
  * Posts an event, retrying a dropped connection, a timeout, a 5xx, 408 or 429; any other 4xx is
  * final. A `run.waiting` that doesn't land rejects, since the run can't wait on a request the API
- * never stored, and rejects with a `RunEndedError` when the API has already ended the run. A
- * `run.started` that doesn't land rejects too: without it the run stays `starting`, and has no
- * session to resume. Every other event is dropped with one line on `warn`: losing it must not take down the run that
+ * never stored. A `run.started` that doesn't land rejects too: without it the run stays `starting`,
+ * and has no session to resume. Either rejects with a `RunEndedError` when the API has already
+ * ended the run. Every other event is dropped with one line on `warn`: losing it must not take down the run that
  * produced it.
  */
 export function createPoster(
@@ -82,7 +83,11 @@ export function createPoster(
             return {
               fail: "HTTP 409 run_not_started: the run's run.started was never stored",
             };
-          if (waiting && res.status === 401 && errorCode(text) === "run_ended")
+          if (
+            mustLand &&
+            res.status === 401 &&
+            errorCode(text) === "run_ended"
+          )
             return { done: "run_ended" };
           const failure = `HTTP ${res.status}`;
           return isTransient(res.status)
@@ -94,7 +99,9 @@ export function createPoster(
           random: options.random,
           now,
           deadline: deadline ?? now() + RIDE_OUT_MS,
-          attemptTimeoutMs: giveUp?.aborted ? GIVEN_UP_TIMEOUT_MS : TIMEOUT_MS,
+          attemptTimeoutMs: giveUp?.aborted
+            ? GIVEN_UP_TIMEOUT_MS
+            : ATTEMPT_TIMEOUT_MS,
           ...(!mustLand &&
             !RIDES_OUT.has(event.type) && { maxAttempts: PROGRESS_ATTEMPTS }),
           ...(maxAttempts !== undefined && { maxAttempts }),
@@ -132,7 +139,7 @@ export const warningReporter =
     );
   };
 
-/** A `run.waiting` the API refused because it already stopped or failed the run, and recorded how. */
+/** A `run.waiting` or `run.started` the API refused because it already stopped or failed the run, and recorded how. */
 export class RunEndedError extends Error {
   constructor() {
     super("the run has already ended");

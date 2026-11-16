@@ -44,7 +44,7 @@ import {
   runnerDirs,
 } from "./claude-auth.js";
 import type { Config } from "./config.js";
-import { type PostEvent, RunEndedError } from "./events.js";
+import { ATTEMPT_TIMEOUT_MS, type PostEvent, RunEndedError } from "./events.js";
 import { createHeartbeat } from "./heartbeat.js";
 import {
   missingServersWarning,
@@ -551,18 +551,32 @@ function sessionHooks(
   };
 }
 
-/** How long before the launch's deadline the runner stops waiting for the repo lock, so its failure is posted before the API's. */
-const LOCK_WAIT_MARGIN_MS = 30_000;
+/** How long before the launch's deadline the runner stops waiting for the repo lock or the start to land, so its failure is posted before the API's. */
+const LAUNCH_MARGIN_MS = 30_000;
 
 /**
  * Seconds worktree setup queues for the repo lock: the launch's time left as this process started,
- * less `elapsedMs` it has spent since and `LOCK_WAIT_MARGIN_MS`. At least 1, because flock reads
+ * less `elapsedMs` it has spent since and `LAUNCH_MARGIN_MS`. At least 1, because flock reads
  * `-w 0` as not waiting at all.
  */
 export const repoLockWaitS = (launchDeadlineMs: number, elapsedMs: number) =>
   Math.max(
     1,
-    Math.ceil((launchDeadlineMs - elapsedMs - LOCK_WAIT_MARGIN_MS) / 1000),
+    Math.ceil((launchDeadlineMs - elapsedMs - LAUNCH_MARGIN_MS) / 1000),
+  );
+
+/**
+ * Milliseconds the run's `run.started` retries for: the wait budget, cut to the launch's time left
+ * less `elapsedMs` and `LAUNCH_MARGIN_MS`, since the API fails a run still starting at its launch
+ * deadline. At least one full attempt.
+ */
+const startBudgetMs = (config: Config, elapsedMs: number) =>
+  Math.max(
+    ATTEMPT_TIMEOUT_MS,
+    Math.min(
+      config.waitTimeoutMs,
+      config.launchDeadlineMs - elapsedMs - LAUNCH_MARGIN_MS,
+    ),
   );
 
 /** Runs one Claude session for the run and reports it; resolves to the process exit code. */
@@ -610,6 +624,7 @@ export async function runSession(
     await post(event);
   };
   const interrupted = () => `interrupted by ${String(deps.signal.reason)}`;
+  const launchElapsedMs = () => deps.elapsedMs?.() ?? performance.now();
   const fail = async (error: string, usage?: Usage, rollup?: RunRollup) => {
     await end({
       type: "run.failed",
@@ -632,10 +647,7 @@ export async function runSession(
       // what the session's own `publish` reads, so the sync looks where it publishes
       env: { ...process.env, ...config.sessionEnv },
       warn,
-      lockWaitS: repoLockWaitS(
-        config.launchDeadlineMs,
-        deps.elapsedMs?.() ?? performance.now(),
-      ),
+      lockWaitS: repoLockWaitS(config.launchDeadlineMs, launchElapsedMs()),
       // a stop while queued behind another run's setup must not go on to make the worktree
       signal: deps.signal,
     }));
@@ -670,6 +682,11 @@ export async function runSession(
     stopReason ??= reason;
     abortController.abort(reason);
   };
+  /** The API already recorded how the run ended, so `end` posts nothing. */
+  const endedByApi = (reason: string) => {
+    ended = true;
+    stopSession(reason);
+  };
 
   // the API keeps one open request per run, so parallel tool calls take turns
   let turn = Promise.resolve();
@@ -700,9 +717,7 @@ export async function runSession(
     const deadline = Date.now() + config.waitTimeoutMs;
     const stop = AbortSignal.any([abortController.signal, signal]);
     const runEnded = () => {
-      // the API already recorded how the run ended
-      ended = true;
-      stopSession("run ended while waiting");
+      endedByApi("run ended while waiting");
       return undefined;
     };
     try {
@@ -1164,11 +1179,25 @@ export async function runSession(
             payload: { sessionId: message.session_id },
           },
           {
-            deadline: Date.now() + config.waitTimeoutMs,
-            giveUp: abortController.signal,
+            deadline: Date.now() + startBudgetMs(config, launchElapsedMs()),
+            // a later stop cuts the attempt in flight: a starting run can go straight to failed or
+            // stopped. A run already stopped here, its credential exposed, still gets one short
+            // attempt, so the API keeps the session a follow-up resumes.
+            ...(abortController.signal.aborted
+              ? { giveUp: abortController.signal }
+              : { signal: abortController.signal }),
           },
         );
-        await startLanded;
+        try {
+          await startLanded;
+        } catch (error) {
+          if (error instanceof RunEndedError)
+            endedByApi("run ended before it started");
+          // a rejection the stop caused carries the stop's reason, which stays the run's
+          else if (!abortController.signal.aborted)
+            stopSession(messageOf(error));
+          throw error;
+        }
       } else if (message.type === "assistant") {
         const parent = message.parent_tool_use_id;
         // a subagent's responses interleave with the main thread's, so each agent's turns are its own;

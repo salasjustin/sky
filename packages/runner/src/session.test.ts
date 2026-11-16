@@ -3780,6 +3780,8 @@ function restartingApi(options: {
       ...timing,
     }),
     signal: new AbortController().signal,
+    // the launch's time left bounds the start's retries; without this it hangs on the worker's uptime
+    elapsedMs: () => 0,
   };
   return { sent, received, deps, polls: () => polls };
 }
@@ -3880,6 +3882,153 @@ test("a run.started that never lands by the run's wait deadline fails the run, n
       error: expect.stringMatching(/run\.started was never recorded.*lost/),
     },
   });
+});
+
+test.each([
+  ["a new run", undefined],
+  ["a follow-up run", "sess-old"],
+])(
+  "%s's run.started retries no longer than the launch has left, however long the wait budget",
+  async (_, sessionId) => {
+    const { sent, received, deps } = restartingApi({
+      outage: 0,
+      startOutage: Number.POSITIVE_INFINITY,
+      pollReplies: [],
+      virtualTime: true,
+    });
+    const startedAt = Date.now();
+    const code = await runSession(
+      {
+        ...config,
+        sessionId,
+        launchDeadlineMs: 90_000,
+        waitTimeoutMs: 600_000,
+      },
+      { ...deps, elapsedMs: () => 20_000, query: scripted([init, success]) },
+    );
+    expect(code).toBe(1);
+    expect(Date.now() - startedAt).toBeLessThanOrEqual(90_000 - 20_000);
+    const startAttempts = received.filter((r) => r.type === "run.started");
+    expect(startAttempts.length).toBeGreaterThan(3);
+    expect(sent.at(-1)).toMatchObject({
+      type: "run.failed",
+      payload: {
+        error: expect.stringMatching(/run\.started was never recorded.*lost/),
+      },
+    });
+  },
+);
+
+test("a lost run.started stops the session, so a hook event queued behind it gets one attempt, not its ride-out", async () => {
+  const { sent, deps } = restartingApi({
+    outage: 0,
+    startOutage: Number.POSITIVE_INFINITY,
+    pollReplies: [],
+    refuse: (event) => event.type === "claude.PreToolUse",
+    virtualTime: true,
+  });
+  const startedAt = Date.now();
+  const query = scripted([
+    // a timer runs after the microtasks that hand init to the loop, so the hook's event queues
+    // behind the run.started it posts
+    async (options: Options) => {
+      setTimeout(
+        () => void fire(options, "PreToolUse", gitPush).catch(() => {}),
+        0,
+      );
+    },
+    init,
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, waitTimeoutMs: 100_000 },
+    { ...deps, query },
+  );
+  expect(code).toBe(1);
+  expect(sent.at(-1)).toMatchObject({
+    type: "run.failed",
+    payload: {
+      error: expect.stringMatching(/run\.started was never recorded.*lost/),
+    },
+  });
+  // the start's own budget, with none of claude.PreToolUse's ride-out after it
+  expect(Date.now() - startedAt).toBeLessThanOrEqual(100_000);
+});
+
+test("a run the API ended before its run.started landed stops the session and posts nothing more", async () => {
+  const tried: string[] = [];
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      const event = (await request.json()) as RunnerEventPost;
+      tried.push(event.type);
+      if (event.type === "run.started")
+        return HttpResponse.json(
+          { error: { code: "run_ended", message: "the run has ended" } },
+          { status: 401 },
+        );
+      return HttpResponse.json({ id: "evt_1" }, { status: 201 });
+    }),
+  );
+  const code = await runSession(config, {
+    query: scripted([init, success]),
+    post: createPoster({
+      apiBaseUrl: "https://api.test",
+      agentToken: "agent-secret",
+      warn: () => {},
+      sleep: async () => {},
+    }),
+    awaitDecision: noDecision,
+    signal: new AbortController().signal,
+  });
+  expect(code).toBe(1);
+  expect(tried).toEqual(["run.started"]);
+});
+
+test("a stop during the run.started retry cuts its attempt in flight and fails the run with the stop's reason", async () => {
+  const timing = virtualTiming();
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const stored: RunnerEventPost[] = [];
+  let startAttempts = 0;
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      const event = (await request.json()) as RunnerEventPost;
+      if (event.type === "run.started") {
+        if (++startAttempts === 1)
+          return new HttpResponse(null, { status: 503 });
+        controller.abort("SIGTERM");
+        // only the stop ends this attempt: left to the poster's per-attempt timeout, it outlasts
+        // Vitest's default test timeout
+        await delay("infinite");
+      }
+      stored.push(event);
+      return HttpResponse.json({ id: "evt_1" }, { status: 201 });
+    }),
+  );
+  const code = await runSession(
+    { ...config, waitTimeoutMs: 600_000 },
+    {
+      query: scripted([init, success]),
+      post: createPoster({
+        apiBaseUrl: "https://api.test",
+        agentToken: "agent-secret",
+        warn: () => {},
+        ...timing,
+      }),
+      awaitDecision: noDecision,
+      signal: controller.signal,
+      elapsedMs: () => 0,
+    },
+  );
+  expect(code).toBe(1);
+  expect(Date.now() - startedAt).toBeLessThan(60_000);
+  expect(stored).toEqual([
+    {
+      runId: "run_1",
+      type: "run.failed",
+      payload: { error: "interrupted by SIGTERM", rollup: expect.any(Object) },
+    },
+  ]);
 });
 
 test("run.waiting is not sent before run.started is stored", async () => {

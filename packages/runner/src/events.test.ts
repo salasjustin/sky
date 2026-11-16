@@ -383,6 +383,27 @@ test("a run.waiting for a run the API already ended rejects with RunEndedError a
   expect(calls).toBe(1);
 });
 
+test("a run.started for a run the API already ended rejects with RunEndedError at once, not as a lost start", async () => {
+  let calls = 0;
+  server.use(
+    http.post(url, () => {
+      calls++;
+      return HttpResponse.json(
+        { error: { code: "run_ended", message: "the run has ended" } },
+        { status: 401 },
+      );
+    }),
+  );
+  const post = createPoster({ ...options, warn: () => {} });
+  await expect(
+    post(
+      { runId: "run_1", type: "run.started", payload: { sessionId: "sess" } },
+      { deadline: Date.now() + 60_000 },
+    ),
+  ).rejects.toBeInstanceOf(RunEndedError);
+  expect(calls).toBe(1);
+});
+
 test("retries back off exponentially with full jitter, capped at 30 s", async () => {
   const clock = virtualClock();
   server.use(http.post(url, () => new HttpResponse(null, { status: 503 })));
