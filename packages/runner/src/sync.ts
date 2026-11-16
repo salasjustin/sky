@@ -771,7 +771,7 @@ export async function syncAgentBranch(options: {
  * branch, that record and git's ORIG_HEAD left as they were, for a GitHub history that matches
  * nothing here, a worktree with uncommitted changes, unpublished commits that include a merge, a
  * branch too far ahead to fetch, a fast-forward or reset git refuses, or a rebase that conflicts
- * or fails; a rebase whose abort fails too is left mid-way, as the note says. Unlike
+ * or fails; a rebase whose abort fails too is left mid-way, as the note says, record kept. Unlike
  * `syncAgentBranch`, which leaves the worktree's own shas and cherry-picks, the published commits
  * here are replaced by GitHub's, so `git log` and GitHub agree. `lines` is what to tell the agent;
  * `ok` is false when the worktree was left as it was for a reason it should act on, and `moved`
@@ -943,9 +943,12 @@ export async function syncOwnBranch(options: {
     } catch (error) {
       const conflicted = await unmerged(cwd);
       const stuck = await abortStopped(cwd, "rebase");
-      await unmark();
-      // left mid-rebase, ORIG_HEAD is the rebase's own: the commit it started from, the way back
-      if (!stuck) await restoreOrigHead();
+      // left mid-rebase onto the pushed commits, the branch may yet take them, so it keeps the record;
+      // and ORIG_HEAD is the rebase's own: the commit it started from, the way back
+      if (!stuck) {
+        await unmark();
+        await restoreOrigHead();
+      }
       const why =
         conflicted.length > 0
           ? `rebasing your ${commits(unpublished.length)} onto it conflicted (in ${pathList(conflicted)})`
