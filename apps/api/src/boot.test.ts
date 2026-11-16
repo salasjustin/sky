@@ -1,9 +1,10 @@
 import { once } from "node:events";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import type { Server } from "node:http";
 import { type AddressInfo, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import {
   agents,
@@ -42,8 +43,11 @@ afterEach(async () => {
 
 const config = () => testConfig({ dataDir: dir, runTimeoutMs: 60_000 });
 
+// the test machine's own free space must never decide whether a migration runs
+const roomy = { freeBytes: () => Number.MAX_SAFE_INTEGER };
+
 const booted = (log: (line: string) => void = () => {}) => {
-  const b = boot(config(), log);
+  const b = boot(config(), log, roomy);
   stops.push(b.stopSweeping, b.stopDelivering);
   return b;
 };
@@ -59,19 +63,20 @@ test("booting on an empty data dir creates sky.db with the schema migrated", asy
   expect((await b.app.request("/healthz")).status).toBe(200);
 });
 
-test("booting checkpoints and truncates the WAL the migrations wrote, and logs its size before and after", () => {
-  const lines: string[] = [];
-  db = booted((line) => lines.push(line)).db;
-  const line = lines.find((l) => l.includes("checkpointed the WAL"));
-  const [, before, after] =
-    line?.match(/(\d+) bytes before, (\d+) after/) ?? [];
-  expect(Number(before)).toBeGreaterThan(0);
-  expect(after).toBe("0");
-  expect(statSync(join(dir, "sky.db-wal")).size).toBe(0);
-});
+const journalTags = () => {
+  const journal = JSON.parse(
+    readFileSync(
+      fileURLToPath(
+        new URL("../../../db/drizzle/meta/_journal.json", import.meta.url),
+      ),
+      "utf8",
+    ),
+  ) as { entries: { tag: string }[] };
+  return journal.entries.map((e) => e.tag);
+};
 
-test("booting refuses and logs the bytes needed and free when a migration can't fit, leaving the file closed", () => {
-  const lines: string[] = [];
+/** Boots once on the empty data dir, then forgets the last migration was applied and closes the DB. */
+const unmigrateLast = () => {
   const b = booted();
   b.db.$client.exec(
     "delete from __drizzle_migrations where created_at = (select max(created_at) from __drizzle_migrations)",
@@ -79,6 +84,32 @@ test("booting refuses and logs the bytes needed and free when a migration can't 
   b.stopSweeping();
   b.stopDelivering();
   b.db.$client.close();
+};
+
+test("booting an empty data dir logs every migration it applied, in order, and the WAL truncated by the checkpoint", () => {
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
+  const migrated = lines.filter((l) => l.startsWith("migrated "));
+  expect(migrated).toHaveLength(1);
+  expect(migrated[0]).toMatch(
+    new RegExp(
+      `^migrated ${journalTags().join(", ")}; checkpointed the WAL: \\d+\\.\\d MB before, 0\\.0 MB after$`,
+    ),
+  );
+});
+
+test("booting with no migration pending says so, without WAL sizes", () => {
+  booted().db.$client.close();
+
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
+  expect(lines).toContain("no migrations pending");
+  expect(lines.some((l) => l.includes("WAL"))).toBe(false);
+});
+
+test("booting refuses and logs the bytes needed and free when a migration can't fit, leaving the file closed", () => {
+  const lines: string[] = [];
+  unmigrateLast();
 
   expect(() =>
     boot(config(), (l) => lines.push(l), { freeBytes: () => 1 }),
@@ -87,6 +118,25 @@ test("booting refuses and logs the bytes needed and free when a migration can't 
   expect(lines[0]).toMatch(
     /^boot failed: not enough free disk space to migrate .*sky\.db: needs \d+ bytes .*, only 1 bytes free/,
   );
+});
+
+test("a boot failure from an error carrying a code logs the code after the message", () => {
+  const lines: string[] = [];
+  unmigrateLast();
+  const full = Object.assign(new Error("database or disk is full"), {
+    code: "SQLITE_FULL",
+  });
+
+  expect(() =>
+    boot(config(), (l) => lines.push(l), {
+      freeBytes: () => {
+        throw full;
+      },
+    }),
+  ).toThrow(full);
+  expect(lines).toEqual([
+    "boot failed: database or disk is full (SQLITE_FULL)",
+  ]);
 });
 
 test("shutdown closes the server before the DB", async () => {
@@ -332,7 +382,7 @@ const seedSilentRun = (minutesAgo: number) => {
 
 // the default 30 m run timeout, not `config()`'s 60 s, so the silent run is probed rather than timed out
 const bootWithProbe = (log: (line: string) => void) => {
-  const b = boot(testConfig({ dataDir: dir }), log);
+  const b = boot(testConfig({ dataDir: dir }), log, roomy);
   stops.push(b.stopSweeping, b.stopDelivering);
   return b;
 };
@@ -486,7 +536,7 @@ test("the sweep deletes envVars once their TTL passes, and redacts them only whi
   first.$client.close();
 
   // the default run timeout, not `config()`'s 60 s, so the run itself stays live across the sweep
-  const b = boot(testConfig({ dataDir: dir }), () => {});
+  const b = boot(testConfig({ dataDir: dir }), () => {}, roomy);
   stops.push(b.stopSweeping, b.stopDelivering);
   db = b.db;
   const echo = async (message: string) => {

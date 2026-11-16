@@ -31,6 +31,14 @@ const walBytes = (dbPath: string) => {
   }
 };
 
+const walMb = (dbPath: string) =>
+  `${(walBytes(dbPath) / 1_048_576).toFixed(1)} MB`;
+
+const errorCode = (err: unknown) =>
+  err instanceof Error && "code" in err && typeof err.code === "string"
+    ? ` (${err.code})`
+    : "";
+
 /**
  * Opens and migrates the one DB handle the app reuses for its lifetime, fails provisioning a previous
  * process left unfinished, and fails silent runs and abandoned waits now and every minute after. Runs
@@ -43,7 +51,7 @@ const walBytes = (dbPath: string) => {
  *
  * A migration that can't fit on the data volume fails the boot with a log line before the DB is
  * touched. Once migrated, the WAL is checkpointed and truncated, so a rebuild's pages don't sit on the
- * volume until the next restart.
+ * volume until the next restart; the boot logs the migrations it applied, or that none were pending.
  */
 export function boot(
   config: Config,
@@ -52,17 +60,28 @@ export function boot(
 ) {
   const dbPath = join(config.dataDir, "sky.db");
   const db = openDb(dbPath);
+  let applied: string[];
   try {
-    migrate(db, migrateOptions);
+    applied = migrate(db, migrateOptions);
   } catch (err) {
-    log(`boot failed: ${err instanceof Error ? err.message : err}`);
+    log(
+      `boot failed: ${err instanceof Error ? err.message : err}${errorCode(err)}`,
+    );
     db.$client.close();
     throw err;
   }
-  const walBefore = walBytes(dbPath);
-  db.$client.pragma("wal_checkpoint(TRUNCATE)");
+  const walBefore = walMb(dbPath);
+  // the row's first column is 1 when another connection kept the checkpoint from finishing, and then the
+  // WAL is left untruncated; the other columns are page counts
+  const busy = db.$client.pragma("wal_checkpoint(TRUNCATE)", { simple: true });
+  const blocked = Number(busy) !== 0;
+  const checkpoint = blocked
+    ? "the WAL checkpoint was blocked by another connection"
+    : "checkpointed the WAL";
   log(
-    `checkpointed the WAL after migrating: ${walBefore} bytes before, ${walBytes(dbPath)} after`,
+    applied.length > 0
+      ? `migrated ${applied.join(", ")}; ${checkpoint}: ${walBefore} before, ${walMb(dbPath)} after`
+      : `no migrations pending${blocked ? `; ${checkpoint}` : ""}`,
   );
   failInterruptedProvisioning(db);
   const dispatcher = createDispatcher({
