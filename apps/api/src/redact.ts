@@ -80,8 +80,9 @@ export function redact(text: string, known: readonly string[]): string {
 }
 
 /**
- * Raw output kept past a tail's bound, so the tail is taken only after redaction. Longer than any
- * secret or token, so one the raw cut splits has its fragment in this margin, which the tail drops.
+ * Raw output kept past a tail's bound, so the tail is taken only after redaction: a secret or token
+ * up to this long that the raw cut splits leaves its fragment in this margin, which the tail drops.
+ * Past every credential the API mints or holds; an env secret's value has no length cap.
  */
 export const REDACTION_MARGIN = 8_192;
 
