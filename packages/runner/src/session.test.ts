@@ -6916,9 +6916,7 @@ describe("the run's scratch directory and reads outside the worktree", () => {
         for (const file_path of [store, kru])
           expect((await call(cfg, "Read", { file_path })).asked).toBe(true);
         const cached = put(`${CACHE}/kru/a.md`);
-        expect((await call(cfg, "Read", { file_path: cached })).asked).toBe(
-          false,
-        );
+        unasked(await call(cfg, "Read", { file_path: cached }), "cached\n");
       });
 
       test("the rest of ~/.claude still asks, or is refused as before", async () => {
@@ -7038,16 +7036,13 @@ describe("the run's scratch directory and reads outside the worktree", () => {
           true,
         );
         const other = put(`${CACHE}/kru/b.md`);
-        expect((await call(named, "Read", { file_path: other })).asked).toBe(
-          false,
-        );
+        unasked(await call(named, "Read", { file_path: other }), "cached\n");
         const bare = settingsOf(".kru", {
           approvalPolicy: ["Read"],
           autoApprove: { defaults: true, commands: [] },
         });
-        expect((await call(bare, "Read", { file_path: file })).asked).toBe(
-          false,
-        );
+        unasked(await call(bare, "Read", { file_path: file }), "cached\n");
+        unasked(await call(bare, "Read", { file_path: store }), "cached\n");
       });
 
       test("with the default commands off, as a shell read of them asks, a Read of the plugin cache or the store asks", async () => {
@@ -7063,6 +7058,19 @@ describe("the run's scratch directory and reads outside the worktree", () => {
           expect(result.decision, file_path).toBe("deny");
           expect(result.copied, file_path).toBeUndefined();
         }
+      });
+
+      test("with the default commands off and a policy that holds no reads, the plugin cache still asks and the store reads as any other path", async () => {
+        const cached = put(`${CACHE}/x/SKILL.md`);
+        const store = put(".kru/plans/x.md", "plan\n");
+        const cfg = settingsOf(".kru", {
+          approvalPolicy: [],
+          autoApprove: { defaults: false, commands: [] },
+        });
+        const asked = await call(cfg, "Read", { file_path: cached });
+        expect(asked.asked).toBe(true);
+        expect(asked.copied).toBeUndefined();
+        unasked(await call(cfg, "Read", { file_path: store }), "plan\n");
       });
     });
 
