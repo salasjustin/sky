@@ -601,3 +601,26 @@ test("a posted approval's toolSummary is bounded at RUNNER_TEXT_MAX", () => {
     RunnerEventPost.safeParse(waiting("x".repeat(RUNNER_TEXT_MAX + 1))).success,
   ).toBe(false);
 });
+
+test("a run.withdrawn names its request and a reason, as posted and as stored", () => {
+  const payload = { requestId: "req_1", reason: "hook_cancelled" };
+  expect(
+    RunnerEventPost.parse({ runId: "run_1", type: "run.withdrawn", payload }),
+  ).toEqual({ runId: "run_1", type: "run.withdrawn", payload });
+  expect(
+    Event.parse({ ...meta, type: "run.withdrawn", payload }).payload,
+  ).toEqual(payload);
+  for (const bad of [
+    { reason: "x" },
+    { requestId: "req_1" },
+    { ...payload, reason: "" },
+  ]) {
+    expect(
+      RunnerEventPost.safeParse({
+        runId: "run_1",
+        type: "run.withdrawn",
+        payload: bad,
+      }).success,
+    ).toBe(false);
+  }
+});

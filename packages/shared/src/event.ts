@@ -43,10 +43,25 @@ export const Decision = z.discriminatedUnion("decision", [
 ]);
 export type Decision = z.infer<typeof Decision>;
 
+/**
+ * Stored in place of a decision when the runner stopped waiting on a request before anyone
+ * answered it; the request is closed, and a later answer is refused.
+ */
+export const Withdrawal = z.object({
+  requestId: RequestId,
+  decision: z.literal("withdrawn"),
+  reason: z.string().min(1),
+});
+export type Withdrawal = z.infer<typeof Withdrawal>;
+
+/** What a request row records as its outcome: a person's decision, or the runner's withdrawal. */
+export type StoredDecision = Decision | Withdrawal;
+
 export const EventType = z.enum([
   "run.started",
   "run.waiting",
   "run.resumed",
+  "run.withdrawn",
   "run.finished",
   "run.failed",
   "run.stopped",
@@ -101,6 +116,11 @@ const runPayloads = {
   /** `sessionId` is the Claude session the API stores to resume the agent's next run. */
   "run.started": z.object({ sessionId: z.string().min(1) }),
   "run.waiting": z.object({ request: PendingRequest }),
+  /** The runner stopped waiting on `requestId` before anyone answered it (`reason`: why); the run goes back to `running`. */
+  "run.withdrawn": z.object({
+    requestId: RequestId,
+    reason: z.string().min(1).max(256),
+  }),
   "run.finished": z.object({
     summary: z.string(),
     usage: Usage,
@@ -268,6 +288,7 @@ const posted = <T extends keyof typeof postPayloads>(type: T) =>
 export const RunnerEventPost = z.discriminatedUnion("type", [
   posted("run.started"),
   posted("run.waiting"),
+  posted("run.withdrawn"),
   posted("run.finished"),
   posted("run.failed"),
   posted("run.stopped"),
@@ -305,6 +326,7 @@ export const Event = z.discriminatedUnion("type", [
   stored("run.started"),
   stored("run.waiting"),
   stored("run.resumed"),
+  stored("run.withdrawn"),
   stored("run.finished"),
   stored("run.failed"),
   stored("run.stopped"),

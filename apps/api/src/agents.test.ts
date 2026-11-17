@@ -1790,7 +1790,7 @@ test("a second run.started with another session gets 409 invalid_transition and 
   ).toEqual({ session_id: "sess-1" });
 });
 
-test("a run.finished on a waiting run gets 409 invalid_transition and leaves the run waiting", async () => {
+test("a run.finished on a waiting run withdraws the open request and finishes the run", async () => {
   hearRunEvents();
   const { agent, run, token } = await startedRun();
   await postEvent(token, {
@@ -1805,16 +1805,16 @@ test("a run.finished on a waiting run gets 409 invalid_transition and leaves the
     type: "run.finished",
     payload: { summary: "skipped the answer", usage },
   });
-  expect(res.status).toBe(409);
-  expect(await res.json()).toMatchObject({
-    error: { code: "invalid_transition" },
-  });
+  expect(res.status).toBe(201);
   expect(eventsOf(run.id).map((e) => e.type)).toEqual([
     "run.started",
     "run.waiting",
+    "run.withdrawn",
+    "run.finished",
   ]);
-  expect(deliveryCount()).toBe(2);
-  expect((await getRun(agent.id, run.id)).body.status).toBe("waiting");
+  // the subscriber hears the run's own events, not run.withdrawn
+  expect(deliveryCount()).toBe(3);
+  expect((await getRun(agent.id, run.id)).body.status).toBe("finished");
 });
 
 test("a run.waiting for a run still starting gets 409 run_not_started, so the runner can name the lost start", async () => {

@@ -1214,3 +1214,51 @@ test("a sky delivery keeps its headers, signature and body shape", async () => {
     expect(only?.headers.has(name)).toBe(false);
   }
 });
+
+test.each([
+  ["sky", {}],
+  ["standard", { secret }],
+  ["openbot", { secret: openbotSecret }],
+] as const)(
+  "a run.withdrawn event is delivered in the %s format with its request and reason",
+  async (format, extra) => {
+    await subscribe(["run.withdrawn"], subscriberUrl, { format, ...extra });
+    const received = subscriber([200]);
+    const { agentId, envId, runId, token } = runningRun();
+    const requestId = "req_withdrawn1";
+    await postEvent(token, {
+      runId,
+      type: "run.waiting",
+      payload: { request: { kind: "question", requestId, prompt: "which?" } },
+    });
+    const posted = await postEvent(token, {
+      runId,
+      type: "run.withdrawn",
+      payload: { requestId, reason: "hook_cancelled" },
+    });
+    expect(posted.status).toBe(201);
+    const { id: eventId } = (await posted.json()) as { id: number };
+
+    await dispatcher.drain();
+    // run.waiting isn't subscribed, so the withdrawal is the one delivery
+    expect(received).toHaveLength(1);
+    const event = {
+      id: `evt_${eventId}`,
+      agentId,
+      environmentId: envId,
+      runId,
+      ts: expect.stringMatching(/Z$/),
+      type: "run.withdrawn",
+      payload: { requestId, reason: "hook_cancelled" },
+    };
+    const parsed = JSON.parse(received[0]?.body ?? "");
+    expect(parsed).toEqual(
+      format === "sky"
+        ? event
+        : format === "standard"
+          ? { type: "run.withdrawn", timestamp: parsed.data.ts, data: event }
+          : { type: "run.withdrawn", data: event },
+    );
+    expect(deliveries().map((d) => d.status)).toEqual(["delivered"]);
+  },
+);

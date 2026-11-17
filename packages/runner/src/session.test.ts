@@ -7145,3 +7145,183 @@ describe("the instructions on commands that run without a person", () => {
     );
   });
 });
+
+/** Answers the first request's polls with a held pending, and any later request's with an approval. */
+function firstRequestHeld(): DecisionReply {
+  let first: string | undefined;
+  return async (requestId) => {
+    first ??= requestId;
+    if (requestId !== first) return decided({ decision: "approve" })(requestId);
+    return heldPending(requestId);
+  };
+}
+
+const withdrawnEvents = (sent: RunnerEventPost[]) =>
+  sent.filter((e) => e.type === "run.withdrawn");
+const waitingId = (event: RunnerEventPost | undefined) =>
+  event?.type === "run.waiting" ? event.payload.request.requestId : undefined;
+
+test("a session that ends with a background subagent's request still open withdraws it, and the run still finishes", async () => {
+  const { sent, deps } = api(heldPending);
+  const query = wakeProcess([
+    init,
+    subagentStart,
+    success,
+    // the woken turn's call is held, and its hook is still waiting when the hold ends the session
+    async (options: Options) => {
+      void fire(options, "PreToolUse", gitPush);
+      return undefined;
+    },
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query, backgroundHoldMs: 30 },
+  );
+  expect(code).toBe(0);
+  const types = sent.map((e) => e.type);
+  expect(types.filter((t) => t.startsWith("run."))).toEqual([
+    "run.started",
+    "run.waiting",
+    "run.withdrawn",
+    "run.finished",
+  ]);
+  const requestId = waitingId(sent.find((e) => e.type === "run.waiting"));
+  expect(withdrawnEvents(sent)).toEqual([
+    {
+      runId: "run_1",
+      type: "run.withdrawn",
+      payload: { requestId, reason: "run_ending" },
+    },
+  ]);
+});
+
+test("a hook the SDK cancels mid-session withdraws its request, and the next held call's run.waiting opens after it", async () => {
+  const { sent, deps } = api(firstRequestHeld());
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      const [gate] = options.hooks?.PreToolUse?.[0]?.hooks ?? [];
+      const cancel = new AbortController();
+      setTimeout(() => cancel.abort(new Error("hook timed out")), 50);
+      await gate?.(
+        {
+          session_id: "sess-new",
+          transcript_path: "/t.jsonl",
+          cwd: options.cwd ?? "",
+          hook_event_name: "PreToolUse",
+          ...gitPush,
+        } as HookInput,
+        "toolu_1",
+        { signal: cancel.signal },
+      );
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query },
+  );
+  expect(code).toBe(0);
+  expect(answers).toEqual([approved]);
+  expect(sent.map((e) => e.type).filter((t) => t.startsWith("run."))).toEqual([
+    "run.started",
+    "run.waiting",
+    "run.withdrawn",
+    "run.waiting",
+    "run.finished",
+  ]);
+  const [first, second] = sent.filter((e) => e.type === "run.waiting");
+  expect(first && second && waitingId(first) !== waitingId(second)).toBe(true);
+  expect(withdrawnEvents(sent)).toEqual([
+    {
+      runId: "run_1",
+      type: "run.withdrawn",
+      payload: { requestId: waitingId(first), reason: "hook_cancelled" },
+    },
+  ]);
+});
+
+test("Claude's question the SDK cancels is withdrawn the same way", async () => {
+  const { sent, deps } = api(heldPending);
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      const cancel = new AbortController();
+      setTimeout(() => cancel.abort(new Error("cancelled")), 50);
+      await options.canUseTool?.(
+        "AskUserQuestion",
+        { questions },
+        { signal: cancel.signal, toolUseID: "t1", requestId: "perm_1" },
+      );
+    },
+    success,
+  ]);
+  expect(await runSession(config, { ...deps, query })).toBe(0);
+  expect(sent.map((e) => e.type).filter((t) => t.startsWith("run."))).toEqual([
+    "run.started",
+    "run.waiting",
+    "run.withdrawn",
+    "run.finished",
+  ]);
+});
+
+test("a stop from the runner's own signal while a call waits withdraws the request before run.failed", async () => {
+  const { sent, deps } = api(heldPending);
+  const controller = new AbortController();
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      setTimeout(() => controller.abort("SIGTERM"), 50);
+      await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query, signal: controller.signal },
+  );
+  expect(code).toBe(1);
+  expect(sent.map((e) => e.type).filter((t) => t.startsWith("run."))).toEqual([
+    "run.started",
+    "run.waiting",
+    "run.withdrawn",
+    "run.failed",
+  ]);
+  expect(withdrawnEvents(sent)).toMatchObject([
+    { payload: { reason: "run_stopping" } },
+  ]);
+});
+
+test("a decision that lands is never withdrawn", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const query = scripted([init, firePush, success]);
+  expect(
+    await runSession(
+      { ...config, approvalPolicy: ["Bash(git push:*)"] },
+      { ...deps, query },
+    ),
+  ).toBe(0);
+  expect(withdrawnEvents(sent)).toEqual([]);
+});
+
+test("a run the API ended while a call waited posts no withdrawal and nothing terminal", async () => {
+  const { sent, deps } = api(() =>
+    HttpResponse.json(
+      { error: { code: "run_ended", message: "the run has ended" } },
+      { status: 401 },
+    ),
+  );
+  const query = scripted([init, firePush, success]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query },
+  );
+  expect(code).toBe(1);
+  expect(withdrawnEvents(sent)).toEqual([]);
+  expect(sent.map((e) => e.type).filter((t) => t.startsWith("run."))).toEqual([
+    "run.started",
+    "run.waiting",
+  ]);
+});

@@ -631,9 +631,14 @@ export async function runSession(
   // the run's `run.started` post: a gated call's `run.waiting` waits for it to be stored
   let startLanded: Promise<void> = Promise.resolve();
   let ended = false;
+  // the request this runner opened and has not seen decided, withdrawn or ended with its run
+  let openRequest: RequestId | undefined;
   const end = async (event: RunnerEvent) => {
     if (ended) return;
     ended = true;
+    // a request still open would make the API refuse a finish; the API closes it itself too, but
+    // only a runner that knew it was open can say why
+    if (openRequest !== undefined && (await withdrawOpen("run_ending"))) return;
     await post(event);
   };
   const interrupted = () => `interrupted by ${String(deps.signal.reason)}`;
@@ -695,6 +700,41 @@ export async function runSession(
     stopReason ??= reason;
     abortController.abort(reason);
   };
+  let withdrawing: Promise<boolean> | undefined;
+  /** Ends the poll for the request the runner has open, once that request is withdrawn. */
+  let endWait: (() => void) | undefined;
+  /**
+   * Tells the API the runner has stopped waiting on its open request, for `reason`, and lands that
+   * before any post queued after it. True when the API had already ended the run; a withdrawal that
+   * can't land is a warning, and the request stays open for the next try.
+   */
+  const withdrawOpen = (reason: string): Promise<boolean> => {
+    const requestId = openRequest;
+    if (requestId === undefined) return Promise.resolve(false);
+    withdrawing ??= post(
+      { type: "run.withdrawn", payload: { requestId, reason } },
+      // a stop ends the retrying but not the send
+      { giveUp: abortController.signal },
+    ).then(
+      () => {
+        if (openRequest === requestId) openRequest = undefined;
+        endWait?.();
+        return false;
+      },
+      (error: unknown) => {
+        if (error instanceof RunEndedError) {
+          endedByApi("run ended while withdrawing a request");
+          openRequest = undefined;
+          return true;
+        }
+        warn(`runner: ${messageOf(error)}`);
+        return false;
+      },
+    );
+    return withdrawing.finally(() => {
+      withdrawing = undefined;
+    });
+  };
   /** The API already recorded how the run ended, so `end` posts nothing. */
   const endedByApi = (reason: string) => {
     ended = true;
@@ -726,11 +766,19 @@ export async function runSession(
   ): Promise<Decision | undefined> => {
     if (abortController.signal.aborted || signal.aborted) return undefined;
     const requestId: RequestId = `req_${randomUUID().replaceAll("-", "")}`;
-    const stop = AbortSignal.any([abortController.signal, signal]);
+    // also ended by a withdrawal the ending makes, so a poll left running doesn't outlive it
+    const withdrawn = new AbortController();
+    endWait = () => withdrawn.abort();
+    const stop = AbortSignal.any([
+      abortController.signal,
+      signal,
+      withdrawn.signal,
+    ]);
     const runEnded = () => {
       endedByApi("run ended while waiting");
       return undefined;
     };
+    let posting = false;
     try {
       // the queue alone doesn't hold this back: a start that never lands rejects, and the queue
       // moves on
@@ -738,6 +786,7 @@ export async function runSession(
       // one budget for opening the request and polling it, from when the start is stored, so a
       // start still retrying takes none of the person's window
       const deadline = Date.now() + config.waitTimeoutMs;
+      posting = true;
       await post(
         {
           type: "run.waiting",
@@ -745,7 +794,12 @@ export async function runSession(
         },
         { deadline, signal: stop },
       );
+      posting = false;
+      openRequest = requestId;
       const outcome = await deps.awaitDecision(requestId, stop, deadline);
+      // each of these leaves nothing for the runner to withdraw: decided, ended with the API's own
+      // record, never stored, or ended by the run's failure (which the API accepts while waiting)
+      openRequest = undefined;
       switch (outcome.kind) {
         case "decided":
           return outcome.decision;
@@ -759,8 +813,30 @@ export async function runSession(
           return undefined;
       }
     } catch (error) {
-      if (error instanceof RunEndedError) return runEnded();
-      if (!stop.aborted) stopSession(messageOf(error));
+      if (error instanceof RunEndedError) {
+        openRequest = undefined;
+        return runEnded();
+      }
+      if (!stop.aborted) {
+        if (openRequest === requestId) openRequest = undefined;
+        stopSession(messageOf(error));
+        return undefined;
+      }
+      // a cancelled wait must not leave its request open: the API would refuse the run's next
+      // request, or its ending. A post cut off by the runner's own stop is left to the ending, which
+      // the API accepts from a waiting run only as a failure or stop.
+      if (posting) {
+        if (abortController.signal.aborted) return undefined;
+        // cut off mid-post, so the API may hold the request
+        openRequest = requestId;
+      }
+      await withdrawOpen(
+        deps.signal.aborted
+          ? "run_stopping"
+          : abortController.signal.aborted
+            ? "session_ending"
+            : "hook_cancelled",
+      );
       return undefined;
     }
   };

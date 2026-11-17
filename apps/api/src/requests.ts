@@ -69,6 +69,9 @@ export function decideRequest(tx: Tx, agentId: AgentId, decision: Decision) {
     )
     .get();
   if (!found) return { kind: "not_found" } as const;
+  if (found.request.decision?.decision === "withdrawn") {
+    return { kind: "withdrawn" } as const;
+  }
   const wanted = decision.decision === "answer" ? "question" : "approval";
   if (found.request.kind !== wanted) {
     return { kind: "wrong_kind", requestKind: found.request.kind } as const;
@@ -103,4 +106,39 @@ export function decideRequest(tx: Tx, agentId: AgentId, decision: Decision) {
     decision: resumedAs[decision.decision],
   });
   return { kind: "decided", run, enqueued } as const;
+}
+
+/**
+ * Closes the run's open request `requestId` as withdrawn and moves the run and agent from `waiting`
+ * back to `running`, recording `run.withdrawn`. A request that is unknown, already decided or not
+ * the open one changes nothing (`noop`): a decision that landed first stands. Publish the request's
+ * id once `tx` commits, so a poll still holding it re-reads.
+ */
+export function withdrawRequest(
+  tx: Tx,
+  run: typeof runs.$inferSelect,
+  requestId: RequestId,
+  reason: string,
+) {
+  const open = openRequestOf(tx, run.id);
+  if (open?.request.requestId !== requestId) return { kind: "noop" } as const;
+  tx.update(runRequests)
+    .set({
+      decision: { requestId, decision: "withdrawn", reason },
+      decidedAt: new Date().toISOString(),
+    })
+    .where(eq(runRequests.id, requestId))
+    .run();
+  if (run.status === "waiting") {
+    tx.update(runs).set({ status: "running" }).where(eq(runs.id, run.id)).run();
+    tx.update(agents)
+      .set({ status: "running" })
+      .where(eq(agents.id, run.agentId))
+      .run();
+  }
+  const { id, enqueued } = recordEvent(tx, run.id, "run.withdrawn", {
+    requestId,
+    reason,
+  });
+  return { kind: "withdrawn", id, enqueued } as const;
 }

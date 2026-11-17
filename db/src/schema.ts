@@ -2,7 +2,6 @@ import type {
   AgentId,
   AgentStatus,
   ApiKeyId,
-  Decision,
   EnvironmentId,
   EnvironmentStatus,
   EventType,
@@ -11,6 +10,7 @@ import type {
   RunId,
   RunRollup,
   RunStatus,
+  StoredDecision,
   WebhookId,
 } from "@sky/shared";
 import { type AnyColumn, sql } from "drizzle-orm";
@@ -361,7 +361,7 @@ export const runRequests = sqliteTable(
       .references(() => runs.id),
     kind: text({ enum: requestKinds }).notNull(),
     request: text({ mode: "json" }).$type<PendingRequest>().notNull(),
-    decision: text({ mode: "json" }).$type<Decision>(),
+    decision: text({ mode: "json" }).$type<StoredDecision>(),
     decidedAt: text("decided_at"),
     createdAt: createdAt(),
   },

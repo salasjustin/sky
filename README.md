@@ -384,15 +384,16 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 
 Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you'll meet:
 
-| code              | means                                                                        |
-| ----------------- | ---------------------------------------------------------------------------- |
-| `concurrency_cap` | the environment already runs its max agents; wait for one to end or stop one |
-| `run_active`      | a run is in progress; wait for it or stop it                                 |
-| `env_not_ready`   | the environment isn't ready to launch agents yet                             |
-| `provisioning`    | the environment is still provisioning; wait for it to finish                 |
-| `agents_exist`    | repo or setup can't change while unarchived agents exist                     |
-| `already_decided` | the request was already decided differently; that decision stands            |
-| `webhooks_filter` | webhooks filter on the environment; delete them first (ids in `webhookIds`)  |
+| code                | means                                                                              |
+| ------------------- | ---------------------------------------------------------------------------------- |
+| `concurrency_cap`   | the environment already runs its max agents; wait for one to end or stop one       |
+| `run_active`        | a run is in progress; wait for it or stop it                                       |
+| `env_not_ready`     | the environment isn't ready to launch agents yet                                   |
+| `provisioning`      | the environment is still provisioning; wait for it to finish                       |
+| `agents_exist`      | repo or setup can't change while unarchived agents exist                           |
+| `already_decided`   | the request was already decided differently; that decision stands                  |
+| `request_withdrawn` | the run stopped waiting on the request before it was answered; nothing was applied |
+| `webhooks_filter`   | webhooks filter on the environment; delete them first (ids in `webhookIds`)        |
 
 ### Run errors
 
@@ -445,6 +446,7 @@ What an agent does arrives as events, each with `agentId`, `environmentId` (the 
 | `run.started`, `run.finished`, `run.failed`, `run.stopped`             | the run's lifecycle                                                                                                             |
 | `run.waiting`                                                          | the agent needs an `answer` or an approval                                                                                      |
 | `run.resumed`                                                          | a question was answered or a tool call approved or denied                                                                       |
+| `run.withdrawn`                                                        | the run stopped waiting on a request before anyone answered it (`requestId`, `reason`); the run is `running` again              |
 | `run.probed`                                                           | a silent run's runner was checked on its sprite and found alive                                                                 |
 | `runner.warning`                                                       | the runner hit a problem that didn't end the run, with its message                                                              |
 | `runner.heartbeat`                                                     | a tool call is still running: its name and how long, about every 60 s                                                           |
@@ -457,6 +459,8 @@ What an agent does arrives as events, each with `agentId`, `environmentId` (the 
 | `claude.Notification`, `claude.PreCompact`, `claude.FileChanged`       | Claude Code's notifications, context compaction, watched-file changes                                                           |
 
 A run that goes quiet while background tasks run is explained by `claude.BackgroundTasksChanged` (what was running) and `claude.TaskNotification` (what each task's end notice said; recording a notice doesn't change how long the run waits for its tasks). The `claude.*` names are Claude Code's own hook names, except those two and `claude.Message`, which come from Claude's message stream. Each text field is redacted (registered secrets and tokens) and then cut to 4,096 characters (`runner.warning` included). `claude.*` and `runner.heartbeat` events are kept for 7 days; `run.*` and `runner.warning` events are kept.
+
+A `run.waiting` ends in `run.resumed` (someone answered) or `run.withdrawn` (the run stopped waiting first: its session ended, the wait was cancelled, or the run was stopping). The withdrawn request is closed and the run goes back to `running`, so a run that ends while it waits still finishes. Answering a withdrawn request is refused with `409 request_withdrawn`, from the API, MCP and `sky approve`, `sky deny` and `sky answer` alike.
 
 Three ways to receive them:
 
