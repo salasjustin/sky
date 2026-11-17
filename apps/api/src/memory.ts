@@ -171,9 +171,7 @@ function cutProcessLines(report: string): string {
   const lines = report.split("\n");
   const start = lines.indexOf(PROCESSES_MARK);
   if (start < 0) return report;
-  const end = lines.findIndex(
-    (line, i) => i > start && line.startsWith("== "),
-  );
+  const end = lines.findIndex((line, i) => i > start && line.startsWith("== "));
   return lines
     .map((line, i) =>
       i > start && (end < 0 || i < end)

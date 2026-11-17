@@ -3337,9 +3337,13 @@ test("diagnostics unavailable, with another live run's agent token in the sprite
   await prober.sweep(silentFor(config.runProbeMs + 1000));
 
   const [message] = warningsOf(run.id);
-  expect(message).toContain("diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]");
+  expect(message).toContain(
+    "diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]",
+  );
   expect(message).not.toContain(other.token);
-  expect(logs.join("\n")).toContain("diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]");
+  expect(logs.join("\n")).toContain(
+    "diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]",
+  );
   expect(logs.join("\n")).not.toContain(other.token);
 });
 
@@ -3383,10 +3387,9 @@ test("a diagnostics exec that throws is stored and logged without the secret, th
                       `connect ECONNRESET ${secret} ${token} ${other.token}`,
                     ),
                   )
-                : (target.execFileHTTP as (...args: unknown[]) => unknown).apply(
-                    target,
-                    call,
-                  );
+                : (
+                    target.execFileHTTP as (...args: unknown[]) => unknown
+                  ).apply(target, call);
           }
           const value = Reflect.get(target, prop);
           return typeof value === "function" ? value.bind(target) : value;
