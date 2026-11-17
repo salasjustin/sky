@@ -131,6 +131,16 @@ function lex(command: string): Token[] | undefined {
   for (let i = 0; i < command.length; i++) {
     const ch = command[i] ?? "";
     const next = command[i + 1];
+    // in double quotes a backslash is kept as is unless `$`, a backtick, `"`, `\` or a newline
+    // follows, so `"a\|b"` reaches the program as `a\|b`
+    if (quote === '"' && ch === "\\") {
+      if (next === undefined || EXPANDING.test(next) || next === '"')
+        return undefined;
+      literal = true;
+      text += ch + next;
+      i++;
+      continue;
+    }
     // single quotes are fully literal in bash and zsh, so awk's `$1` is plain text there
     if (EXPANDING.test(ch)) {
       if (quote !== "'") return undefined;

@@ -1001,3 +1001,49 @@ test("an entry is plain leading words", () => {
   ])
     expect(parseCommandEntry(bad)).toBeUndefined();
 });
+
+describe("a backslash in double quotes", () => {
+  const sub = `cd ${CWD}/sub && `;
+
+  test.each([
+    'grep -n "PanelRoute\\|^import\\|^export" AppShell.jsx',
+    "grep -nE \"^\\s*'?(bell|mail)'?:\" glyphs.js | head",
+    'grep -n "donateProfile\\|buildProfile\\|profile(" lib/server/pages/view.ts | head',
+    'grep -n "^describe\\|^})" AppShell.dom.spec.tsx | tail -12',
+  ])(
+    "runs for a text tool, inside the worktree and after a cd: %s",
+    (command) => {
+      expect(verdict(command)).toBe("approved");
+      expect(verdict(sub + command)).toBe("approved");
+    },
+  );
+
+  test.each([
+    'grep "a\\$b"',
+    'grep "a\\"b"',
+    'grep "a\\\\b"',
+    'grep "\\`x\\`"',
+    'grep "a$b"',
+    'grep "a!b"',
+    'grep "a\\!b"',
+    'grep "a\\',
+  ])("still asks on %s", (command) => {
+    expect(verdict(command)).toBe("syntax");
+  });
+
+  test("other programs, and an unquoted backslash, still ask", () => {
+    const make = { defaults: true, commands: ["make"] };
+    expect(verdict('pnpm test "a\\|b"')).toBe("syntax");
+    expect(verdict('make "x\\y"', make)).toBe("syntax");
+    expect(verdict("grep a\\|b file")).toBe("syntax");
+  });
+
+  test("the per-program checks see the text bash passes, backslash included", () => {
+    // `1\,2p` is not the sed script `1,2p`, so it asks
+    expect(verdict('sed -n "1,2p" a.ts')).toBe("approved");
+    expect(verdict('sed -n "1\\,2p" a.ts')).toBe("unsafe-option");
+    // `\-g` is a pattern, not rg's `-g`
+    expect(verdict('rg "\\-g" src')).toBe("approved");
+    expect(verdict('rg "-g" src')).toBe("unsafe-option");
+  });
+});

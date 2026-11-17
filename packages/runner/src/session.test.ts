@@ -46,6 +46,7 @@ import { createDecisionWaiter } from "./requests.js";
 import type { Seal } from "./seal.js";
 import {
   nestedClaude,
+  QUIET_COMMANDS,
   type QueryFn,
   removeScratchNow,
   repoLockWaitS,
@@ -7085,5 +7086,38 @@ describe("the run's scratch directory on disk", () => {
     removeScratchNow();
     expect(existsSync(dir)).toBe(false);
     expect(() => removeScratchNow()).not.toThrow();
+  });
+});
+
+describe("the instructions on commands that run without a person", () => {
+  const withPolicy = async (approvalPolicy: string[]) => {
+    const query = scripted([init, success]);
+    await runSession(
+      { ...config, approvalPolicy },
+      {
+        query,
+        post: recorder().post,
+        signal: new AbortController().signal,
+        awaitDecision: noDecision,
+        credentialEnv: {},
+      },
+    );
+    return (
+      (query.calls[0]?.options.systemPrompt as { append?: string } | undefined)
+        ?.append ?? ""
+    );
+  };
+
+  test("are in the prompt when the policy holds Bash", async () => {
+    const append = await withPolicy(["Bash"]);
+    expect(append).toContain(QUIET_COMMANDS);
+    expect(append).toContain("single-quoted patterns");
+    expect(append).toContain("`rg` instead of `grep -r`");
+    expect(append).toContain("`runner.mjs sync` instead of `git fetch`");
+  });
+
+  test("are left out when it doesn't", async () => {
+    expect(await withPolicy([])).not.toContain(QUIET_COMMANDS);
+    expect(await withPolicy(["Write"])).not.toContain(QUIET_COMMANDS);
   });
 });
