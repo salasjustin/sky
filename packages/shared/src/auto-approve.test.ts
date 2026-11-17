@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, describe, expect, test } from "vitest";
 import {
   type AskReason,
@@ -122,10 +122,7 @@ const reasons: Record<Exclude<AskReason, "unresolvable">, string[]> = {
     "echo $HOME",
     'echo "$' + '{HOME}"',
     "echo $" + "{HOME}",
-    "ls ~",
-    "cat ~/.claude/.credentials.json",
     "cat ~root/x",
-    "rg foo ~/.ssh",
     "ls *",
     "cat src/*.ts",
     "cat .e?v",
@@ -280,6 +277,10 @@ const reasons: Record<Exclude<AskReason, "unresolvable">, string[]> = {
     "rg --hostname-bin x foo",
   ],
   "outside-root": [
+    // with no home in the scope a `~` stays unexpanded
+    "ls ~",
+    "cat ~/.claude/.credentials.json",
+    "rg foo ~/.ssh",
     "cat /home/sprite/.claude/.credentials.json",
     'cat "~/.ssh/id_rsa"',
     "cat ../x",
@@ -532,6 +533,364 @@ describe("the realpath hook", () => {
   });
 });
 
+describe("the plugin cache, the kru store and the repo's skill files", () => {
+  const base = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "auto-approve-home-")),
+  );
+  const home = join(base, "home");
+  const root = join(base, "wt");
+  const cache = join(home, ".claude/plugins/cache");
+  const skill = join(cache, "kru/kru/0.213.0/skills/lead/SKILL.md");
+  mkdirSync(join(skill, ".."), { recursive: true });
+  mkdirSync(join(home, ".kru/audit"), { recursive: true });
+  mkdirSync(join(home, ".kru/management/plan/slug"), { recursive: true });
+  mkdirSync(join(home, ".ssh"));
+  mkdirSync(join(root, ".claude/skills/release"), { recursive: true });
+  mkdirSync(join(root, "packages/ui"), { recursive: true });
+  writeFileSync(skill, "x");
+  writeFileSync(join(home, ".kru/audit/run.jsonl"), "x");
+  writeFileSync(join(home, ".kru/management/plan/slug/brief.md"), "x");
+  writeFileSync(join(home, ".claude/.credentials.json"), "x");
+  writeFileSync(join(home, ".claude/settings.json"), "x");
+  writeFileSync(join(home, ".ssh/id_rsa"), "x");
+  writeFileSync(join(root, ".claude/skills/release/SKILL.md"), "x");
+  writeFileSync(join(root, ".claude/settings.json"), "x");
+  writeFileSync(join(root, ".claude/settings.local.json"), "x");
+  writeFileSync(join(root, "packages/ui/image.tsx"), "x");
+  symlinkSync(join(home, ".ssh/id_rsa"), join(home, ".kru/to-key"));
+  symlinkSync(join(home, ".claude/.credentials.json"), join(cache, "to-login"));
+  symlinkSync(join(home, ".kru/audit"), join(cache, "to-store"));
+  symlinkSync(join(root, "packages"), join(home, ".kru/to-worktree"));
+  symlinkSync(
+    join(root, ".claude/settings.json"),
+    join(root, ".claude/skills/to-settings"),
+  );
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+
+  const withHome = (command: string, realpath?: (path: string) => string) =>
+    autoApproveVerdict(command, DEFAULTS, { root, home, realpath });
+  const both = (command: string) => {
+    const plain = withHome(command);
+    expect(withHome(command, realpathSync.native), command).toBe(plain);
+    return plain;
+  };
+
+  test("approves a read under the plugin cache", () => {
+    expect(both(`grep -n 'Step 3' -A 200 ${skill} | head -300`)).toBe(
+      "approved",
+    );
+    expect(
+      both("cat ~/.claude/plugins/cache/kru/kru/0.213.0/skills/lead/SKILL.md"),
+    ).toBe("approved");
+    expect(both("ls ~/.claude/plugins/cache")).toBe("approved");
+  });
+
+  test("approves a read under the kru store, by absolute path or `~`", () => {
+    expect(both(`cat ${home}/.kru/audit/run.jsonl | head -c 400000`)).toBe(
+      "approved",
+    );
+    expect(
+      both(
+        "cat ~/.kru/management/plan/slug/brief.md && git diff f4d7ee9 --stat",
+      ),
+    ).toBe("approved");
+    expect(both("ls ~/.kru")).toBe("approved");
+  });
+
+  test("a root beside the worktree is named, never entered", () => {
+    expect(both("cd ~/.kru/audit && cat run.jsonl")).toBe("outside-root");
+    expect(both("cd ~/.kru && pnpm test")).toBe("outside-root");
+    expect(both("cd ~/.claude/plugins/cache/p && git status")).toBe(
+      "outside-root",
+    );
+    for (const realpath of [undefined, realpathSync.native]) {
+      const inStore = (command: string) =>
+        autoApproveVerdict(command, DEFAULTS, {
+          root,
+          home,
+          cwd: join(home, ".kru"),
+          realpath,
+        });
+      expect(inStore("ls")).toBe("outside-root");
+      expect(inStore("cat audit/run.jsonl")).toBe("outside-root");
+    }
+  });
+
+  test("approves the worktree's skills, agents and commands", () => {
+    expect(
+      both("cat .claude/skills/release/SKILL.md && cat packages/ui/image.tsx"),
+    ).toBe("approved");
+    expect(both("ls .claude/agents .claude/commands")).toBe("approved");
+    expect(both(`cat ${root}/.claude/skills/release/SKILL.md`)).toBe(
+      "approved",
+    );
+  });
+
+  test("expands a bare `~` to the home, which is outside both roots", () => {
+    expect(both("ls ~")).toBe("outside-root");
+    expect(both("cd ~ && ls")).toBe("outside-root");
+  });
+
+  test("a `~` is the home in arguments and in a cd target", () => {
+    const inside = join(root, "packages/ui");
+    const at = (command: string, realpath?: (path: string) => string) =>
+      autoApproveVerdict(command, DEFAULTS, { root, home: inside, realpath });
+    for (const realpath of [undefined, realpathSync.native]) {
+      expect(at("cat ~/image.tsx", realpath)).toBe("approved");
+      expect(at("cat ~", realpath)).toBe("approved");
+      expect(at("cd ~ && cat image.tsx", realpath)).toBe("approved");
+      // from packages/ui, `../../.env` is the worktree's own `.env`
+      expect(at("cd ~ && cat ../../.env", realpath)).toBe("sensitive-path");
+    }
+  });
+
+  test("a home of `/` makes `~` the filesystem root, as bash does", () => {
+    const atRoot = (command: string) =>
+      autoApproveVerdict(command, DEFAULTS, { root, home: "/" });
+    expect(atRoot("ls ~")).toBe("outside-root");
+    expect(atRoot("cd ~ && cat etc/passwd")).toBe("outside-root");
+    expect(atRoot("cat ~/etc/x")).toBe("outside-root");
+    expect(atRoot("cat ~/.kru/x")).toBe("approved");
+  });
+
+  test("asks for a sibling that only shares a root's prefix", () => {
+    expect(both("ls ~/.krux/a")).toBe("outside-root");
+    expect(both("cat ~/.claude/plugins/cache2/a")).toBe("outside-root");
+  });
+
+  test("asks for the rest of ~/.claude, whatever the spelling", () => {
+    expect(both("cat ~/.claude/.credentials.json")).toBe("outside-root");
+    expect(both("cat ~/.claude/settings.json")).toBe("outside-root");
+    expect(both("cat ~/.claude/plugins/../.credentials.json")).toBe(
+      "outside-root",
+    );
+    expect(
+      both(`cat ${home}/.claude/plugins/cache/../../.credentials.json`),
+    ).toBe("outside-root");
+    expect(both("ls ~/.claude")).toBe("outside-root");
+    expect(both("cat ~/.kru/../.ssh/id_rsa")).toBe("outside-root");
+    expect(both("cat ~/.ssh/id_rsa")).toBe("outside-root");
+  });
+
+  test("asks for the rest of the worktree's .claude", () => {
+    expect(both("cat .claude/settings.local.json")).toBe("sensitive-path");
+    expect(both("cat .claude/settings.json")).toBe("sensitive-path");
+    expect(both("cat .claude/skills/../settings.json")).toBe("sensitive-path");
+    expect(both("ls .claude")).toBe("sensitive-path");
+  });
+
+  test("only the worktree's top-level .claude lets skills through", () => {
+    expect(both("cat packages/x/.claude/skills/a")).toBe("sensitive-path");
+    expect(both("cat ~/.kru/.claude/skills/x")).toBe("sensitive-path");
+    expect(both("cat ~/.claude/plugins/cache/p/.claude/skills/x")).toBe(
+      "sensitive-path",
+    );
+  });
+
+  test("a secret under a root still asks", () => {
+    expect(both("cat ~/.kru/.env")).toBe("sensitive-path");
+    expect(both("cat ~/.kru/x/credentials.json")).toBe("sensitive-path");
+    expect(both("cat .claude/skills/.env")).toBe("sensitive-path");
+    expect(both(`cat ${cache}/x/.ssh/y`)).toBe("sensitive-path");
+  });
+
+  test("a symlink under a root that leads out of it or onto a secret asks", () => {
+    const real = (command: string) => withHome(command, realpathSync.native);
+    expect(real("cat ~/.kru/to-key")).toBe("outside-root");
+    expect(real("cat ~/.claude/plugins/cache/to-login")).toBe("outside-root");
+    // another root is no better than outside
+    expect(real("cat ~/.claude/plugins/cache/to-store/run.jsonl")).toBe(
+      "outside-root",
+    );
+    expect(real("cat ~/.kru/to-worktree/ui/image.tsx")).toBe("outside-root");
+    expect(real("cat .claude/skills/to-settings")).toBe("sensitive-path");
+    expect(real("cd ~/.kru/to-key && ls")).toBe("outside-root");
+  });
+
+  test("a `~` that the shell wouldn't expand to the home still asks", () => {
+    expect(both("cat ~root/x")).toBe("syntax");
+    expect(both("ls x=~/y")).toBe("outside-root");
+    expect(both("ls x:~/.kru")).toBe("outside-root");
+    expect(both('cat "~/x"')).toBe("outside-root");
+    expect(both("cat '~/.kru/x'")).toBe("outside-root");
+    expect(both("cat ~+/x")).toBe("syntax");
+    expect(both("cat {~,a}/x")).toBe("syntax");
+    expect(both("cat ~/{a,b}")).toBe("syntax");
+    expect(both("cat x > ~/.kru/y")).toBe("syntax");
+  });
+
+  test("without a home the roots don't exist and a `~` asks", () => {
+    const bare = (command: string) =>
+      autoApproveVerdict(command, DEFAULTS, { root });
+    expect(bare(`cat ${home}/.kru/audit/run.jsonl`)).toBe("outside-root");
+    expect(bare("cat ~/.kru/audit/run.jsonl")).toBe("outside-root");
+    expect(
+      autoApproveVerdict("cat ~/.kru/x", DEFAULTS, { root, home: "relative" }),
+    ).toBe("outside-root");
+  });
+
+  test("an allowlist entry can't hold a `~`", () => {
+    expect(parseCommandEntry("ls ~/.kru")).toBeUndefined();
+  });
+});
+
+describe("a root that is a link to somewhere broader", () => {
+  const base = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "auto-approve-links-")),
+  );
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+  let n = 0;
+
+  /**
+   * A fresh home and worktree, with the root `name` replaced by a link to
+   * `target(home, elsewhere, claude)`. With `linkClaude`, `~/.claude` is a link
+   * to the real config folder `claude`, which sits outside the home.
+   */
+  const setup = (
+    name: ".kru" | ".claude/plugins/cache",
+    target: (home: string, elsewhere: string, claude: string) => string,
+    linkClaude = false,
+  ) => {
+    const dir = join(base, `case-${++n}`);
+    const home = join(dir, "home");
+    const elsewhere = join(dir, "elsewhere");
+    const root = join(dir, "wt");
+    const claude = linkClaude
+      ? join(dir, "persist/claude")
+      : join(home, ".claude");
+    for (const d of [
+      join(claude, "plugins"),
+      join(claude, "x"),
+      join(home, ".config/gh"),
+      elsewhere,
+      root,
+    ])
+      mkdirSync(d, { recursive: true });
+    if (linkClaude) symlinkSync(claude, join(home, ".claude"));
+    for (const f of [
+      join(claude, "settings.json"),
+      join(claude, "x/settings.json"),
+      join(home, "settings.json"),
+      join(home, ".config/gh/hosts.yml"),
+      join(elsewhere, "settings.json"),
+    ])
+      writeFileSync(f, "x");
+    const to = target(home, elsewhere, claude);
+    symlinkSync(to, join(home, name));
+    return { home, root, claude, read: `${join(home, name)}/settings.json` };
+  };
+  const verdictOf = (s: { home: string; root: string }, command: string) =>
+    autoApproveVerdict(command, DEFAULTS, {
+      root: s.root,
+      home: s.home,
+      realpath: realpathSync.native,
+    });
+
+  describe.each([".kru", ".claude/plugins/cache"] as const)("%s", (name) => {
+    test.each([
+      ["/", () => "/"],
+      ["the home", (home: string) => home],
+      ["~/.claude", (home: string) => join(home, ".claude")],
+      ["~/.claude/x", (home: string) => join(home, ".claude/x")],
+      ["a folder holding the home", (home: string) => dirname(home)],
+    ])("linked to %s, reads there ask", (_label, target) => {
+      const s = setup(name, target);
+      expect(verdictOf(s, `cat ${s.read}`)).toBe("outside-root");
+      expect(verdictOf(s, `cat ~/${name}/settings.json`)).toBe("outside-root");
+      expect(verdictOf(s, `ls ~/${name}`)).toBe("outside-root");
+    });
+
+    test.each([
+      ["the real ~/.claude", (claude: string) => claude],
+      ["inside the real ~/.claude", (claude: string) => join(claude, "x")],
+      [
+        "a folder holding the real ~/.claude",
+        (claude: string) => dirname(claude),
+      ],
+    ])("with ~/.claude a link, linked to %s, reads ask", (_label, at) => {
+      const s = setup(name, (_home, _elsewhere, claude) => at(claude), true);
+      expect(verdictOf(s, `cat ${s.read}`)).toBe("outside-root");
+      expect(verdictOf(s, `cat ~/${name}/settings.json`)).toBe("outside-root");
+      expect(verdictOf(s, `ls ~/${name}`)).toBe("outside-root");
+    });
+
+    test("linked into another secret folder, reads there ask", () => {
+      const s = setup(name, (home) => join(home, ".config/gh"));
+      expect(verdictOf(s, `cat ~/${name}/hosts.yml`)).toBe("outside-root");
+      expect(verdictOf(s, `ls ~/${name}`)).toBe("outside-root");
+    });
+
+    test("linked to a harmless folder elsewhere, reads still pass", () => {
+      const s = setup(name, (_home, elsewhere) => elsewhere);
+      expect(verdictOf(s, `cat ${s.read}`)).toBe("approved");
+      expect(verdictOf(s, `cat ~/${name}/settings.json`)).toBe("approved");
+    });
+
+    test("is judged for each command, not once", () => {
+      const s = setup(name, (_home, elsewhere) => elsewhere);
+      expect(verdictOf(s, `cat ${s.read}`)).toBe("approved");
+      const link = join(s.home, name);
+      rmSync(link);
+      symlinkSync(join(s.home, ".claude"), link);
+      expect(verdictOf(s, `cat ${s.read}`)).toBe("outside-root");
+    });
+  });
+
+  test.each([
+    ["a real ~/.claude", false],
+    ["~/.claude a link", true],
+  ])("with %s, a real plugin cache and .kru still read", (_label, link) => {
+    const s = setup(".kru", (_home, elsewhere) => elsewhere, link);
+    mkdirSync(join(s.claude, "plugins/cache/p"), { recursive: true });
+    writeFileSync(join(s.claude, "plugins/cache/p/plugin.json"), "x");
+    expect(verdictOf(s, "cat ~/.kru/settings.json")).toBe("approved");
+    expect(verdictOf(s, "cat ~/.claude/plugins/cache/p/plugin.json")).toBe(
+      "approved",
+    );
+  });
+
+  test("a home reached through a link still keeps a real root", () => {
+    const s = setup(".kru", (_home, elsewhere) => elsewhere);
+    const viaLink = join(base, `home-link-${n}`);
+    symlinkSync(s.home, viaLink);
+    expect(verdictOf({ ...s, home: viaLink }, "cat ~/.kru/settings.json")).toBe(
+      "approved",
+    );
+  });
+});
+
+describe(".claude.json holds account and MCP settings, so it is a secret name", () => {
+  const base = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "auto-approve-account-")),
+  );
+  const home = join(base, "home");
+  mkdirSync(join(home, "src"), { recursive: true });
+  writeFileSync(join(home, ".claude.json"), "{}");
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+
+  test.each([
+    "cat .claude.json",
+    "cat .CLAUDE.JSON",
+    "cat src/../.Claude.json",
+    "grep -n mcp .claude.json",
+  ])("in the worktree: %s", (command) => {
+    expect(verdict(command)).toBe("sensitive-path");
+  });
+
+  test("in the home, whether the worktree is the home or not", () => {
+    const elsewhere = join(base, "wt");
+    mkdirSync(elsewhere);
+    for (const realpath of [undefined, realpathSync.native]) {
+      const at = (root: string, command: string) =>
+        autoApproveVerdict(command, DEFAULTS, { root, home, realpath });
+      expect(at(home, "cat .claude.json")).toBe("sensitive-path");
+      expect(at(home, "cat ~/.claude.json")).toBe("sensitive-path");
+      expect(at(home, "cat ~/.CLAUDE.json")).toBe("sensitive-path");
+      expect(at(elsewhere, "cat ~/.claude.json")).toBe("outside-root");
+    }
+  });
+});
+
 test("every argument is path-checked, so a pattern or name holding token, secret or credentials asks", () => {
   // deliberate fail-closed: the parser can't tell a search pattern from a path, and these
   // three match anywhere in a segment, not only as a whole file name
@@ -738,7 +1097,7 @@ describe("cd", () => {
     ["cd .ssh && ls", "sensitive-path"],
     ["cd .git && cat config", "sensitive-path"],
     ["cd src && cat ../.env", "sensitive-path"],
-    ["cd ~", "syntax"],
+    ["cd ~", "outside-root"],
     ["cd src | ls", "syntax"],
     ["ls | cd src", "syntax"],
     ["cd", "unsafe-option"],

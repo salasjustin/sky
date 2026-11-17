@@ -32,12 +32,14 @@ export const PINNED_SETTINGS = {
   processWrapper: "",
 } as const;
 
-// the session's redirect variables, plus two only a settings `env` entry is refused for: one moving
-// Claude Code's own config, and with it the credential it reads, and one switching off the
-// host-managed mode the runner sets
+// the session's redirect variables, plus three only a settings `env` entry is refused for: one moving
+// Claude Code's own config, and with it the credential it reads, one moving the home that `~` and
+// the read-only command checks take from the session, and one switching off the host-managed mode
+// the runner sets
 export const REDIRECT_SETTINGS_ENV = [
   ...REDIRECT_VARIABLES,
   "CLAUDE_CONFIG_DIR",
+  "HOME",
   HOST_MANAGED,
 ];
 
