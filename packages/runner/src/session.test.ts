@@ -7006,10 +7006,28 @@ describe("the run's scratch directory and reads outside the worktree", () => {
         expect((await call(named, "Read", { file_path: other })).asked).toBe(
           false,
         );
-        const bare = settingsOf(".kru", { approvalPolicy: ["Read"] });
+        const bare = settingsOf(".kru", {
+          approvalPolicy: ["Read"],
+          autoApprove: { defaults: true, commands: [] },
+        });
         expect((await call(bare, "Read", { file_path: file })).asked).toBe(
           false,
         );
+      });
+
+      test("with the default commands off, as a shell read of them asks, a Read of the plugin cache or the store asks", async () => {
+        const cached = put(`${CACHE}/x/SKILL.md`);
+        const store = put(".kru/plans/x.md");
+        const cfg = settingsOf(".kru", {
+          approvalPolicy: ["Bash", "Read", "Grep", "Glob"],
+          autoApprove: { defaults: false, commands: [] },
+        });
+        for (const file_path of [cached, store]) {
+          const result = await call(cfg, "Read", { file_path });
+          expect(result.asked, file_path).toBe(true);
+          expect(result.decision, file_path).toBe("deny");
+          expect(result.copied, file_path).toBeUndefined();
+        }
       });
     });
 
@@ -7503,10 +7521,11 @@ describe("the instructions on commands that run without a person", () => {
   const withPolicy = async (
     approvalPolicy: string[],
     autoApprove = config.autoApprove,
+    storeHome: string | undefined = undefined,
   ) => {
     const query = scripted([init, success]);
     await runSession(
-      { ...config, approvalPolicy, autoApprove },
+      { ...config, approvalPolicy, autoApprove, storeHome },
       {
         query,
         post: recorder().post,
@@ -7523,6 +7542,19 @@ describe("the instructions on commands that run without a person", () => {
 
   test("are in the prompt when the policy holds Bash", async () => {
     expect(await withPolicy(["Bash"])).toContain(quietCommands(undefined));
+  });
+
+  test("name the environment's store when its base profile has one", async () => {
+    const prompt = await withPolicy(
+      ["Bash"],
+      { defaults: true, commands: [] },
+      ".sky-store",
+    );
+    expect(prompt).toContain("`~/.sky-store/`");
+    expect(prompt).toContain("`cat ~/.sky-store/plans/x.md`");
+    expect(prompt).toContain(
+      "The Read, Grep and Glob tools read the plugin cache and the store without asking too.",
+    );
   });
 
   test("recommend only commands that run without a person", () => {

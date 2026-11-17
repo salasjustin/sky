@@ -910,7 +910,7 @@ export async function runSession(
   /**
    * Decides a Read, Grep or Glob of a path outside the worktree and the scratch directory: the env's
    * approval policy holds it for a person's answer or lets it run, a path in or around Claude Code's
-   * config directory (the plugin cache and the store apart) always waits for one, and this session's saved tool output never does. Claude
+   * config directory (the plugin cache and the store apart, with the default commands on) always waits for one, and this session's saved tool output never does. Claude
    * Code can't be told to allow one its settings block, so an allowed path is copied into the scratch
    * directory and the call is pointed at the copy. A path `refusedReads` holds is declined at once,
    * with no one asked; a hard link to one is found at the copy.
@@ -935,10 +935,13 @@ export async function runSession(
     // `Read(...)` pattern also holds any spelling of its path and any search of a tree around it;
     // Claude Code's saved output for this session is always readable, and the rest of its config
     // directory is always a person's to approve
-    // the plugin cache and the store read without asking, as shell reads of them do, so they are
-    // judged before the config directory that holds the cache; only a `Read(...)` rule naming
-    // such a path holds one, as only a named `Bash(...)` pattern holds a read-only command
-    const shared = inExtraRoot(read.path, claudeHome, config.storeHome);
+    // with the default commands on, the plugin cache and the store read without asking, as shell
+    // reads of them do, so they are judged before the config directory that holds the cache; only
+    // a `Read(...)` rule naming such a path holds one, as only a named `Bash(...)` pattern holds a
+    // read-only command. With them off, the read is judged like any other outside the worktree
+    const shared =
+      config.autoApprove.defaults &&
+      inExtraRoot(read.path, claudeHome, config.storeHome);
     const place = shared
       ? undefined
       : configDirPlace(read.path, settingsDirs.userDirs, sessionId);
