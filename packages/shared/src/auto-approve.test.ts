@@ -734,6 +734,114 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
   });
 });
 
+describe("a root that is a link to somewhere broader", () => {
+  const base = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "auto-approve-links-")),
+  );
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+  let n = 0;
+
+  /** A fresh home and worktree, with the root `name` replaced by a link to `target(home)`. */
+  const setup = (
+    name: ".kru" | ".claude/plugins/cache",
+    target: (home: string, elsewhere: string) => string,
+  ) => {
+    const dir = join(base, `case-${++n}`);
+    const home = join(dir, "home");
+    const elsewhere = join(dir, "elsewhere");
+    const root = join(dir, "wt");
+    for (const d of [join(home, ".claude/plugins"), elsewhere, root])
+      mkdirSync(d, { recursive: true });
+    mkdirSync(join(home, ".claude/x"));
+    for (const f of [
+      join(home, ".claude/settings.json"),
+      join(home, ".claude/x/settings.json"),
+      join(home, "settings.json"),
+      join(elsewhere, "settings.json"),
+    ])
+      writeFileSync(f, "x");
+    const to = target(home, elsewhere);
+    symlinkSync(to, join(home, name));
+    return { home, root, read: `${join(home, name)}/settings.json` };
+  };
+  const verdictOf = (s: { home: string; root: string }, command: string) =>
+    autoApproveVerdict(command, DEFAULTS, {
+      root: s.root,
+      home: s.home,
+      realpath: realpathSync.native,
+    });
+
+  describe.each([".kru", ".claude/plugins/cache"] as const)("%s", (name) => {
+    test.each([
+      ["/", () => "/"],
+      ["the home", (home: string) => home],
+      ["~/.claude", (home: string) => join(home, ".claude")],
+      ["~/.claude/x", (home: string) => join(home, ".claude/x")],
+    ])("linked to %s, reads there ask", (_label, target) => {
+      const s = setup(name, target);
+      expect(verdictOf(s, `cat ${s.read}`)).toBe("outside-root");
+      expect(verdictOf(s, `cat ~/${name}/settings.json`)).toBe("outside-root");
+      expect(verdictOf(s, `ls ~/${name}`)).toBe("outside-root");
+    });
+
+    test("linked to a harmless folder elsewhere, reads still pass", () => {
+      const s = setup(name, (_home, elsewhere) => elsewhere);
+      expect(verdictOf(s, `cat ${s.read}`)).toBe("approved");
+      expect(verdictOf(s, `cat ~/${name}/settings.json`)).toBe("approved");
+    });
+
+    test("is judged for each command, not once", () => {
+      const s = setup(name, (_home, elsewhere) => elsewhere);
+      expect(verdictOf(s, `cat ${s.read}`)).toBe("approved");
+      const link = join(s.home, name);
+      rmSync(link);
+      symlinkSync(join(s.home, ".claude"), link);
+      expect(verdictOf(s, `cat ${s.read}`)).toBe("outside-root");
+    });
+  });
+
+  test("a home reached through a link still keeps a real root", () => {
+    const s = setup(".kru", (_home, elsewhere) => elsewhere);
+    const viaLink = join(base, `home-link-${n}`);
+    symlinkSync(s.home, viaLink);
+    expect(verdictOf({ ...s, home: viaLink }, "cat ~/.kru/settings.json")).toBe(
+      "approved",
+    );
+  });
+});
+
+describe(".claude.json holds account and MCP settings, so it is a secret name", () => {
+  const base = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "auto-approve-account-")),
+  );
+  const home = join(base, "home");
+  mkdirSync(join(home, "src"), { recursive: true });
+  writeFileSync(join(home, ".claude.json"), "{}");
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+
+  test.each([
+    "cat .claude.json",
+    "cat .CLAUDE.JSON",
+    "cat src/../.Claude.json",
+    "grep -n mcp .claude.json",
+  ])("in the worktree: %s", (command) => {
+    expect(verdict(command)).toBe("sensitive-path");
+  });
+
+  test("in the home, whether the worktree is the home or not", () => {
+    const elsewhere = join(base, "wt");
+    mkdirSync(elsewhere);
+    for (const realpath of [undefined, realpathSync.native]) {
+      const at = (root: string, command: string) =>
+        autoApproveVerdict(command, DEFAULTS, { root, home, realpath });
+      expect(at(home, "cat .claude.json")).toBe("sensitive-path");
+      expect(at(home, "cat ~/.claude.json")).toBe("sensitive-path");
+      expect(at(home, "cat ~/.CLAUDE.json")).toBe("sensitive-path");
+      expect(at(elsewhere, "cat ~/.claude.json")).toBe("outside-root");
+    }
+  });
+});
+
 test("every argument is path-checked, so a pattern or name holding token, secret or credentials asks", () => {
   // deliberate fail-closed: the parser can't tell a search pattern from a path, and these
   // three match anywhere in a segment, not only as a whole file name

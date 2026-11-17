@@ -290,7 +290,7 @@ const SENSITIVE_DIRS = new Set([
   "environ",
 ]);
 const SENSITIVE_FILES =
-  /^(\.env|\.dev\.vars|\.npmrc|\.yarnrc|\.netrc|\.pgpass|\.pypirc|\.htpasswd|id_(rsa|dsa|ecdsa|ed25519))|credentials|token|secret|\.tfstate|\.(pem|key|p12|pfx)$/i;
+  /^(\.env|\.claude\.json|\.dev\.vars|\.npmrc|\.yarnrc|\.netrc|\.pgpass|\.pypirc|\.htpasswd|id_(rsa|dsa|ecdsa|ed25519))|credentials|token|secret|\.tfstate|\.(pem|key|p12|pfx)$/i;
 
 /** Every reading of `word` that a program might open as a path. */
 function pathCandidates(word: string): string[] {
@@ -314,12 +314,45 @@ const CLAUDE_READABLE = /^\.claude\/(skills|agents|commands)(\/|$)/;
 /**
  * Beside the worktree, read-only commands may name these, below the session's home: the plugin
  * cache only, since the rest of `~/.claude` holds the login, settings and account files, and
- * the kru store checkout.
+ * the kru store checkout. Taken afresh for each command: with `realpath`, a root whose real
+ * location is `/`, the home, a directory holding the home, or inside `~/.claude` outside the
+ * plugin cache (a link to a broader place) is dropped, so reads there ask.
  */
-function extraRoots(home: string | undefined): string[] {
+function extraRoots(
+  home: string | undefined,
+  realpath?: (path: string) => string,
+): string[] {
   if (home === undefined || !posix.isAbsolute(home)) return [];
   const base = posix.resolve(home);
-  return [posix.join(base, ".claude/plugins/cache"), posix.join(base, ".kru")];
+  const roots = [
+    posix.join(base, ".claude/plugins/cache"),
+    posix.join(base, ".kru"),
+  ];
+  if (!realpath) return roots;
+  const real = (path: string): string | undefined => {
+    try {
+      return realpath(path);
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      // a root that doesn't exist yet is judged on its text; any other failure drops it
+      return code === "ENOENT" || code === "ENOTDIR" ? path : undefined;
+    }
+  };
+  const realHome = real(base);
+  if (realHome === undefined) return [];
+  const realCache = posix.join(realHome, ".claude/plugins/cache");
+  const within = (parent: string, path: string) =>
+    !isOutside(posix.relative(parent, path));
+  return roots.filter((root) => {
+    const target = real(root);
+    if (target === undefined || target === "/" || target === realHome)
+      return false;
+    if (within(target, realHome)) return false;
+    return (
+      !within(posix.join(realHome, ".claude"), target) ||
+      within(realCache, target)
+    );
+  });
 }
 
 /** The word with a leading `~` or `~/` taken to `home`, as the shell does; unchanged without a usable home. */
@@ -805,7 +838,7 @@ function stepVerdict(
   const args = fileArgs(raw).flatMap(pathCandidates);
   // "." stands for the cwd itself, which `ls` or `git status` reads with no argument
   const targets = [".", ...args];
-  const roots = [root, ...extraRoots(home)];
+  const roots = [root, ...extraRoots(home, realpath)];
   // a `~` left in a word is one the shell won't expand to the home, and it asks
   const owners = targets.map((t) =>
     t.startsWith("~") ? undefined : rootOf(roots, posix.resolve(cwd, t)),
