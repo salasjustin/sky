@@ -50,8 +50,8 @@ import { createDecisionWaiter } from "./requests.js";
 import type { Seal } from "./seal.js";
 import {
   nestedClaude,
-  QUIET_COMMANDS,
   type QueryFn,
+  quietCommands,
   removeScratchNow,
   repoLockWaitS,
   scratchDirOf,
@@ -110,6 +110,7 @@ beforeEach(() => {
     mcpServers: {},
     waitTimeoutMs: 60_000,
     launchDeadlineMs: 15 * 60_000,
+    storeHome: undefined,
     startBranch: undefined,
   };
 });
@@ -3288,6 +3289,7 @@ async function bareBashRun(
   calls: (worktree: string) => { command: string; cwd?: string }[],
   autoApprove = config.autoApprove,
   sessionEnv: Record<string, string> = {},
+  storeHome?: string,
 ) {
   const { sent, deps } = api(decided({ decision: "approve" }));
   const warned: string[] = [];
@@ -3305,7 +3307,7 @@ async function bareBashRun(
     success,
   ]);
   const code = await runSession(
-    { ...config, approvalPolicy: ["Bash"], autoApprove, sessionEnv },
+    { ...config, approvalPolicy: ["Bash"], autoApprove, sessionEnv, storeHome },
     { ...deps, query, warn: (line) => warned.push(line) },
   );
   const held = sent.flatMap((e) =>
@@ -3403,6 +3405,7 @@ describe("reads of the plugin cache, the kru store and the repo's skill files", 
       },
       undefined,
       { HOME: spriteHome() },
+      ".kru",
     );
     expect(held).toEqual([]);
     expect(warned).toHaveLength(4);
@@ -3442,6 +3445,7 @@ describe("reads of the plugin cache, the kru store and the repo's skill files", 
       },
       undefined,
       { HOME: spriteHome() },
+      ".kru",
     );
     expect(held).toEqual(asked);
   });
@@ -6733,6 +6737,343 @@ describe("the run's scratch directory and reads outside the worktree", () => {
       expect(sent.map((e) => e.type)).toContain("runner.warning");
     });
 
+    describe("the plugin cache and the store beside the worktree", () => {
+      const home = () => join(realpathSync(root), "sprite-home");
+      const dirs = () => ({
+        settingsDirs: {
+          userDirs: [join(home(), ".claude")],
+          managedDir: join(root, "managed"),
+        },
+      });
+      const put = (relative: string, text = "cached\n") => {
+        const path = join(home(), relative);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, text);
+        return path;
+      };
+      const CACHE = ".claude/plugins/cache";
+      const settingsOf = (storeHome: string | undefined, extra = {}) =>
+        gated({ sessionEnv: { HOME: home() }, storeHome, ...extra });
+
+      /** Fires one call of a file tool; whether anyone was asked, what the hook decided, and what the call was pointed at. */
+      const call = async (
+        runConfig: Config,
+        tool_name: "Read" | "Grep" | "Glob",
+        tool_input: object,
+      ) => {
+        const { sent, deps } = api(decided({ decision: "deny" }));
+        let answers: unknown[] = [];
+        let seen: Record<string, unknown> = {};
+        let copied: string | undefined;
+        let scratch = "";
+        const query = scripted([
+          init,
+          async (options: Options) => {
+            scratch = options.additionalDirectories?.[0] ?? "";
+            answers = await fire(options, "PreToolUse", {
+              tool_name,
+              tool_input,
+              tool_use_id: "t1",
+            });
+            const output = (
+              answers[0] as {
+                hookSpecificOutput?: {
+                  updatedInput?: Record<string, unknown>;
+                };
+              }
+            ).hookSpecificOutput;
+            seen = output?.updatedInput ?? {};
+            const target = seen.file_path ?? seen.path;
+            if (typeof target === "string")
+              copied = statSync(target).isDirectory()
+                ? readdirSync(target, { recursive: true }).sort().join(",")
+                : readFileSync(target, "utf8");
+          },
+          success,
+        ]);
+        await runSession(runConfig, { ...deps, query, ...dirs() });
+        const decision = (
+          answers[0] as {
+            hookSpecificOutput?: { permissionDecision?: string };
+          }
+        ).hookSpecificOutput?.permissionDecision;
+        return {
+          asked: sent.some((e) => e.type === "run.waiting"),
+          warned: sent.some((e) => e.type === "runner.warning"),
+          decision,
+          copied,
+          copy: seen,
+          scratch,
+        };
+      };
+
+      /** A call that read a staged copy, with no request. */
+      const unasked = (
+        result: Awaited<ReturnType<typeof call>>,
+        copied: string,
+      ) => {
+        expect(result.asked).toBe(false);
+        expect(result.decision).toBe("allow");
+        expect(result.copied).toBe(copied);
+        const target = String(result.copy.file_path ?? result.copy.path);
+        expect(target.startsWith(`${result.scratch}/`)).toBe(true);
+      };
+
+      test("Read, Grep and Glob of the plugin cache read a staged copy without asking", async () => {
+        const file = put(`${CACHE}/kru/kru/0.214.0/skills/doop/SKILL.md`);
+        const dir = dirname(file);
+        const cfg = settingsOf(undefined);
+        unasked(await call(cfg, "Read", { file_path: file }), "cached\n");
+        unasked(
+          await call(cfg, "Read", {
+            file_path:
+              "~/.claude/plugins/cache/kru/kru/0.214.0/skills/doop/SKILL.md",
+          }),
+          "cached\n",
+        );
+        unasked(
+          await call(cfg, "Grep", { pattern: "cached", path: file }),
+          "cached\n",
+        );
+        unasked(
+          await call(cfg, "Grep", { pattern: "cached", path: dir }),
+          "SKILL.md",
+        );
+        const glob = await call(cfg, "Glob", { pattern: "*.md", path: dir });
+        unasked(glob, "SKILL.md");
+        expect(glob.copy.pattern).toBe("*.md");
+        const rooted = await call(cfg, "Glob", {
+          pattern: `${home()}/${CACHE}/kru/**/SKILL.md`,
+        });
+        unasked(
+          rooted,
+          "kru,kru/0.214.0,kru/0.214.0/skills,kru/0.214.0/skills/doop,kru/0.214.0/skills/doop/SKILL.md",
+        );
+        expect(rooted.copy.pattern).toBe("**/SKILL.md");
+      });
+
+      test("a search of a shared place leaves out .git and secret-named files, which a read by name still asks about", async () => {
+        const cfg = settingsOf(".sky-store");
+        put(".sky-store/plans/a.md", "plan\n");
+        put(".sky-store/plans/credentials.json", "secret\n");
+        put(".sky-store/plans/.env", "secret\n");
+        put(".sky-store/.git/HEAD", "ref\n");
+        put(`${CACHE}/kru/token.txt`, "secret\n");
+        put(`${CACHE}/kru/a.md`);
+        const plans = join(home(), ".sky-store/plans");
+        unasked(
+          await call(cfg, "Grep", { pattern: "plan", path: plans }),
+          "a.md",
+        );
+        unasked(await call(cfg, "Glob", { pattern: "*", path: plans }), "a.md");
+        unasked(
+          await call(cfg, "Grep", {
+            pattern: "x",
+            path: join(home(), ".sky-store"),
+          }),
+          "plans,plans/a.md",
+        );
+        unasked(
+          await call(cfg, "Grep", {
+            pattern: "x",
+            path: join(home(), CACHE, "kru"),
+          }),
+          "a.md",
+        );
+        const byName = await call(cfg, "Read", {
+          file_path: join(plans, "credentials.json"),
+        });
+        expect(byName.asked).toBe(true);
+      });
+
+      test.each([".sky-store", ".kru"])(
+        "the store of a profile with home %s reads the same way, and the other directory asks",
+        async (storeHome) => {
+          const file = put(`${storeHome}/plans/x.md`, "plan\n");
+          const cfg = settingsOf(storeHome);
+          unasked(await call(cfg, "Read", { file_path: file }), "plan\n");
+          unasked(
+            await call(cfg, "Grep", { pattern: "plan", path: dirname(file) }),
+            "x.md",
+          );
+          unasked(
+            await call(cfg, "Glob", { pattern: "*.md", path: dirname(file) }),
+            "x.md",
+          );
+          const elsewhere = put(
+            `${storeHome === ".kru" ? ".sky-store" : ".kru"}/plans/y.md`,
+          );
+          expect(
+            (await call(cfg, "Read", { file_path: elsewhere })).asked,
+          ).toBe(true);
+        },
+      );
+
+      test("with no base profile a store read asks, and the plugin cache still reads", async () => {
+        const store = put(".sky-store/plans/x.md");
+        const kru = put(".kru/plans/x.md");
+        const cfg = settingsOf(undefined);
+        for (const file_path of [store, kru])
+          expect((await call(cfg, "Read", { file_path })).asked).toBe(true);
+        const cached = put(`${CACHE}/kru/a.md`);
+        unasked(await call(cfg, "Read", { file_path: cached }), "cached\n");
+      });
+
+      test("the rest of ~/.claude still asks, or is refused as before", async () => {
+        const cfg = settingsOf(".kru");
+        const settings = put(".claude/settings.json", "{}\n");
+        const projects = put(".claude/projects/-work/sess/notes.txt");
+        for (const file_path of [settings, projects]) {
+          const result = await call(cfg, "Read", { file_path });
+          expect(result.asked, file_path).toBe(true);
+        }
+        const account = put(".claude.json", "{}\n");
+        // the session's HOME is not the runner's here, so a person is asked, and the file is never copied
+        const refused = await call(cfg, "Read", { file_path: account });
+        expect(refused.asked).toBe(true);
+        expect(refused.decision).toBe("deny");
+        expect(refused.copied).toBeUndefined();
+      });
+
+      test("a secret-named file in the plugin cache or the store still asks", async () => {
+        const cfg = settingsOf(".kru");
+        for (const relative of [
+          `${CACHE}/kru/token.txt`,
+          `${CACHE}/kru/.env`,
+          ".kru/plans/credentials.json",
+          ".kru/.ssh/id_rsa",
+        ]) {
+          const file_path = put(relative);
+          expect((await call(cfg, "Read", { file_path })).asked, relative).toBe(
+            true,
+          );
+        }
+      });
+
+      test("a link in the cache or store that leads outside it is judged by where it leads", async () => {
+        const cfg = settingsOf(".kru");
+        put(".claude/settings.json", "{}\n");
+        put("notes.txt");
+        mkdirSync(join(home(), CACHE, "kru"), { recursive: true });
+        mkdirSync(join(home(), ".kru"), { recursive: true });
+        const links: [string, string][] = [
+          [
+            join(home(), ".claude/settings.json"),
+            join(home(), CACHE, "kru/to-settings"),
+          ],
+          [join(home(), ".claude"), join(home(), CACHE, "kru/to-claude")],
+          [home(), join(home(), CACHE, "kru/to-home")],
+          [
+            join(home(), ".claude/settings.json"),
+            join(home(), ".kru/to-settings"),
+          ],
+          [home(), join(home(), ".kru/to-home")],
+        ];
+        for (const [target, link] of links) symlinkSync(target, link);
+        for (const [, link] of links) {
+          expect(
+            (await call(cfg, "Read", { file_path: link })).asked,
+            link,
+          ).toBe(true);
+          expect(
+            (await call(cfg, "Grep", { pattern: "x", path: link })).asked,
+            link,
+          ).toBe(true);
+        }
+      });
+
+      test("a Glob of ~/.claude, a Grep of the home or of ~/.claude/plugins, and a Glob that climbs out ask", async () => {
+        const cfg = settingsOf(".kru");
+        put(".claude/settings.json", "{}\n");
+        put(`${CACHE}/kru/a.md`);
+        for (const [tool, input] of [
+          ["Glob", { pattern: "~/.claude/**" }],
+          ["Glob", { pattern: `${home()}/.claude/**/*.json` }],
+          ["Glob", { pattern: "**", path: "~/.claude" }],
+          [
+            "Glob",
+            {
+              pattern: "../../../settings.json",
+              path: `${home()}/${CACHE}/kru`,
+            },
+          ],
+          ["Grep", { pattern: "x", path: home() }],
+          ["Grep", { pattern: "x", path: "~" }],
+          ["Grep", { pattern: "x", path: "~/.claude" }],
+          ["Grep", { pattern: "x", path: "~/.claude/plugins" }],
+        ] as const) {
+          const result = await call(cfg, tool, input);
+          expect(result.asked, JSON.stringify(input)).toBe(true);
+        }
+      });
+
+      test("a plugin cache that is itself a link to the home is no root: its reads ask", async () => {
+        const cfg = settingsOf(".kru");
+        put("notes.txt");
+        put(".claude/settings.json", "{}\n");
+        mkdirSync(join(home(), ".claude/plugins"), { recursive: true });
+        symlinkSync(home(), join(home(), CACHE));
+        for (const file_path of [
+          join(home(), CACHE, "notes.txt"),
+          join(home(), CACHE, ".claude/settings.json"),
+        ])
+          expect(
+            (await call(cfg, "Read", { file_path })).asked,
+            file_path,
+          ).toBe(true);
+      });
+
+      test("a Read(...) rule naming a path in a root still asks, and a bare Read rule does not hold a root's reads", async () => {
+        const file = put(`${CACHE}/kru/a.md`);
+        const store = put(".kru/plans/x.md");
+        const named = settingsOf(".kru", {
+          approvalPolicy: [`Read(${file})`, `Read(${home()}/.kru:*)`],
+        });
+        expect((await call(named, "Read", { file_path: file })).asked).toBe(
+          true,
+        );
+        expect((await call(named, "Read", { file_path: store })).asked).toBe(
+          true,
+        );
+        const other = put(`${CACHE}/kru/b.md`);
+        unasked(await call(named, "Read", { file_path: other }), "cached\n");
+        const bare = settingsOf(".kru", {
+          approvalPolicy: ["Read"],
+          autoApprove: { defaults: true, commands: [] },
+        });
+        unasked(await call(bare, "Read", { file_path: file }), "cached\n");
+        unasked(await call(bare, "Read", { file_path: store }), "cached\n");
+      });
+
+      test("with the default commands off, as a shell read of them asks, a Read of the plugin cache or the store asks", async () => {
+        const cached = put(`${CACHE}/x/SKILL.md`);
+        const store = put(".kru/plans/x.md");
+        const cfg = settingsOf(".kru", {
+          approvalPolicy: ["Bash", "Read", "Grep", "Glob"],
+          autoApprove: { defaults: false, commands: [] },
+        });
+        for (const file_path of [cached, store]) {
+          const result = await call(cfg, "Read", { file_path });
+          expect(result.asked, file_path).toBe(true);
+          expect(result.decision, file_path).toBe("deny");
+          expect(result.copied, file_path).toBeUndefined();
+        }
+      });
+
+      test("with the default commands off and a policy that holds no reads, the plugin cache still asks and the store reads as any other path", async () => {
+        const cached = put(`${CACHE}/x/SKILL.md`);
+        const store = put(".kru/plans/x.md", "plan\n");
+        const cfg = settingsOf(".kru", {
+          approvalPolicy: [],
+          autoApprove: { defaults: false, commands: [] },
+        });
+        const asked = await call(cfg, "Read", { file_path: cached });
+        expect(asked.asked).toBe(true);
+        expect(asked.copied).toBeUndefined();
+        unasked(await call(cfg, "Read", { file_path: store }), "plan\n");
+      });
+    });
+
     describe("Claude Code's config directory", () => {
       const cfg = () => join(root, "claude-config");
       const dirs = () => ({
@@ -7223,10 +7564,11 @@ describe("the instructions on commands that run without a person", () => {
   const withPolicy = async (
     approvalPolicy: string[],
     autoApprove = config.autoApprove,
+    storeHome: string | undefined = undefined,
   ) => {
     const query = scripted([init, success]);
     await runSession(
-      { ...config, approvalPolicy, autoApprove },
+      { ...config, approvalPolicy, autoApprove, storeHome },
       {
         query,
         post: recorder().post,
@@ -7242,11 +7584,24 @@ describe("the instructions on commands that run without a person", () => {
   };
 
   test("are in the prompt when the policy holds Bash", async () => {
-    expect(await withPolicy(["Bash"])).toContain(QUIET_COMMANDS);
+    expect(await withPolicy(["Bash"])).toContain(quietCommands(undefined));
+  });
+
+  test("name the environment's store when its base profile has one", async () => {
+    const prompt = await withPolicy(
+      ["Bash"],
+      { defaults: true, commands: [] },
+      ".sky-store",
+    );
+    expect(prompt).toContain("`~/.sky-store/`");
+    expect(prompt).toContain("`cat ~/.sky-store/plans/x.md`");
+    expect(prompt).toContain(
+      "The Read, Grep and Glob tools read the plugin cache and the store without asking too.",
+    );
   });
 
   test("recommend only commands that run without a person", () => {
-    const examples = [...QUIET_COMMANDS.matchAll(/\(`([^`]+)`\)/g)].map(
+    const examples = [...quietCommands(".kru").matchAll(/\(`([^`]+)`\)/g)].map(
       (m) => m[1] ?? "",
     );
     expect(examples).toEqual([
@@ -7261,7 +7616,31 @@ describe("the instructions on commands that run without a person", () => {
         autoApproveVerdict(
           command,
           { defaults: true, commands: [] },
-          { root: "/work/repo", home: "/home/sprite" },
+          { root: "/work/repo", home: "/home/sprite", storeHome: ".kru" },
+        ),
+        command,
+      ).toBe("approved");
+    }
+  });
+
+  test("with no store name only the plugin cache, and what they recommend runs without a person", () => {
+    const line = quietCommands(undefined);
+    expect(line).not.toContain(".kru");
+    expect(line).not.toContain(".sky-store");
+    expect(line).toContain("~/.claude/plugins/cache");
+    expect(line.trimEnd()).toMatch(
+      /The Read, Grep and Glob tools read the plugin cache without asking too\.$/,
+    );
+    const examples = [...line.matchAll(/\(`([^`]+)`\)/g)].map(
+      (m) => m[1] ?? "",
+    );
+    expect(examples).toContain("ls ~/.claude/plugins/cache");
+    for (const command of examples) {
+      expect(
+        autoApproveVerdict(
+          command,
+          { defaults: true, commands: [] },
+          { root: "/work/repo", home: "/home/sprite", storeHome: undefined },
         ),
         command,
       ).toBe("approved");
@@ -7271,14 +7650,14 @@ describe("the instructions on commands that run without a person", () => {
   test("are left out when the environment drops the default commands", async () => {
     expect(
       await withPolicy(["Bash"], { defaults: false, commands: ["ls"] }),
-    ).not.toContain(QUIET_COMMANDS);
+    ).not.toContain(quietCommands(undefined));
   });
 
   test("are left out when it doesn't", async () => {
-    expect(await withPolicy([])).not.toContain(QUIET_COMMANDS);
-    expect(await withPolicy(["Write"])).not.toContain(QUIET_COMMANDS);
+    expect(await withPolicy([])).not.toContain(quietCommands(undefined));
+    expect(await withPolicy(["Write"])).not.toContain(quietCommands(undefined));
     expect(await withPolicy(["Bash(git push:*)"])).not.toContain(
-      QUIET_COMMANDS,
+      quietCommands(undefined),
     );
   });
 });

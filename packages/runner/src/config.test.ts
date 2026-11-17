@@ -29,6 +29,7 @@ test("reads a run from env, defaulting the sprite paths", () => {
     mcpServers: {},
     waitTimeoutMs: 120 * 60_000,
     launchDeadlineMs: 15 * 60_000,
+    storeHome: undefined,
     startBranch: undefined,
   });
 });
@@ -95,6 +96,16 @@ test.each([
   expect(loadConfig({ ...env, START_BRANCH: value }).startBranch).toBe(
     expected,
   );
+});
+
+test.each([
+  ["set", ".kru", ".kru"],
+  ["empty", "", undefined],
+])("reads the store home when %s", (_, value, expected) => {
+  expect(loadConfig({ ...env, SKY_STORE_HOME: value }).storeHome).toBe(
+    expected,
+  );
+  expect(loadConfig(env).storeHome).toBeUndefined();
 });
 
 test("reads the approval policy and the max wait", () => {

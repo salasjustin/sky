@@ -49,6 +49,11 @@ const Env = z.object({
   SKY_MCP_SERVERS: json
     .pipe(z.record(z.string(), BaseProfileMcpServer))
     .default({}),
+  // the store checkout's directory below $HOME; the API sets it with the base profile's store, so it is absent without one
+  SKY_STORE_HOME: z
+    .string()
+    .optional()
+    .transform((s) => s || undefined),
   START_BRANCH: z
     .string()
     .optional()
@@ -89,6 +94,8 @@ export type Config = {
    * as `launch_timeout`; the wait for the repo lock ends early enough inside it to report its own failure.
    */
   launchDeadlineMs: number;
+  /** The store checkout's directory below the session's home, from `SKY_STORE_HOME`; none without a base profile's store. */
+  storeHome?: string | undefined;
   /** An existing GitHub branch the agent's work continues; `publish` updates it instead of `claude/<agentId>`. */
   startBranch: string | undefined;
 };
@@ -128,6 +135,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     mcpServers: e.SKY_MCP_SERVERS,
     waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
     launchDeadlineMs: e.LAUNCH_DEADLINE_MINUTES * 60_000,
+    storeHome: e.SKY_STORE_HOME,
     startBranch: e.START_BRANCH,
   };
 }

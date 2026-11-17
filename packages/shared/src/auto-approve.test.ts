@@ -13,6 +13,7 @@ import {
   type AskReason,
   type AutoApprove,
   autoApproveVerdict,
+  extraRoots,
   isAutoApproved,
   parseCommandEntry,
 } from "./auto-approve.js";
@@ -568,7 +569,12 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
   afterAll(() => rmSync(base, { recursive: true, force: true }));
 
   const withHome = (command: string, realpath?: (path: string) => string) =>
-    autoApproveVerdict(command, DEFAULTS, { root, home, realpath });
+    autoApproveVerdict(command, DEFAULTS, {
+      root,
+      home,
+      realpath,
+      storeHome: ".kru",
+    });
   const both = (command: string) => {
     const plain = withHome(command);
     expect(withHome(command, realpathSync.native), command).toBe(plain);
@@ -608,6 +614,7 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
         autoApproveVerdict(command, DEFAULTS, {
           root,
           home,
+          storeHome: ".kru",
           cwd: join(home, ".kru"),
           realpath,
         });
@@ -634,7 +641,12 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
   test("a `~` is the home in arguments and in a cd target", () => {
     const inside = join(root, "packages/ui");
     const at = (command: string, realpath?: (path: string) => string) =>
-      autoApproveVerdict(command, DEFAULTS, { root, home: inside, realpath });
+      autoApproveVerdict(command, DEFAULTS, {
+        root,
+        home: inside,
+        realpath,
+        storeHome: ".kru",
+      });
     for (const realpath of [undefined, realpathSync.native]) {
       expect(at("cat ~/image.tsx", realpath)).toBe("approved");
       expect(at("cat ~", realpath)).toBe("approved");
@@ -646,11 +658,102 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
 
   test("a home of `/` makes `~` the filesystem root, as bash does", () => {
     const atRoot = (command: string) =>
-      autoApproveVerdict(command, DEFAULTS, { root, home: "/" });
+      autoApproveVerdict(command, DEFAULTS, {
+        root,
+        home: "/",
+        storeHome: ".kru",
+      });
     expect(atRoot("ls ~")).toBe("outside-root");
     expect(atRoot("cd ~ && cat etc/passwd")).toBe("outside-root");
     expect(atRoot("cat ~/etc/x")).toBe("outside-root");
     expect(atRoot("cat ~/.kru/x")).toBe("approved");
+  });
+
+  describe("the store root follows the base profile's store home", () => {
+    const storeIn = (storeHome: string | undefined, command: string) =>
+      [undefined, realpathSync.native].map((realpath) =>
+        autoApproveVerdict(command, DEFAULTS, {
+          root,
+          home,
+          realpath,
+          storeHome,
+        }),
+      );
+
+    test.each([".sky-store", ".kru", "a/store"])("%s reads", (storeHome) => {
+      expect(storeIn(storeHome, `cat ~/${storeHome}/plans/x.md`)).toEqual([
+        "approved",
+        "approved",
+      ]);
+      expect(storeIn(storeHome, `ls ${home}/${storeHome}`)).toEqual([
+        "approved",
+        "approved",
+      ]);
+    });
+
+    test("only the named directory is a root", () => {
+      expect(storeIn(".sky-store", "cat ~/.kru/audit/run.jsonl")).toEqual([
+        "outside-root",
+        "outside-root",
+      ]);
+      expect(storeIn(".kru", "cat ~/.sky-store/x")).toEqual([
+        "outside-root",
+        "outside-root",
+      ]);
+    });
+
+    test("without a store home there is no store root, the plugin cache stays", () => {
+      expect(storeIn(undefined, "cat ~/.kru/audit/run.jsonl")).toEqual([
+        "outside-root",
+        "outside-root",
+      ]);
+      expect(storeIn(undefined, "cat ~/.sky-store/x")).toEqual([
+        "outside-root",
+        "outside-root",
+      ]);
+      expect(storeIn(undefined, `cat ${skill}`)).toEqual([
+        "approved",
+        "approved",
+      ]);
+    });
+
+    test.each([
+      "",
+      ".",
+      "..",
+      "../x",
+      "a/../..",
+      "/etc",
+      ".claude",
+      ".claude/store",
+      "a b",
+    ])("%j is no store root", (storeHome) => {
+      expect(extraRoots(home, undefined, storeHome)).toEqual([cache]);
+    });
+
+    test("a store home with a trailing slash is the same root, judged from the store down", () => {
+      expect(extraRoots(home, undefined, "a/store/")).toEqual([
+        cache,
+        join(home, "a/store"),
+      ]);
+      const secretHome = join(base, "secret-home");
+      const verdicts = ["store/", "store"].map((storeHome) =>
+        autoApproveVerdict("cat ~/store/plans/x.md", DEFAULTS, {
+          root,
+          home: secretHome,
+          storeHome,
+        }),
+      );
+      expect(verdicts).toEqual(["approved", "approved"]);
+    });
+
+    test("extraRoots lists the plugin cache and the store below the home", () => {
+      expect(extraRoots(home, realpathSync.native, ".kru")).toEqual([
+        cache,
+        join(home, ".kru"),
+      ]);
+      expect(extraRoots(undefined, undefined, ".kru")).toEqual([]);
+    });
   });
 
   test("asks for a sibling that only shares a root's prefix", () => {
@@ -725,7 +828,11 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
     expect(bare(`cat ${home}/.kru/audit/run.jsonl`)).toBe("outside-root");
     expect(bare("cat ~/.kru/audit/run.jsonl")).toBe("outside-root");
     expect(
-      autoApproveVerdict("cat ~/.kru/x", DEFAULTS, { root, home: "relative" }),
+      autoApproveVerdict("cat ~/.kru/x", DEFAULTS, {
+        root,
+        home: "relative",
+        storeHome: ".kru",
+      }),
     ).toBe("outside-root");
   });
 
@@ -783,6 +890,7 @@ describe("a root that is a link to somewhere broader", () => {
     autoApproveVerdict(command, DEFAULTS, {
       root: s.root,
       home: s.home,
+      storeHome: ".kru",
       realpath: realpathSync.native,
     });
 
