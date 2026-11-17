@@ -28,7 +28,11 @@ import type {
   Options,
   SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { RUNNER_TEXT_MAX, RunnerEventPost } from "@sky/shared";
+import {
+  autoApproveVerdict,
+  RUNNER_TEXT_MAX,
+  RunnerEventPost,
+} from "@sky/shared";
 import { delay, HttpResponse, http } from "msw";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -7109,15 +7113,35 @@ describe("the instructions on commands that run without a person", () => {
   };
 
   test("are in the prompt when the policy holds Bash", async () => {
-    const append = await withPolicy(["Bash"]);
-    expect(append).toContain(QUIET_COMMANDS);
-    expect(append).toContain("single-quoted patterns");
-    expect(append).toContain("`rg` instead of `grep -r`");
-    expect(append).toContain("`runner.mjs sync` instead of `git fetch`");
+    expect(await withPolicy(["Bash"])).toContain(QUIET_COMMANDS);
+  });
+
+  test("recommend only commands that run without a person", () => {
+    const examples = [...QUIET_COMMANDS.matchAll(/\(`([^`]+)`\)/g)].map(
+      (m) => m[1] ?? "",
+    );
+    expect(examples).toEqual([
+      "grep -n 'a\\|b' file",
+      "rg -n foo src",
+      "rg -t ts foo src",
+    ]);
+    for (const command of examples) {
+      expect(
+        autoApproveVerdict(
+          command,
+          { defaults: true, commands: [] },
+          "/work/repo",
+        ),
+        command,
+      ).toBe("approved");
+    }
   });
 
   test("are left out when it doesn't", async () => {
     expect(await withPolicy([])).not.toContain(QUIET_COMMANDS);
     expect(await withPolicy(["Write"])).not.toContain(QUIET_COMMANDS);
+    expect(await withPolicy(["Bash(git push:*)"])).not.toContain(
+      QUIET_COMMANDS,
+    );
   });
 });
