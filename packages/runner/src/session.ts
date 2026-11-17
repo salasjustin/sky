@@ -57,7 +57,7 @@ import {
 } from "./mcp.js";
 import {
   configDirPlace,
-  inExtraRoot,
+  extraRootOf,
   type OutsideRead,
   outsideRead,
   pathRefusal,
@@ -909,10 +909,12 @@ export async function runSession(
 
   /**
    * Decides a Read, Grep or Glob of a path outside the worktree and the scratch directory: the env's
-   * approval policy holds it for a person's answer or lets it run, a path in or around Claude Code's
-   * config directory (the plugin cache and the store apart, with the default commands on) always waits for one, and this session's saved tool output never does. Claude
-   * Code can't be told to allow one its settings block, so an allowed path is copied into the scratch
-   * directory and the call is pointed at the copy. A path `refusedReads` holds is declined at once,
+   * approval policy holds it for a person's answer or lets it run, and a path in or around Claude
+   * Code's config directory always waits for one, except this session's saved tool output, which
+   * never does, and the plugin cache, which with the default commands on is read as the store is
+   * (see below); the store is not in that directory. Claude Code can't be told to allow one its
+   * settings block, so an allowed path is copied into the scratch directory and the call is pointed
+   * at the copy. A path `refusedReads` holds is declined at once,
    * with no one asked; a hard link to one is found at the copy.
    */
   const gateOutsideRead = async (
@@ -939,9 +941,10 @@ export async function runSession(
     // reads of them do, so they are judged before the config directory that holds the cache; only
     // a `Read(...)` rule naming such a path holds one, as only a named `Bash(...)` pattern holds a
     // read-only command. With them off, the read is judged like any other outside the worktree
-    const shared =
-      config.autoApprove.defaults &&
-      inExtraRoot(read.path, claudeHome, config.storeHome);
+    const sharedRoot = config.autoApprove.defaults
+      ? extraRootOf(read.path, claudeHome, config.storeHome)
+      : undefined;
+    const shared = sharedRoot !== undefined;
     const place = shared
       ? undefined
       : configDirPlace(read.path, settingsDirs.userDirs, sessionId);
@@ -983,7 +986,16 @@ export async function runSession(
       if (!scratch)
         return declined("the run has no scratch directory to copy it into.");
       try {
-        const copy = await stageRead(read, scratch, ++staged, refusedReads());
+        const copy = await stageRead(
+          read,
+          scratch,
+          ++staged,
+          refusedReads(),
+          // a copy no one was asked about leaves out `.git` and secret names
+          decision === "unasked" && sharedRoot !== undefined
+            ? { sharedRoot }
+            : {},
+        );
         const note =
           decision === "unasked" ? undefined : approvalNote(decision.reason);
         return {

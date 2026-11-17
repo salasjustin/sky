@@ -173,20 +173,21 @@ export function configDirPlace(
 }
 
 /**
- * Whether the real path `path` lies in one of the places beside the worktree that read-only shell
- * commands may name (`extraRoots`: the plugin cache and the store, with the same guards) and has no
- * secret name below that root. A search of a tree that holds a root, or of `~/.claude` or the
- * home, is not inside one.
+ * The real root of the place beside the worktree that read-only shell commands may name
+ * (`extraRoots`: the plugin cache and the store, with the same guards) that holds the real path
+ * `path`, when no part of `path` below that root has a secret name; else undefined. A search of a
+ * tree that holds a root, or of `~/.claude` or the home, is not inside one.
  */
-export function inExtraRoot(
+export function extraRootOf(
   path: string,
   home: string,
   storeHome: string | undefined,
-): boolean {
-  return extraRoots(home, realpathSync.native, storeHome).some((root) => {
+): string | undefined {
+  for (const root of extraRoots(home, realpathSync.native, storeHome)) {
     const real = realpathLoose(root);
-    return within(real, path) && !namesSecret(relative(real, path));
-  });
+    if (within(real, path) && !namesSecret(relative(real, path))) return real;
+  }
+  return undefined;
 }
 
 /** What no approval copies, whatever the person answered. */
@@ -199,7 +200,16 @@ export type RefusedPaths = {
   systemDirs: readonly string[];
 };
 
-export type StageLimits = { maxBytes?: number; maxEntries?: number };
+export type StageLimits = {
+  maxBytes?: number;
+  maxEntries?: number;
+  /**
+   * The real root of a place read with no one asked: below the read's own path, `.git` and
+   * entries with a secret name (by their path from this root) are left out of the copy, so a
+   * search never sees what a read by name would ask about, and the limits count what is searched.
+   */
+  sharedRoot?: string;
+};
 
 const inodeOf = (info: Stats) => `${info.dev}:${info.ino}`;
 
@@ -286,6 +296,8 @@ type Walk = {
   refusal: Refusal;
   maxBytes: number;
   maxEntries: number;
+  /** An entry below the read's path that is left out of the copy. */
+  skip?: (path: string) => boolean;
   bytes: number;
   entries: number;
 };
@@ -341,8 +353,10 @@ async function copyEntry(src: string, dest: string, walk: Walk): Promise<void> {
   if (why) throw new Error(`${src} ${why}`);
   if (info.isDirectory()) {
     await mkdir(dest, { mode: 0o700 });
-    for (const name of await readdir(src))
-      await copyEntry(join(src, name), join(dest, name), walk);
+    for (const name of await readdir(src)) {
+      const child = join(src, name);
+      if (!walk.skip?.(child)) await copyEntry(child, join(dest, name), walk);
+    }
   } else if (info.isFile()) await copyFile(src, dest, info, walk);
 }
 
@@ -361,6 +375,7 @@ export async function stageRead(
   {
     maxBytes = STAGE_MAX_BYTES,
     maxEntries = STAGE_MAX_ENTRIES,
+    sharedRoot,
   }: StageLimits = {},
 ): Promise<string> {
   const source = await realpath(read.path).catch((error: unknown) => {
@@ -376,6 +391,10 @@ export async function stageRead(
     refusal: await refusalOf(scratch, refused),
     maxBytes,
     maxEntries,
+    ...(sharedRoot !== undefined && {
+      skip: (path: string) =>
+        basename(path) === ".git" || namesSecret(relative(sharedRoot, path)),
+    }),
     bytes: 0,
     entries: 0,
   };

@@ -6852,6 +6852,40 @@ describe("the run's scratch directory and reads outside the worktree", () => {
         expect(rooted.copy.pattern).toBe("**/SKILL.md");
       });
 
+      test("a search of a shared place leaves out .git and secret-named files, which a read by name still asks about", async () => {
+        const cfg = settingsOf(".sky-store");
+        put(".sky-store/plans/a.md", "plan\n");
+        put(".sky-store/plans/credentials.json", "secret\n");
+        put(".sky-store/plans/.env", "secret\n");
+        put(".sky-store/.git/HEAD", "ref\n");
+        put(`${CACHE}/kru/token.txt`, "secret\n");
+        put(`${CACHE}/kru/a.md`);
+        const plans = join(home(), ".sky-store/plans");
+        unasked(
+          await call(cfg, "Grep", { pattern: "plan", path: plans }),
+          "a.md",
+        );
+        unasked(await call(cfg, "Glob", { pattern: "*", path: plans }), "a.md");
+        unasked(
+          await call(cfg, "Grep", {
+            pattern: "x",
+            path: join(home(), ".sky-store"),
+          }),
+          "plans,plans/a.md",
+        );
+        unasked(
+          await call(cfg, "Grep", {
+            pattern: "x",
+            path: join(home(), CACHE, "kru"),
+          }),
+          "a.md",
+        );
+        const byName = await call(cfg, "Read", {
+          file_path: join(plans, "credentials.json"),
+        });
+        expect(byName.asked).toBe(true);
+      });
+
       test.each([".sky-store", ".kru"])(
         "the store of a profile with home %s reads the same way, and the other directory asks",
         async (storeHome) => {

@@ -701,6 +701,48 @@ describe("staging an approved outside read", () => {
     expect(existsSync(slot())).toBe(false);
   });
 
+  describe("a read of a shared place", () => {
+    /** A store-like tree: two plan files, secret-named ones, and a `.git` of many files. */
+    const store = () => {
+      const tree = join(root, "store");
+      mkdirSync(join(tree, "plans"), { recursive: true });
+      mkdirSync(join(tree, ".git/objects"), { recursive: true });
+      writeFileSync(join(tree, "plans/a.md"), "a");
+      writeFileSync(join(tree, "plans/credentials.json"), "secret");
+      writeFileSync(join(tree, "plans/.env"), "secret");
+      writeFileSync(join(tree, "token.txt"), "secret");
+      for (let i = 0; i < 20; i++)
+        writeFileSync(join(tree, `.git/objects/o${i}`), "x");
+      return tree;
+    };
+    const names = (dir: string) =>
+      readdirSync(dir, { recursive: true }).map(String).sort();
+
+    test("leaves out .git and secret-named entries, so a search sees neither and the limits count the rest", async () => {
+      const tree = store();
+      const copy = await stage(tree, { sharedRoot: tree, maxEntries: 5 });
+      expect(names(copy)).toEqual(["plans", "plans/a.md"]);
+    });
+
+    test("without a shared root, the same tree is copied whole or refused by the cap", async () => {
+      const tree = store();
+      await expect(stage(tree, { maxEntries: 5 })).rejects.toThrow(
+        "holds more than 5 files and directories",
+      );
+      const copy = await stage(tree);
+      expect(names(copy)).toContain("plans/credentials.json");
+      expect(names(copy)).toContain(".git/objects/o0");
+    });
+
+    test("judges entries by their path from the root, not the root's own path", async () => {
+      const tree = join(root, ".config/store");
+      mkdirSync(join(tree, "plans"), { recursive: true });
+      writeFileSync(join(tree, "plans/a.md"), "a");
+      const copy = await stage(tree, { sharedRoot: tree });
+      expect(names(copy)).toEqual(["plans", "plans/a.md"]);
+    });
+  });
+
   test("a copied read-only directory is the owner's alone and can be removed", async () => {
     const tree = join(root, "readonly");
     mkdirSync(join(tree, "sub"), { recursive: true });
