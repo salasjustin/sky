@@ -6896,8 +6896,9 @@ describe("the run's scratch directory and reads outside the worktree", () => {
           expect(result.asked, file_path).toBe(true);
         }
         const account = put(".claude.json", "{}\n");
-        // asked, or refused outright where the runner's own HOME is the session's; never copied
+        // the session's HOME is not the runner's here, so a person is asked, and the file is never copied
         const refused = await call(cfg, "Read", { file_path: account });
+        expect(refused.asked).toBe(true);
         expect(refused.decision).toBe("deny");
         expect(refused.copied).toBeUndefined();
       });
@@ -7574,6 +7575,30 @@ describe("the instructions on commands that run without a person", () => {
           command,
           { defaults: true, commands: [] },
           { root: "/work/repo", home: "/home/sprite", storeHome: ".kru" },
+        ),
+        command,
+      ).toBe("approved");
+    }
+  });
+
+  test("with no store name only the plugin cache, and what they recommend runs without a person", () => {
+    const line = quietCommands(undefined);
+    expect(line).not.toContain(".kru");
+    expect(line).not.toContain(".sky-store");
+    expect(line).toContain("~/.claude/plugins/cache");
+    expect(line.trimEnd()).toMatch(
+      /The Read, Grep and Glob tools read the plugin cache without asking too\.$/,
+    );
+    const examples = [...line.matchAll(/\(`([^`]+)`\)/g)].map(
+      (m) => m[1] ?? "",
+    );
+    expect(examples).toContain("ls ~/.claude/plugins/cache");
+    for (const command of examples) {
+      expect(
+        autoApproveVerdict(
+          command,
+          { defaults: true, commands: [] },
+          { root: "/work/repo", home: "/home/sprite", storeHome: undefined },
         ),
         command,
       ).toBe("approved");
