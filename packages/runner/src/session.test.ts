@@ -805,8 +805,27 @@ test("the session turns Claude Code's commit and pull request attribution off", 
   expect(settings).toEqual({
     attribution: { commit: "", pr: "" },
     ...PINNED_SETTINGS,
-    env: { KRU_NO_LEAD_GATE: "1" },
+    env: { KRU_NO_LEAD_GATE: "1", HOME: expect.any(String) },
   });
+});
+
+test("the session's flag settings pin HOME to the home the auto-approve check expands `~` with", async () => {
+  // a settings file's `env` that moved HOME would have the shell read `~/.kru/x` from elsewhere
+  // than the checker approved; the checker's use of the same home is shown by the "reads of the
+  // plugin cache, the kru store and the repo's skill files" tests, which set it the same way
+  const query = scripted([init, success]);
+  await runSession(
+    { ...config, sessionEnv: { HOME: root } },
+    {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    },
+  );
+  const options = query.calls[0]?.options;
+  expect(options?.settings).toMatchObject({ env: { HOME: root } });
+  expect(options?.env?.HOME).toBe(root);
 });
 
 test("the session's flag settings turn kru's lead gate off, above any settings file's env", async () => {
@@ -3323,9 +3342,13 @@ test("a symlink in the worktree that leads outside it still asks", async () => {
 });
 
 describe("reads of the plugin cache, the kru store and the repo's skill files", () => {
+  // resolved, so the absolute commands below sit under the roots the checker builds from HOME
+  // where the tmpdir is behind a symlink
+  const spriteHome = () => join(realpathSync(root), "sprite-home");
+
   /** A home laid out as the sprite's, with the session env's HOME pointing at it. */
   const layout = (worktree: string) => {
-    const home = join(root, "sprite-home");
+    const home = spriteHome();
     const skill = join(
       home,
       ".claude/plugins/cache/kru/kru/0.213.0/skills/lead/SKILL.md",
@@ -3354,7 +3377,7 @@ describe("reads of the plugin cache, the kru store and the repo's skill files", 
       join(worktree, "packages/ui/src/components/image.tsx"),
       "export {};\n",
     );
-    return { home: realpathSync(home), skill: realpathSync(skill) };
+    return { home, skill };
   };
 
   test("four reads that stopped for a person now run", async () => {
@@ -3379,7 +3402,7 @@ describe("reads of the plugin cache, the kru store and the repo's skill files", 
         ];
       },
       undefined,
-      { HOME: join(root, "sprite-home") },
+      { HOME: spriteHome() },
     );
     expect(held).toEqual([]);
     expect(warned).toHaveLength(4);
@@ -3418,7 +3441,7 @@ describe("reads of the plugin cache, the kru store and the repo's skill files", 
         return asked.map((command) => ({ command }));
       },
       undefined,
-      { HOME: join(root, "sprite-home") },
+      { HOME: spriteHome() },
     );
     expect(held).toEqual(asked);
   });
