@@ -1070,19 +1070,18 @@ export function createLauncher({
           throw err;
         })
         .catch((err: unknown) => {
-          // the SDK's socket errors quote the session URL, which carries the env
-          const detail = redact(
-            err instanceof Error ? err.message : String(err),
-            [...secrets.values(), agentToken],
-          );
-          log(`launching ${launch.runId} failed: ${detail}`);
+          const message = err instanceof Error ? err.message : String(err);
+          // the SDK's socket errors quote the session URL, which carries the env, and a sprite's
+          // stderr can echo any live run's token. This run's own is listed too: it may have ended
+          const known = [
+            ...secrets.values(),
+            agentToken,
+            ...liveAgentTokens(db, config.apiKey),
+          ];
+          log(`launching ${launch.runId} failed: ${redact(message, known)}`);
           const ended = db.transaction(
             (tx) => {
-              // a sprite's stderr can echo any live run's token, and is stored in the event
-              const stored = eventText(detail, [
-                ...secrets.values(),
-                ...liveAgentTokens(tx, config.apiKey),
-              ]);
+              const stored = eventText(message, known);
               return failRun(
                 tx,
                 launch.runId,
