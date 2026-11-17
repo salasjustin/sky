@@ -244,8 +244,8 @@ export function sessionOptions(
     env: claudeProcessEnv(sessionEnvOf(config), config.claudeAuth, runnerEnv),
     ...(spawn && { spawnClaudeCodeProcess: spawn }),
     // Claude Code's own commit trailer and pull request footer are off, for hosting that rejects them;
-    // the credential helpers, kru's lead-gate switch and HOME are pinned above every settings file,
-    // the ones written mid-run included; see `sessionHomeOf` for HOME
+    // the credential helpers, kru's lead-gate switch and HOME are pinned above the user, project and
+    // local settings files, the ones written mid-run included; see `sessionHomeOf` for HOME
     settings: {
       attribution: { commit: "", pr: "" },
       ...PINNED_SETTINGS,
