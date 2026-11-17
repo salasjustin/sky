@@ -731,6 +731,22 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
       expect(extraRoots(home, undefined, storeHome)).toEqual([cache]);
     });
 
+    test("a store home with a trailing slash is the same root, judged from the store down", () => {
+      expect(extraRoots(home, undefined, "a/store/")).toEqual([
+        cache,
+        join(home, "a/store"),
+      ]);
+      const secretHome = join(base, "secret-home");
+      const verdicts = ["store/", "store"].map((storeHome) =>
+        autoApproveVerdict("cat ~/store/plans/x.md", DEFAULTS, {
+          root,
+          home: secretHome,
+          storeHome,
+        }),
+      );
+      expect(verdicts).toEqual(["approved", "approved"]);
+    });
+
     test("extraRoots lists the plugin cache and the store below the home", () => {
       expect(extraRoots(home, realpathSync.native, ".kru")).toEqual([
         cache,

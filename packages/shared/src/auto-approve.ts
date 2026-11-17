@@ -312,14 +312,15 @@ const isOutside = (relative: string) =>
 const CLAUDE_READABLE = /^\.claude\/(skills|agents|commands)(\/|$)/;
 
 /**
- * `storeHome` as a path below the session's home, or undefined when it isn't a plain directory
- * name there: absolute, climbing out, the home itself or inside `~/.claude`.
+ * `storeHome` as a normalized path below the session's home (one or more segments, no trailing
+ * slash), or undefined when it can't be one: empty, with whitespace, absolute, climbing out, the
+ * home itself or inside `~/.claude`.
  */
 function storeRoot(base: string, storeHome: string | undefined) {
   if (storeHome === undefined || storeHome === "" || /[\0\s]/.test(storeHome))
     return undefined;
   if (posix.isAbsolute(storeHome)) return undefined;
-  const path = posix.join(base, storeHome);
+  const path = posix.resolve(base, storeHome);
   const rel = posix.relative(base, path);
   if (rel === "" || isOutside(rel) || rel.split("/")[0] === ".claude")
     return undefined;
@@ -397,6 +398,8 @@ function expandTilde(word: string, home: string | undefined): string {
 /**
  * Whether this path-ish text names somewhere secrets live. `allowClaude` lets the worktree's
  * `.claude/skills`, `.claude/agents` and `.claude/commands` through; the rest of `.claude` asks.
+ * A caller outside this file passes a path relative to the root it is in (the plugin cache or the
+ * store), since `.claude` in the root's own path isn't a secret name.
  */
 export function namesSecret(text: string, allowClaude = false): boolean {
   let segments = text.split(/[/=:]/).filter(Boolean);
