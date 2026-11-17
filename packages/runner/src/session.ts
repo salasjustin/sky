@@ -823,8 +823,9 @@ export async function runSession(
         return undefined;
       }
       // a cancelled wait must not leave its request open: the API would refuse the run's next
-      // request, or its ending. A post cut off by the runner's own stop is left to the ending, which
-      // the API accepts from a waiting run only as a failure or stop.
+      // request. A post cut off by the runner's own stop is left to the ending, which the API
+      // accepts from a waiting run as a failure or stop, or as a finish that withdraws the open
+      // request in the same commit.
       if (posting) {
         if (abortController.signal.aborted) return undefined;
         // cut off mid-post, so the API may hold the request

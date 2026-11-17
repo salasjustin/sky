@@ -146,8 +146,8 @@ export const warningReporter =
   };
 
 /**
- * A `run.waiting` or `run.started` the API refused because it already stopped or failed the run,
- * and recorded how.
+ * A `run.waiting`, `run.withdrawn` or `run.started` the API refused because it already stopped or
+ * failed the run, and recorded how.
  */
 export class RunEndedError extends Error {
   constructor() {
