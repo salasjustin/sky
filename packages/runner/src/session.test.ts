@@ -7156,20 +7156,44 @@ function firstRequestHeld(): DecisionReply {
   };
 }
 
+/**
+ * Runs `onPoll` at the first poll of any request, the point where the runner has that request open.
+ */
+function onFirstPoll(
+  reply: DecisionReply,
+  onPoll: () => void,
+): DecisionReply {
+  let seen = false;
+  return (requestId) => {
+    if (!seen) {
+      seen = true;
+      onPoll();
+    }
+    return reply(requestId);
+  };
+}
+
 const withdrawnEvents = (sent: RunnerEventPost[]) =>
   sent.filter((e) => e.type === "run.withdrawn");
 const waitingId = (event: RunnerEventPost | undefined) =>
   event?.type === "run.waiting" ? event.payload.request.requestId : undefined;
 
 test("a session that ends with a background subagent's request still open withdraws it, and the run still finishes", async () => {
-  const { sent, deps } = api(heldPending);
+  let polling!: () => void;
+  const polled = new Promise<void>((resolve) => {
+    polling = resolve;
+  });
+  const { sent, deps } = api(onFirstPoll(heldPending, polling));
+  let held: Promise<unknown[]> | undefined;
   const query = wakeProcess([
     init,
     subagentStart,
     success,
-    // the woken turn's call is held, and its hook is still waiting when the hold ends the session
+    // the woken turn's call is held, and the turn ends only once the runner is polling its request,
+    // so the hold that closes the input ends the session with that request still open
     async (options: Options) => {
-      void fire(options, "PreToolUse", gitPush);
+      held = fire(options, "PreToolUse", gitPush);
+      await polled;
       return undefined;
     },
   ]);
@@ -7177,6 +7201,7 @@ test("a session that ends with a background subagent's request still open withdr
     { ...config, approvalPolicy: ["Bash"] },
     { ...deps, query, backgroundHoldMs: 30 },
   );
+  await held;
   expect(code).toBe(0);
   const types = sent.map((e) => e.type);
   expect(types.filter((t) => t.startsWith("run."))).toEqual([
@@ -7196,14 +7221,17 @@ test("a session that ends with a background subagent's request still open withdr
 });
 
 test("a hook the SDK cancels mid-session withdraws its request, and the next held call's run.waiting opens after it", async () => {
-  const { sent, deps } = api(firstRequestHeld());
+  const cancel = new AbortController();
+  const { sent, deps } = api(
+    onFirstPoll(firstRequestHeld(), () =>
+      cancel.abort(new Error("hook timed out")),
+    ),
+  );
   let answers: unknown[] = [];
   const query = scripted([
     init,
     async (options: Options) => {
       const [gate] = options.hooks?.PreToolUse?.[0]?.hooks ?? [];
-      const cancel = new AbortController();
-      setTimeout(() => cancel.abort(new Error("hook timed out")), 50);
       await gate?.(
         {
           session_id: "sess-new",
@@ -7244,12 +7272,13 @@ test("a hook the SDK cancels mid-session withdraws its request, and the next hel
 });
 
 test("Claude's question the SDK cancels is withdrawn the same way", async () => {
-  const { sent, deps } = api(heldPending);
+  const cancel = new AbortController();
+  const { sent, deps } = api(
+    onFirstPoll(heldPending, () => cancel.abort(new Error("cancelled"))),
+  );
   const query = scripted([
     init,
     async (options: Options) => {
-      const cancel = new AbortController();
-      setTimeout(() => cancel.abort(new Error("cancelled")), 50);
       await options.canUseTool?.(
         "AskUserQuestion",
         { questions },
@@ -7267,13 +7296,72 @@ test("Claude's question the SDK cancels is withdrawn the same way", async () => 
   ]);
 });
 
-test("a stop from the runner's own signal while a call waits withdraws the request before run.failed", async () => {
-  const { sent, deps } = api(heldPending);
-  const controller = new AbortController();
+test("two held calls in parallel: the first's wait is cancelled, and only after its withdrawal does the second open its own request", async () => {
+  const cancel = new AbortController();
+  const { sent, deps } = api(
+    onFirstPoll(firstRequestHeld(), () =>
+      cancel.abort(new Error("hook timed out")),
+    ),
+  );
+  let answers: unknown[] = [];
   const query = scripted([
     init,
     async (options: Options) => {
-      setTimeout(() => controller.abort("SIGTERM"), 50);
+      const [gate] = options.hooks?.PreToolUse?.[0]?.hooks ?? [];
+      const call = (toolUseId: string, signal: AbortSignal) =>
+        gate?.(
+          {
+            session_id: "sess-new",
+            transcript_path: "/t.jsonl",
+            cwd: options.cwd ?? "",
+            hook_event_name: "PreToolUse",
+            ...gitPush,
+            tool_use_id: toolUseId,
+          } as HookInput,
+          toolUseId,
+          { signal },
+        );
+      // both calls start before either has a request open; t1 enters the gate first, so it holds
+      // the turn
+      answers = await Promise.all([
+        call("t1", cancel.signal),
+        call("t2", new AbortController().signal),
+      ]);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query },
+  );
+  expect(code).toBe(0);
+  expect(answers[1]).toEqual(approved);
+  expect(sent.map((e) => e.type).filter((t) => t.startsWith("run."))).toEqual([
+    "run.started",
+    "run.waiting",
+    "run.withdrawn",
+    "run.waiting",
+    "run.finished",
+  ]);
+  const [first, second] = sent.filter((e) => e.type === "run.waiting");
+  expect(first && second && waitingId(first) !== waitingId(second)).toBe(true);
+  expect(withdrawnEvents(sent)).toEqual([
+    {
+      runId: "run_1",
+      type: "run.withdrawn",
+      payload: { requestId: waitingId(first), reason: "hook_cancelled" },
+    },
+  ]);
+});
+
+test("a stop from the runner's own signal while a call waits withdraws the request before run.failed", async () => {
+  const controller = new AbortController();
+  const { sent, deps } = api(
+    onFirstPoll(heldPending, () => controller.abort("SIGTERM")),
+  );
+  const query = scripted([
+    init,
+    async (options: Options) => {
       await fire(options, "PreToolUse", gitPush);
     },
     success,
