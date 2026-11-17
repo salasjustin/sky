@@ -805,8 +805,27 @@ test("the session turns Claude Code's commit and pull request attribution off", 
   expect(settings).toEqual({
     attribution: { commit: "", pr: "" },
     ...PINNED_SETTINGS,
-    env: { KRU_NO_LEAD_GATE: "1" },
+    env: { KRU_NO_LEAD_GATE: "1", HOME: expect.any(String) },
   });
+});
+
+test("the session's flag settings pin HOME to the home the auto-approve check expands `~` with", async () => {
+  // a settings file's `env` that moved HOME would have the shell read `~/.kru/x` from elsewhere
+  // than the checker approved; the checker's use of the same home is shown by the "reads of the
+  // plugin cache, the kru store and the repo's skill files" tests, which set it the same way
+  const query = scripted([init, success]);
+  await runSession(
+    { ...config, sessionEnv: { HOME: root } },
+    {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    },
+  );
+  const options = query.calls[0]?.options;
+  expect(options?.settings).toMatchObject({ env: { HOME: root } });
+  expect(options?.env?.HOME).toBe(root);
 });
 
 test("the session's flag settings turn kru's lead gate off, above any settings file's env", async () => {
@@ -3268,6 +3287,7 @@ test("a read-only Bash command runs without an approval request even under a bar
 async function bareBashRun(
   calls: (worktree: string) => { command: string; cwd?: string }[],
   autoApprove = config.autoApprove,
+  sessionEnv: Record<string, string> = {},
 ) {
   const { sent, deps } = api(decided({ decision: "approve" }));
   const warned: string[] = [];
@@ -3285,7 +3305,7 @@ async function bareBashRun(
     success,
   ]);
   const code = await runSession(
-    { ...config, approvalPolicy: ["Bash"], autoApprove },
+    { ...config, approvalPolicy: ["Bash"], autoApprove, sessionEnv },
     { ...deps, query, warn: (line) => warned.push(line) },
   );
   const held = sent.flatMap((e) =>
@@ -3319,6 +3339,112 @@ test("a symlink in the worktree that leads outside it still asks", async () => {
     return [{ command: "cat link" }];
   });
   expect(held).toEqual(["cat link"]);
+});
+
+describe("reads of the plugin cache, the kru store and the repo's skill files", () => {
+  // resolved, so the absolute commands below sit under the roots the checker builds from HOME
+  // where the tmpdir is behind a symlink
+  const spriteHome = () => join(realpathSync(root), "sprite-home");
+
+  /** A home laid out as the sprite's, with the session env's HOME pointing at it. */
+  const layout = (worktree: string) => {
+    const home = spriteHome();
+    const skill = join(
+      home,
+      ".claude/plugins/cache/kru/kru/0.213.0/skills/lead/SKILL.md",
+    );
+    mkdirSync(dirname(skill), { recursive: true });
+    writeFileSync(skill, "Step 3\n");
+    mkdirSync(join(home, ".kru/audit"), { recursive: true });
+    writeFileSync(join(home, ".kru/audit/run.jsonl"), "{}\n");
+    const plan = join(home, ".kru/management/design-system/plan/slug");
+    mkdirSync(plan, { recursive: true });
+    writeFileSync(join(plan, "brief.md"), "plan\n");
+    writeFileSync(join(home, ".claude/.credentials.json"), "{}\n");
+    writeFileSync(join(home, ".claude/settings.json"), "{}\n");
+    mkdirSync(join(worktree, ".claude/skills/registry-release"), {
+      recursive: true,
+    });
+    writeFileSync(
+      join(worktree, ".claude/skills/registry-release/SKILL.md"),
+      "skill\n",
+    );
+    writeFileSync(join(worktree, ".claude/settings.local.json"), "{}\n");
+    mkdirSync(join(worktree, "packages/ui/src/components"), {
+      recursive: true,
+    });
+    writeFileSync(
+      join(worktree, "packages/ui/src/components/image.tsx"),
+      "export {};\n",
+    );
+    return { home, skill };
+  };
+
+  test("four reads that stopped for a person now run", async () => {
+    let paths: ReturnType<typeof layout> | undefined;
+    const { held, warned } = await bareBashRun(
+      (worktree) => {
+        paths = layout(worktree);
+        const { home, skill } = paths;
+        return [
+          {
+            command:
+              "cat .claude/skills/registry-release/SKILL.md && cat packages/ui/src/components/image.tsx",
+          },
+          {
+            command: `grep -n 'Step 3' -A 200 ${skill} | head -300`,
+          },
+          { command: `cat ${home}/.kru/audit/run.jsonl | head -c 400000` },
+          {
+            command:
+              "cat ~/.kru/management/design-system/plan/slug/brief.md && git diff f4d7ee9 --stat",
+          },
+        ];
+      },
+      undefined,
+      { HOME: spriteHome() },
+    );
+    expect(held).toEqual([]);
+    expect(warned).toHaveLength(4);
+  });
+
+  test("the login, settings, secrets and links out of the two roots still ask", async () => {
+    const asked = [
+      "cat ~/.claude/.credentials.json",
+      "cat ~/.claude/settings.json",
+      "cat ~/.claude/plugins/../.credentials.json",
+      "cat ~/.kru/../.ssh/id_rsa",
+      "cat ~/.kru/to-outside",
+      "cat ~/.kru/to-secret",
+      "cat ~/.claude/plugins/cache/to-outside",
+      "cat .claude/settings.local.json",
+      "cat ~root/x",
+      "ls x=~/y",
+      'cat "~/x"',
+      "cat x > ~/.kru/y",
+    ];
+    const { held } = await bareBashRun(
+      (worktree) => {
+        const { home } = layout(worktree);
+        symlinkSync(
+          join(worktree, "packages/ui/src/components/image.tsx"),
+          join(home, ".kru/to-outside"),
+        );
+        symlinkSync(
+          join(home, ".claude/.credentials.json"),
+          join(home, ".kru/to-secret"),
+        );
+        symlinkSync(
+          join(home, ".claude/settings.json"),
+          join(home, ".claude/plugins/cache/to-outside"),
+        );
+        return asked.map((command) => ({ command }));
+      },
+      undefined,
+      { HOME: spriteHome() },
+    );
+    expect(held).toEqual(asked);
+  });
 });
 
 test("an auto-approved call is logged by its tool use id; held and unheld calls are not", async () => {
@@ -7094,10 +7220,13 @@ describe("the run's scratch directory on disk", () => {
 });
 
 describe("the instructions on commands that run without a person", () => {
-  const withPolicy = async (approvalPolicy: string[]) => {
+  const withPolicy = async (
+    approvalPolicy: string[],
+    autoApprove = config.autoApprove,
+  ) => {
     const query = scripted([init, success]);
     await runSession(
-      { ...config, approvalPolicy },
+      { ...config, approvalPolicy, autoApprove },
       {
         query,
         post: recorder().post,
@@ -7124,17 +7253,25 @@ describe("the instructions on commands that run without a person", () => {
       "grep -n 'a\\|b' file",
       "rg -n foo src",
       "rg -t ts foo src",
+      "ls ~/.claude/plugins/cache",
+      "cat ~/.kru/plans/x.md",
     ]);
     for (const command of examples) {
       expect(
         autoApproveVerdict(
           command,
           { defaults: true, commands: [] },
-          "/work/repo",
+          { root: "/work/repo", home: "/home/sprite" },
         ),
         command,
       ).toBe("approved");
     }
+  });
+
+  test("are left out when the environment drops the default commands", async () => {
+    expect(
+      await withPolicy(["Bash"], { defaults: false, commands: ["ls"] }),
+    ).not.toContain(QUIET_COMMANDS);
   });
 
   test("are left out when it doesn't", async () => {

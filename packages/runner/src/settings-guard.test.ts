@@ -140,6 +140,7 @@ describe("a settings file that redirects Claude or swaps its credential", () => 
       "CLAUDE_CODE_USE_MANTLE",
       "CLAUDE_CODE_USE_VERTEX",
       "CLAUDE_CONFIG_DIR",
+      "HOME",
       "HTTPS_PROXY",
       "HTTP_PROXY",
       "all_proxy",

@@ -47,11 +47,12 @@ export type AutoApprove = {
 type Operator = ";" | "&&" | "||" | "|";
 /**
  * `literal` marks a word holding `$`, a backtick, `\` or `!` inside single quotes, or a kept
- * backslash inside double quotes, `braced` one of the words a `{a,b}` group expanded to;
- * `redirect` is one of the harmless ones `lex` lets through.
+ * backslash inside double quotes, `braced` one of the words a `{a,b}` group expanded to,
+ * `tilde` a word that starts with an unquoted `~` the shell expands to its home; `redirect` is
+ * one of the harmless ones `lex` lets through.
  */
 type Token =
-  | { word: string; literal: boolean; braced: boolean }
+  | { word: string; literal: boolean; braced: boolean; tilde: boolean }
   | { op: Operator }
   | { redirect: true };
 
@@ -97,6 +98,7 @@ function lex(command: string): Token[] | undefined {
   let open = false;
   let quoted = false;
   let literal = false;
+  let tilde = false;
   let quote: string | undefined;
   // a word with brace groups: the alternatives of each finished segment, and the group still open
   let parts: string[][] = [];
@@ -106,6 +108,7 @@ function lex(command: string): Token[] | undefined {
     open = false;
     quoted = false;
     literal = false;
+    tilde = false;
     parts = [];
   };
   /** False when the word's braces don't make a plain `{a,b}` expansion. */
@@ -120,7 +123,7 @@ function lex(command: string): Token[] | undefined {
     const braced = parts.length > 0;
     // tilde and zsh's `=` expansion run after brace expansion, and an empty word vanishes
     if (braced && words.some((w) => w === "" || /^[~=]/.test(w))) return false;
-    for (const word of words) tokens.push({ word, literal, braced });
+    for (const word of words) tokens.push({ word, literal, braced, tilde });
     dropWord();
     return true;
   };
@@ -201,8 +204,13 @@ function lex(command: string): Token[] | undefined {
     } else if (UNQUOTED_SPECIAL.test(ch)) {
       return undefined;
     } else {
-      // a leading unquoted `~` is tilde expansion, and in zsh a leading `=` expands to a program's path
-      if (!open && (ch === "~" || ch === "=")) return undefined;
+      // in zsh a leading `=` expands to a program's path
+      if (!open && ch === "=") return undefined;
+      // a leading unquoted `~` or `~/` is the home directory; `~user`, `~+` and the like ask
+      if (!open && ch === "~") {
+        if (next !== undefined && !/[/ \t;&|]/.test(next)) return undefined;
+        tilde = true;
+      }
       append(ch);
     }
   }
@@ -215,7 +223,13 @@ function lex(command: string): Token[] | undefined {
  * `literal` when a word holds single-quoted expansion characters or a kept backslash in double
  * quotes.
  */
-type Step = { words: string[]; piped: boolean; literal: boolean };
+type Step = {
+  words: string[];
+  /** Per word: it started with an unquoted `~` that expands to the home directory. */
+  tilde: boolean[];
+  piped: boolean;
+  literal: boolean;
+};
 
 /** Steps joined by `|`, run when `after` (the operator before it) lets them. */
 type Pipeline = { steps: Step[]; after?: Exclude<Operator, "|"> };
@@ -226,6 +240,7 @@ function parsePipelines(command: string): Pipeline[] | undefined {
   if (!tokens) return undefined;
   const newStep = (piped: boolean): Step => ({
     words: [],
+    tilde: [],
     piped,
     literal: false,
   });
@@ -239,6 +254,7 @@ function parsePipelines(command: string): Pipeline[] | undefined {
       // braces in the program's place would choose the program
       if (token.braced && step.words.length === 0) return undefined;
       step.words.push(token.word);
+      step.tilde.push(token.tilde);
       step.literal ||= token.literal;
     } else if (step.words.length === 0) return undefined;
     else if (token.op === "|") pipeline.steps.push(newStep(true));
@@ -253,7 +269,10 @@ export function parseCommandEntry(entry: string): string[] | undefined {
   const tokens = lex(entry);
   if (!tokens || tokens.length === 0) return undefined;
   const words = tokens.flatMap((t) => ("word" in t ? [t.word] : []));
-  return words.length === tokens.length && !isAssignment(words[0] ?? "")
+  const tilde = tokens.some((t) => "tilde" in t && t.tilde);
+  return !tilde &&
+    words.length === tokens.length &&
+    !isAssignment(words[0] ?? "")
     ? words
     : undefined;
 }
@@ -271,7 +290,7 @@ const SENSITIVE_DIRS = new Set([
   "environ",
 ]);
 const SENSITIVE_FILES =
-  /^(\.env|\.dev\.vars|\.npmrc|\.yarnrc|\.netrc|\.pgpass|\.pypirc|\.htpasswd|id_(rsa|dsa|ecdsa|ed25519))|credentials|token|secret|\.tfstate|\.(pem|key|p12|pfx)$/i;
+  /^(\.env|\.claude\.json|\.dev\.vars|\.npmrc|\.yarnrc|\.netrc|\.pgpass|\.pypirc|\.htpasswd|id_(rsa|dsa|ecdsa|ed25519))|credentials|token|secret|\.tfstate|\.(pem|key|p12|pfx)$/i;
 
 /** Every reading of `word` that a program might open as a path. */
 function pathCandidates(word: string): string[] {
@@ -289,17 +308,89 @@ function pathCandidates(word: string): string[] {
 const isOutside = (relative: string) =>
   relative === ".." || relative.startsWith("../");
 
-/** Whether this path-ish text, resolved against `cwd`, points outside `root`. */
-function leavesRoot(text: string, root: string, cwd: string): boolean {
-  return (
-    text.startsWith("~") ||
-    isOutside(posix.relative(root, posix.resolve(cwd, text)))
-  );
+/** Under the worktree's `.claude`, only these hold files an agent has reason to read. */
+const CLAUDE_READABLE = /^\.claude\/(skills|agents|commands)(\/|$)/;
+
+/**
+ * Beside the worktree, read-only commands may name these, below the session's home: the plugin
+ * cache only, since the rest of `~/.claude` holds the login, settings and account files, and
+ * the kru store checkout. Taken afresh for each command: with `realpath`, a root whose real
+ * location holds the home, holds `~/.claude`, sits inside `~/.claude` outside its plugin cache,
+ * or has a secret name in its path is dropped, so reads there ask. `~/.claude` counts both
+ * beside the real home and where its own link leads.
+ */
+function extraRoots(
+  home: string | undefined,
+  realpath?: (path: string) => string,
+): string[] {
+  if (home === undefined || !posix.isAbsolute(home)) return [];
+  const base = posix.resolve(home);
+  const roots = [
+    posix.join(base, ".claude/plugins/cache"),
+    posix.join(base, ".kru"),
+  ];
+  if (!realpath) return roots;
+  const real = (path: string): string | undefined => {
+    try {
+      return realpath(path);
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      // a path that doesn't exist yet is judged on its text; any other failure drops the
+      // roots it decides
+      return code === "ENOENT" || code === "ENOTDIR" ? path : undefined;
+    }
+  };
+  const realHome = real(base);
+  const realClaude = real(posix.join(base, ".claude"));
+  if (realHome === undefined || realClaude === undefined) return [];
+  const claudes = [posix.join(realHome, ".claude"), realClaude];
+  const cacheOf = (claude: string) => posix.join(claude, "plugins/cache");
+  const within = (parent: string, path: string) =>
+    !isOutside(posix.relative(parent, path));
+  return roots.filter((root) => {
+    const target = real(root);
+    if (target === undefined || within(target, realHome)) return false;
+    const exposesClaude = (claude: string) =>
+      within(target, claude) ||
+      (within(claude, target) && !within(cacheOf(claude), target));
+    if (claudes.some(exposesClaude)) return false;
+    // the plugin cache's own `.claude/plugins/cache` isn't a secret name
+    const claude = claudes.find((c) => within(cacheOf(c), target));
+    const path =
+      claude === undefined
+        ? target
+        : posix.join(
+            posix.dirname(claude),
+            posix.relative(cacheOf(claude), target),
+          );
+    return !namesSecret(path);
+  });
 }
 
-/** Whether this path-ish text names somewhere secrets live. */
-function namesSecret(text: string): boolean {
-  const segments = text.split(/[/=:]/).filter(Boolean);
+/** The word with a leading `~` or `~/` taken to `home`, as the shell does; unchanged without a usable home. */
+function expandTilde(word: string, home: string | undefined): string {
+  if (home === undefined || !posix.isAbsolute(home)) return word;
+  const base = posix.resolve(home);
+  if (word === "~") return base;
+  // a home of `/` takes `~/x` to `/x`, not `//x`
+  return (base === "/" ? "" : base) + word.slice(1);
+}
+
+/**
+ * Whether this path-ish text names somewhere secrets live. `allowClaude` lets the worktree's
+ * `.claude/skills`, `.claude/agents` and `.claude/commands` through; the rest of `.claude` asks.
+ */
+function namesSecret(text: string, allowClaude = false): boolean {
+  let segments = text.split(/[/=:]/).filter(Boolean);
+  if (allowClaude) {
+    const i = segments.indexOf(".claude");
+    const next = segments[i + 1];
+    if (
+      i >= 0 &&
+      (next === "skills" || next === "agents" || next === "commands")
+    )
+      segments = segments.filter((_, j) => j !== i);
+  }
   return (
     segments.some((s) => SENSITIVE_DIRS.has(s) || SENSITIVE_FILES.test(s)) ||
     segments.some((s, i) => s === ".git" && segments[i + 1] === "config")
@@ -659,6 +750,13 @@ export type AutoApproveScope = {
    * other throw asks.
    */
   realpath?: (path: string) => string;
+  /**
+   * The home the shell's `~` stands for, an absolute path taken from the session's env. With it,
+   * a word's leading `~` or `~/` is expanded to it, and read-only commands may also name paths in
+   * `.claude/plugins/cache` and `.kru` below it; the cwd and a `cd` target must still be in
+   * `root`. Without it a `~` asks.
+   */
+  home?: string;
 };
 
 /**
@@ -691,13 +789,17 @@ export function autoApproveVerdict(
       }
       // a cd that fails leaves the shell where it was
       if (first?.words[0] === "cd") {
-        const dir = posix.resolve(cwd, first.words[1] ?? "");
+        const target = first.words[1] ?? "";
+        const dir = posix.resolve(
+          cwd,
+          first.tilde[1] ? expandTilde(target, resolved.home) : target,
+        );
         // bash moves to this lexical path when it exists and otherwise falls back to the physical
-        // one, which the text doesn't track, so the target must resolve inside the root
+        // one, which the text doesn't track, so the target must resolve inside the worktree
         if (resolved.realpath) {
           const verdict = resolvedVerdict(
             [dir],
-            resolved.root,
+            [resolved.root],
             cwd,
             resolved.realpath,
             true,
@@ -717,9 +819,11 @@ export function autoApproveVerdict(
 function stepVerdict(
   step: Step,
   autoApprove: AutoApprove,
-  { root, cwd = root, realpath }: AutoApproveScope,
+  { root, cwd = root, realpath, home }: AutoApproveScope,
 ): "approved" | AskReason {
-  const raw = step.words;
+  const raw = step.words.map((w, i) =>
+    step.tilde[i] ? expandTilde(w, home) : w,
+  );
   const first = raw[0] ?? "";
   if (step.literal && !TAKES_LITERALS.has(first)) return "syntax";
   if (isAssignment(first) || first.includes("/") || first.startsWith("-"))
@@ -746,26 +850,52 @@ function stepVerdict(
   const args = fileArgs(raw).flatMap(pathCandidates);
   // "." stands for the cwd itself, which `ls` or `git status` reads with no argument
   const targets = [".", ...args];
-  if (targets.some((t) => leavesRoot(t, root, cwd))) return "outside-root";
-  // `.git/./config` is `.git/config`, so the collapsed form is checked too
-  const collapsed = targets.map((t) =>
-    posix.relative(root, posix.resolve(cwd, t)),
+  const roots = [root, ...extraRoots(home, realpath)];
+  // a `~` left in a word is one the shell won't expand to the home, and it asks
+  const owners = targets.map((t) =>
+    t.startsWith("~") ? undefined : rootOf(roots, posix.resolve(cwd, t)),
   );
-  if ([...args, ...collapsed].some(namesSecret)) return "sensitive-path";
-  return realpath ? resolvedVerdict(targets, root, cwd, realpath) : "approved";
+  if (owners.some((owner) => owner === undefined)) return "outside-root";
+  // extra roots are named, never entered: `pnpm test` or `git` run there would act on
+  // their files, so the shell's cwd and a cd target stay in the worktree
+  const entered = first === "cd" ? owners : owners.slice(0, 1);
+  if (entered.some((owner) => owner !== root)) return "outside-root";
+  for (const [i, target] of targets.entries()) {
+    const owner = owners[i] ?? root;
+    const inWorktree = owner === root;
+    // `.git/./config` is `.git/config`, so the collapsed form is checked too
+    const collapsed = posix.relative(owner, posix.resolve(cwd, target));
+    const allowClaude = inWorktree && CLAUDE_READABLE.test(collapsed);
+    // beside the worktree the root's own path holds `.claude`, so only what follows it is read
+    const text =
+      !inWorktree && target.startsWith(`${owner}/`)
+        ? target.slice(owner.length)
+        : target === owner
+          ? ""
+          : target;
+    if (namesSecret(text, allowClaude) || namesSecret(collapsed, allowClaude))
+      return "sensitive-path";
+  }
+  return realpath ? resolvedVerdict(targets, roots, cwd, realpath) : "approved";
 }
 
+/** The first of `roots` that holds `path`, which is already resolved. */
+const rootOf = (roots: string[], path: string): string | undefined =>
+  roots.find((r) => !isOutside(posix.relative(r, path)));
+
 /**
- * The same root and secret checks, on where each target's symlinks really lead. A target that
- * doesn't exist is skipped, or asks with `missingAsks`.
+ * The same root and secret checks, on where each target's symlinks really lead; a target must
+ * stay in the root it names, the first of `roots` being the worktree. A target that doesn't
+ * exist is skipped, or asks with `missingAsks`.
  */
 function resolvedVerdict(
   targets: string[],
-  root: string,
+  roots: string[],
   cwd: string,
   realpath: (path: string) => string,
   missingAsks = false,
 ): "approved" | AskReason {
+  const [root = ""] = roots;
   const resolve = (path: string): string | undefined => {
     try {
       return realpath(path);
@@ -779,6 +909,8 @@ function resolvedVerdict(
     const realRoot = resolve(root);
     if (realRoot === undefined) return "unresolvable";
     for (const target of targets) {
+      const owner = rootOf(roots, posix.resolve(cwd, target));
+      if (owner === undefined) return "outside-root";
       // joined, not normalized: the kernel applies `..` after following a link, not before
       const real = resolve(
         target.startsWith("/") ? target : `${cwd}/${target}`,
@@ -787,9 +919,12 @@ function resolvedVerdict(
         if (missingAsks) return "unresolvable";
         continue;
       }
-      const rel = posix.relative(realRoot, real);
+      const realOwner = owner === root ? realRoot : resolve(owner);
+      if (realOwner === undefined) return "outside-root";
+      const rel = posix.relative(realOwner, real);
       if (isOutside(rel)) return "outside-root";
-      if (namesSecret(rel)) return "sensitive-path";
+      if (namesSecret(rel, owner === root && CLAUDE_READABLE.test(rel)))
+        return "sensitive-path";
     }
     return "approved";
   } catch {
