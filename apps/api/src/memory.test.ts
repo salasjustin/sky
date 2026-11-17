@@ -320,15 +320,18 @@ test("a process line is kept to its 240th column and cut past it, while a longer
   const fits = padded("4242 1 3100000 12:03 node a ", 240);
   const over = `${padded("77 1 2000 00:10 node b ", 240)}Q`;
   const uptime = ` 17:03:01 up 1 day, ${"u".repeat(300)}`;
-  sprite({ dmesg: [], processes: [fits, over], uptime });
+  const kill = `[${(STUB_UPTIME_SEC - 10).toFixed(6)}] Out of memory: Killed process 3912 (node) total-vm:9012344kB`;
+  sprite({ dmesg: [kill], processes: [fits, over], uptime });
   const lines = (await collectOver(60_000)).text.split("\n");
 
   expect(lines).toContain(fits);
   expect(lines).toContain(over.slice(0, 240));
   expect(lines).not.toContain(over);
   expect(lines).toContain(uptime);
-  // the process section ends at the next heading, which is left as it was
-  expect(lines).toContain("== kernel kills");
+  // the process section ends at the next heading: it and the kill line under it come through as they were
+  const heading = lines.indexOf("== kernel kills");
+  expect(lines[heading - 1]).toBe(over.slice(0, 240));
+  expect(lines[heading + 1]).toBe(kill);
 });
 
 // the runner up at 1_000 s, the probe set out and the report taken at 1_600 s (epoch ms): with the 30 s

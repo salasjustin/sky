@@ -27,6 +27,7 @@ import {
   vi,
 } from "vitest";
 import { server } from "../../../test/msw.js";
+import { mintAgentToken } from "./agent-token.js";
 import { DIFF, DIFF_MAX_BYTES } from "./agents.js";
 import { createApp } from "./app.js";
 import { BASE_ENV_NAMES } from "./base-profile.js";
@@ -752,6 +753,36 @@ test("a runner that exits at launch echoing another live run's token leaves it o
   expect(logs.join("\n")).not.toContain(other.token);
 });
 
+test("a runner's output split across socket frames is redacted whole, a registered secret and a live run's token alike", async () => {
+  const other = await runningRun();
+  const secret = config.webhookSigningKey;
+  const secretHead = secret.slice(0, 20);
+  const secretTail = secret.slice(20);
+  const tokenHead = other.token.slice(0, 20);
+  const tokenTail = other.token.slice(20);
+  wire.sessionExit = {
+    output: [
+      `fatal: ${secretHead}`,
+      `${secretTail} and ${tokenHead}`,
+      `${tokenTail}\r\n`,
+    ],
+    code: 1,
+  };
+  const { run } = await launched(readyEnv());
+  await vi.waitFor(() => expect(runFailure(run.id)).toBeDefined());
+
+  expect(runFailure(run.id)).toBe(
+    "launch_failed: runner exited 1 at launch: fatal: [redacted] and [redacted]",
+  );
+  expect(logs).toContain(
+    `launching ${run.id} failed: runner exited 1 at launch: fatal: [redacted] and [redacted]`,
+  );
+  const everyLog = logs.join("\n");
+  for (const fragment of [secretTail, tokenHead, tokenTail]) {
+    expect(everyLog).not.toContain(fragment);
+  }
+});
+
 /** Makes the runner bundle's install fail on the stub sprite, with `stderr` as `mv`'s complaint. */
 const bundleInstallFails = (stderr: string) => {
   const exec = wire.exec;
@@ -780,6 +811,32 @@ test("a launch failure redacts another live run's token and a registered secret 
   const everyLog = logs.join("\n");
   expect(everyLog).not.toContain(other.token);
   expect(everyLog).not.toContain(config.webhookSigningKey);
+});
+
+test("a launch failure redacts the run's own token from its log line after a stop ended the run, when no live token covers it", async () => {
+  const exec = wire.exec;
+  let own = "";
+  wire.exec = (argv) => {
+    if (argv[0] === "sha256sum") return { exitCode: 1 };
+    if (argv[0] !== "mv") return exec(argv);
+    // the staged bundle's name ends in the run id
+    const runId = argv[2]?.split(".").pop() ?? "";
+    own = mintAgentToken(config.apiKey, runId);
+    // a stop landing mid-launch: the run is no longer live, so `liveAgentTokens` skips its token
+    db.update(runs)
+      .set({ status: "stopped" })
+      .where(eq(runs.id, runId as RunId))
+      .run();
+    return { exitCode: 1, stderr: `mv: ${own} is busy\n` };
+  };
+  const { run } = await launched(readyEnv());
+  const failedLine = `launching ${run.id} failed: ${BUNDLE_FAILED}mv: [redacted] is busy`;
+  await vi.waitFor(() => expect(logs).toContain(failedLine));
+
+  expect(own).not.toBe("");
+  expect(logs.join("\n")).not.toContain(own);
+  // already ended, so nothing records a failure
+  expect(runFailure(run.id)).toBeUndefined();
 });
 
 test("a launch failure cuts its stored error and its log line to EVENT_TEXT_MAX with the marker, after redacting a token the cut falls inside", async () => {
@@ -3601,6 +3658,22 @@ test("a secret straddling EVENT_TEXT_MAX is redacted before the cut, not split b
       truncationMarker(redacted.length - EVENT_TEXT_MAX),
   );
   expect(message).not.toContain("hunter2");
+});
+
+test("another live run's token straddling EVENT_TEXT_MAX is redacted before the cut, leaving no fragment of it", async () => {
+  const other = await runningRun();
+  const lead = EVENT_TEXT_MAX - 6;
+  const { message } = await failedWith(
+    () => `${"a".repeat(lead)}${other.token}${"b".repeat(50)}`,
+    new KnownSecrets(),
+  );
+  const redacted = `${"a".repeat(lead)}[redacted]${"b".repeat(50)}`;
+  expect(message).toBe(
+    redacted.slice(0, EVENT_TEXT_MAX) +
+      truncationMarker(redacted.length - EVENT_TEXT_MAX),
+  );
+  // the six characters a raw cut would leave of it
+  expect(message).not.toContain(other.token.slice(0, 6));
 });
 
 test("a runner gone after the kernel logged a kill fails as runner_killed, naming the sprite and the memory it had", async () => {
