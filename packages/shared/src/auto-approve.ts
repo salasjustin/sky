@@ -330,11 +330,11 @@ function storeRoot(base: string, storeHome: string | undefined) {
 /**
  * Beside the worktree, read-only commands and the Read, Grep and Glob tools may name these,
  * below the session's home: the plugin cache only, since the rest of `~/.claude` holds the
- * login, settings and account files, and the store checkout, `storeHome` (the base profile's
- * `SKY_STORE_HOME`, relative to the home; none without one). Taken afresh for each use: with `realpath`, a root whose real
- * location holds the home, holds `~/.claude`, sits inside `~/.claude` outside its plugin cache,
- * or has a secret name in its path is dropped, so reads there ask. `~/.claude` counts both
- * beside the real home and where its own link leads.
+ * login, settings and account files, and the store checkout at `storeHome` below the home (the
+ * runner's `SKY_STORE_HOME`, set from the base profile's store; none without one). Taken afresh
+ * for each use: with `realpath`, a root whose real location holds the home, holds `~/.claude`,
+ * sits inside `~/.claude` outside its plugin cache, or has a secret name in its path is dropped,
+ * so reads there ask. `~/.claude` counts both beside the real home and where its own link leads.
  */
 export function extraRoots(
   home: string | undefined,
@@ -778,7 +778,7 @@ export type AutoApproveScope = {
    * `root`. Without it a `~` asks.
    */
   home?: string;
-  /** The store checkout's directory below `home` (the base profile's `SKY_STORE_HOME`); without it there is no store root. */
+  /** The store checkout's directory below `home` (the runner's `SKY_STORE_HOME`); without it there is no store root. */
   storeHome?: string;
 };
 

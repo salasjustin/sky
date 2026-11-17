@@ -311,8 +311,10 @@ const publishInstructions = (refreshed?: Refreshed) =>
 
 /**
  * For an environment whose policy holds Bash: spellings of read-only commands that the default
- * auto-approve list lets run without a person. Each parenthesized example must get `"approved"`
- * from `autoApproveVerdict`; `rg -g` and a `>` into a file ask, so they aren't offered.
+ * auto-approve list lets run without a person, and the places the Read, Grep and Glob tools read
+ * without one: the plugin cache, and the store when `storeHome` names it. Each parenthesized
+ * example must get `"approved"` from `autoApproveVerdict`; `rg -g` and a `>` into a file ask, so
+ * they aren't offered.
  */
 export const quietCommands = (storeHome: string | undefined): string => {
   const store = storeHome && posix.normalize(storeHome).replace(/\/+$/, "");
@@ -910,11 +912,10 @@ export async function runSession(
   /**
    * Decides a Read, Grep or Glob of a path outside the worktree and the scratch directory: the env's
    * approval policy holds it for a person's answer or lets it run, and a path in or around Claude
-   * Code's config directory always waits for one, except this session's saved tool output, which
-   * never does, and the plugin cache, which with the default commands on is read as the store is
-   * (see below); the store is not in that directory. Claude Code can't be told to allow one its
-   * settings block, so an allowed path is copied into the scratch directory and the call is pointed
-   * at the copy. A path `refusedReads` holds is declined at once,
+   * Code's config directory always waits for one. Two exceptions never wait: this session's saved
+   * tool output, and, with the default commands on, the plugin cache and the store. Claude Code
+   * can't be told to allow a path its settings block, so an allowed path is copied into the scratch
+   * directory and the call is pointed at the copy. A path `refusedReads` holds is declined at once,
    * with no one asked; a hard link to one is found at the copy.
    */
   const gateOutsideRead = async (
@@ -936,11 +937,11 @@ export async function runSession(
     // the env's approval policy answers, as it does for the same tool inside the worktree, and a
     // `Read(...)` pattern also holds any spelling of its path and any search of a tree around it;
     // Claude Code's saved output for this session is always readable, and the rest of its config
-    // directory is always a person's to approve
-    // with the default commands on, the plugin cache and the store read without asking, as shell
+    // directory is a person's to approve, the plugin cache aside.
+    // With the default commands on, the plugin cache and the store read without asking, as shell
     // reads of them do, so they are judged before the config directory that holds the cache; only
     // a `Read(...)` rule naming such a path holds one, as only a named `Bash(...)` pattern holds a
-    // read-only command. With them off, the read is judged like any other outside the worktree
+    // read-only command. With them off, the read is judged like any other outside the worktree.
     const sharedRoot = config.autoApprove.defaults
       ? extraRootOf(read.path, claudeHome, config.storeHome)
       : undefined;
