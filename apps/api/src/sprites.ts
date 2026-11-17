@@ -5,7 +5,7 @@ import {
   FilesystemError,
   type SpritesClient,
 } from "@fly/sprites";
-import { type KnownSecrets, redact, REDACTION_MARGIN } from "./redact.js";
+import { type KnownSecrets, REDACTION_MARGIN, redact } from "./redact.js";
 
 /**
  * The one sprite an environment owns. Hashed because the API rejects names outside lowercase
