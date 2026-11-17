@@ -1486,6 +1486,30 @@ test("a failed event records its error and frees the agent", async () => {
   });
 });
 
+test("a 5000-char run.failed error is redacted whole, then stored cut to EVENT_TEXT_MAX with the marker", async () => {
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const secret = config.webhookSigningKey;
+  const lead = `commit failed: ${"e".repeat(EVENT_TEXT_MAX - 31)}`;
+  // the secret straddles the cut: cutting first would leave a 16-char stub of it
+  const error = `${lead}${secret}`.padEnd(5000, "f");
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "run.failed",
+    payload: { error },
+  });
+  expect(res.status).toBe(201);
+  const redacted = error.replace(secret, "[redacted]");
+  expect(runFailure(run.id)).toBe(
+    redacted.slice(0, EVENT_TEXT_MAX) +
+      truncationMarker(redacted.length - EVENT_TEXT_MAX),
+  );
+});
+
 test("another live run's token gets 403 and stores nothing", async () => {
   const envId = readyEnv();
   const a = await runningRun(envId);

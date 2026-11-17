@@ -224,6 +224,13 @@ export function internalRoutes(
           ) {
             redacted.payload.error = UPSTREAM_BLOCKED;
           }
+          // a failed commit or worktree setup quotes git's or a hook's whole stderr
+          if (redacted.type === "run.failed") {
+            redacted.payload.error = cut(
+              redacted.payload.error,
+              EVENT_TEXT_MAX,
+            );
+          }
           const { id, enqueued } = recordEvent(
             tx,
             run.id,
