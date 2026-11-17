@@ -46,9 +46,9 @@ export type AutoApprove = {
 
 type Operator = ";" | "&&" | "||" | "|";
 /**
- * `literal` marks a word holding `$`, a backtick, `\` or `!` inside single quotes, `braced` one
- * of the words a `{a,b}` group expanded to; `redirect` is one of the harmless ones `lex` lets
- * through.
+ * `literal` marks a word holding `$`, a backtick, `\` or `!` inside single quotes, or a kept
+ * backslash inside double quotes, `braced` one of the words a `{a,b}` group expanded to;
+ * `redirect` is one of the harmless ones `lex` lets through.
  */
 type Token =
   | { word: string; literal: boolean; braced: boolean }
@@ -80,7 +80,8 @@ const TAKES_LITERALS = new Set([
 
 // Outside quotes these either chain, redirect, substitute, expand or comment; inside quotes they are literal.
 const UNQUOTED_SPECIAL = /[;&|<>()*?[\]{}#]/;
-// Expand or escape even inside double quotes, so they are refused outside single quotes.
+// Expand or escape even inside double quotes, so they are refused outside single quotes, except
+// a backslash in double quotes that bash keeps as is.
 const EXPANDING = /[$`\\!]/;
 // End a command, or hide the rest of it, wherever they appear.
 const LINE_BREAKING = /[\n\r\0]/;
@@ -131,8 +132,9 @@ function lex(command: string): Token[] | undefined {
   for (let i = 0; i < command.length; i++) {
     const ch = command[i] ?? "";
     const next = command[i + 1];
-    // in double quotes a backslash is kept as is unless `$`, a backtick, `"`, `\` or a newline
-    // follows, so `"a\|b"` reaches the program as `a\|b`
+    // in double quotes bash keeps a backslash as is unless `$`, a backtick, `"` or `\` follows,
+    // so `"a\|b"` reaches the program as `a\|b`; `\!` asks too, since zsh drops that backslash
+    // and bash with history expansion on keeps it
     if (quote === '"' && ch === "\\") {
       if (next === undefined || EXPANDING.test(next) || next === '"')
         return undefined;
@@ -210,7 +212,8 @@ function lex(command: string): Token[] | undefined {
 
 /**
  * One simple command of a compound one; `piped` when its stdin is the previous step's output,
- * `literal` when a word holds single-quoted expansion characters.
+ * `literal` when a word holds single-quoted expansion characters or a kept backslash in double
+ * quotes.
  */
 type Step = { words: string[]; piped: boolean; literal: boolean };
 
