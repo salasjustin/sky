@@ -581,7 +581,8 @@ function watchSession(
     session.once("exit", (code: number) => {
       // output pushed to the stream just before 'exit' may not have reached 'data' yet
       setImmediate(() => {
-        // redacted before the tail is taken: a secret the raw cut split is out of redact's reach
+        // redacted before the tail is taken: a raw tail could split a secret out of redact's reach,
+        // and one the window above split sits in the margin the tail drops
         const tail = redact(output, options.known).slice(-OUTPUT_TAIL);
         settle(
           code === 0

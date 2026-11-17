@@ -187,8 +187,8 @@ function cutProcessLines(report: string): string {
  * by RSS with their command lines, uptime, and the kernel's kill lines where `dmesg` is readable. Only
  * kill lines logged since `startedAt` (epoch ms, the run's creation) are `killLines`: the kernel's
  * buffer outlives runs, and a kill from before this one says nothing of its runner.
- * `text` is redacted but not cut: the event that stores it cuts it, after redacting it again with the
- * live tokens, and a log line uses `bounded`.
+ * `text` is redacted, and only its process lines are cut: the event that stores it cuts it whole, after
+ * redacting it again with the live tokens, and a log line uses `bounded`.
  * Never throws: a sprite that can't answer is reported in `text`, and the caller fails the run anyway.
  */
 export async function collectDiagnostics(
