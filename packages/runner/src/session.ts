@@ -637,8 +637,8 @@ export async function runSession(
   const end = async (event: RunnerEvent) => {
     if (ended) return;
     ended = true;
-    // a request still open would make the API refuse a finish; the API closes it itself too, but
-    // only a runner that knew it was open can say why
+    // the API closes a request still open itself when the run ends, but only the runner knows why
+    // it stopped waiting
     if (openRequest !== undefined && (await withdrawOpen("run_ending"))) return;
     await post(event);
   };
@@ -707,7 +707,8 @@ export async function runSession(
   /**
    * Tells the API the runner has stopped waiting on its open request, for `reason`, and lands that
    * before any post queued after it. True when the API had already ended the run; a withdrawal that
-   * can't land is a warning, and the request stays open for the next try.
+   * can't land is a warning, and the request stays open for `end` to withdraw as `run_ending`, past
+   * which the API closes it with the run.
    */
   const withdrawOpen = (reason: WithdrawalReason): Promise<boolean> => {
     const requestId = openRequest;
