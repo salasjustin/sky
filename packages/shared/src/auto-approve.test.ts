@@ -122,10 +122,7 @@ const reasons: Record<Exclude<AskReason, "unresolvable">, string[]> = {
     "echo $HOME",
     'echo "$' + '{HOME}"',
     "echo $" + "{HOME}",
-    "ls ~",
-    "cat ~/.claude/.credentials.json",
     "cat ~root/x",
-    "rg foo ~/.ssh",
     "ls *",
     "cat src/*.ts",
     "cat .e?v",
@@ -280,6 +277,10 @@ const reasons: Record<Exclude<AskReason, "unresolvable">, string[]> = {
     "rg --hostname-bin x foo",
   ],
   "outside-root": [
+    // with no home in the scope a `~` stays unexpanded
+    "ls ~",
+    "cat ~/.claude/.credentials.json",
+    "rg foo ~/.ssh",
     "cat /home/sprite/.claude/.credentials.json",
     'cat "~/.ssh/id_rsa"',
     "cat ../x",
@@ -532,6 +533,153 @@ describe("the realpath hook", () => {
   });
 });
 
+describe("the plugin cache, the kru store and the repo's skill files", () => {
+  const base = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "auto-approve-home-")),
+  );
+  const home = join(base, "home");
+  const root = join(base, "wt");
+  const cache = join(home, ".claude/plugins/cache");
+  const skill = join(cache, "kru/kru/0.213.0/skills/lead/SKILL.md");
+  mkdirSync(join(skill, ".."), { recursive: true });
+  mkdirSync(join(home, ".kru/audit"), { recursive: true });
+  mkdirSync(join(home, ".kru/management/plan/slug"), { recursive: true });
+  mkdirSync(join(home, ".ssh"));
+  mkdirSync(join(root, ".claude/skills/release"), { recursive: true });
+  mkdirSync(join(root, "packages/ui"), { recursive: true });
+  writeFileSync(skill, "x");
+  writeFileSync(join(home, ".kru/audit/run.jsonl"), "x");
+  writeFileSync(join(home, ".kru/management/plan/slug/brief.md"), "x");
+  writeFileSync(join(home, ".claude/.credentials.json"), "x");
+  writeFileSync(join(home, ".claude/settings.json"), "x");
+  writeFileSync(join(home, ".ssh/id_rsa"), "x");
+  writeFileSync(join(root, ".claude/skills/release/SKILL.md"), "x");
+  writeFileSync(join(root, ".claude/settings.json"), "x");
+  writeFileSync(join(root, ".claude/settings.local.json"), "x");
+  writeFileSync(join(root, "packages/ui/image.tsx"), "x");
+  symlinkSync(join(home, ".ssh/id_rsa"), join(home, ".kru/to-key"));
+  symlinkSync(join(home, ".claude/.credentials.json"), join(cache, "to-login"));
+  symlinkSync(join(home, ".kru/audit"), join(cache, "to-store"));
+  symlinkSync(join(root, "packages"), join(home, ".kru/to-worktree"));
+  symlinkSync(
+    join(root, ".claude/settings.json"),
+    join(root, ".claude/skills/to-settings"),
+  );
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+
+  const withHome = (command: string, realpath?: (path: string) => string) =>
+    autoApproveVerdict(command, DEFAULTS, { root, home, realpath });
+  const both = (command: string) => {
+    const plain = withHome(command);
+    expect(withHome(command, realpathSync.native), command).toBe(plain);
+    return plain;
+  };
+
+  test("approves a read under the plugin cache", () => {
+    expect(both(`grep -n 'Step 3' -A 200 ${skill} | head -300`)).toBe(
+      "approved",
+    );
+    expect(
+      both("cat ~/.claude/plugins/cache/kru/kru/0.213.0/skills/lead/SKILL.md"),
+    ).toBe("approved");
+    expect(both("ls ~/.claude/plugins/cache")).toBe("approved");
+  });
+
+  test("approves a read under the kru store, by absolute path or `~`", () => {
+    expect(both(`cat ${home}/.kru/audit/run.jsonl | head -c 400000`)).toBe(
+      "approved",
+    );
+    expect(
+      both(
+        "cat ~/.kru/management/plan/slug/brief.md && git diff f4d7ee9 --stat",
+      ),
+    ).toBe("approved");
+    expect(both("ls ~/.kru")).toBe("approved");
+    expect(both("cd ~/.kru/audit && cat run.jsonl")).toBe("approved");
+  });
+
+  test("approves the worktree's skills, agents and commands", () => {
+    expect(
+      both("cat .claude/skills/release/SKILL.md && cat packages/ui/image.tsx"),
+    ).toBe("approved");
+    expect(both("ls .claude/agents .claude/commands")).toBe("approved");
+    expect(both(`cat ${root}/.claude/skills/release/SKILL.md`)).toBe(
+      "approved",
+    );
+  });
+
+  test("expands a bare `~` to the home, which is outside both roots", () => {
+    expect(both("ls ~")).toBe("outside-root");
+    expect(both("cd ~ && ls")).toBe("outside-root");
+  });
+
+  test("asks for the rest of ~/.claude, whatever the spelling", () => {
+    expect(both("cat ~/.claude/.credentials.json")).toBe("outside-root");
+    expect(both("cat ~/.claude/settings.json")).toBe("outside-root");
+    expect(both("cat ~/.claude/plugins/../.credentials.json")).toBe(
+      "outside-root",
+    );
+    expect(
+      both(`cat ${home}/.claude/plugins/cache/../../.credentials.json`),
+    ).toBe("outside-root");
+    expect(both("ls ~/.claude")).toBe("outside-root");
+    expect(both("cat ~/.kru/../.ssh/id_rsa")).toBe("outside-root");
+  });
+
+  test("asks for the rest of the worktree's .claude", () => {
+    expect(both("cat .claude/settings.local.json")).toBe("sensitive-path");
+    expect(both("cat .claude/settings.json")).toBe("sensitive-path");
+    expect(both("cat .claude/skills/../settings.json")).toBe("sensitive-path");
+    expect(both("ls .claude")).toBe("sensitive-path");
+  });
+
+  test("a secret under a root still asks", () => {
+    expect(both("cat ~/.kru/.env")).toBe("sensitive-path");
+    expect(both("cat ~/.kru/x/credentials.json")).toBe("sensitive-path");
+    expect(both("cat .claude/skills/.env")).toBe("sensitive-path");
+    expect(both(`cat ${cache}/x/.ssh/y`)).toBe("sensitive-path");
+  });
+
+  test("a symlink under a root that leads out of it or onto a secret asks", () => {
+    const real = (command: string) => withHome(command, realpathSync.native);
+    expect(real("cat ~/.kru/to-key")).toBe("outside-root");
+    expect(real("cat ~/.claude/plugins/cache/to-login")).toBe("outside-root");
+    // another root is no better than outside
+    expect(real("cat ~/.claude/plugins/cache/to-store/run.jsonl")).toBe(
+      "outside-root",
+    );
+    expect(real("cat ~/.kru/to-worktree/ui/image.tsx")).toBe("outside-root");
+    expect(real("cat .claude/skills/to-settings")).toBe("sensitive-path");
+    expect(real("cd ~/.kru/to-key && ls")).toBe("outside-root");
+  });
+
+  test("a `~` that the shell wouldn't expand to the home still asks", () => {
+    expect(both("cat ~root/x")).toBe("syntax");
+    expect(both("ls x=~/y")).toBe("outside-root");
+    expect(both("ls x:~/.kru")).toBe("outside-root");
+    expect(both('cat "~/x"')).toBe("outside-root");
+    expect(both("cat '~/.kru/x'")).toBe("outside-root");
+    expect(both("cat ~+/x")).toBe("syntax");
+    expect(both("cat {~,a}/x")).toBe("syntax");
+    expect(both("cat ~/{a,b}")).toBe("syntax");
+    expect(both("cat x > ~/.kru/y")).toBe("syntax");
+  });
+
+  test("without a home the roots don't exist and a `~` asks", () => {
+    const bare = (command: string) =>
+      autoApproveVerdict(command, DEFAULTS, { root });
+    expect(bare(`cat ${home}/.kru/audit/run.jsonl`)).toBe("outside-root");
+    expect(bare("cat ~/.kru/audit/run.jsonl")).toBe("outside-root");
+    expect(
+      autoApproveVerdict("cat ~/.kru/x", DEFAULTS, { root, home: "relative" }),
+    ).toBe("outside-root");
+  });
+
+  test("an allowlist entry can't hold a `~`", () => {
+    expect(parseCommandEntry("ls ~/.kru")).toBeUndefined();
+  });
+});
+
 test("every argument is path-checked, so a pattern or name holding token, secret or credentials asks", () => {
   // deliberate fail-closed: the parser can't tell a search pattern from a path, and these
   // three match anywhere in a segment, not only as a whole file name
@@ -738,7 +886,7 @@ describe("cd", () => {
     ["cd .ssh && ls", "sensitive-path"],
     ["cd .git && cat config", "sensitive-path"],
     ["cd src && cat ../.env", "sensitive-path"],
-    ["cd ~", "syntax"],
+    ["cd ~", "outside-root"],
     ["cd src | ls", "syntax"],
     ["ls | cd src", "syntax"],
     ["cd", "unsafe-option"],
