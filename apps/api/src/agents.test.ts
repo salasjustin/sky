@@ -3240,8 +3240,9 @@ test("an oversized diagnostics report is stored as EVENT_TEXT_MAX characters and
   });
   pgrepAnswers(1);
   // a kernel section is not cut per line, so it carries the report past the limit
-  const kernel = Array.from({ length: 200 }, (_, i) =>
-    `old kernel line ${i} ${"k".repeat(60)}`,
+  const kernel = Array.from(
+    { length: 200 },
+    (_, i) => `old kernel line ${i} ${"k".repeat(60)}`,
   );
   diagnosticsAnswer(diagnosticsReport({ availableMb: 5_000, kernel }));
   const { prober } = proberOver();
@@ -3249,7 +3250,9 @@ test("an oversized diagnostics report is stored as EVENT_TEXT_MAX characters and
 
   const [message] = warningsOf(run.id);
   const heading = `diagnostics of sprite ${spriteNameFor(envId)}, collected when its runner was found gone:\n`;
-  const logged = logs.find((line) => line.startsWith(`run ${run.id}: ${heading}`));
+  const logged = logs.find((line) =>
+    line.startsWith(`run ${run.id}: ${heading}`),
+  );
   expect(logged).toBeDefined();
   // the whole report as the sprite gave it, less its trailing whitespace
   const full = `${heading}${diagnosticsReport({ availableMb: 5_000, kernel }).trim()}`;
@@ -3357,9 +3360,13 @@ test("diagnostics unavailable, with another live run's agent token in the sprite
   await prober.sweep(silentFor(config.runProbeMs + 1000));
 
   const [message] = warningsOf(run.id);
-  expect(message).toContain("diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]");
+  expect(message).toContain(
+    "diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]",
+  );
   expect(message).not.toContain(other.token);
-  expect(logs.join("\n")).toContain("diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]");
+  expect(logs.join("\n")).toContain(
+    "diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]",
+  );
   expect(logs.join("\n")).not.toContain(other.token);
 });
 
@@ -3387,31 +3394,34 @@ test("a diagnostics exec that throws is stored and logged without the secret, th
   const other = await runningRun();
   const { run, token, known } = await lostRun(secret);
   // only the diagnostics script's exec throws, as a transport error quoting what it was sent; the rest reaches the stub
-  const { prober } = proberOver(known, (real) => ({
-    sprite: (name: string) => {
-      const handle = real.sprite(name);
-      return new Proxy(handle, {
-        get(target, prop) {
-          if (prop === "execFileHTTP") {
-            return (...call: unknown[]) =>
-              call[0] === "bash" &&
-              (call[1] as string[])[1]?.includes("== free -m")
-                ? Promise.reject(
-                    new Error(
-                      `connect ECONNRESET ${secret} ${token} ${other.token}`,
-                    ),
-                  )
-                : (target.execFileHTTP as (...args: unknown[]) => unknown).apply(
-                    target,
-                    call,
-                  );
-          }
-          const value = Reflect.get(target, prop);
-          return typeof value === "function" ? value.bind(target) : value;
+  const { prober } = proberOver(
+    known,
+    (real) =>
+      ({
+        sprite: (name: string) => {
+          const handle = real.sprite(name);
+          return new Proxy(handle, {
+            get(target, prop) {
+              if (prop === "execFileHTTP") {
+                return (...call: unknown[]) =>
+                  call[0] === "bash" &&
+                  (call[1] as string[])[1]?.includes("== free -m")
+                    ? Promise.reject(
+                        new Error(
+                          `connect ECONNRESET ${secret} ${token} ${other.token}`,
+                        ),
+                      )
+                    : (
+                        target.execFileHTTP as (...args: unknown[]) => unknown
+                      ).apply(target, call);
+              }
+              const value = Reflect.get(target, prop);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
         },
-      });
-    },
-  }) as unknown as SpritesClient);
+      }) as unknown as SpritesClient,
+  );
   await prober.sweep(silentFor(config.runProbeMs + 1000));
 
   const unavailable =
