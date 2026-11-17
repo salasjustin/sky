@@ -173,7 +173,10 @@ export async function collectDiagnostics(
   spriteName: string,
   runId: RunId,
   startedAt: number,
+  /** Values besides the registered secrets to scrub from `text`, such as the live agent tokens. */
+  extraKnown: readonly string[] = [],
 ): Promise<Diagnostics> {
+  const known = [...ops.secrets.values(), ...extraKnown];
   const path = `/tmp/sky-diagnostics-${runId}.txt`;
   try {
     const out = await execInSprite(
@@ -184,7 +187,12 @@ export async function collectDiagnostics(
     );
     if (out.exitCode !== 0) {
       return {
-        text: `diagnostics unavailable: exit ${out.exitCode}: ${out.stderr.trim()}`,
+        text: bounded(
+          redact(
+            `diagnostics unavailable: exit ${out.exitCode}: ${out.stderr.trim()}`,
+            known,
+          ),
+        ),
         killLines: [],
       };
     }
@@ -202,7 +210,7 @@ export async function collectDiagnostics(
       }).catch(() => {});
     }
     // command lines can carry a secret
-    const text = redact(raw, [...ops.secrets.values()]);
+    const text = redact(raw, known);
     return {
       text: bounded(text.trim()),
       memory: parseFree(text),
@@ -213,7 +221,12 @@ export async function collectDiagnostics(
     };
   } catch (err) {
     return {
-      text: `diagnostics unavailable: ${err instanceof Error ? err.message : String(err)}`,
+      text: bounded(
+        redact(
+          `diagnostics unavailable: ${err instanceof Error ? err.message : String(err)}`,
+          known,
+        ),
+      ),
       killLines: [],
     };
   }

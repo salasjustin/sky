@@ -45,13 +45,14 @@ import {
   WITH_PACKAGE_MANAGERS,
   WORKTREES_DIR,
 } from "./provision.js";
-import { type KnownSecrets, redact } from "./redact.js";
+import { eventText, type KnownSecrets, redact } from "./redact.js";
 import type { BundleInstaller } from "./runner-bundle.js";
 import {
   activeRunOf,
   failRun,
   isActive,
   isSilentLaunch,
+  liveAgentTokens,
   recordEvent,
   type Tx,
 } from "./runs.js";
@@ -1076,16 +1077,22 @@ export function createLauncher({
           );
           log(`launching ${launch.runId} failed: ${detail}`);
           const ended = db.transaction(
-            (tx) =>
-              failRun(
+            (tx) => {
+              // a sprite's stderr can echo any live run's token, and is stored in the event
+              const stored = eventText(detail, [
+                ...secrets.values(),
+                ...liveAgentTokens(tx, config.apiKey),
+              ]);
+              return failRun(
                 tx,
                 launch.runId,
                 // already worded as a run error, with its own code
                 err instanceof LowMemoryError ||
                   err instanceof ClaudeCredentialError
-                  ? detail
-                  : `launch_failed: ${detail}`,
-              ),
+                  ? stored
+                  : `launch_failed: ${stored}`,
+              );
+            },
             { behavior: "immediate" },
           );
           nudgeDeliveries();

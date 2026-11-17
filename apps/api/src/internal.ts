@@ -10,23 +10,23 @@ import {
   RunnerEventPost,
   RunRollup,
   type RunStatus,
-  truncationMarker,
 } from "@sky/shared";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
-import { isAgentTokenFor, mintAgentToken } from "./agent-token.js";
+import { isAgentTokenFor } from "./agent-token.js";
 import {
   isCloudflareChallenge,
   UPSTREAM_BLOCKED,
 } from "./claude-credentials.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
-import { redactDeep } from "./redact.js";
+import { cut, redactDeep } from "./redact.js";
 import { openRequest, openRequestOf, requestDecisions } from "./requests.js";
 import {
   activeRunStatuses,
   agentStatusFor,
   isActive,
+  liveAgentTokens,
   recordEvent,
   runError,
   type Tx,
@@ -61,12 +61,6 @@ const statusAfter: Record<EventType, RunStatus | null> = {
 
 /** Most of an approval's `toolSummary` stored after redaction, before the truncation marker. */
 const TOOL_SUMMARY_MAX = 2_000;
-
-/** `text` cut to `max`, marking how much it dropped. */
-const cut = (text: string, max: number) =>
-  text.length > max
-    ? text.slice(0, max) + truncationMarker(text.length - max)
-    : text;
 
 /** Cuts each string field of a flat payload to `EVENT_TEXT_MAX`, marking how much it dropped. */
 function trimText<T extends object>(payload: T): T {
@@ -213,15 +207,9 @@ export function internalRoutes(
             return { kind: "illegal", from: run.status, to: next } as const;
           }
           // Claude's output can echo its own environment, or any other live runner's on its sprite
-          const liveTokens = tx
-            .select({ id: runs.id })
-            .from(runs)
-            .where(inArray(runs.status, activeRunStatuses))
-            .all()
-            .map((r) => mintAgentToken(config.apiKey, r.id));
           const redacted = redactDeep(event, [
             ...secrets.values(),
-            ...liveTokens,
+            ...liveAgentTokens(tx, config.apiKey),
           ]);
           // trimmed only after redaction, so a cut can't split a secret out of its match
           if (redacted.type === "run.waiting") {
