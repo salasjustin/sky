@@ -2817,13 +2817,18 @@ test("a wake whose pgrep the Sprites API fails is logged, holds the sprite again
  * A prober over the stub sprites; `nudges` counts its dispatcher nudges. `sprites` is the ops it
  * probes through, wired as `boot` wires them: an exec on it that exits 137 probes the sprite's runs,
  * and names the sprite in `execsKilled`; `probed` holds each such probe, to await its settling.
+ * `wrapClient` swaps the stub client for one built over it: the prober keeps its own copy of the ops,
+ * so a client set on `sprites` afterwards would never be probed through.
  */
-function proberOver(secrets = new KnownSecrets()) {
+function proberOver(
+  secrets = new KnownSecrets(),
+  wrapClient: (real: SpritesClient) => SpritesClient = (real) => real,
+) {
   const nudges = { count: 0 };
   const execsKilled: string[] = [];
   const probed: Promise<void>[] = [];
   const sprites: SpriteOps = {
-    client: new SpritesClient(spritesToken),
+    client: wrapClient(new SpritesClient(spritesToken)),
     log: () => {},
     secrets,
     timeoutMs: SPRITES_TIMEOUT_MS,
@@ -3225,23 +3230,38 @@ test("a runner found gone has its sprite's diagnostics collected, redacted, logg
   ).toEqual(["runner.warning", "run.failed"]);
 });
 
-test("the diagnostics stored on a run are bounded below what an event holds", async () => {
-  const { run, token } = await runningRun();
+test("an oversized diagnostics report is stored as EVENT_TEXT_MAX characters and the truncation marker, and logged shorter", async () => {
+  const envId = readyEnv();
+  const { run, token } = await runningRun(envId);
   await postEvent(token, {
     runId: run.id,
     type: "run.started",
     payload: { sessionId: "s" },
   });
   pgrepAnswers(1);
-  diagnosticsAnswer(
-    diagnosticsReport({ availableMb: 5_000, ps: "x".repeat(20_000) }),
+  // a kernel section is not cut per line, so it carries the report past the limit
+  const kernel = Array.from({ length: 200 }, (_, i) =>
+    `old kernel line ${i} ${"k".repeat(60)}`,
   );
+  diagnosticsAnswer(diagnosticsReport({ availableMb: 5_000, kernel }));
   const { prober } = proberOver();
   await prober.sweep(silentFor(config.runProbeMs + 1000));
 
   const [message] = warningsOf(run.id);
-  expect(message?.length).toBeLessThan(EVENT_TEXT_MAX);
-  expect(message).toMatch(/\d+ characters omitted/);
+  const heading = `diagnostics of sprite ${spriteNameFor(envId)}, collected when its runner was found gone:\n`;
+  const logged = logs.find((line) => line.startsWith(`run ${run.id}: ${heading}`));
+  expect(logged).toBeDefined();
+  // the whole report as the sprite gave it, less its trailing whitespace
+  const full = `${heading}${diagnosticsReport({ availableMb: 5_000, kernel }).trim()}`;
+  expect(full.length).toBeGreaterThan(EVENT_TEXT_MAX);
+  expect(message).toBe(
+    full.slice(0, EVENT_TEXT_MAX) +
+      truncationMarker(full.length - EVENT_TEXT_MAX),
+  );
+  expect(message).not.toMatch(/characters omitted/);
+  // the log line stays under the limit, with its own note
+  expect(logged?.length).toBeLessThan(EVENT_TEXT_MAX);
+  expect(logged).toMatch(/\d+ characters omitted/);
   expect(runStatus(run.id)).toEqual({ status: "failed" });
 });
 
@@ -3270,7 +3290,7 @@ test("a sprite that can't give its diagnostics still fails the run, saying so in
 
 /** A started run whose runner is gone from a sprite: the run, its live agent token, and secrets registering `secretValue` as `PROJECT_TOKEN`. */
 async function lostRun(secretValue: string) {
-  const { run, token } = await runningRun();
+  const { run, token, envId } = await runningRun();
   await postEvent(token, {
     runId: run.id,
     type: "run.started",
@@ -3279,7 +3299,7 @@ async function lostRun(secretValue: string) {
   pgrepAnswers(1);
   const known = new KnownSecrets();
   known.add("PROJECT_TOKEN", secretValue);
-  return { run, token, known };
+  return { run, token, envId, known };
 }
 
 test("diagnostics unavailable, with a registered secret and a live agent token in the sprite's stderr, store neither", async () => {
@@ -3337,13 +3357,9 @@ test("diagnostics unavailable, with another live run's agent token in the sprite
   await prober.sweep(silentFor(config.runProbeMs + 1000));
 
   const [message] = warningsOf(run.id);
-  expect(message).toContain(
-    "diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]",
-  );
+  expect(message).toContain("diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]");
   expect(message).not.toContain(other.token);
-  expect(logs.join("\n")).toContain(
-    "diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]",
-  );
+  expect(logs.join("\n")).toContain("diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]");
   expect(logs.join("\n")).not.toContain(other.token);
 });
 
@@ -3370,10 +3386,8 @@ test("a diagnostics exec that throws is stored and logged without the secret, th
   const secret = "hunter2-hunter2";
   const other = await runningRun();
   const { run, token, known } = await lostRun(secret);
-  const { prober, sprites } = proberOver(known);
-  const real = sprites.client;
   // only the diagnostics script's exec throws, as a transport error quoting what it was sent; the rest reaches the stub
-  sprites.client = {
+  const { prober } = proberOver(known, (real) => ({
     sprite: (name: string) => {
       const handle = real.sprite(name);
       return new Proxy(handle, {
@@ -3387,16 +3401,17 @@ test("a diagnostics exec that throws is stored and logged without the secret, th
                       `connect ECONNRESET ${secret} ${token} ${other.token}`,
                     ),
                   )
-                : (
-                    target.execFileHTTP as (...args: unknown[]) => unknown
-                  ).apply(target, call);
+                : (target.execFileHTTP as (...args: unknown[]) => unknown).apply(
+                    target,
+                    call,
+                  );
           }
           const value = Reflect.get(target, prop);
           return typeof value === "function" ? value.bind(target) : value;
         },
       });
     },
-  } as unknown as SpritesClient;
+  }) as unknown as SpritesClient);
   await prober.sweep(silentFor(config.runProbeMs + 1000));
 
   const unavailable =
@@ -3409,8 +3424,8 @@ test("a diagnostics exec that throws is stored and logged without the secret, th
   }
 });
 
-test("a very large stderr from a failed diagnostics exec is stored bounded, with the omitted count and not the truncation marker", async () => {
-  const { run, known } = await lostRun("hunter2-hunter2");
+test("a very large stderr from a failed diagnostics exec is stored as EVENT_TEXT_MAX characters and the truncation marker", async () => {
+  const { run, envId, known } = await lostRun("hunter2-hunter2");
   const exec = wire.exec;
   wire.exec = (argv) =>
     argv[0] === "bash" && argv[2]?.includes("== free -m")
@@ -3420,10 +3435,14 @@ test("a very large stderr from a failed diagnostics exec is stored bounded, with
   await prober.sweep(silentFor(config.runProbeMs + 1000));
 
   const [message] = warningsOf(run.id);
-  expect(message).toContain("diagnostics unavailable: exit 3");
-  expect(message?.length).toBeLessThan(EVENT_TEXT_MAX);
-  expect(message).toMatch(/\d+ characters omitted/);
-  expect(message).not.toContain("[truncated");
+  const text = `diagnostics unavailable: exit 3: ${"e".repeat(EVENT_TEXT_MAX * 2)}`;
+  const heading = `diagnostics of sprite ${spriteNameFor(envId)}, collected when its runner was found gone:\n`;
+  const full = heading + text;
+  expect(message).toBe(
+    full.slice(0, EVENT_TEXT_MAX) +
+      truncationMarker(full.length - EVENT_TEXT_MAX),
+  );
+  expect(message).not.toMatch(/characters omitted/);
 });
 
 /** Fails a started run through `failLostRun` with `text(token)` as its diagnostics; the warning it stored. */

@@ -3,6 +3,7 @@ import type { RunId } from "@sky/shared";
 import { eq } from "drizzle-orm";
 import { isRunnerAlive } from "./launch.js";
 import {
+  bounded,
   collectDiagnostics,
   type Diagnostics,
   type Restart,
@@ -217,7 +218,7 @@ export function createRunProber({
         secrets: sprites.secrets.values(),
       })
     ) {
-      if (report) log(`run ${runId}: ${report}`);
+      if (report) log(`run ${runId}: ${bounded(report)}`);
       log(`run ${runId} failed: ${code} on sprite ${spriteName}`);
       nudgeDeliveries();
     }

@@ -111,7 +111,7 @@ function parseLoad5(report: string): number | undefined {
   return found ? Number(found[1]) : undefined;
 }
 
-/** The most of a sprite's diagnostics kept: under `EVENT_TEXT_MAX`, with room for the event's own heading. */
+/** The most of a sprite's diagnostics written to a log line. */
 export const DIAGNOSTICS_MAX = 3_400;
 
 export type Diagnostics = {
@@ -161,7 +161,8 @@ export function restartSince(
   return undefined;
 }
 
-const bounded = (text: string) =>
+/** `text` cut to `DIAGNOSTICS_MAX` for a log line, noting how much it dropped. */
+export const bounded = (text: string) =>
   text.length <= DIAGNOSTICS_MAX
     ? text
     : `${text.slice(0, DIAGNOSTICS_MAX)}\n… (${text.length - DIAGNOSTICS_MAX} characters omitted)`;
@@ -186,6 +187,8 @@ function cutProcessLines(report: string): string {
  * by RSS with their command lines, uptime, and the kernel's kill lines where `dmesg` is readable. Only
  * kill lines logged since `startedAt` (epoch ms, the run's creation) are `killLines`: the kernel's
  * buffer outlives runs, and a kill from before this one says nothing of its runner.
+ * `text` is redacted but not cut: the event that stores it cuts it, after redacting it again with the
+ * live tokens, and a log line uses `bounded`.
  * Never throws: a sprite that can't answer is reported in `text`, and the caller fails the run anyway.
  */
 export async function collectDiagnostics(
@@ -207,11 +210,9 @@ export async function collectDiagnostics(
     );
     if (out.exitCode !== 0) {
       return {
-        text: bounded(
-          redact(
-            `diagnostics unavailable: exit ${out.exitCode}: ${out.stderr.trim()}`,
-            known,
-          ),
+        text: redact(
+          `diagnostics unavailable: exit ${out.exitCode}: ${out.stderr.trim()}`,
+          known,
         ),
         killLines: [],
       };
@@ -232,7 +233,7 @@ export async function collectDiagnostics(
     // command lines can carry a secret
     const text = cutProcessLines(redact(raw, known));
     return {
-      text: bounded(text.trim()),
+      text: text.trim(),
       memory: parseFree(text),
       killLines: killLinesWithin(text, withinSec),
       bootAgeSec: secondsAfter(text, UPTIME_MARK),
@@ -241,11 +242,9 @@ export async function collectDiagnostics(
     };
   } catch (err) {
     return {
-      text: bounded(
-        redact(
-          `diagnostics unavailable: ${err instanceof Error ? err.message : String(err)}`,
-          known,
-        ),
+      text: redact(
+        `diagnostics unavailable: ${err instanceof Error ? err.message : String(err)}`,
+        known,
       ),
       killLines: [],
     };
