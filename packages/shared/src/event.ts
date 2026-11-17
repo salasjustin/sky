@@ -43,6 +43,16 @@ export const Decision = z.discriminatedUnion("decision", [
 ]);
 export type Decision = z.infer<typeof Decision>;
 
+/** Why a request was withdrawn: the runner's `hook_cancelled`, `session_ending`, `run_stopping` and `run_ending`, and the API's `run_finished`. */
+export const WithdrawalReason = z.enum([
+  "hook_cancelled",
+  "session_ending",
+  "run_stopping",
+  "run_ending",
+  "run_finished",
+]);
+export type WithdrawalReason = z.infer<typeof WithdrawalReason>;
+
 /**
  * Stored in place of a decision when the runner stopped waiting on a request before anyone
  * answered it; the request is closed, and a later answer is refused.
@@ -50,7 +60,7 @@ export type Decision = z.infer<typeof Decision>;
 export const Withdrawal = z.object({
   requestId: RequestId,
   decision: z.literal("withdrawn"),
-  reason: z.string().min(1),
+  reason: WithdrawalReason,
 });
 export type Withdrawal = z.infer<typeof Withdrawal>;
 
@@ -119,7 +129,7 @@ const runPayloads = {
   /** The runner stopped waiting on `requestId` before anyone answered it (`reason`: why); the run goes back to `running`. */
   "run.withdrawn": z.object({
     requestId: RequestId,
-    reason: z.string().min(1).max(256),
+    reason: WithdrawalReason,
   }),
   "run.finished": z.object({
     summary: z.string(),

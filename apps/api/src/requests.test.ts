@@ -728,9 +728,7 @@ test("a run.withdrawn naming another run's open request changes nothing for eith
     db.$client.prepare("select status from agents where id = ?").get(agentId),
   ).toEqual({ status: "waiting" });
   expect(
-    db.$client
-      .prepare("select status from runs where id = ?")
-      .get(otherRunId),
+    db.$client.prepare("select status from runs where id = ?").get(otherRunId),
   ).toEqual({ status: "running" });
   expect(eventTypes()).toEqual(["run.waiting"]);
   // the request is still the open one: its own run can withdraw it
@@ -815,4 +813,29 @@ test("the long-poll on a withdrawn request answers pending, never a decision", a
   );
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ status: "pending" });
+});
+
+test.each([
+  "hook_cancelled",
+  "session_ending",
+  "run_stopping",
+  "run_ending",
+  "run_finished",
+])("a run.withdrawn with reason %s is stored with it", async (reason) => {
+  const { requestId } = await waitingOn(question());
+  expect((await withdraw(requestId, reason)).status).toBe(201);
+  expect(JSON.parse(requestRow(requestId).decision ?? "null")).toEqual({
+    requestId,
+    decision: "withdrawn",
+    reason,
+  });
+});
+
+test("a run.withdrawn with a reason outside the list gets 400 and changes nothing", async () => {
+  const { requestId } = await waitingOn(question());
+  const res = await withdraw(requestId, "because");
+  expect(res.status).toBe(400);
+  expect(statuses()).toEqual({ run: "waiting", agent: "waiting" });
+  expect(requestRow(requestId).decision).toBeNull();
+  expect(eventTypes()).toEqual(["run.waiting"]);
 });

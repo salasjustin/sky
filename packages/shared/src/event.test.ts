@@ -610,18 +610,10 @@ test("a run.withdrawn names its request and a reason, as posted and as stored", 
   expect(
     Event.parse({ ...meta, type: "run.withdrawn", payload }).payload,
   ).toEqual(payload);
-  expect(
-    RunnerEventPost.safeParse({
-      runId: "run_1",
-      type: "run.withdrawn",
-      payload: { ...payload, reason: "x".repeat(256) },
-    }).success,
-  ).toBe(true);
   for (const bad of [
     { reason: "x" },
     { requestId: "req_1" },
     { ...payload, reason: "" },
-    { ...payload, reason: "x".repeat(257) },
   ]) {
     expect(
       RunnerEventPost.safeParse({
@@ -631,4 +623,41 @@ test("a run.withdrawn names its request and a reason, as posted and as stored", 
       }).success,
     ).toBe(false);
   }
+});
+
+test.each([
+  "hook_cancelled",
+  "session_ending",
+  "run_stopping",
+  "run_ending",
+  "run_finished",
+])(
+  "a run.withdrawn with reason %s is valid, as posted and as stored",
+  (reason) => {
+    const payload = { requestId: "req_1", reason };
+    expect(
+      RunnerEventPost.safeParse({
+        runId: "run_1",
+        type: "run.withdrawn",
+        payload,
+      }).success,
+    ).toBe(true);
+    expect(
+      Event.safeParse({ ...meta, type: "run.withdrawn", payload }).success,
+    ).toBe(true);
+  },
+);
+
+test("a run.withdrawn with any other reason is rejected, as posted and as stored", () => {
+  const payload = { requestId: "req_1", reason: "because" };
+  expect(
+    RunnerEventPost.safeParse({
+      runId: "run_1",
+      type: "run.withdrawn",
+      payload,
+    }).success,
+  ).toBe(false);
+  expect(
+    Event.safeParse({ ...meta, type: "run.withdrawn", payload }).success,
+  ).toBe(false);
 });

@@ -7159,10 +7159,7 @@ function firstRequestHeld(): DecisionReply {
 /**
  * Runs `onPoll` at the first poll of any request, the point where the runner has that request open.
  */
-function onFirstPoll(
-  reply: DecisionReply,
-  onPoll: () => void,
-): DecisionReply {
+function onFirstPoll(reply: DecisionReply, onPoll: () => void): DecisionReply {
   let seen = false;
   return (requestId) => {
     if (!seen) {

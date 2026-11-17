@@ -27,6 +27,7 @@ import {
   type RunnerEventPost,
   type RunRollup,
   type Usage,
+  type WithdrawalReason,
 } from "@sky/shared";
 import {
   type CommandEnv,
@@ -708,7 +709,7 @@ export async function runSession(
    * before any post queued after it. True when the API had already ended the run; a withdrawal that
    * can't land is a warning, and the request stays open for the next try.
    */
-  const withdrawOpen = (reason: string): Promise<boolean> => {
+  const withdrawOpen = (reason: WithdrawalReason): Promise<boolean> => {
     const requestId = openRequest;
     if (requestId === undefined) return Promise.resolve(false);
     withdrawing ??= post(

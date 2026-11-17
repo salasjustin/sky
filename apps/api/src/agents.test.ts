@@ -1677,7 +1677,7 @@ test("an event the transition table forbids gets 409 and leaves the run as it wa
 const hearRunEvents = () =>
   db.$client
     .prepare(
-      "insert into webhooks (id, url, event_types) values ('whk_runs', 'https://hooks.example.com/runs', '[\"run.started\",\"run.waiting\",\"run.withdrawn\",\"run.finished\"]')",
+      'insert into webhooks (id, url, event_types) values (\'whk_runs\', \'https://hooks.example.com/runs\', \'["run.started","run.waiting","run.withdrawn","run.finished"]\')',
     )
     .run();
 const deliveryCount = () =>

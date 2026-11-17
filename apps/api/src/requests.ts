@@ -6,6 +6,7 @@ import type {
   PendingRequest,
   RequestId,
   RunId,
+  WithdrawalReason,
 } from "@sky/shared";
 import { and, eq, isNull } from "drizzle-orm";
 import { recordEvent, type Tx } from "./runs.js";
@@ -117,7 +118,7 @@ export function withdrawRequest(
   tx: Tx,
   run: typeof runs.$inferSelect,
   requestId: RequestId,
-  reason: string,
+  reason: WithdrawalReason,
 ) {
   const open = openRequestOf(tx, run.id);
   if (open?.request.requestId !== requestId) return { kind: "noop" } as const;
