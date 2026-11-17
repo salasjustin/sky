@@ -767,8 +767,9 @@ const BUNDLE_FAILED = "installing the runner bundle failed: ";
 
 test("a launch failure redacts another live run's token and a registered secret from its stored error and its log line", async () => {
   const other = await runningRun();
+  // no credential pattern matches it, so only the registered value can redact it
   bundleInstallFails(
-    `mv: ${other.token} and ${config.claudeOauthToken} are busy\n`,
+    `mv: ${other.token} and ${config.webhookSigningKey} are busy\n`,
   );
   const { run } = await launched(readyEnv());
   await vi.waitFor(() => expect(runFailure(run.id)).toBeDefined());
@@ -778,7 +779,7 @@ test("a launch failure redacts another live run's token and a registered secret 
   expect(logs).toContain(`launching ${run.id} failed: ${redacted}`);
   const everyLog = logs.join("\n");
   expect(everyLog).not.toContain(other.token);
-  expect(everyLog).not.toContain(config.claudeOauthToken);
+  expect(everyLog).not.toContain(config.webhookSigningKey);
 });
 
 test("a launch failure cuts its stored error and its log line to EVENT_TEXT_MAX with the marker, after redacting a token the cut falls inside", async () => {
