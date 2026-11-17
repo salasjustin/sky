@@ -312,22 +312,40 @@ const isOutside = (relative: string) =>
 const CLAUDE_READABLE = /^\.claude\/(skills|agents|commands)(\/|$)/;
 
 /**
- * Beside the worktree, read-only commands may name these, below the session's home: the plugin
- * cache only, since the rest of `~/.claude` holds the login, settings and account files, and
- * the kru store checkout. Taken afresh for each command: with `realpath`, a root whose real
+ * `storeHome` as a path below the session's home, or undefined when it isn't a plain directory
+ * name there: absolute, climbing out, the home itself or inside `~/.claude`.
+ */
+function storeRoot(base: string, storeHome: string | undefined) {
+  if (storeHome === undefined || storeHome === "" || /[\0\s]/.test(storeHome))
+    return undefined;
+  if (posix.isAbsolute(storeHome)) return undefined;
+  const path = posix.join(base, storeHome);
+  const rel = posix.relative(base, path);
+  if (rel === "" || isOutside(rel) || rel.split("/")[0] === ".claude")
+    return undefined;
+  return path;
+}
+
+/**
+ * Beside the worktree, read-only commands and the Read, Grep and Glob tools may name these,
+ * below the session's home: the plugin cache only, since the rest of `~/.claude` holds the
+ * login, settings and account files, and the store checkout, `storeHome` (the base profile's
+ * `SKY_STORE_HOME`, relative to the home; none without one). Taken afresh for each use: with `realpath`, a root whose real
  * location holds the home, holds `~/.claude`, sits inside `~/.claude` outside its plugin cache,
  * or has a secret name in its path is dropped, so reads there ask. `~/.claude` counts both
  * beside the real home and where its own link leads.
  */
-function extraRoots(
+export function extraRoots(
   home: string | undefined,
   realpath?: (path: string) => string,
+  storeHome?: string,
 ): string[] {
   if (home === undefined || !posix.isAbsolute(home)) return [];
   const base = posix.resolve(home);
+  const store = storeRoot(base, storeHome);
   const roots = [
     posix.join(base, ".claude/plugins/cache"),
-    posix.join(base, ".kru"),
+    ...(store === undefined ? [] : [store]),
   ];
   if (!realpath) return roots;
   const real = (path: string): string | undefined => {
@@ -380,7 +398,7 @@ function expandTilde(word: string, home: string | undefined): string {
  * Whether this path-ish text names somewhere secrets live. `allowClaude` lets the worktree's
  * `.claude/skills`, `.claude/agents` and `.claude/commands` through; the rest of `.claude` asks.
  */
-function namesSecret(text: string, allowClaude = false): boolean {
+export function namesSecret(text: string, allowClaude = false): boolean {
   let segments = text.split(/[/=:]/).filter(Boolean);
   if (allowClaude) {
     const i = segments.indexOf(".claude");
@@ -753,10 +771,12 @@ export type AutoApproveScope = {
   /**
    * The home the shell's `~` stands for, an absolute path taken from the session's env. With it,
    * a word's leading `~` or `~/` is expanded to it, and read-only commands may also name paths in
-   * `.claude/plugins/cache` and `.kru` below it; the cwd and a `cd` target must still be in
+   * `.claude/plugins/cache` and `storeHome` below it; the cwd and a `cd` target must still be in
    * `root`. Without it a `~` asks.
    */
   home?: string;
+  /** The store checkout's directory below `home` (the base profile's `SKY_STORE_HOME`); without it there is no store root. */
+  storeHome?: string;
 };
 
 /**
@@ -819,7 +839,7 @@ export function autoApproveVerdict(
 function stepVerdict(
   step: Step,
   autoApprove: AutoApprove,
-  { root, cwd = root, realpath, home }: AutoApproveScope,
+  { root, cwd = root, realpath, home, storeHome }: AutoApproveScope,
 ): "approved" | AskReason {
   const raw = step.words.map((w, i) =>
     step.tilde[i] ? expandTilde(w, home) : w,
@@ -850,7 +870,7 @@ function stepVerdict(
   const args = fileArgs(raw).flatMap(pathCandidates);
   // "." stands for the cwd itself, which `ls` or `git status` reads with no argument
   const targets = [".", ...args];
-  const roots = [root, ...extraRoots(home, realpath)];
+  const roots = [root, ...extraRoots(home, realpath, storeHome)];
   // a `~` left in a word is one the shell won't expand to the home, and it asks
   const owners = targets.map((t) =>
     t.startsWith("~") ? undefined : rootOf(roots, posix.resolve(cwd, t)),

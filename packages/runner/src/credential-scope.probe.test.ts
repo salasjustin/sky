@@ -350,6 +350,7 @@ async function runCase(c: Case): Promise<Findings> {
     mcpServers: {},
     waitTimeoutMs: 60_000,
     launchDeadlineMs: 15 * 60_000,
+    storeHome: undefined,
     startBranch: undefined,
   };
   const seal = c.sealed

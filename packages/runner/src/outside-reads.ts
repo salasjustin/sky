@@ -26,6 +26,7 @@ import {
   sep,
 } from "node:path";
 import { pipeline } from "node:stream/promises";
+import { extraRoots, namesSecret } from "@sky/shared";
 import { readRules } from "./policy.js";
 
 /** The path input of each file-reading tool, which Claude Code refuses outside its working directories. */
@@ -169,6 +170,23 @@ export function configDirPlace(
       : "config";
   }
   return undefined;
+}
+
+/**
+ * Whether the real path `path` lies in one of the places beside the worktree that read-only shell
+ * commands may name (`extraRoots`: the plugin cache and the store, with the same guards) and has no
+ * secret name below that root. A search of a tree that holds a root, or of `~/.claude` or the
+ * home, is not inside one.
+ */
+export function inExtraRoot(
+  path: string,
+  home: string,
+  storeHome: string | undefined,
+): boolean {
+  return extraRoots(home, realpathSync.native, storeHome).some((root) => {
+    const real = realpathLoose(root);
+    return within(real, path) && !namesSecret(relative(real, path));
+  });
 }
 
 /** What no approval copies, whatever the person answered. */
