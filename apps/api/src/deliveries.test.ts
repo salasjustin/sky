@@ -1242,21 +1242,23 @@ test.each([
     await dispatcher.drain();
     // run.waiting isn't subscribed, so the withdrawal is the one delivery
     expect(received).toHaveLength(1);
+    const stored = db.$client
+      .prepare("select ts from events where id = ?")
+      .get(eventId) as { ts: string };
     const event = {
       id: `evt_${eventId}`,
       agentId,
       environmentId: envId,
       runId,
-      ts: expect.stringMatching(/Z$/),
+      ts: stored.ts,
       type: "run.withdrawn",
       payload: { requestId, reason: "hook_cancelled" },
     };
-    const parsed = JSON.parse(received[0]?.body ?? "");
-    expect(parsed).toEqual(
+    expect(JSON.parse(received[0]?.body ?? "")).toEqual(
       format === "sky"
         ? event
         : format === "standard"
-          ? { type: "run.withdrawn", timestamp: parsed.data.ts, data: event }
+          ? { type: "run.withdrawn", timestamp: stored.ts, data: event }
           : { type: "run.withdrawn", data: event },
     );
     expect(deliveries().map((d) => d.status)).toEqual(["delivered"]);

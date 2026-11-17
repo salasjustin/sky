@@ -610,10 +610,18 @@ test("a run.withdrawn names its request and a reason, as posted and as stored", 
   expect(
     Event.parse({ ...meta, type: "run.withdrawn", payload }).payload,
   ).toEqual(payload);
+  expect(
+    RunnerEventPost.safeParse({
+      runId: "run_1",
+      type: "run.withdrawn",
+      payload: { ...payload, reason: "x".repeat(256) },
+    }).success,
+  ).toBe(true);
   for (const bad of [
     { reason: "x" },
     { requestId: "req_1" },
     { ...payload, reason: "" },
+    { ...payload, reason: "x".repeat(257) },
   ]) {
     expect(
       RunnerEventPost.safeParse({

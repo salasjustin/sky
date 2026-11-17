@@ -1671,13 +1671,13 @@ test("an event the transition table forbids gets 409 and leaves the run as it wa
 });
 
 /**
- * Subscribes an admin webhook to run.started, run.waiting and run.finished, so each one stored
- * enqueues a delivery.
+ * Subscribes an admin webhook to run.started, run.waiting, run.withdrawn and run.finished, so each
+ * one stored enqueues a delivery.
  */
 const hearRunEvents = () =>
   db.$client
     .prepare(
-      "insert into webhooks (id, url, event_types) values ('whk_runs', 'https://hooks.example.com/runs', '[\"run.started\",\"run.waiting\",\"run.finished\"]')",
+      "insert into webhooks (id, url, event_types) values ('whk_runs', 'https://hooks.example.com/runs', '[\"run.started\",\"run.waiting\",\"run.withdrawn\",\"run.finished\"]')",
     )
     .run();
 const deliveryCount = () =>
@@ -1812,8 +1812,8 @@ test("a run.finished on a waiting run withdraws the open request and finishes th
     "run.withdrawn",
     "run.finished",
   ]);
-  // the subscriber hears the run's own events, not run.withdrawn
-  expect(deliveryCount()).toBe(3);
+  // the run.withdrawn the finish wrote reaches the subscriber like any stored event
+  expect(deliveryCount()).toBe(4);
   expect((await getRun(agent.id, run.id)).body.status).toBe("finished");
 });
 
