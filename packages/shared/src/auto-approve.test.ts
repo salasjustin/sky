@@ -595,7 +595,25 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
       ),
     ).toBe("approved");
     expect(both("ls ~/.kru")).toBe("approved");
-    expect(both("cd ~/.kru/audit && cat run.jsonl")).toBe("approved");
+  });
+
+  test("a root beside the worktree is named, never entered", () => {
+    expect(both("cd ~/.kru/audit && cat run.jsonl")).toBe("outside-root");
+    expect(both("cd ~/.kru && pnpm test")).toBe("outside-root");
+    expect(both("cd ~/.claude/plugins/cache/p && git status")).toBe(
+      "outside-root",
+    );
+    for (const realpath of [undefined, realpathSync.native]) {
+      const inStore = (command: string) =>
+        autoApproveVerdict(command, DEFAULTS, {
+          root,
+          home,
+          cwd: join(home, ".kru"),
+          realpath,
+        });
+      expect(inStore("ls")).toBe("outside-root");
+      expect(inStore("cat audit/run.jsonl")).toBe("outside-root");
+    }
   });
 
   test("approves the worktree's skills, agents and commands", () => {
@@ -613,6 +631,33 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
     expect(both("cd ~ && ls")).toBe("outside-root");
   });
 
+  test("a `~` is the home in arguments and in a cd target", () => {
+    const inside = join(root, "packages/ui");
+    const at = (command: string, realpath?: (path: string) => string) =>
+      autoApproveVerdict(command, DEFAULTS, { root, home: inside, realpath });
+    for (const realpath of [undefined, realpathSync.native]) {
+      expect(at("cat ~/image.tsx", realpath)).toBe("approved");
+      expect(at("cat ~", realpath)).toBe("approved");
+      expect(at("cd ~ && cat image.tsx", realpath)).toBe("approved");
+      // from packages/ui, `../../.env` is the worktree's own `.env`
+      expect(at("cd ~ && cat ../../.env", realpath)).toBe("sensitive-path");
+    }
+  });
+
+  test("a home of `/` makes `~` the filesystem root, as bash does", () => {
+    const atRoot = (command: string) =>
+      autoApproveVerdict(command, DEFAULTS, { root, home: "/" });
+    expect(atRoot("ls ~")).toBe("outside-root");
+    expect(atRoot("cd ~ && cat etc/passwd")).toBe("outside-root");
+    expect(atRoot("cat ~/etc/x")).toBe("outside-root");
+    expect(atRoot("cat ~/.kru/x")).toBe("approved");
+  });
+
+  test("asks for a sibling that only shares a root's prefix", () => {
+    expect(both("ls ~/.krux/a")).toBe("outside-root");
+    expect(both("cat ~/.claude/plugins/cache2/a")).toBe("outside-root");
+  });
+
   test("asks for the rest of ~/.claude, whatever the spelling", () => {
     expect(both("cat ~/.claude/.credentials.json")).toBe("outside-root");
     expect(both("cat ~/.claude/settings.json")).toBe("outside-root");
@@ -624,6 +669,7 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
     ).toBe("outside-root");
     expect(both("ls ~/.claude")).toBe("outside-root");
     expect(both("cat ~/.kru/../.ssh/id_rsa")).toBe("outside-root");
+    expect(both("cat ~/.ssh/id_rsa")).toBe("outside-root");
   });
 
   test("asks for the rest of the worktree's .claude", () => {
@@ -631,6 +677,14 @@ describe("the plugin cache, the kru store and the repo's skill files", () => {
     expect(both("cat .claude/settings.json")).toBe("sensitive-path");
     expect(both("cat .claude/skills/../settings.json")).toBe("sensitive-path");
     expect(both("ls .claude")).toBe("sensitive-path");
+  });
+
+  test("only the worktree's top-level .claude lets skills through", () => {
+    expect(both("cat packages/x/.claude/skills/a")).toBe("sensitive-path");
+    expect(both("cat ~/.kru/.claude/skills/x")).toBe("sensitive-path");
+    expect(both("cat ~/.claude/plugins/cache/p/.claude/skills/x")).toBe(
+      "sensitive-path",
+    );
   });
 
   test("a secret under a root still asks", () => {

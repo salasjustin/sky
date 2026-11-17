@@ -324,8 +324,10 @@ function extraRoots(home: string | undefined): string[] {
 /** The word with a leading `~` or `~/` taken to `home`, as the shell does; unchanged without a usable home. */
 function expandTilde(word: string, home: string | undefined): string {
   if (home === undefined || !posix.isAbsolute(home)) return word;
-  const base = home.replace(/\/+$/, "");
-  return base + word.slice(1);
+  const base = posix.resolve(home);
+  if (word === "~") return base;
+  // a home of `/` takes `~/x` to `/x`, not `//x`
+  return (base === "/" ? "" : base) + word.slice(1);
 }
 
 /**
@@ -704,8 +706,9 @@ export type AutoApproveScope = {
   realpath?: (path: string) => string;
   /**
    * The home the shell's `~` stands for, an absolute path taken from the session's env. With it,
-   * read-only commands may also name `.claude/plugins/cache` and `.kru` below it, and a word's
-   * leading `~/` is expanded to it; without it a `~` asks.
+   * read-only commands may also name paths in `.claude/plugins/cache` and `.kru` below it,
+   * though the cwd and a `cd` target must still be in `root`, and a word's leading `~` or `~/`
+   * is expanded to it; without it a `~` asks.
    */
   home?: string;
 };
@@ -746,11 +749,11 @@ export function autoApproveVerdict(
           first.tilde[1] ? expandTilde(target, resolved.home) : target,
         );
         // bash moves to this lexical path when it exists and otherwise falls back to the physical
-        // one, which the text doesn't track, so the target must resolve inside the root
+        // one, which the text doesn't track, so the target must resolve inside the worktree
         if (resolved.realpath) {
           const verdict = resolvedVerdict(
             [dir],
-            [resolved.root, ...extraRoots(resolved.home)],
+            [resolved.root],
             cwd,
             resolved.realpath,
             true,
@@ -807,6 +810,10 @@ function stepVerdict(
     t.startsWith("~") ? undefined : rootOf(roots, posix.resolve(cwd, t)),
   );
   if (owners.some((owner) => owner === undefined)) return "outside-root";
+  // extra roots are named, never entered: `pnpm test` or `git` run there would act on
+  // their files, so the shell's cwd and a cd target stay in the worktree
+  const entered = first === "cd" ? owners : owners.slice(0, 1);
+  if (entered.some((owner) => owner !== root)) return "outside-root";
   for (const [i, target] of targets.entries()) {
     const owner = owners[i] ?? root;
     const inWorktree = owner === root;
