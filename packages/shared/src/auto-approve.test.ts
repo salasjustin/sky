@@ -1001,3 +1001,73 @@ test("an entry is plain leading words", () => {
   ])
     expect(parseCommandEntry(bad)).toBeUndefined();
 });
+
+describe("a backslash in double quotes", () => {
+  const sub = `cd ${CWD}/sub && `;
+
+  test.each([
+    'grep -n "PanelRoute\\|^import\\|^export" AppShell.jsx',
+    "grep -nE \"^\\s*'?(bell|mail)'?:\" glyphs.js | head",
+    'grep -n "donateProfile\\|buildProfile\\|profile(" lib/server/pages/view.ts | head',
+    'grep -n "^describe\\|^})" AppShell.dom.spec.tsx | tail -12',
+  ])(
+    "runs for a text tool, inside the worktree and after a cd: %s",
+    (command) => {
+      expect(verdict(command)).toBe("approved");
+      expect(verdict(sub + command)).toBe("approved");
+    },
+  );
+
+  test.each([
+    'grep "a\\$b"',
+    'grep "a\\"b"',
+    'grep "a\\\\b"',
+    'grep "\\`x\\`"',
+    'grep "a$b"',
+    'grep "a!b"',
+    'grep "a\\!b"',
+    'grep "a\\',
+  ])("still asks on %s", (command) => {
+    expect(verdict(command)).toBe("syntax");
+  });
+
+  test("other programs, and an unquoted backslash, still ask", () => {
+    const make = { defaults: true, commands: ["make"] };
+    expect(verdict('pnpm test "a\\|b"')).toBe("syntax");
+    expect(verdict('make "x\\y"', make)).toBe("syntax");
+    expect(verdict("grep a\\|b file")).toBe("syntax");
+  });
+
+  test("zsh escapes `\\!` and bash with history keeps the backslash, so it asks", () => {
+    expect(verdict('grep "a\\!b"')).toBe("syntax");
+  });
+
+  test("the path checks still run on the text with its backslash", () => {
+    expect(verdict('grep p "/etc/pa\\sswd"')).toBe("outside-root");
+    expect(verdict('grep p "secrets\\x/a"')).toBe("sensitive-path");
+    expect(verdict('grep p ".env\\x"')).toBe("sensitive-path");
+    expect(verdict('grep p "src\\x/a"')).toBe("approved");
+  });
+
+  test("a literal word asks only its own step, never a later one", () => {
+    const make = { defaults: true, commands: ["make check"] };
+    expect(verdict('grep "a\\|b" f | pnpm test')).toBe("approved");
+    expect(verdict('grep "a\\|b" f && pnpm test')).toBe("approved");
+    expect(verdict('grep "a\\|b" f | make check', make)).toBe("approved");
+    expect(verdict('ls | make "x\\y"', make)).toBe("syntax");
+  });
+
+  test("a backslash word glued to other quoted or plain text is still one literal word", () => {
+    expect(verdict('grep "a\\|b"c f')).toBe("approved");
+    expect(verdict("grep 'x'\"a\\|b\" f")).toBe("approved");
+  });
+
+  test("the per-program checks see the text bash passes, backslash included", () => {
+    // `1\,2p` is not the sed script `1,2p`, so it asks
+    expect(verdict('sed -n "1,2p" a.ts')).toBe("approved");
+    expect(verdict('sed -n "1\\,2p" a.ts')).toBe("unsafe-option");
+    // `\-g` is a pattern, not rg's `-g`
+    expect(verdict('rg "\\-g" src')).toBe("approved");
+    expect(verdict('rg "-g" src')).toBe("unsafe-option");
+  });
+});
