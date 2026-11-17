@@ -611,7 +611,7 @@ test("a run.withdrawn names its request and a reason, as posted and as stored", 
     Event.parse({ ...meta, type: "run.withdrawn", payload }).payload,
   ).toEqual(payload);
   for (const bad of [
-    { reason: "x" },
+    { reason: "hook_cancelled" },
     { requestId: "req_1" },
     { ...payload, reason: "" },
   ]) {

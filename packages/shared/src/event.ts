@@ -54,8 +54,8 @@ export const WithdrawalReason = z.enum([
 export type WithdrawalReason = z.infer<typeof WithdrawalReason>;
 
 /**
- * Stored in place of a decision when the runner stopped waiting on a request before anyone
- * answered it; the request is closed, and a later answer is refused.
+ * Stored in place of a decision when a request closed before anyone answered it, because the
+ * runner stopped waiting or the run finished; a later answer is refused.
  */
 export const Withdrawal = z.object({
   requestId: RequestId,
@@ -64,7 +64,7 @@ export const Withdrawal = z.object({
 });
 export type Withdrawal = z.infer<typeof Withdrawal>;
 
-/** What a request row records as its outcome: a person's decision, or the runner's withdrawal. */
+/** What a request row records as its outcome: a person's decision, or a withdrawal. */
 export type StoredDecision = Decision | Withdrawal;
 
 export const EventType = z.enum([
@@ -126,7 +126,7 @@ const runPayloads = {
   /** `sessionId` is the Claude session the API stores to resume the agent's next run. */
   "run.started": z.object({ sessionId: z.string().min(1) }),
   "run.waiting": z.object({ request: PendingRequest }),
-  /** The runner stopped waiting on `requestId` before anyone answered it (`reason`: why); the run goes back to `running`. */
+  /** `requestId` closed before anyone answered it (`reason`: why); the run goes back to `running`, or finishes on `run_finished`. */
   "run.withdrawn": z.object({
     requestId: RequestId,
     reason: WithdrawalReason,
