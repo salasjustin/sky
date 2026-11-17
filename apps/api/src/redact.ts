@@ -1,3 +1,4 @@
+import { EVENT_TEXT_MAX, truncationMarker } from "@sky/shared";
 import type { Config } from "./config.js";
 
 const REDACTED = "[redacted]";
@@ -77,6 +78,26 @@ export function redact(text: string, known: readonly string[]): string {
   for (const pattern of tokenPatterns) out = out.replace(pattern, REDACTED);
   return out;
 }
+
+/**
+ * Raw output kept past a tail's bound, so the tail is taken only after redaction: a secret or token
+ * up to this long that the raw cut splits leaves its fragment in this margin, which the tail drops.
+ * Past every credential the API mints or holds; an env secret's value has no length cap.
+ */
+export const REDACTION_MARGIN = 8_192;
+
+/** `text` cut to `max`, marking how much it dropped. */
+export const cut = (text: string, max: number) =>
+  text.length > max
+    ? text.slice(0, max) + truncationMarker(text.length - max)
+    : text;
+
+/**
+ * `text` redacted by `known`, then cut to `EVENT_TEXT_MAX` with the truncation marker: cut only after
+ * redaction, so a cut can't split a secret out of its match. For text from a sprite that an event stores.
+ */
+export const eventText = (text: string, known: readonly string[]) =>
+  cut(redact(text, known), EVENT_TEXT_MAX);
 
 /** `redact` applied to every string leaf of a JSON value, object and array nesting included. */
 export function redactDeep<T>(value: T, known: readonly string[]): T {

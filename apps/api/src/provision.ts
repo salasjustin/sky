@@ -2,7 +2,7 @@ import { type Db, type environmentFailureSteps, environments } from "@sky/db";
 import type { BaseProfile, EnvironmentId } from "@sky/shared";
 import { eq, sql } from "drizzle-orm";
 import { storeEnv } from "./base-profile.js";
-import { type KnownSecrets, redact } from "./redact.js";
+import { type KnownSecrets, REDACTION_MARGIN, redact } from "./redact.js";
 import { cloneUrl } from "./remote.js";
 import type { BundleInstaller } from "./runner-bundle.js";
 import { hasConnectorSecret, openEnvSecrets } from "./secrets.js";
@@ -352,7 +352,8 @@ export function createProvisioner({
         known,
         cwd,
         log,
-        tailBytes: TAIL_CHARS,
+        // the failure handler redacts this, then keeps its last TAIL_CHARS
+        tailBytes: TAIL_CHARS + REDACTION_MARGIN,
       });
       if (out.exitCode !== 0) {
         throw new StepFailed(out.tail || `exited with code ${out.exitCode}`);

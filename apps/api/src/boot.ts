@@ -104,6 +104,7 @@ export function boot(
   const prober = createRunProber({
     db,
     sprites: spriteOps,
+    apiKey: config.apiKey,
     probeMs: config.runProbeMs,
     lowMemoryMb: config.spriteMinFreeMb,
     log,

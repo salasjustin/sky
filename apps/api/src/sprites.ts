@@ -5,7 +5,7 @@ import {
   FilesystemError,
   type SpritesClient,
 } from "@fly/sprites";
-import { type KnownSecrets, redact } from "./redact.js";
+import { type KnownSecrets, REDACTION_MARGIN, redact } from "./redact.js";
 
 /**
  * The one sprite an environment owns. Hashed because the API rejects names outside lowercase
@@ -499,14 +499,15 @@ export async function writeSpriteFile(
 
 // past any run: the runner holds the sprite itself and exits on its own; the server default is undocumented
 const RUN_AFTER_DISCONNECT = "24h";
-const OUTPUT_TAIL = 2000;
+export const OUTPUT_TAIL = 2000;
 
 /**
  * Starts `argv` in a detachable session, stays attached for `watchMs`, then disconnects: the process
  * keeps running in the sprite with nothing held open to it. A plain exec's process is reaped when
  * its connection drops, so this is the one way to leave a process running. Rejects when the process
- * exits nonzero inside the window, with its exit code and output tail. A TTY merges stderr into
- * that output, and the SDK reads its exit code from the socket's close, so it is only ever 0 or 1.
+ * exits nonzero inside the window, with its exit code and output tail, redacted by `ops.secrets` and
+ * `known`. A TTY merges stderr into that output, and the SDK reads its exit code from the socket's
+ * close, so it is only ever 0 or 1.
  * Bounded by `ops.timeoutMs` past `watchMs`, so a session that never spawns can't hang the caller;
  * the session is closed when the bound runs out.
  */
@@ -535,6 +536,7 @@ export function startDetached(
         env,
         watchMs,
         signal,
+        known: [...ops.secrets.values(), ...(options.known ?? [])],
       }),
   );
 }
@@ -548,6 +550,7 @@ function watchSession(
     env: Record<string, string>;
     watchMs: number;
     signal: AbortSignal;
+    known: readonly string[];
   },
 ): Promise<void> {
   const session = client.sprite(name).createSession(file, args, {
@@ -568,20 +571,25 @@ function watchSession(
       else resolve();
     };
     session.stdout.on("data", (chunk: Buffer) => {
-      output = (output + chunk.toString()).slice(-OUTPUT_TAIL);
+      output = (output + chunk.toString()).slice(
+        -(OUTPUT_TAIL + REDACTION_MARGIN),
+      );
     });
     session.once("spawn", () => {
       watch = setTimeout(() => settle(), options.watchMs);
     });
     session.once("exit", (code: number) => {
       // output pushed to the stream just before 'exit' may not have reached 'data' yet
-      setImmediate(() =>
+      setImmediate(() => {
+        // redacted before the tail is taken: a raw tail could split a secret out of redact's reach,
+        // and one the window above split sits in the margin the tail drops
+        const tail = redact(output, options.known).slice(-OUTPUT_TAIL);
         settle(
           code === 0
             ? undefined
-            : new Error(`runner exited ${code} at launch: ${output.trim()}`),
-        ),
-      );
+            : new Error(`runner exited ${code} at launch: ${tail.trim()}`),
+        );
+      });
     });
     // `on`, not `once`: an 'error' emitted after the first, with no listener, would crash the process
     session.on("error", (err: Error) => settle(err));

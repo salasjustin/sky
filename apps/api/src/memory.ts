@@ -53,16 +53,21 @@ const KERNEL_KILL_LINE = new RegExp(KERNEL_KILL, "i");
 const KERNEL_MARK = "== kernel kills";
 const UPTIME_MARK = "== seconds since boot";
 const INIT_MARK = "== seconds since pid 1 started";
+const PROCESSES_MARK =
+  "== top processes by RSS (pid ppid rss_kb elapsed command)";
+// how much of a process line the report keeps, cut only after redaction so a cut can't split a secret
+const PROCESS_LINE_MAX = 240;
 
 // into a file rather than back over the exec: its frames carry no length, and a few KB re-chunked by an
 // intermediary is misread (see `execLogged`); each command's failure is part of the report, never the script's.
-// `LC_ALL=C`: a locale with a comma decimal prints the load as `0,52, 0,58`, which `parseLoad5` misreads
+// `LC_ALL=C`: a locale with a comma decimal prints the load as `0,52, 0,58`, which `parseLoad5` misreads.
+// Command lines are capped far past `PROCESS_LINE_MAX` only to bound the file: argv can run to megabytes
 const DIAGNOSTICS_SCRIPT = `{
 echo "== free -m"; free -m
 echo "== uptime"; LC_ALL=C uptime
 echo "${UPTIME_MARK}"; cut -d' ' -f1 /proc/uptime
 echo "${INIT_MARK}"; LC_ALL=C ps -o etimes= -p 1
-echo "== top processes by RSS (pid ppid rss_kb elapsed command)"; LC_ALL=C ps -eo pid=,ppid=,rss=,etime=,args= --sort=-rss | head -n 12 | cut -c1-240
+echo "${PROCESSES_MARK}"; LC_ALL=C ps -eo pid=,ppid=,rss=,etime=,args= --sort=-rss | head -n 12 | cut -c1-8192
 echo "${KERNEL_MARK}"; if k=$(dmesg 2>&1); then printf '%s\\n' "$k" | grep -iE '${KERNEL_KILL}' | tail -n 8 | cut -c1-240; else echo "dmesg not readable"; fi
 } >"$1" 2>&1; exit 0`;
 
@@ -106,7 +111,7 @@ function parseLoad5(report: string): number | undefined {
   return found ? Number(found[1]) : undefined;
 }
 
-/** The most of a sprite's diagnostics kept: under `EVENT_TEXT_MAX`, with room for the event's own heading. */
+/** The most of a sprite's diagnostics written to a log line. */
 export const DIAGNOSTICS_MAX = 3_400;
 
 export type Diagnostics = {
@@ -156,16 +161,34 @@ export function restartSince(
   return undefined;
 }
 
-const bounded = (text: string) =>
+/** `text` cut to `DIAGNOSTICS_MAX` for a log line, noting how much it dropped. */
+export const bounded = (text: string) =>
   text.length <= DIAGNOSTICS_MAX
     ? text
     : `${text.slice(0, DIAGNOSTICS_MAX)}\n… (${text.length - DIAGNOSTICS_MAX} characters omitted)`;
+
+/** The report with each line of its process section, up to the next `== ` heading, cut to `PROCESS_LINE_MAX`. */
+function cutProcessLines(report: string): string {
+  const lines = report.split("\n");
+  const start = lines.indexOf(PROCESSES_MARK);
+  if (start < 0) return report;
+  const end = lines.findIndex((line, i) => i > start && line.startsWith("== "));
+  return lines
+    .map((line, i) =>
+      i > start && (end < 0 || i < end)
+        ? line.slice(0, PROCESS_LINE_MAX)
+        : line,
+    )
+    .join("\n");
+}
 
 /**
  * What a sprite looked like when a run's runner was found gone: memory and swap, the biggest processes
  * by RSS with their command lines, uptime, and the kernel's kill lines where `dmesg` is readable. Only
  * kill lines logged since `startedAt` (epoch ms, the run's creation) are `killLines`: the kernel's
  * buffer outlives runs, and a kill from before this one says nothing of its runner.
+ * `text` is redacted, and only its process lines are cut: the event that stores it cuts it whole, after
+ * redacting it again with the live tokens, and a log line uses `bounded`.
  * Never throws: a sprite that can't answer is reported in `text`, and the caller fails the run anyway.
  */
 export async function collectDiagnostics(
@@ -173,7 +196,10 @@ export async function collectDiagnostics(
   spriteName: string,
   runId: RunId,
   startedAt: number,
+  /** Values besides the registered secrets to scrub from `text`, such as the live agent tokens. */
+  extraKnown: readonly string[] = [],
 ): Promise<Diagnostics> {
+  const known = [...ops.secrets.values(), ...extraKnown];
   const path = `/tmp/sky-diagnostics-${runId}.txt`;
   try {
     const out = await execInSprite(
@@ -184,7 +210,10 @@ export async function collectDiagnostics(
     );
     if (out.exitCode !== 0) {
       return {
-        text: `diagnostics unavailable: exit ${out.exitCode}: ${out.stderr.trim()}`,
+        text: redact(
+          `diagnostics unavailable: exit ${out.exitCode}: ${out.stderr.trim()}`,
+          known,
+        ),
         killLines: [],
       };
     }
@@ -202,9 +231,9 @@ export async function collectDiagnostics(
       }).catch(() => {});
     }
     // command lines can carry a secret
-    const text = redact(raw, [...ops.secrets.values()]);
+    const text = cutProcessLines(redact(raw, known));
     return {
-      text: bounded(text.trim()),
+      text: text.trim(),
       memory: parseFree(text),
       killLines: killLinesWithin(text, withinSec),
       bootAgeSec: secondsAfter(text, UPTIME_MARK),
@@ -213,7 +242,10 @@ export async function collectDiagnostics(
     };
   } catch (err) {
     return {
-      text: `diagnostics unavailable: ${err instanceof Error ? err.message : String(err)}`,
+      text: redact(
+        `diagnostics unavailable: ${err instanceof Error ? err.message : String(err)}`,
+        known,
+      ),
       killLines: [],
     };
   }
