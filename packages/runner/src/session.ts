@@ -245,8 +245,7 @@ export function sessionOptions(
     ...(spawn && { spawnClaudeCodeProcess: spawn }),
     // Claude Code's own commit trailer and pull request footer are off, for hosting that rejects them;
     // the credential helpers, kru's lead-gate switch and HOME are pinned above every settings file,
-    // the ones written mid-run included. A file's `env` that moved HOME would have the shell read `~`
-    // from somewhere other than the home the auto-approve check expands it with
+    // the ones written mid-run included; see `sessionHomeOf` for HOME
     settings: {
       attribution: { commit: "", pr: "" },
       ...PINNED_SETTINGS,

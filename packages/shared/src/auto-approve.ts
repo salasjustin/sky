@@ -48,7 +48,8 @@ type Operator = ";" | "&&" | "||" | "|";
 /**
  * `literal` marks a word holding `$`, a backtick, `\` or `!` inside single quotes, or a kept
  * backslash inside double quotes, `braced` one of the words a `{a,b}` group expanded to,
- * `tilde` a word that starts with an unquoted `~` the shell expands to its home; `redirect` is one of the harmless ones `lex` lets through.
+ * `tilde` a word that starts with an unquoted `~` the shell expands to its home; `redirect` is
+ * one of the harmless ones `lex` lets through.
  */
 type Token =
   | { word: string; literal: boolean; braced: boolean; tilde: boolean }
@@ -706,9 +707,9 @@ export type AutoApproveScope = {
   realpath?: (path: string) => string;
   /**
    * The home the shell's `~` stands for, an absolute path taken from the session's env. With it,
-   * read-only commands may also name paths in `.claude/plugins/cache` and `.kru` below it,
-   * though the cwd and a `cd` target must still be in `root`, and a word's leading `~` or `~/`
-   * is expanded to it; without it a `~` asks.
+   * a word's leading `~` or `~/` is expanded to it, and read-only commands may also name paths in
+   * `.claude/plugins/cache` and `.kru` below it; the cwd and a `cd` target must still be in
+   * `root`. Without it a `~` asks.
    */
   home?: string;
 };
