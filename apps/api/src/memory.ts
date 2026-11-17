@@ -53,16 +53,21 @@ const KERNEL_KILL_LINE = new RegExp(KERNEL_KILL, "i");
 const KERNEL_MARK = "== kernel kills";
 const UPTIME_MARK = "== seconds since boot";
 const INIT_MARK = "== seconds since pid 1 started";
+const PROCESSES_MARK =
+  "== top processes by RSS (pid ppid rss_kb elapsed command)";
+// how much of a process line the report keeps, cut only after redaction so a cut can't split a secret
+const PROCESS_LINE_MAX = 240;
 
 // into a file rather than back over the exec: its frames carry no length, and a few KB re-chunked by an
 // intermediary is misread (see `execLogged`); each command's failure is part of the report, never the script's.
-// `LC_ALL=C`: a locale with a comma decimal prints the load as `0,52, 0,58`, which `parseLoad5` misreads
+// `LC_ALL=C`: a locale with a comma decimal prints the load as `0,52, 0,58`, which `parseLoad5` misreads.
+// Command lines are capped far past `PROCESS_LINE_MAX` only to bound the file: argv can run to megabytes
 const DIAGNOSTICS_SCRIPT = `{
 echo "== free -m"; free -m
 echo "== uptime"; LC_ALL=C uptime
 echo "${UPTIME_MARK}"; cut -d' ' -f1 /proc/uptime
 echo "${INIT_MARK}"; LC_ALL=C ps -o etimes= -p 1
-echo "== top processes by RSS (pid ppid rss_kb elapsed command)"; LC_ALL=C ps -eo pid=,ppid=,rss=,etime=,args= --sort=-rss | head -n 12 | cut -c1-240
+echo "${PROCESSES_MARK}"; LC_ALL=C ps -eo pid=,ppid=,rss=,etime=,args= --sort=-rss | head -n 12 | cut -c1-8192
 echo "${KERNEL_MARK}"; if k=$(dmesg 2>&1); then printf '%s\\n' "$k" | grep -iE '${KERNEL_KILL}' | tail -n 8 | cut -c1-240; else echo "dmesg not readable"; fi
 } >"$1" 2>&1; exit 0`;
 
@@ -161,6 +166,23 @@ const bounded = (text: string) =>
     ? text
     : `${text.slice(0, DIAGNOSTICS_MAX)}\n… (${text.length - DIAGNOSTICS_MAX} characters omitted)`;
 
+/** The report with each line of its process section, up to the next `== ` heading, cut to `PROCESS_LINE_MAX`. */
+function cutProcessLines(report: string): string {
+  const lines = report.split("\n");
+  const start = lines.indexOf(PROCESSES_MARK);
+  if (start < 0) return report;
+  const end = lines.findIndex(
+    (line, i) => i > start && line.startsWith("== "),
+  );
+  return lines
+    .map((line, i) =>
+      i > start && (end < 0 || i < end)
+        ? line.slice(0, PROCESS_LINE_MAX)
+        : line,
+    )
+    .join("\n");
+}
+
 /**
  * What a sprite looked like when a run's runner was found gone: memory and swap, the biggest processes
  * by RSS with their command lines, uptime, and the kernel's kill lines where `dmesg` is readable. Only
@@ -210,7 +232,7 @@ export async function collectDiagnostics(
       }).catch(() => {});
     }
     // command lines can carry a secret
-    const text = redact(raw, known);
+    const text = cutProcessLines(redact(raw, known));
     return {
       text: bounded(text.trim()),
       memory: parseFree(text),

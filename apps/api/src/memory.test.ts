@@ -181,7 +181,16 @@ const stubTool = (name: string, body: string) => {
 };
 
 /** A PATH holding only coreutils the script needs plus stand-ins for `free`, `ps`, `uptime` and `dmesg`. */
-function sprite({ dmesg }: { dmesg: string[] | "unreadable" }) {
+function sprite({
+  dmesg,
+  processes = [
+    "4242 1 3100000 12:03 node server.js",
+    "77 1 2000 00:10 sleep 9",
+  ],
+}: {
+  dmesg: string[] | "unreadable";
+  processes?: string[];
+}) {
   for (const name of ["head", "grep", "tail"]) {
     symlinkSync(realTool(name), join(tools, name));
   }
@@ -199,7 +208,7 @@ function sprite({ dmesg }: { dmesg: string[] | "unreadable" }) {
   stubTool("uptime", `echo ' 17:03:01 up 1 day,  1:00,  0 users'`);
   stubTool(
     "ps",
-    `[ "$1" = "-eo" ] || exit 2\nprintf '%s\\n' '4242 1 3100000 12:03 node server.js' '77 1 2000 00:10 sleep 9'`,
+    `[ "$1" = "-eo" ] || exit 2\nprintf '%s\\n' ${processes.map((l) => `'${l}'`).join(" ")}`,
   );
   stubTool(
     "dmesg",
@@ -210,7 +219,10 @@ function sprite({ dmesg }: { dmesg: string[] | "unreadable" }) {
 }
 
 /** Collects diagnostics from the stub sprite, its script run under bash with `tools` as the whole PATH. */
-function collectOver(startedAtMsAgo: number) {
+function collectOver(
+  startedAtMsAgo: number,
+  extraKnown: readonly string[] = [],
+) {
   const wire = stubSprites();
   wire.sprites.add("sprite-a");
   const exec = wire.exec;
@@ -236,6 +248,7 @@ function collectOver(startedAtMsAgo: number) {
     "sprite-a",
     "run_x" as RunId,
     Date.now() - startedAtMsAgo,
+    extraKnown,
   );
 }
 
@@ -278,6 +291,24 @@ test("the real diagnostics script reports an unreadable dmesg as such and finds 
   expect(diagnostics.text).toContain("dmesg not readable");
   expect(diagnostics.killLines).toEqual([]);
   expect(diagnostics.memory?.availableMb).toBe(6200);
+});
+
+test("a known value straddling a process line's 240th column is redacted whole, and the line is cut to 240 after", async () => {
+  // no credential pattern matches it, as with an agent token: only the exact value can redact it
+  const token = "a7Kq9ZxW2mB4nR8tY1uV6cE3dF5gH0jL2pS4wX7zQ9k";
+  const line = `4242 1 3100000 12:03 node server.js ${"-v ".repeat(60)}--token=${token} --port 3000`;
+  expect(line.indexOf(token)).toBeLessThan(240);
+  expect(line.indexOf(token) + token.length).toBeGreaterThan(240);
+  sprite({ dmesg: [], processes: [line] });
+  const diagnostics = await collectOver(60_000, [token]);
+
+  expect(diagnostics.text).not.toContain(token.slice(0, 8));
+  expect(diagnostics.text).toContain("--token=[redacted]");
+  const stored = diagnostics.text
+    .split("\n")
+    .find((l) => l.startsWith("4242 "));
+  expect(stored).toHaveLength(240);
+  expect(diagnostics.text).not.toContain("--port 3000");
 });
 
 // the runner up at 1_000 s, the probe set out and the report taken at 1_600 s (epoch ms): with the 30 s
