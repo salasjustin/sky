@@ -45,13 +45,14 @@ import {
   WITH_PACKAGE_MANAGERS,
   WORKTREES_DIR,
 } from "./provision.js";
-import { type KnownSecrets, redact } from "./redact.js";
+import { eventText, type KnownSecrets } from "./redact.js";
 import type { BundleInstaller } from "./runner-bundle.js";
 import {
   activeRunOf,
   failRun,
   isActive,
   isSilentLaunch,
+  liveAgentTokens,
   recordEvent,
   type Tx,
 } from "./runs.js";
@@ -747,7 +748,8 @@ export function createLauncher({
           },
           watchMs,
           op: "start-runner",
-          known,
+          // its failure quotes the runner's output, which can echo any live run's token
+          known: [...known, ...liveAgentTokens(db, config.apiKey)],
         },
       ).catch(async (err: unknown) => {
         // the runner never started, so nothing else deletes the file its secrets sit in or the task
@@ -1069,23 +1071,28 @@ export function createLauncher({
           throw err;
         })
         .catch((err: unknown) => {
-          // the SDK's socket errors quote the session URL, which carries the env
-          const detail = redact(
-            err instanceof Error ? err.message : String(err),
-            [...secrets.values(), agentToken],
-          );
-          log(`launching ${launch.runId} failed: ${detail}`);
+          const message = err instanceof Error ? err.message : String(err);
+          // the SDK's socket errors quote the session URL, which carries the env, and a sprite's
+          // stderr can echo any live run's token. This run's own is listed too: it may have ended
+          const known = [
+            ...secrets.values(),
+            agentToken,
+            ...liveAgentTokens(db, config.apiKey),
+          ];
+          const stored = eventText(message, known);
+          log(`launching ${launch.runId} failed: ${stored}`);
           const ended = db.transaction(
-            (tx) =>
-              failRun(
+            (tx) => {
+              return failRun(
                 tx,
                 launch.runId,
                 // already worded as a run error, with its own code
                 err instanceof LowMemoryError ||
                   err instanceof ClaudeCredentialError
-                  ? detail
-                  : `launch_failed: ${detail}`,
-              ),
+                  ? stored
+                  : `launch_failed: ${stored}`,
+              );
+            },
             { behavior: "immediate" },
           );
           nudgeDeliveries();

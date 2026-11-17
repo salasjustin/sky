@@ -29,7 +29,9 @@ import {
   sql,
 } from "drizzle-orm";
 import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
+import { mintAgentToken } from "./agent-token.js";
 import { enqueueDeliveries } from "./deliveries.js";
+import { eventText } from "./redact.js";
 import { runEvents } from "./run-events.js";
 
 export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -105,6 +107,15 @@ export const activeRunOf = (tx: Db | Tx, agentId: AgentId) =>
       and(eq(runs.agentId, agentId), inArray(runs.status, activeRunStatuses)),
     )
     .get();
+
+/** The agent token of every run that hasn't ended: output from a shared sprite can echo any of them. */
+export const liveAgentTokens = (tx: Db | Tx, apiKey: string) =>
+  tx
+    .select({ id: runs.id })
+    .from(runs)
+    .where(inArray(runs.status, activeRunStatuses))
+    .all()
+    .map((r) => mintAgentToken(apiKey, r.id));
 
 /** The error of the run's `run.failed` event; null for a run that hasn't failed. */
 export function runError(tx: Db | Tx, runId: RunId): string | null {
@@ -515,7 +526,8 @@ export function recordProbe(
  * A later event means the runner spoke meanwhile, and the sweep's next window judges it. Event ids,
  * not clock times: a fast host can stamp the last event and the probe's start in the same millisecond.
  * The sprite's `diagnostics`, when collected, are recorded as a `runner.warning` just before the
- * failure, in the same transaction, so the guard above can't be tripped by it.
+ * failure, in the same transaction, so the guard above can't be tripped by it. The sprite's text can
+ * echo its environment, so it is redacted by `secrets` and every live agent token (of `apiKey`), then cut.
  * False when the run was left alone.
  */
 export function failLostRun(
@@ -523,7 +535,8 @@ export function failLostRun(
   runId: RunId,
   lastEventId: number,
   error: string,
-  diagnostics?: string,
+  diagnostics: string | undefined,
+  { apiKey, secrets }: { apiKey: string; secrets: readonly string[] },
 ): boolean {
   return db.transaction(
     (tx) => {
@@ -543,7 +556,12 @@ export function failLostRun(
         .get();
       if (!silent) return false;
       if (diagnostics) {
-        recordEvent(tx, runId, "runner.warning", { message: diagnostics });
+        recordEvent(tx, runId, "runner.warning", {
+          message: eventText(diagnostics, [
+            ...secrets,
+            ...liveAgentTokens(tx, apiKey),
+          ]),
+        });
       }
       failRun(tx, runId, error);
       return true;

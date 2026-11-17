@@ -3,6 +3,7 @@ import type { RunId } from "@sky/shared";
 import { eq } from "drizzle-orm";
 import { isRunnerAlive } from "./launch.js";
 import {
+  bounded,
   collectDiagnostics,
   type Diagnostics,
   type Restart,
@@ -12,6 +13,7 @@ import { redact } from "./redact.js";
 import {
   failLostRun,
   lastBashCommand,
+  liveAgentTokens,
   recordProbe,
   runnerStartedAt,
   runningRunsOn,
@@ -22,6 +24,8 @@ import { type SpriteOps, spriteExists } from "./sprites.js";
 type Deps = {
   db: Db;
   sprites: SpriteOps;
+  /** The API key agent tokens are minted from, so a sprite's text can be scrubbed of the live ones. */
+  apiKey: string;
   /** How long a `running` run may be silent before its runner is checked, and the window between checks. */
   probeMs: number;
   /** Below this many MB available, a sprite whose runner is gone is taken to have killed it for memory. */
@@ -114,6 +118,7 @@ export async function wakeLaunch(
 export function createRunProber({
   db,
   sprites: ops,
+  apiKey,
   probeMs,
   lowMemoryMb,
   log,
@@ -162,7 +167,13 @@ export function createRunProber({
     probeStartedAt: number,
   ): Promise<void> {
     const diagnostics = spriteIsThere
-      ? await collectDiagnostics(sprites, spriteName, runId, createdAt(runId))
+      ? await collectDiagnostics(
+          sprites,
+          spriteName,
+          runId,
+          createdAt(runId),
+          liveAgentTokens(db, apiKey),
+        )
       : undefined;
     const now = Date.now();
     // a sprite that can't read its kernel log (dmesg is often closed to the sprite's user) still shows
@@ -201,8 +212,13 @@ export function createRunProber({
     const report =
       diagnostics &&
       `diagnostics of sprite ${spriteName}, collected when its runner was found gone:\n${diagnostics.text}`;
-    if (failLostRun(db, runId, lastEventId, error, report)) {
-      if (report) log(`run ${runId}: ${report}`);
+    if (
+      failLostRun(db, runId, lastEventId, error, report, {
+        apiKey,
+        secrets: sprites.secrets.values(),
+      })
+    ) {
+      if (report) log(`run ${runId}: ${bounded(report)}`);
       log(`run ${runId} failed: ${code} on sprite ${spriteName}`);
       nudgeDeliveries();
     }

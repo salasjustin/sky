@@ -130,9 +130,12 @@ export function stubSprites() {
     },
     /**
      * When set, each session's process prints `output` and exits right after the socket opens; the
-     * SDK reads a TTY session's exit from its close code, 1000 as 0 and any other as 1.
+     * SDK reads a TTY session's exit from its close code, 1000 as 0 and any other as 1. A list of
+     * `output` is sent as one frame each, on ticks of their own, so a value can split across frames.
      */
-    sessionExit: undefined as { output: string; code: 0 | 1 } | undefined,
+    sessionExit: undefined as
+      | { output: string | readonly string[]; code: 0 | 1 }
+      | undefined,
     /**
      * When set, HTTP exec frames are cut into pieces of this many bytes, each on its own tick, as an
      * intermediary may re-chunk them; the SDK takes each read to start a frame, so this breaks it.
@@ -432,13 +435,17 @@ export function stubSprites() {
       const exit = wire.sessionExit;
       if (exit) {
         // on separate ticks, as the live server sends them: sent in the close's tick, the output never arrives
-        setTimeout(
-          () => client.send(new TextEncoder().encode(exit.output)),
-          10,
-        );
+        const frames =
+          typeof exit.output === "string" ? [exit.output] : exit.output;
+        frames.forEach((frame, i) => {
+          setTimeout(
+            () => client.send(new TextEncoder().encode(frame)),
+            10 + 5 * i,
+          );
+        });
         setTimeout(
           () => client.close(exit.code === 0 ? 1000 : 1011, "process exited"),
-          20,
+          10 + 5 * Math.max(frames.length - 1, 0) + 10,
         );
       }
     }),
