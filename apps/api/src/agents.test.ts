@@ -2871,6 +2871,7 @@ test("a wake whose pgrep the Sprites API fails is logged, holds the sprite again
  * A prober over the stub sprites; `nudges` counts its dispatcher nudges. `sprites` is the ops it
  * probes through, wired as `boot` wires them: an exec on it that exits 137 probes the sprite's runs,
  * and names the sprite in `execsKilled`; `probed` holds each such probe, to await its settling.
+ * `spriteLogs` holds what each call through the sprites logs, apart from the prober's own `logs`.
  * `wrapClient` swaps the stub client for one built over it: the prober keeps its own copy of the ops,
  * so a client set on `sprites` afterwards would never be probed through.
  */
@@ -2881,9 +2882,10 @@ function proberOver(
   const nudges = { count: 0 };
   const execsKilled: string[] = [];
   const probed: Promise<void>[] = [];
+  const spriteLogs: string[] = [];
   const sprites: SpriteOps = {
     client: wrapClient(new SpritesClient(spritesToken)),
-    log: () => {},
+    log: (line) => spriteLogs.push(line),
     secrets,
     timeoutMs: SPRITES_TIMEOUT_MS,
     longTimeoutMs: config.spritesLongTimeoutMs,
@@ -2903,7 +2905,7 @@ function proberOver(
       nudges.count++;
     },
   });
-  return { prober, nudges, sprites, execsKilled, probed };
+  return { prober, nudges, sprites, spriteLogs, execsKilled, probed };
 }
 
 /** Makes `pgrep` on the stub sprite answer `exitCode` (0 found a runner, 1 none, 2 an error of its own). */
@@ -3446,9 +3448,9 @@ test("a full diagnostics report with another live run's agent token in a command
 test("a diagnostics exec that throws is stored and logged without the secret, the run's token or another live run's token in its message", async () => {
   const secret = "hunter2-hunter2";
   const other = await runningRun();
-  const { run, token, known } = await lostRun(secret);
+  const { run, token, envId, known } = await lostRun(secret);
   // only the diagnostics script's exec throws, as a transport error quoting what it was sent; the rest reaches the stub
-  const { prober } = proberOver(
+  const { prober, spriteLogs } = proberOver(
     known,
     (real) =>
       ({
@@ -3486,6 +3488,13 @@ test("a diagnostics exec that throws is stored and logged without the secret, th
     expect(warningsOf(run.id)[0]).not.toContain(leaked);
     expect(logs.join("\n")).not.toContain(leaked);
   }
+  // the call's own failure line, logged by the sprites client, redacts the registered secret
+  const failed = spriteLogs.filter((line) =>
+    line.startsWith(`sprite ${spriteNameFor(envId)} diagnostics: failed in `),
+  );
+  expect(failed).toHaveLength(1);
+  expect(failed[0]).toContain("connect ECONNRESET [redacted] ");
+  expect(failed[0]).not.toContain(secret);
 });
 
 test("a very large stderr from a failed diagnostics exec is stored as EVENT_TEXT_MAX characters and the truncation marker", async () => {
