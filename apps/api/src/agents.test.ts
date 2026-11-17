@@ -767,7 +767,7 @@ test("a launch failure cuts its stored error to EVENT_TEXT_MAX with the marker, 
 
 test("a launch refused for want of a credential stores its error without the launch_failed prefix, redacted of a live run's token", async () => {
   const other = await runningRun();
-  // an assignment naming a token is how a live run's token reaches a ClaudeCredentialError's message
+  // a ClaudeCredentialError quotes the credential's name, so naming it after a live run's token puts the token in its message
   const { run } = await launched(readyEnv({ claudeCredential: other.token }));
   await vi.waitFor(() => expect(runFailure(run.id)).toBeDefined());
 
@@ -3268,7 +3268,7 @@ test("a sprite that can't give its diagnostics still fails the run, saying so in
   );
 });
 
-/** A started run whose runner is gone from a sprite: the run, its live agent token, and a prober holding `PROJECT_TOKEN`. */
+/** A started run whose runner is gone from a sprite: the run, its live agent token, and secrets registering `secretValue` as `PROJECT_TOKEN`. */
 async function lostRun(secretValue: string) {
   const { run, token } = await runningRun();
   await postEvent(token, {
