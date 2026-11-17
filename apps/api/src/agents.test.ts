@@ -723,6 +723,60 @@ test("a runner that exits at launch fails the run with its exit code and output 
   ).toEqual({ status: "idle" });
 });
 
+/** Makes the runner bundle's install fail on the stub sprite, with `stderr` as `mv`'s complaint. */
+const bundleInstallFails = (stderr: string) => {
+  const exec = wire.exec;
+  wire.exec = (argv) => {
+    // a bundle already on the stub would skip the install, as the first launch left it there
+    if (argv[0] === "sha256sum") return { exitCode: 1 };
+    if (argv[0] === "mv") return { exitCode: 1, stderr };
+    return exec(argv);
+  };
+};
+
+const BUNDLE_FAILED = "installing the runner bundle failed: ";
+
+test("a launch failure redacts another live run's token and a registered secret from its stored error and its log line", async () => {
+  const other = await runningRun();
+  bundleInstallFails(
+    `mv: ${other.token} and ${config.claudeOauthToken} are busy\n`,
+  );
+  const { run } = await launched(readyEnv());
+  await vi.waitFor(() => expect(runFailure(run.id)).toBeDefined());
+
+  const redacted = `${BUNDLE_FAILED}mv: [redacted] and [redacted] are busy`;
+  expect(runFailure(run.id)).toBe(`launch_failed: ${redacted}`);
+  expect(logs).toContain(`launching ${run.id} failed: ${redacted}`);
+  const everyLog = logs.join("\n");
+  expect(everyLog).not.toContain(other.token);
+  expect(everyLog).not.toContain(config.claudeOauthToken);
+});
+
+test("a launch failure cuts its stored error to EVENT_TEXT_MAX with the marker, after redacting a token the cut falls inside", async () => {
+  const other = await runningRun();
+  const lead = EVENT_TEXT_MAX - BUNDLE_FAILED.length - 6;
+  bundleInstallFails(`${"a".repeat(lead)}${other.token}${"b".repeat(50)}\n`);
+  const { run } = await launched(readyEnv());
+  await vi.waitFor(() => expect(runFailure(run.id)).toBeDefined());
+
+  const redacted = `${BUNDLE_FAILED}${"a".repeat(lead)}[redacted]${"b".repeat(50)}`;
+  expect(runFailure(run.id)).toBe(
+    `launch_failed: ${redacted.slice(0, EVENT_TEXT_MAX)}${truncationMarker(redacted.length - EVENT_TEXT_MAX)}`,
+  );
+});
+
+test("a launch refused for want of a credential stores its error without the launch_failed prefix, redacted of a live run's token", async () => {
+  const other = await runningRun();
+  // an assignment naming a token is how a live run's token reaches a ClaudeCredentialError's message
+  const { run } = await launched(readyEnv({ claudeCredential: other.token }));
+  await vi.waitFor(() => expect(runFailure(run.id)).toBeDefined());
+
+  expect(runFailure(run.id)).toBe(
+    'claude_credential_missing: this server has no token for the Claude credential "[redacted]" this environment is assigned',
+  );
+  expect(logs.join("\n")).not.toContain(other.token);
+});
+
 test("a runner that fails to start deletes the run's keep-awake task and still reports the start error", async () => {
   wire.sessionExit = { output: "node: bad option\r\n", code: 1 };
   const envId = readyEnv();
@@ -1691,6 +1745,28 @@ test("secrets a runner echoes are redacted before the event is stored", async ()
   expect(stored).not.toContain(token);
   expect(stored).not.toContain(config.claudeOauthToken);
   expect(stored).toContain("AGENT_TOKEN=[redacted]");
+});
+
+test("another live run's agent token echoed in an event is redacted before the event is stored", async () => {
+  const other = await runningRun();
+  const { run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "claude.Message",
+    payload: { text: `lsof: ${other.token} holds the socket` },
+  });
+  expect(res.status).toBe(201);
+  const stored = eventsOf(run.id)
+    .filter((e) => e.type === "claude.Message")
+    .map((e) => e.payload)
+    .join("\n");
+  expect(stored).toContain("lsof: [redacted] holds the socket");
+  expect(stored).not.toContain(other.token);
 });
 
 test("a credential in a nested payload field is redacted, even at the start of a line", async () => {
@@ -3244,7 +3320,107 @@ test("a full diagnostics report with a registered secret and a live agent token 
   expect(message).toContain("node server.js");
   expect(message).not.toContain(secret);
   expect(message).not.toContain(token);
+  expect(logs.join("\n")).toContain("node server.js");
+  expect(logs.join("\n")).not.toContain(secret);
   expect(logs.join("\n")).not.toContain(token);
+});
+
+test("diagnostics unavailable, with another live run's agent token in the sprite's stderr, store and log neither", async () => {
+  const other = await runningRun();
+  const { run, known } = await lostRun("hunter2-hunter2");
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "bash" && argv[2]?.includes("== free -m")
+      ? { exitCode: 3, stderr: `env: AGENT_TOKEN=${other.token}\n` }
+      : exec(argv);
+  const { prober } = proberOver(known);
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  const [message] = warningsOf(run.id);
+  expect(message).toContain("diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]");
+  expect(message).not.toContain(other.token);
+  expect(logs.join("\n")).toContain("diagnostics unavailable: exit 3: env: AGENT_TOKEN=[redacted]");
+  expect(logs.join("\n")).not.toContain(other.token);
+});
+
+test("a full diagnostics report with another live run's agent token in a command line stores and logs without it", async () => {
+  const other = await runningRun();
+  const { run, known } = await lostRun("hunter2-hunter2");
+  diagnosticsAnswer(
+    diagnosticsReport({
+      availableMb: 5_000,
+      ps: `4242 1 3100000 12:03 node server.js --agent ${other.token}`,
+    }),
+  );
+  const { prober } = proberOver(known);
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  const [message] = warningsOf(run.id);
+  expect(message).toContain("node server.js --agent [redacted]");
+  expect(message).not.toContain(other.token);
+  expect(logs.join("\n")).toContain("node server.js --agent [redacted]");
+  expect(logs.join("\n")).not.toContain(other.token);
+});
+
+test("a diagnostics exec that throws is stored and logged without the secret, the run's token or another live run's token in its message", async () => {
+  const secret = "hunter2-hunter2";
+  const other = await runningRun();
+  const { run, token, known } = await lostRun(secret);
+  const { prober, sprites } = proberOver(known);
+  const real = sprites.client;
+  // only the diagnostics script's exec throws, as a transport error quoting what it was sent; the rest reaches the stub
+  sprites.client = {
+    sprite: (name: string) => {
+      const handle = real.sprite(name);
+      return new Proxy(handle, {
+        get(target, prop) {
+          if (prop === "execFileHTTP") {
+            return (...call: unknown[]) =>
+              call[0] === "bash" &&
+              (call[1] as string[])[1]?.includes("== free -m")
+                ? Promise.reject(
+                    new Error(
+                      `connect ECONNRESET ${secret} ${token} ${other.token}`,
+                    ),
+                  )
+                : (target.execFileHTTP as (...args: unknown[]) => unknown).apply(
+                    target,
+                    call,
+                  );
+          }
+          const value = Reflect.get(target, prop);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    },
+  } as unknown as SpritesClient;
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  const unavailable =
+    "diagnostics unavailable: connect ECONNRESET [redacted] [redacted] [redacted]";
+  expect(warningsOf(run.id)[0]).toContain(unavailable);
+  expect(logs.join("\n")).toContain(unavailable);
+  for (const leaked of [secret, token, other.token]) {
+    expect(warningsOf(run.id)[0]).not.toContain(leaked);
+    expect(logs.join("\n")).not.toContain(leaked);
+  }
+});
+
+test("a very large stderr from a failed diagnostics exec is stored bounded, with the omitted count and not the truncation marker", async () => {
+  const { run, known } = await lostRun("hunter2-hunter2");
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "bash" && argv[2]?.includes("== free -m")
+      ? { exitCode: 3, stderr: "e".repeat(EVENT_TEXT_MAX * 2) }
+      : exec(argv);
+  const { prober } = proberOver(known);
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  const [message] = warningsOf(run.id);
+  expect(message).toContain("diagnostics unavailable: exit 3");
+  expect(message?.length).toBeLessThan(EVENT_TEXT_MAX);
+  expect(message).toMatch(/\d+ characters omitted/);
+  expect(message).not.toContain("[truncated");
 });
 
 /** Fails a started run through `failLostRun` with `text(token)` as its diagnostics; the warning it stored. */
@@ -3279,6 +3455,15 @@ test("an oversized diagnostics text is stored cut to EVENT_TEXT_MAX with the tru
     new KnownSecrets(),
   );
   expect(message).toBe("x".repeat(EVENT_TEXT_MAX) + truncationMarker(1_000));
+});
+
+test("failLostRun redacts another live run's token from the stored diagnostics, with no help from the caller's list", async () => {
+  const other = await runningRun();
+  const { message } = await failedWith(
+    () => `ps: node --agent ${other.token} --port 80`,
+    new KnownSecrets(),
+  );
+  expect(message).toBe("ps: node --agent [redacted] --port 80");
 });
 
 test("a secret straddling EVENT_TEXT_MAX is redacted before the cut, not split by it", async () => {
