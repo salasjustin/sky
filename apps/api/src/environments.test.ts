@@ -820,6 +820,20 @@ test("a failed setup's tail is the last 4000 bytes of its stdout and stderr, how
   );
 });
 
+test("a failed setup's output is redacted before its 4000-char tail is taken, so a token the tail's start falls inside leaves no fragment", async () => {
+  const fragment = ghToken.slice(-10);
+  const rest = "x".repeat(4000 - fragment.length);
+  wire.exec = (argv) =>
+    isSetup(argv)
+      ? { exitCode: 1, stdout: `${ghToken}${rest}` }
+      : { exitCode: 0 };
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  expect(await settled(id)).toMatchObject({
+    status: "failed",
+    failure: { step: "setup", stderr: `[redacted]${rest}` },
+  });
+});
+
 test("a second POST with the same name gets 409 and never creates a second sprite", async () => {
   const first = (await (await post(kru)).json()) as { id: string };
   await settled(first.id);

@@ -44,6 +44,7 @@ import {
 } from "./runs.js";
 import {
   execInSprite,
+  OUTPUT_TAIL,
   SPRITES_TIMEOUT_MS,
   type SpriteOps,
   spriteNameFor,
@@ -721,6 +722,22 @@ test("a runner that exits at launch fails the run with its exit code and output 
   expect(
     db.$client.prepare("select status from agents where id = ?").get(agent.id),
   ).toEqual({ status: "idle" });
+});
+
+test("a runner's output is redacted before its tail is taken, so a secret the tail's start falls inside leaves no fragment", async () => {
+  const secret = config.webhookSigningKey;
+  const fragment = secret.slice(-16);
+  wire.sessionExit = {
+    output: `${secret}${"x".repeat(OUTPUT_TAIL - fragment.length)}`,
+    code: 1,
+  };
+  const { run } = await launched(readyEnv());
+  await vi.waitFor(() => expect(runFailure(run.id)).toBeDefined());
+
+  expect(runFailure(run.id)).toBe(
+    `launch_failed: runner exited 1 at launch: [redacted]${"x".repeat(OUTPUT_TAIL - fragment.length)}`,
+  );
+  expect(logs.join("\n")).not.toContain(fragment);
 });
 
 /** Makes the runner bundle's install fail on the stub sprite, with `stderr` as `mv`'s complaint. */

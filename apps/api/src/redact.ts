@@ -79,6 +79,12 @@ export function redact(text: string, known: readonly string[]): string {
   return out;
 }
 
+/**
+ * Raw output kept past a tail's bound, so the tail is taken only after redaction. Longer than any
+ * secret or token, so one the raw cut splits has its fragment in this margin, which the tail drops.
+ */
+export const REDACTION_MARGIN = 8_192;
+
 /** `text` cut to `max`, marking how much it dropped. */
 export const cut = (text: string, max: number) =>
   text.length > max
