@@ -3324,6 +3324,31 @@ test("an oversized diagnostics report is stored as EVENT_TEXT_MAX characters and
   expect(runStatus(run.id)).toEqual({ status: "failed" });
 });
 
+test("a stored diagnostics report cuts only its process lines: a longer uptime or kernel line comes through whole, and the process section ends at the next heading", async () => {
+  const { run } = await lostRun("hunter2-hunter2");
+  const process241 = `4242 1 3100000 12:03 node server.js ${"p".repeat(205)}`;
+  expect(process241).toHaveLength(241);
+  const uptime = ` 17:03:01 up 1 day,  1:00,  0 users,  load average: 9.10, 4.20, 1.70 ${"u".repeat(300)}`;
+  const kernelLine = `an old kernel line ${"k".repeat(300)}`;
+  diagnosticsAnswer(
+    diagnosticsReport({
+      availableMb: 5_000,
+      ps: process241,
+      uptime,
+      kernel: [kernelLine],
+    }),
+  );
+  const { prober } = proberOver();
+  await prober.sweep(silentFor(config.runProbeMs + 1000));
+
+  const lines = warningsOf(run.id)[0]?.split("\n");
+  expect(lines).toContain(uptime);
+  expect(lines).toContain(process241.slice(0, 240));
+  expect(lines).not.toContain(process241);
+  expect(lines).toContain("== kernel kills");
+  expect(lines).toContain(kernelLine);
+});
+
 test("a sprite that can't give its diagnostics still fails the run, saying so in the stored report", async () => {
   const envId = readyEnv();
   const { run, token } = await runningRun(envId);

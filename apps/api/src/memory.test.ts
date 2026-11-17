@@ -187,9 +187,12 @@ function sprite({
     "4242 1 3100000 12:03 node server.js",
     "77 1 2000 00:10 sleep 9",
   ],
+  uptime = " 17:03:01 up 1 day,  1:00,  0 users",
 }: {
   dmesg: string[] | "unreadable";
   processes?: string[];
+  /** The line `uptime` prints. */
+  uptime?: string;
 }) {
   for (const name of ["head", "grep", "tail"]) {
     symlinkSync(realTool(name), join(tools, name));
@@ -205,7 +208,7 @@ function sprite({
     "free",
     `printf '%s\\n' '               total        used        free      shared  buff/cache   available' '${mem}' 'Swap:              0           0           0'`,
   );
-  stubTool("uptime", `echo ' 17:03:01 up 1 day,  1:00,  0 users'`);
+  stubTool("uptime", `echo '${uptime}'`);
   stubTool(
     "ps",
     `[ "$1" = "-eo" ] || exit 2\nprintf '%s\\n' ${processes.map((l) => `'${l}'`).join(" ")}`,
@@ -309,6 +312,23 @@ test("a known value straddling a process line's 240th column is redacted whole, 
     .find((l) => l.startsWith("4242 "));
   expect(stored).toHaveLength(240);
   expect(diagnostics.text).not.toContain("--port 3000");
+});
+
+test("a process line is kept to its 240th column and cut past it, while a longer line outside the process section comes through whole", async () => {
+  const padded = (head: string, length: number) =>
+    head + "p".repeat(length - head.length);
+  const fits = padded("4242 1 3100000 12:03 node a ", 240);
+  const over = `${padded("77 1 2000 00:10 node b ", 240)}Q`;
+  const uptime = ` 17:03:01 up 1 day, ${"u".repeat(300)}`;
+  sprite({ dmesg: [], processes: [fits, over], uptime });
+  const lines = (await collectOver(60_000)).text.split("\n");
+
+  expect(lines).toContain(fits);
+  expect(lines).toContain(over.slice(0, 240));
+  expect(lines).not.toContain(over);
+  expect(lines).toContain(uptime);
+  // the process section ends at the next heading, which is left as it was
+  expect(lines).toContain("== kernel kills");
 });
 
 // the runner up at 1_000 s, the probe set out and the report taken at 1_600 s (epoch ms): with the 30 s
