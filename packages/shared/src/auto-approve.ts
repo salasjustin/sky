@@ -315,8 +315,9 @@ const CLAUDE_READABLE = /^\.claude\/(skills|agents|commands)(\/|$)/;
  * Beside the worktree, read-only commands may name these, below the session's home: the plugin
  * cache only, since the rest of `~/.claude` holds the login, settings and account files, and
  * the kru store checkout. Taken afresh for each command: with `realpath`, a root whose real
- * location is `/`, the home, a directory holding the home, or inside `~/.claude` outside the
- * plugin cache (a link to a broader place) is dropped, so reads there ask.
+ * location holds the home, holds `~/.claude`, sits inside `~/.claude` outside its plugin cache,
+ * or has a secret name in its path is dropped, so reads there ask. `~/.claude` counts both
+ * beside the real home and where its own link leads.
  */
 function extraRoots(
   home: string | undefined,
@@ -334,24 +335,35 @@ function extraRoots(
       return realpath(path);
     } catch (error) {
       const code = (error as { code?: unknown } | null)?.code;
-      // a root that doesn't exist yet is judged on its text; any other failure drops it
+      // a path that doesn't exist yet is judged on its text; any other failure drops the
+      // roots it decides
       return code === "ENOENT" || code === "ENOTDIR" ? path : undefined;
     }
   };
   const realHome = real(base);
-  if (realHome === undefined) return [];
-  const realCache = posix.join(realHome, ".claude/plugins/cache");
+  const realClaude = real(posix.join(base, ".claude"));
+  if (realHome === undefined || realClaude === undefined) return [];
+  const claudes = [posix.join(realHome, ".claude"), realClaude];
+  const cacheOf = (claude: string) => posix.join(claude, "plugins/cache");
   const within = (parent: string, path: string) =>
     !isOutside(posix.relative(parent, path));
   return roots.filter((root) => {
     const target = real(root);
-    if (target === undefined || target === "/" || target === realHome)
-      return false;
-    if (within(target, realHome)) return false;
-    return (
-      !within(posix.join(realHome, ".claude"), target) ||
-      within(realCache, target)
-    );
+    if (target === undefined || within(target, realHome)) return false;
+    const exposesClaude = (claude: string) =>
+      within(target, claude) ||
+      (within(claude, target) && !within(cacheOf(claude), target));
+    if (claudes.some(exposesClaude)) return false;
+    // the plugin cache's own `.claude/plugins/cache` isn't a secret name
+    const claude = claudes.find((c) => within(cacheOf(c), target));
+    const path =
+      claude === undefined
+        ? target
+        : posix.join(
+            posix.dirname(claude),
+            posix.relative(cacheOf(claude), target),
+          );
+    return !namesSecret(path);
   });
 }
 

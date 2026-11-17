@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, describe, expect, test } from "vitest";
 import {
   type AskReason,
@@ -741,28 +741,43 @@ describe("a root that is a link to somewhere broader", () => {
   afterAll(() => rmSync(base, { recursive: true, force: true }));
   let n = 0;
 
-  /** A fresh home and worktree, with the root `name` replaced by a link to `target(home)`. */
+  /**
+   * A fresh home and worktree, with the root `name` replaced by a link to
+   * `target(home, elsewhere, claude)`. With `linkClaude`, `~/.claude` is a link
+   * to the real config folder `claude`, which sits outside the home.
+   */
   const setup = (
     name: ".kru" | ".claude/plugins/cache",
-    target: (home: string, elsewhere: string) => string,
+    target: (home: string, elsewhere: string, claude: string) => string,
+    linkClaude = false,
   ) => {
     const dir = join(base, `case-${++n}`);
     const home = join(dir, "home");
     const elsewhere = join(dir, "elsewhere");
     const root = join(dir, "wt");
-    for (const d of [join(home, ".claude/plugins"), elsewhere, root])
+    const claude = linkClaude
+      ? join(dir, "persist/claude")
+      : join(home, ".claude");
+    for (const d of [
+      join(claude, "plugins"),
+      join(claude, "x"),
+      join(home, ".config/gh"),
+      elsewhere,
+      root,
+    ])
       mkdirSync(d, { recursive: true });
-    mkdirSync(join(home, ".claude/x"));
+    if (linkClaude) symlinkSync(claude, join(home, ".claude"));
     for (const f of [
-      join(home, ".claude/settings.json"),
-      join(home, ".claude/x/settings.json"),
+      join(claude, "settings.json"),
+      join(claude, "x/settings.json"),
       join(home, "settings.json"),
+      join(home, ".config/gh/hosts.yml"),
       join(elsewhere, "settings.json"),
     ])
       writeFileSync(f, "x");
-    const to = target(home, elsewhere);
+    const to = target(home, elsewhere, claude);
     symlinkSync(to, join(home, name));
-    return { home, root, read: `${join(home, name)}/settings.json` };
+    return { home, root, claude, read: `${join(home, name)}/settings.json` };
   };
   const verdictOf = (s: { home: string; root: string }, command: string) =>
     autoApproveVerdict(command, DEFAULTS, {
@@ -777,10 +792,31 @@ describe("a root that is a link to somewhere broader", () => {
       ["the home", (home: string) => home],
       ["~/.claude", (home: string) => join(home, ".claude")],
       ["~/.claude/x", (home: string) => join(home, ".claude/x")],
+      ["a folder holding the home", (home: string) => dirname(home)],
     ])("linked to %s, reads there ask", (_label, target) => {
       const s = setup(name, target);
       expect(verdictOf(s, `cat ${s.read}`)).toBe("outside-root");
       expect(verdictOf(s, `cat ~/${name}/settings.json`)).toBe("outside-root");
+      expect(verdictOf(s, `ls ~/${name}`)).toBe("outside-root");
+    });
+
+    test.each([
+      ["the real ~/.claude", (claude: string) => claude],
+      ["inside the real ~/.claude", (claude: string) => join(claude, "x")],
+      [
+        "a folder holding the real ~/.claude",
+        (claude: string) => dirname(claude),
+      ],
+    ])("with ~/.claude a link, linked to %s, reads ask", (_label, at) => {
+      const s = setup(name, (_home, _elsewhere, claude) => at(claude), true);
+      expect(verdictOf(s, `cat ${s.read}`)).toBe("outside-root");
+      expect(verdictOf(s, `cat ~/${name}/settings.json`)).toBe("outside-root");
+      expect(verdictOf(s, `ls ~/${name}`)).toBe("outside-root");
+    });
+
+    test("linked into another secret folder, reads there ask", () => {
+      const s = setup(name, (home) => join(home, ".config/gh"));
+      expect(verdictOf(s, `cat ~/${name}/hosts.yml`)).toBe("outside-root");
       expect(verdictOf(s, `ls ~/${name}`)).toBe("outside-root");
     });
 
@@ -798,6 +834,19 @@ describe("a root that is a link to somewhere broader", () => {
       symlinkSync(join(s.home, ".claude"), link);
       expect(verdictOf(s, `cat ${s.read}`)).toBe("outside-root");
     });
+  });
+
+  test.each([
+    ["a real ~/.claude", false],
+    ["~/.claude a link", true],
+  ])("with %s, a real plugin cache and .kru still read", (_label, link) => {
+    const s = setup(".kru", (_home, elsewhere) => elsewhere, link);
+    mkdirSync(join(s.claude, "plugins/cache/p"), { recursive: true });
+    writeFileSync(join(s.claude, "plugins/cache/p/plugin.json"), "x");
+    expect(verdictOf(s, "cat ~/.kru/settings.json")).toBe("approved");
+    expect(verdictOf(s, "cat ~/.claude/plugins/cache/p/plugin.json")).toBe(
+      "approved",
+    );
   });
 
   test("a home reached through a link still keeps a real root", () => {
