@@ -111,8 +111,7 @@ export function decideRequest(tx: Tx, agentId: AgentId, decision: Decision) {
 /**
  * Closes the run's open request `requestId` as withdrawn and moves the run and agent from `waiting`
  * back to `running`, recording `run.withdrawn`. A request that is unknown, already decided or not
- * the open one changes nothing (`noop`): a decision that landed first stands. Publish the request's
- * id once `tx` commits, so a poll still holding it re-reads.
+ * the open one changes nothing (`noop`): a decision that landed first stands.
  */
 export function withdrawRequest(
   tx: Tx,
