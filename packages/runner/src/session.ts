@@ -649,8 +649,8 @@ export async function runSession(
   const end = async (event: RunnerEvent) => {
     if (ended) return;
     ended = true;
-    // the API closes a request still open itself when the run ends, but only the runner knows why
-    // it stopped waiting
+    // the API closes a request still open when the run ends, but only the runner knows why it
+    // stopped waiting
     if (openRequest !== undefined && (await withdrawOpen("run_ending"))) return;
     await post(event);
   };
