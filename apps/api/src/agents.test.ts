@@ -781,7 +781,7 @@ test("a launch failure redacts another live run's token and a registered secret 
   expect(everyLog).not.toContain(config.claudeOauthToken);
 });
 
-test("a launch failure cuts its stored error to EVENT_TEXT_MAX with the marker, after redacting a token the cut falls inside", async () => {
+test("a launch failure cuts its stored error and its log line to EVENT_TEXT_MAX with the marker, after redacting a token the cut falls inside", async () => {
   const other = await runningRun();
   const lead = EVENT_TEXT_MAX - BUNDLE_FAILED.length - 6;
   bundleInstallFails(`${"a".repeat(lead)}${other.token}${"b".repeat(50)}\n`);
@@ -789,9 +789,9 @@ test("a launch failure cuts its stored error to EVENT_TEXT_MAX with the marker, 
   await vi.waitFor(() => expect(runFailure(run.id)).toBeDefined());
 
   const redacted = `${BUNDLE_FAILED}${"a".repeat(lead)}[redacted]${"b".repeat(50)}`;
-  expect(runFailure(run.id)).toBe(
-    `launch_failed: ${redacted.slice(0, EVENT_TEXT_MAX)}${truncationMarker(redacted.length - EVENT_TEXT_MAX)}`,
-  );
+  const cutText = `${redacted.slice(0, EVENT_TEXT_MAX)}${truncationMarker(redacted.length - EVENT_TEXT_MAX)}`;
+  expect(runFailure(run.id)).toBe(`launch_failed: ${cutText}`);
+  expect(logs).toContain(`launching ${run.id} failed: ${cutText}`);
 });
 
 test("a launch refused for want of a credential stores its error without the launch_failed prefix, redacted of a live run's token", async () => {

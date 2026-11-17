@@ -45,7 +45,7 @@ import {
   WITH_PACKAGE_MANAGERS,
   WORKTREES_DIR,
 } from "./provision.js";
-import { eventText, type KnownSecrets, redact } from "./redact.js";
+import { eventText, type KnownSecrets } from "./redact.js";
 import type { BundleInstaller } from "./runner-bundle.js";
 import {
   activeRunOf,
@@ -1079,10 +1079,10 @@ export function createLauncher({
             agentToken,
             ...liveAgentTokens(db, config.apiKey),
           ];
-          log(`launching ${launch.runId} failed: ${redact(message, known)}`);
+          const stored = eventText(message, known);
+          log(`launching ${launch.runId} failed: ${stored}`);
           const ended = db.transaction(
             (tx) => {
-              const stored = eventText(message, known);
               return failRun(
                 tx,
                 launch.runId,
