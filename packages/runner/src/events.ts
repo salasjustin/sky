@@ -35,8 +35,9 @@ export type PostEvent = (
 /**
  * Posts an event, retrying a dropped connection, a timeout, a 5xx, 408 or 429; any other 4xx is
  * final. A `run.waiting` that doesn't land rejects, since the run can't wait on a request the API
- * never stored. A `run.started` that doesn't land rejects too: without it the run stays `starting`,
- * and has no session to resume. Either rejects with a `RunEndedError` when the API has already
+ * never stored, and so does a `run.withdrawn`, which the caller must know didn't close its request.
+ * A `run.started` that doesn't land rejects too: without it the run stays `starting`,
+ * and has no session to resume. Each rejects with a `RunEndedError` when the API has already
  * ended the run. Every other event is dropped with one line on `warn`: losing it must not take
  * down the run that produced it.
  */
@@ -52,8 +53,10 @@ export function createPoster(
   return async (event, { deadline, signal, giveUp, maxAttempts } = {}) => {
     const body = JSON.stringify(RunnerEventPost.parse(event));
     const waiting = event.type === "run.waiting";
-    // a start must be stored, so it is retried to its deadline like a wait
-    const mustLand = waiting || event.type === "run.started";
+    // a start must be stored, so it is retried to its deadline like a wait; so is a withdrawal,
+    // since the run's next request is refused while the one it withdraws stays open
+    const mustLand =
+      waiting || event.type === "run.started" || event.type === "run.withdrawn";
     let landed: "stored" | "run_ended" | undefined;
     try {
       landed = await retry<"stored" | "run_ended">(
@@ -115,6 +118,10 @@ export function createPoster(
         throw new Error(
           `run.waiting for request ${event.payload.request.requestId} not recorded ${failure}`,
         );
+      if (event.type === "run.withdrawn")
+        throw new Error(
+          `run.withdrawn for request ${event.payload.requestId} not recorded ${failure}`,
+        );
       if (event.type === "run.started")
         throw new Error(
           `run.started was never recorded ${failure}: the start of the run was lost`,
@@ -139,8 +146,8 @@ export const warningReporter =
   };
 
 /**
- * A `run.waiting` or `run.started` the API refused because it already stopped or failed the run,
- * and recorded how.
+ * A `run.waiting`, `run.withdrawn` or `run.started` the API refused because it already stopped or
+ * failed the run, and recorded how.
  */
 export class RunEndedError extends Error {
   constructor() {

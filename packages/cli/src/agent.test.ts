@@ -671,6 +671,26 @@ test("a request whose run ended exits 1 with request_closed", async () => {
   );
 });
 
+test("a request the run withdrew exits 1 with request_withdrawn and the API's message", async () => {
+  const message =
+    "the run stopped waiting on this request before it was answered; nothing was applied";
+  for (const [argv, path] of [
+    [["approve", agentId, "req_a"], "approvals"],
+    [["deny", agentId, "req_a", "--reason=no"], "approvals"],
+    [["answer", agentId, "req_q", "main"], "answers"],
+  ] as const) {
+    server.use(
+      post(`/v1/agents/:id/${path}`, 409, {
+        error: { code: "request_withdrawn", message },
+      }),
+    );
+    const r = await runCli([...argv]);
+    expect(r.code, argv[0]).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe(`sky: ${message} (request_withdrawn)\n`);
+  }
+});
+
 test("decision argv mistakes are usage errors with no request", async () => {
   for (const argv of [
     ["approve", agentId],

@@ -341,6 +341,13 @@ async function decide(
         },
         409,
       );
+    case "withdrawn":
+      return apiError(
+        c,
+        409,
+        "request_withdrawn",
+        "the run stopped waiting on this request before it was answered; nothing was applied",
+      );
     case "closed":
       return apiError(
         c,

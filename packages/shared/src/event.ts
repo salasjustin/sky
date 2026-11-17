@@ -43,10 +43,35 @@ export const Decision = z.discriminatedUnion("decision", [
 ]);
 export type Decision = z.infer<typeof Decision>;
 
+/** Why a request was withdrawn: the runner's `hook_cancelled`, `session_ending`, `run_stopping` and `run_ending`, and the API's `run_finished`. */
+export const WithdrawalReason = z.enum([
+  "hook_cancelled",
+  "session_ending",
+  "run_stopping",
+  "run_ending",
+  "run_finished",
+]);
+export type WithdrawalReason = z.infer<typeof WithdrawalReason>;
+
+/**
+ * Stored in place of a decision when a request closed before anyone answered it, because the
+ * runner stopped waiting or the run finished; a later answer is refused.
+ */
+export const Withdrawal = z.object({
+  requestId: RequestId,
+  decision: z.literal("withdrawn"),
+  reason: WithdrawalReason,
+});
+export type Withdrawal = z.infer<typeof Withdrawal>;
+
+/** What a request row records as its outcome: a person's decision, or a withdrawal. */
+export type StoredDecision = Decision | Withdrawal;
+
 export const EventType = z.enum([
   "run.started",
   "run.waiting",
   "run.resumed",
+  "run.withdrawn",
   "run.finished",
   "run.failed",
   "run.stopped",
@@ -101,6 +126,11 @@ const runPayloads = {
   /** `sessionId` is the Claude session the API stores to resume the agent's next run. */
   "run.started": z.object({ sessionId: z.string().min(1) }),
   "run.waiting": z.object({ request: PendingRequest }),
+  /** `requestId` closed before anyone answered it (`reason`: why); the run goes back to `running`, or finishes on `run_finished`. */
+  "run.withdrawn": z.object({
+    requestId: RequestId,
+    reason: WithdrawalReason,
+  }),
   "run.finished": z.object({
     summary: z.string(),
     usage: Usage,
@@ -268,6 +298,7 @@ const posted = <T extends keyof typeof postPayloads>(type: T) =>
 export const RunnerEventPost = z.discriminatedUnion("type", [
   posted("run.started"),
   posted("run.waiting"),
+  posted("run.withdrawn"),
   posted("run.finished"),
   posted("run.failed"),
   posted("run.stopped"),
@@ -305,6 +336,7 @@ export const Event = z.discriminatedUnion("type", [
   stored("run.started"),
   stored("run.waiting"),
   stored("run.resumed"),
+  stored("run.withdrawn"),
   stored("run.finished"),
   stored("run.failed"),
   stored("run.stopped"),

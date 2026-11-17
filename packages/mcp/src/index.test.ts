@@ -446,6 +446,28 @@ test.each(decisions)(
 );
 
 test.each(decisions)(
+  "$tool on a withdrawn request is an error naming request_withdrawn",
+  async ({ tool, path, args }) => {
+    const envelope = {
+      error: {
+        code: "request_withdrawn",
+        message: "the run stopped waiting on this request",
+      },
+    };
+    route("post", `/v1/agents/agt_1${path}`, 409, envelope);
+    const client = await connect();
+
+    const result = await client.callTool({
+      name: tool,
+      arguments: { agentId: "agt_1", requestId: "req_1", ...args },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toEqual({ status: 409, ...envelope });
+  },
+);
+
+test.each(decisions)(
   "$tool on a closed request is an error",
   async ({ tool, path, args }) => {
     const envelope = {

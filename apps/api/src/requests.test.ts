@@ -583,3 +583,259 @@ test.each([
     expect(await pendingOf()).toBeNull();
   },
 );
+
+const withdraw = (requestId: string, reason = "hook_cancelled") =>
+  postEvent({ runId, type: "run.withdrawn", payload: { requestId, reason } });
+
+const eventTypes = () =>
+  (
+    db.$client.prepare("select type from events order by id").all() as {
+      type: string;
+    }[]
+  ).map((r) => r.type);
+
+const requestRow = (requestId: string) =>
+  db.$client
+    .prepare("select decision, decided_at from run_requests where id = ?")
+    .get(requestId) as { decision: string | null; decided_at: string | null };
+
+test("a run.withdrawn closes the open request as withdrawn, returns the run to running and reaches a subscriber", async () => {
+  await subscribe(["run.withdrawn"]);
+  const received = subscriber();
+  const { requestId } = await waitingOn(question());
+  const res = await withdraw(requestId);
+  expect(res.status).toBe(201);
+  expect(statuses()).toEqual({ run: "running", agent: "running" });
+  const row = requestRow(requestId);
+  expect(JSON.parse(row.decision ?? "null")).toEqual({
+    requestId,
+    decision: "withdrawn",
+    reason: "hook_cancelled",
+  });
+  expect(row.decided_at).not.toBeNull();
+  expect(eventTypes()).toEqual(["run.waiting", "run.withdrawn"]);
+  await dispatcher.drain();
+  expect(received).toHaveLength(1);
+  expect(received[0]).toMatchObject({
+    runId,
+    type: "run.withdrawn",
+    payload: { requestId, reason: "hook_cancelled" },
+  });
+});
+
+test.each([
+  ["an answer", question, { answer: "main" }, "answers"],
+  ["an approval", approval, { decision: "approve" }, "approvals"],
+] as const)(
+  "%s to a withdrawn request gets 409 request_withdrawn and applies nothing",
+  async (_, request, extra, verb) => {
+    const { requestId } = await waitingOn(request());
+    expect((await withdraw(requestId)).status).toBe(201);
+    const res = await decide(verb, { requestId, ...extra });
+    expect(res.status).toBe(409);
+    const { error } = (await res.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(error.code).toBe("request_withdrawn");
+    expect(error.message).toMatch(/stopped waiting on this request/);
+    expect(statuses()).toEqual({ run: "running", agent: "running" });
+    expect(resumed()).toEqual([]);
+  },
+);
+
+test("a request to a withdrawn question of the other kind still gets request_withdrawn, not wrong_kind", async () => {
+  const { requestId } = await waitingOn(question());
+  await withdraw(requestId);
+  const res = await decide("approvals", { requestId, decision: "approve" });
+  expect([res.status, await errorCode(res)]).toEqual([
+    409,
+    "request_withdrawn",
+  ]);
+});
+
+test("after a withdrawal the run's next run.waiting opens normally instead of request_open", async () => {
+  const first = await waitingOn(question());
+  await withdraw(first.requestId);
+  const next = question();
+  const res = await postEvent({
+    runId,
+    type: "run.waiting",
+    payload: { request: next },
+  });
+  expect(res.status).toBe(201);
+  expect(statuses()).toEqual({ run: "waiting", agent: "waiting" });
+  const answered = await decide("answers", {
+    requestId: next.requestId,
+    answer: "main",
+  });
+  expect(answered.status).toBe(200);
+});
+
+test("a run.withdrawn for a request already decided changes nothing, and the decision stands", async () => {
+  const { requestId } = await waitingOn(question());
+  await decide("answers", { requestId, answer: "main" });
+  const res = await withdraw(requestId);
+  expect(res.status).toBe(200);
+  expect(eventTypes()).toEqual(["run.waiting", "run.resumed"]);
+  expect(JSON.parse(requestRow(requestId).decision ?? "null")).toMatchObject({
+    decision: "answer",
+  });
+  expect(statuses()).toEqual({ run: "running", agent: "running" });
+});
+
+test("a run.withdrawn for a request the run never opened changes nothing", async () => {
+  await waitingOn(question());
+  const res = await withdraw(mintId("req"));
+  expect(res.status).toBe(200);
+  expect(eventTypes()).toEqual(["run.waiting"]);
+  expect(statuses()).toEqual({ run: "waiting", agent: "waiting" });
+});
+
+test("a run.withdrawn naming another run's open request changes nothing for either run", async () => {
+  const { requestId } = await waitingOn(question());
+  const otherRunId = "run_other" as RunId;
+  db.insert(agents)
+    .values({
+      id: "agt_other" as AgentId,
+      envId: "env_test" as EnvironmentId,
+      branch: "claude/agt_other",
+      status: "running",
+    })
+    .run();
+  db.insert(runs)
+    .values({
+      id: otherRunId,
+      agentId: "agt_other" as AgentId,
+      status: "running",
+    })
+    .run();
+  const res = await app.request("/internal/events", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${mintAgentToken(config.apiKey, otherRunId)}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      runId: otherRunId,
+      type: "run.withdrawn",
+      payload: { requestId, reason: "hook_cancelled" },
+    }),
+  });
+  expect(res.status).toBe(200);
+  expect(statuses()).toEqual({ run: "waiting", agent: "waiting" });
+  expect(requestRow(requestId).decision).toBeNull();
+  expect(
+    db.$client.prepare("select status from agents where id = ?").get(agentId),
+  ).toEqual({ status: "waiting" });
+  expect(
+    db.$client.prepare("select status from runs where id = ?").get(otherRunId),
+  ).toEqual({ status: "running" });
+  expect(eventTypes()).toEqual(["run.waiting"]);
+  // the request is still the open one: its own run can withdraw it
+  expect((await withdraw(requestId)).status).toBe(201);
+});
+
+test("the same run.withdrawn posted twice is stored once and answered 200 the second time", async () => {
+  const { requestId } = await waitingOn(question());
+  const first = await withdraw(requestId);
+  expect(first.status).toBe(201);
+  const second = await withdraw(requestId);
+  expect(second.status).toBe(200);
+  expect(eventTypes()).toEqual(["run.waiting", "run.withdrawn"]);
+  expect(JSON.parse(requestRow(requestId).decision ?? "null")).toMatchObject({
+    decision: "withdrawn",
+  });
+});
+
+const finishedEvent = {
+  type: "run.finished",
+  payload: {
+    summary: "done",
+    usage: {
+      inputTokens: 1,
+      outputTokens: 1,
+      costUsd: 0,
+      turns: 1,
+      durationMs: 1,
+    },
+  },
+};
+
+test("a run.finished on a waiting run withdraws the open request and finishes in one commit", async () => {
+  await subscribe(["run.withdrawn"]);
+  const received = subscriber();
+  const { requestId } = await waitingOn(question());
+  const res = await postEvent({ runId, ...finishedEvent });
+  expect(res.status).toBe(201);
+  expect(statuses()).toEqual({ run: "finished", agent: "idle" });
+  expect(eventTypes()).toEqual([
+    "run.waiting",
+    "run.withdrawn",
+    "run.finished",
+  ]);
+  expect(JSON.parse(requestRow(requestId).decision ?? "null")).toEqual({
+    requestId,
+    decision: "withdrawn",
+    reason: "run_finished",
+  });
+  await dispatcher.drain();
+  expect(received).toHaveLength(1);
+  expect(received[0]).toMatchObject({
+    type: "run.withdrawn",
+    payload: { requestId, reason: "run_finished" },
+  });
+  const late = await decide("answers", { requestId, answer: "a" });
+  expect([late.status, await errorCode(late)]).toEqual([
+    409,
+    "request_withdrawn",
+  ]);
+});
+
+test("a run.failed on a waiting run still fails it, as before", async () => {
+  await waitingOn(question());
+  const res = await postEvent({
+    runId,
+    type: "run.failed",
+    payload: { error: "boom" },
+  });
+  expect(res.status).toBe(201);
+  expect(statuses()).toEqual({ run: "failed", agent: "idle" });
+});
+
+test("the long-poll on a withdrawn request answers pending, never a decision", async () => {
+  const { requestId } = await waitingOn(question());
+  await withdraw(requestId);
+  const res = await app.request(
+    `/internal/runs/${runId}/requests/${requestId}`,
+    {
+      headers: { Authorization: `Bearer ${token}` },
+    },
+  );
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ status: "pending" });
+});
+
+test.each([
+  "hook_cancelled",
+  "session_ending",
+  "run_stopping",
+  "run_ending",
+  "run_finished",
+])("a run.withdrawn with reason %s is stored with it", async (reason) => {
+  const { requestId } = await waitingOn(question());
+  expect((await withdraw(requestId, reason)).status).toBe(201);
+  expect(JSON.parse(requestRow(requestId).decision ?? "null")).toEqual({
+    requestId,
+    decision: "withdrawn",
+    reason,
+  });
+});
+
+test("a run.withdrawn with a reason outside the list gets 400 and changes nothing", async () => {
+  const { requestId } = await waitingOn(question());
+  const res = await withdraw(requestId, "because");
+  expect(res.status).toBe(400);
+  expect(statuses()).toEqual({ run: "waiting", agent: "waiting" });
+  expect(requestRow(requestId).decision).toBeNull();
+  expect(eventTypes()).toEqual(["run.waiting"]);
+});

@@ -10,6 +10,7 @@ import {
   RunnerEventPost,
   RunRollup,
   type RunStatus,
+  type StoredDecision,
 } from "@sky/shared";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
@@ -21,7 +22,12 @@ import {
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { cut, redactDeep } from "./redact.js";
-import { openRequest, openRequestOf, requestDecisions } from "./requests.js";
+import {
+  openRequest,
+  openRequestOf,
+  requestDecisions,
+  withdrawRequest,
+} from "./requests.js";
 import {
   activeRunStatuses,
   agentStatusFor,
@@ -38,6 +44,8 @@ const statusAfter: Record<EventType, RunStatus | null> = {
   "run.started": "running",
   "run.waiting": "waiting",
   "run.resumed": null,
+  // withdrawRequest moves the run back to running
+  "run.withdrawn": null,
   "run.finished": "finished",
   "run.failed": "failed",
   "run.stopped": "stopped",
@@ -105,6 +113,10 @@ const requestParam = zValidator(
       return apiError(c, 404, "not_found", "no such request");
   },
 );
+
+/** `decision` unless it is empty or the runner's withdrawal. */
+const answered = (decision: StoredDecision | null | undefined) =>
+  decision && decision.decision !== "withdrawn" ? decision : undefined;
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
@@ -202,15 +214,50 @@ export function internalRoutes(
           if (event.type === "run.waiting" && openRequestOf(tx, run.id)) {
             return { kind: "request_open" } as const;
           }
-          const next = statusAfter[event.type];
-          if (next && !canTransition(run.status, next)) {
-            return { kind: "illegal", from: run.status, to: next } as const;
-          }
           // Claude's output can echo its own environment, or any other live runner's on its sprite
           const redacted = redactDeep(event, [
             ...secrets.values(),
             ...liveAgentTokens(tx, config.apiKey),
           ]);
+          let enqueued = 0;
+          if (redacted.type === "run.withdrawn") {
+            const withdrawn = withdrawRequest(
+              tx,
+              run,
+              redacted.payload.requestId,
+              redacted.payload.reason,
+            );
+            // a decision that landed first stands, and so does a request that was never stored
+            if (withdrawn.kind === "noop") return { kind: "noop" } as const;
+            return {
+              kind: "stored",
+              id: withdrawn.id,
+              enqueued: withdrawn.enqueued,
+              failure: undefined,
+            } as const;
+          }
+          // a run ending while it waits withdraws its open request in the same commit, so the ending
+          // lands whatever the runner knew of the request; every other ending needs no such help
+          let status = run.status;
+          if (event.type === "run.finished" && status === "waiting") {
+            const open = openRequestOf(tx, run.id);
+            if (open) {
+              const withdrawn = withdrawRequest(
+                tx,
+                run,
+                open.request.requestId,
+                "run_finished",
+              );
+              if (withdrawn.kind === "withdrawn") {
+                status = "running";
+                enqueued += withdrawn.enqueued;
+              }
+            }
+          }
+          const next = statusAfter[event.type];
+          if (next && !canTransition(status, next)) {
+            return { kind: "illegal", from: status, to: next } as const;
+          }
           // trimmed only after redaction, so a cut can't split a secret out of its match
           if (redacted.type === "run.waiting") {
             redacted.payload.request = trimRequest(redacted.payload.request);
@@ -231,7 +278,7 @@ export function internalRoutes(
               EVENT_TEXT_MAX,
             );
           }
-          const { id, enqueued } = recordEvent(
+          const { id, enqueued: recorded } = recordEvent(
             tx,
             run.id,
             event.type,
@@ -268,7 +315,7 @@ export function internalRoutes(
           return {
             kind: "stored",
             id,
-            enqueued,
+            enqueued: enqueued + recorded,
             failure:
               redacted.type === "run.failed"
                 ? { runId: run.id, error: redacted.payload.error }
@@ -308,6 +355,8 @@ export function internalRoutes(
           );
         case "repeat":
           return c.json({ id: outcome.id }, 201);
+        case "noop":
+          return c.json({}, 200);
       }
       // after the commit, so the dispatcher sees the rows; never awaited, so delivery can't slow the runner
       if (outcome.enqueued > 0) c.var.nudgeDeliveries();
@@ -356,8 +405,9 @@ export function internalRoutes(
       try {
         const first = decisionOf();
         if (!first) return apiError(c, 404, "not_found", "no such request");
-        if (!first.decision) await woken;
-        const decision = first.decision ?? decisionOf()?.decision;
+        // a withdrawn request is no one's to answer: the runner that withdrew it has stopped asking
+        if (!answered(first.decision)) await woken;
+        const decision = answered(first.decision ?? decisionOf()?.decision);
         return decision
           ? c.json({ status: "decided" as const, decision }, 200)
           : c.json({ status: "pending" as const }, 200);

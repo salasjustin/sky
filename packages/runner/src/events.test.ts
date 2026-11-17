@@ -627,3 +627,62 @@ test("a runner.warning reaches the API as an ordinary event post", async () => {
     payload: { message: "runner: sprite not held" },
   });
 });
+
+const withdrawn = {
+  runId: "run_1",
+  type: "run.withdrawn",
+  payload: { requestId: "req_1", reason: "hook_cancelled" },
+} as const;
+
+test("a run.withdrawn outlasts a minute-long API outage, as a run.waiting does", async () => {
+  const clock = virtualClock();
+  const landedAt: number[] = [];
+  server.use(
+    http.post(url, () => {
+      if (clock.time < 60_000) return HttpResponse.error();
+      landedAt.push(clock.time);
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const warnings: string[] = [];
+  const post = createPoster({
+    ...options,
+    ...timing(clock),
+    warn: (m) => warnings.push(m),
+  });
+  await post(withdrawn);
+  expect(warnings).toEqual([]);
+  expect(landedAt).toHaveLength(1);
+});
+
+test("a run.withdrawn that never lands rejects naming the request, instead of being dropped", async () => {
+  const clock = virtualClock();
+  server.use(http.post(url, () => new HttpResponse(null, { status: 503 })));
+  const warnings: string[] = [];
+  const post = createPoster({
+    ...options,
+    ...timing(clock),
+    warn: (m) => warnings.push(m),
+  });
+  await expect(post(withdrawn)).rejects.toThrow(
+    /run\.withdrawn for request req_1 not recorded.*HTTP 503/,
+  );
+  expect(clock.time).toBeGreaterThanOrEqual(90_000);
+  expect(warnings).toEqual([]);
+});
+
+test("a run.withdrawn for a run the API already ended rejects with RunEndedError at once", async () => {
+  let calls = 0;
+  server.use(
+    http.post(url, () => {
+      calls++;
+      return HttpResponse.json(
+        { error: { code: "run_ended", message: "the run has ended" } },
+        { status: 401 },
+      );
+    }),
+  );
+  const post = createPoster({ ...options, warn: () => {} });
+  await expect(post(withdrawn)).rejects.toBeInstanceOf(RunEndedError);
+  expect(calls).toBe(1);
+});
