@@ -740,6 +740,18 @@ test("a runner's output is redacted before its tail is taken, so a secret the ta
   expect(logs.join("\n")).not.toContain(fragment);
 });
 
+test("a runner that exits at launch echoing another live run's token leaves it out of its stored error and every log line", async () => {
+  const other = await runningRun();
+  wire.sessionExit = { output: `fatal: ${other.token}\r\n`, code: 1 };
+  const { run } = await launched(readyEnv());
+  await vi.waitFor(() => expect(runFailure(run.id)).toBeDefined());
+
+  expect(runFailure(run.id)).toBe(
+    "launch_failed: runner exited 1 at launch: fatal: [redacted]",
+  );
+  expect(logs.join("\n")).not.toContain(other.token);
+});
+
 /** Makes the runner bundle's install fail on the stub sprite, with `stderr` as `mv`'s complaint. */
 const bundleInstallFails = (stderr: string) => {
   const exec = wire.exec;

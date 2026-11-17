@@ -748,7 +748,8 @@ export function createLauncher({
           },
           watchMs,
           op: "start-runner",
-          known,
+          // its failure quotes the runner's output, which can echo any live run's token
+          known: [...known, ...liveAgentTokens(db, config.apiKey)],
         },
       ).catch(async (err: unknown) => {
         // the runner never started, so nothing else deletes the file its secrets sit in or the task
