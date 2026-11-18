@@ -818,11 +818,13 @@ const JQ_UNSAFE = /\b(env|ENV|import|include|modulemeta)\b/;
 /**
  * A glob `rg` filters by: any exclusion, or an inclusion of one source or doc extension. rg's `*`
  * matches a leading dot and a matching glob beats its hidden and gitignore filters, so `*.env`
- * would read `.env`. Matched case-sensitively, so `--iglob '*.NPMRC'` can't reach `.npmrc`.
+ * would read `.env`, and `*.json` a gitignored `credentials.json` or a hidden `.claude.json`: so
+ * no config or data extension (`json`, `jsonc`, `yml`, `yaml`, `toml`, `txt`) is on the list.
+ * Matched case-sensitively, so `--iglob '*.NPMRC'` can't reach `.npmrc`.
  */
 const rgGlobOk = (glob: string) =>
   glob.startsWith("!") ||
-  /^(\*\*\/)?\*\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|json|jsonc|md|mdx|css|scss|html|svelte|vue|astro|yml|yaml|toml|sql|go|py|rs|zig|sh|txt|graphql|prisma)$/.test(
+  /^(\*\*\/)?\*\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|md|mdx|css|scss|html|svelte|vue|astro|sql|go|py|rs|zig|sh|graphql|prisma)$/.test(
     glob,
   );
 

@@ -50,6 +50,13 @@ describe("rg globs", () => {
   ])("%s still asks (%s)", (command, reason) => {
     expect(verdict(command)).toBe(reason);
   });
+
+  test("a config or data extension asks while a code extension or an exclusion runs", () => {
+    expect(verdict("rg -n x src -g '*.json'")).toBe("unsafe-option");
+    expect(verdict("rg -n x src -g '*.yaml'")).toBe("unsafe-option");
+    expect(verdict("rg -n x src -g '*.ts'")).toBe("approved");
+    expect(verdict("rg -n x src --glob '!node_modules'")).toBe("approved");
+  });
 });
 
 describe("a quoted ~", () => {
