@@ -95,7 +95,7 @@ test.each([
   ["grep --rec", /`--rec` is refused/],
   ["find . -delete", /`-delete` is refused/],
   ["git branch -d", /`-d` is refused/],
-  ["sed -i", /`-i` is refused/],
+  ["sed -n w", /`w` is refused/],
   ["node script.js", /`script.js` is refused/],
 ])(
   "rejects the never-matching command entry %j with a reason",

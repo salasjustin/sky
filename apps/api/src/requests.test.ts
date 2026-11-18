@@ -562,6 +562,64 @@ const pendingOf = async () => {
   return ((await res.json()) as { pendingRequest: unknown }).pendingRequest;
 };
 
+const eventPayloads = () =>
+  (
+    db.$client
+      .prepare("select payload from events where type = 'run.waiting'")
+      .all() as { payload: string }[]
+  ).map((r) => JSON.parse(r.payload));
+
+test("an approval's full tool input is kept on the request, not on its event or webhook", async () => {
+  await subscribe(["run.waiting"]);
+  const received = subscriber();
+  const toolInput = JSON.stringify({
+    command: `echo ${"x".repeat(3_000)}`,
+    description: "long",
+  });
+  const request = { ...approval(), toolSummary: "echo xxx", toolInput };
+  await waitingOn(request);
+  expect(await pendingOf()).toEqual(request);
+  const { toolInput: _kept, ...summary } = request;
+  expect(eventPayloads()).toEqual([{ request: summary }]);
+  await expect.poll(() => received.length).toBe(1);
+  expect(received[0]).toMatchObject({ payload: { request: summary } });
+  expect(JSON.stringify(received[0])).not.toContain("xxxxxxxxxx");
+});
+
+test("an approval's tool input is redacted, and cut at 64 KiB with the truncation marker", async () => {
+  const secret = `sk-${"a".repeat(30)}`;
+  const toolInput = JSON.stringify({
+    command: `curl -H "x: ${secret}" ${"y".repeat(70_000)}`,
+  });
+  // the runner bounds it to 64 KiB itself; the API cuts after redaction
+  const request = {
+    ...approval(),
+    toolInput: toolInput.slice(0, 65_536),
+  };
+  await waitingOn(request);
+  const pending = (await pendingOf()) as { toolInput: string };
+  expect(pending.toolInput).not.toContain(secret);
+  expect(pending.toolInput).toContain("[redacted]");
+  expect(pending.toolInput.length).toBeLessThanOrEqual(65_536 + 64);
+});
+
+test("a tool input past 64 KiB is refused", async () => {
+  runningRun();
+  const res = await postEvent({
+    runId,
+    type: "run.waiting",
+    payload: { request: { ...approval(), toolInput: "x".repeat(65_537) } },
+  });
+  expect(res.status).toBe(400);
+});
+
+test("an approval without a tool input has none on GET run", async () => {
+  const request = approval();
+  await waitingOn(request);
+  expect(await pendingOf()).toEqual(request);
+  expect(await pendingOf()).not.toHaveProperty("toolInput");
+});
+
 test.each([
   ["a question", question, { answer: "main" }, "answers"],
   ["an approval", approval, { decision: "approve" }, "approvals"],

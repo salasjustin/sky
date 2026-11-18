@@ -3125,6 +3125,7 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
         requestId: expect.stringMatching(/^req_[0-9A-Za-z]+$/),
         toolName: "Bash",
         toolSummary: "git push origin main",
+        toolInput: JSON.stringify(gitPush.tool_input),
       },
     },
   });
@@ -7585,6 +7586,13 @@ describe("the instructions on commands that run without a person", () => {
 
   test("are in the prompt when the policy holds Bash", async () => {
     expect(await withPolicy(["Bash"])).toContain(quietCommands(undefined));
+  });
+
+  test("tell the run what runs unasked, where edits go and how much of a command is shown", () => {
+    const line = quietCommands(undefined);
+    expect(line).toContain("One plain command per Bash call runs without");
+    expect(line).toContain("Edit or Write tools");
+    expect(line).toContain("over about 1,000 characters");
   });
 
   test("name the environment's store when its base profile has one", async () => {

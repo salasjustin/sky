@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, realpathSync, rmSync } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, posix } from "node:path";
@@ -19,6 +19,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AskUserQuestionInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools";
 import {
+  type AutoApproveScope,
   BACKGROUND_TASKS_MAX,
   type Decision,
   type PendingRequest,
@@ -26,6 +27,7 @@ import {
   RUNNER_TEXT_MAX,
   type RunnerEventPost,
   type RunRollup,
+  TOOL_INPUT_MAX,
   type Usage,
   type WithdrawalReason,
 } from "@sky/shared";
@@ -313,12 +315,13 @@ const publishInstructions = (refreshed?: Refreshed) =>
  * For an environment whose policy holds Bash: spellings of read-only commands that the default
  * auto-approve list lets run without a person, and the places the Read, Grep and Glob tools read
  * without one: the plugin cache, and the store when `storeHome` names it. Each parenthesized
- * example must get `"approved"` from `autoApproveVerdict`; `rg -g` and a `>` into a file ask, so
- * they aren't offered.
+ * example must get `"approved"` from `autoApproveVerdict`; a `>` into a file asks, so it isn't
+ * offered.
  */
 export const quietCommands = (storeHome: string | undefined): string => {
   const store = storeHome && posix.normalize(storeHome).replace(/\/+$/, "");
   return [
+    "One plain command per Bash call runs without waiting on a person; a call that chains many commands, substitutes or redirects output may wait. Make file edits with the Edit or Write tools, which never wait, rather than through the shell. A person reading a held Bash command sees only the start of one over about 1,000 characters, so write long text to a file with Write and pass the file's path instead. ",
     "To avoid waiting on a person, write read-only shell commands in the forms that run on their own: single-quoted patterns (`grep -n 'a\\|b' file`); `rg` instead of `grep -r` (`rg -n foo src`); file names, a directory or a type filter instead of shell globs (`rg -t ts foo src`); and paths inside the worktree, the plugin cache under `~/.claude/plugins/cache/` (`ls ~/.claude/plugins/cache`)",
     store
       ? ` and the store under \`~/${store}/\` (\`cat ~/${store}/plans/x.md\`). The Read, Grep and Glob tools read the plugin cache and the store without asking too.`
@@ -918,6 +921,23 @@ export async function runSession(
    * directory and the call is pointed at the copy. A path `refusedReads` holds is declined at once,
    * with no one asked; a hard link to one is found at the copy.
    */
+  /** Where a command runs, for the policy; the hook's cwd is the shell's, which an earlier `cd` may have moved off the worktree. */
+  const commandScope = (shellCwd: string): AutoApproveScope => ({
+    root: cwd,
+    cwd: shellCwd,
+    realpath: realpathSync.native,
+    isSymlink: (path) => {
+      try {
+        return lstatSync(path).isSymbolicLink();
+      } catch {
+        return false;
+      }
+    },
+    home: claudeHome,
+    storeHome: config.storeHome,
+    ...(scratch && { scratch }),
+  });
+
   const gateOutsideRead = async (
     input: PreToolUseHookInput,
     read: OutsideRead,
@@ -962,13 +982,7 @@ export async function runSession(
             policyOutcome(
               config.approvalPolicy,
               config.autoApprove,
-              {
-                root: cwd,
-                cwd: input.cwd,
-                realpath: realpathSync.native,
-                home: claudeHome,
-                storeHome: config.storeHome,
-              },
+              commandScope(input.cwd),
               input.tool_name,
               input.tool_input,
             ) === "hold")));
@@ -978,6 +992,10 @@ export async function runSession(
             kind: "approval",
             toolName: input.tool_name,
             toolSummary: bound(read.path),
+            toolInput: JSON.stringify(input.tool_input).slice(
+              0,
+              TOOL_INPUT_MAX,
+            ),
           },
           signal,
         )
@@ -1049,14 +1067,7 @@ export async function runSession(
     const outcome = policyOutcome(
       config.approvalPolicy,
       config.autoApprove,
-      // the hook's cwd is the shell's, which an earlier `cd` may have moved off the worktree
-      {
-        root: cwd,
-        cwd: input.cwd,
-        realpath: realpathSync.native,
-        home: claudeHome,
-        storeHome: config.storeHome,
-      },
+      commandScope(input.cwd),
       input.tool_name,
       input.tool_input,
     );
@@ -1065,6 +1076,7 @@ export async function runSession(
         `runner: auto-approved ${input.tool_name} call ${input.tool_use_id} without an approval request`,
       );
     if (outcome !== "hold") return { continue: true };
+    const inputJson = JSON.stringify(input.tool_input);
     const decision = await decide(
       {
         kind: "approval",
@@ -1073,6 +1085,10 @@ export async function runSession(
           toolHint(input.tool_input) ??
             (JSON.stringify(input.tool_input) || input.tool_name),
         ),
+        // the whole input, for the person who reads it where the summary is cut
+        ...(inputJson !== undefined && {
+          toolInput: inputJson.slice(0, TOOL_INPUT_MAX),
+        }),
       },
       signal,
     );
