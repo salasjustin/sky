@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "516d785a-958a-4d22-b23e-43baa0bb6136",
+  "id": "d5c1c107-2d40-4ec8-8b43-58321847c512",
   "prevId": "8df14833-a1f1-4bcf-bf09-2595b7e95944",
   "tables": {
     "agents": {
@@ -588,11 +588,39 @@
           "notNull": true,
           "autoincrement": false
         },
-        "cmd": {
-          "name": "cmd",
+        "build_cmd": {
+          "name": "build_cmd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "start_cmd": {
+          "name": "start_cmd",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "detail": {
+          "name": "detail",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "failure": {
+          "name": "failure",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "token_hash": {
@@ -651,6 +679,14 @@
         "previews_port": {
           "name": "previews_port",
           "value": "\"port\" between 1 and 65535"
+        },
+        "previews_state": {
+          "name": "previews_state",
+          "value": "\"state\" in ('building', 'starting', 'ready', 'failed')"
+        },
+        "previews_failure": {
+          "name": "previews_failure",
+          "value": "(\"state\" = 'failed') = (\"failure\" is not null)"
         },
         "previews_expires_at": {
           "name": "previews_expires_at",

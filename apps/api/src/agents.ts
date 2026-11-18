@@ -708,7 +708,7 @@ export function agentRoutes(
         c.var.nudgeDeliveries();
         await signalRunner(sprites, spriteName, run.id, log);
       }
-      // the dev server runs in the worktree, so it ends first, and so does the public URL it holds open
+      // the app runs in the worktree, so it ends first, and so does the public URL it holds open
       try {
         await previews.stopForAgent(id, agent.envId);
       } catch (err) {
@@ -786,12 +786,18 @@ export function agentRoutes(
               "preview_busy",
               "a preview started by another key is running in this environment, and one environment has one preview; it must stop or expire before this agent's can start",
             );
-          case "command_failed":
-            return apiError(c, 422, "preview_failed", result.detail);
+          case "commands_needed":
+            return apiError(
+              c,
+              400,
+              "preview_commands_needed",
+              `the agent's worktree has no lockfile (pnpm-lock.yaml, yarn.lock, bun.lock or package-lock.json) to choose commands from; send ${result.missing.map((m) => `\`${m}\``).join(" and ")} (build may be "none" to skip the build; the CLI's flags are --build and --start)`,
+            );
           case "failed":
             return apiError(c, 502, "preview_failed", result.detail);
         }
-        return c.json({ preview: result.preview }, 200);
+        // answered once the link works; the build and the app's start go on, `state` following them
+        return c.json({ preview: result.preview }, 202);
       },
     )
     .delete("/:id/preview", agentParam, async (c) => {
@@ -816,10 +822,26 @@ export function agentRoutes(
     })
     .get("/:id/preview", agentParam, async (c) => {
       const { id } = c.req.valid("param");
-      const state = await previews.state(id, c.var.principal);
-      if (state === undefined)
+      const found = await previews.state(id, c.var.principal);
+      if (found === undefined)
         return apiError(c, 404, "not_found", "no such agent");
-      return c.json({ preview: state }, 200);
+      if (found === null) return c.json({ preview: null }, 200);
+      const { preview, failure } = found;
+      // a failed preview answers as its start would have: 422 when the user's own build or start command
+      // failed, 502 when the sprite did, with the state beside the error
+      if (preview.state === "failed") {
+        return c.json(
+          {
+            error: {
+              code: "preview_failed",
+              message: preview.detail ?? "the preview failed",
+            },
+            preview,
+          },
+          failure === "command" ? 422 : 502,
+        );
+      }
+      return c.json({ preview }, 200);
     })
     .post("/:id/answers", agentParam, jsonBody, body(AnswerInput), (c) => {
       const { id } = c.req.valid("param");

@@ -12,6 +12,7 @@ import {
   EnvironmentId,
   EventCursor,
   EventType,
+  PREVIEW_BUILD_NONE,
   PREVIEW_DEFAULT_TTL_SECONDS,
   PREVIEW_MAX_TTL_SECONDS,
   PREVIEW_MIN_TTL_SECONDS,
@@ -211,35 +212,36 @@ const ListAgentsInput = z.strictObject({
 const PreviewInput = z
   .strictObject({
     agentId: AgentId,
-    cmd: PreviewStart.shape.cmd
-      .optional()
-      .describe(
-        "The shell command that starts the app's dev server, run from the agent's worktree, for example `pnpm dev --host`. It must listen on port (it is also given $PORT) and on all interfaces; `--host` for Vite. Needs port.",
-      ),
+    build: PreviewStart.shape.build.describe(
+      `The shell command that builds the app for production, run once in the agent's worktree with NODE_ENV=production and the environment's secrets, for at most 15 minutes. "${PREVIEW_BUILD_NONE}" skips the build. Defaults from the worktree's lockfile (pnpm build, yarn build, bun run build or npm run build). Goes with port.`,
+    ),
+    start: PreviewStart.shape.start.describe(
+      "The shell command that starts the app's production server from the worktree. It must listen on port (it is also given $PORT) on all interfaces. Defaults from the worktree's lockfile (pnpm start, yarn start, bun run start or npm start). Goes with port.",
+    ),
     port: PreviewStart.shape.port
       .optional()
       .describe(
-        `The port the dev server listens on: 1024 to 65535, and not ${PREVIEW_PROXY_PORT}, which the preview's own proxy holds. Needs cmd.`,
+        `The port the app listens on: 1024 to 65535, and not ${PREVIEW_PROXY_PORT}, which the preview's own proxy holds. Starts the preview.`,
       ),
     // unwrap() drops the default: the API applies it to an omitted TTL
     ttlSeconds: PreviewStart.shape.ttlSeconds
       .unwrap()
       .optional()
       .describe(
-        `How long the link works, ${PREVIEW_MIN_TTL_SECONDS} to ${PREVIEW_MAX_TTL_SECONDS} seconds; ${PREVIEW_DEFAULT_TTL_SECONDS} (24 hours) when omitted. Goes with cmd and port.`,
+        `How long the link works, ${PREVIEW_MIN_TTL_SECONDS} to ${PREVIEW_MAX_TTL_SECONDS} seconds; ${PREVIEW_DEFAULT_TTL_SECONDS} (24 hours) when omitted. Goes with port.`,
       ),
     stop: z.boolean().optional().describe("true: end the agent's preview."),
   })
-  .refine((i) => (i.cmd === undefined) === (i.port === undefined), {
-    message: "cmd and port go together",
-    path: ["cmd"],
-  })
-  .refine((i) => i.ttlSeconds === undefined || i.cmd !== undefined, {
-    message: "ttlSeconds goes with cmd and port",
-    path: ["ttlSeconds"],
-  })
-  .refine((i) => !i.stop || i.cmd === undefined, {
-    message: "stop takes no cmd, port or ttlSeconds",
+  .refine(
+    (i) =>
+      i.port !== undefined ||
+      (i.build === undefined &&
+        i.start === undefined &&
+        i.ttlSeconds === undefined),
+    { message: "build, start and ttlSeconds go with port", path: ["port"] },
+  )
+  .refine((i) => !i.stop || i.port === undefined, {
+    message: "stop takes no port, build, start or ttlSeconds",
     path: ["stop"],
   });
 
@@ -439,7 +441,7 @@ function buildServer(call: Call) {
     "preview",
     {
       description:
-        "Preview an agent's branch in a browser. With cmd and port: starts the app's dev server from the agent's worktree on its environment's sprite (with the environment's secrets) and returns { preview: { link, expiresAt, replaced, … } }. Give the link to a person; opening it in any browser, with no login, shows the app at its root path with hot reload, and the link is shown only in this answer. An environment has one preview: starting one replaces the environment's running preview, and replaced names the agent whose it was (null when none). The preview outlives the agent's runs, so a followup's edits reach it; it ends at the TTL, with stop: true, when the agent is archived or the environment is deleted. A command that exits within seconds of starting fails the start with 422 preview_failed and its redacted output (fix the command and start again); 502 preview_failed means the sprite failed, so retry. With a runs key, a start while another key's preview runs in the environment is refused with 409 preview_busy, naming no agent. With stop: true: ends it, or answers preview: null when none runs. With neither: returns the agent's preview state (port, expiresAt, and the status of its app and proxy services; preview is null when none runs), never the link. The preview uses the sprite's memory like anything else running there. A runs key can preview only the agents it started.",
+        "Preview an agent's branch in a browser, as a production build. With port: builds the app once in the agent's worktree on its environment's sprite (build, defaulting from the lockfile), then serves it with start, using the environment's secrets. It answers at once, 202, with { preview: { link, state, expiresAt, replaced, … } }: give the link to a person; opening it in any browser, with no login, shows a page that says it is building until the app is up, then the app at its root path. The link is shown only in this answer. state is building, starting, ready or failed: call preview again with only agentId until it is ready (a build can take minutes), or failed. A failed one answers 422 preview_failed when the build or start command failed, with the redacted tail of its output (fix the command and start again), or 502 preview_failed when the sprite failed (retry), with the preview's state beside the error. With no lockfile and no build or start, the start is refused with 400 preview_commands_needed. A production server doesn't pick up worktree edits: after a followup's commit, call preview again with port to rebuild, which replaces this agent's running preview. An environment has one preview: starting one replaces the environment's running preview, and replaced names the agent whose it was (null when none). With a runs key, a start while another key's preview runs in the environment is refused with 409 preview_busy, naming no agent. The preview outlives the agent's runs; it ends at the TTL, with stop: true, when the agent is archived or the environment is deleted. A build is a heavy job on the sprite's memory, so start a preview while no other heavy job runs on the environment. With stop: true: ends it, or answers preview: null when none runs. With only agentId: returns the agent's preview (port, build, start, state, expiresAt, and the status of its app and proxy services; preview is null when none runs), never the link. A runs key can preview only the agents it started.",
       inputSchema: PreviewInput,
       annotations: {
         destructiveHint: true,
@@ -447,13 +449,14 @@ function buildServer(call: Call) {
         readOnlyHint: false,
       },
     },
-    ({ agentId, cmd, port, ttlSeconds, stop }) => {
+    ({ agentId, build, start, port, ttlSeconds, stop }) => {
       const path = `/v1/agents/${agentId}/preview`;
       if (stop) return api("DELETE", path);
-      if (cmd === undefined) return api("GET", path);
+      if (port === undefined) return api("GET", path);
       return api("POST", path, {
-        cmd,
         port,
+        ...(build !== undefined && { build }),
+        ...(start !== undefined && { start }),
         ...(ttlSeconds !== undefined && { ttlSeconds }),
       });
     },

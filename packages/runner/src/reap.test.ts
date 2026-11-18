@@ -151,7 +151,7 @@ test_(
     const runId = uniqueRun("preview");
     // the dev server this run's own commands started: ended with the run
     const leftover = await orphan({ RUN_ID: runId });
-    // what the sprite's service manager runs for a preview: the dev server with the env's secrets and its
+    // what the sprite's service manager runs for a preview: the app server with the env's secrets and its
     // port, and the token proxy with its hash; neither carries the run's id, and neither is the runner's child
     const devServer = await orphan({ PORT: "5173", DATABASE_URL: "x" });
     const proxy = await orphan({

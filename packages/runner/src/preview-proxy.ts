@@ -20,7 +20,7 @@ import { z } from "zod";
 export type PreviewProxyOptions = {
   /** Lowercase-hex sha-256 of the preview's token: all the proxy ever holds of it. */
   tokenHash: string;
-  /** The dev server's port on this sprite. */
+  /** The app's port on this sprite. */
   upstreamPort: number;
   /** When the token stops working, whatever the API has or hasn't done by then. */
   expiresAt: Date;
@@ -29,6 +29,10 @@ export type PreviewProxyOptions = {
 };
 
 const NOT_FOUND = "<!doctype html><title>Not found</title><h1>Not found</h1>\n";
+
+const REFRESH_SECONDS = 3;
+// what a browser with the cookie sees while the app isn't listening yet: a page that reloads itself
+const BUILDING = `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="${REFRESH_SECONDS}"><title>Building preview…</title><h1>Building preview…</h1><p>This page refreshes by itself.</p>\n`;
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest();
 
@@ -62,10 +66,10 @@ function cookieOf(headers: IncomingHttpHeaders): string | undefined {
 }
 
 /**
- * The sprite's HTTP port, with the dev server behind it. It answers a browser only once that browser
+ * The sprite's HTTP port, with the app behind it. It answers a browser only once that browser
  * holds the preview's token as a cookie, which the link's one path hands out; everything else gets a
- * plain 404 that names nothing. The dev server sees the request as if it came from localhost: the
- * `Host` is rewritten, since dev servers refuse a host they weren't told of, and the preview cookie is
+ * plain 404 that names nothing. The app sees the request as if it came from localhost: the
+ * `Host` is rewritten, since app servers refuse a host they weren't told of, and the preview cookie is
  * stripped.
  */
 export function createPreviewProxy({
@@ -150,8 +154,20 @@ export function createPreviewProxy({
         pipeline(answer, res, () => {});
       },
     );
-    upstream.on("error", () => {
+    upstream.on("error", (error: NodeJS.ErrnoException) => {
       if (res.headersSent) return res.destroy();
+      // nothing listens yet: the preview is still being built or started, which only a browser holding
+      // the cookie gets to hear
+      if (error.code === "ECONNREFUSED") {
+        res.writeHead(503, {
+          "content-type": "text/html; charset=utf-8",
+          "content-length": Buffer.byteLength(BUILDING),
+          "retry-after": String(REFRESH_SECONDS),
+          "cache-control": "no-store",
+        });
+        res.end(BUILDING);
+        return;
+      }
       res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
       res.end("Bad gateway\n");
     });
@@ -159,7 +175,7 @@ export function createPreviewProxy({
     req.pipe(upstream);
   });
 
-  // a websocket upgrade (the dev server's hot reload): the same check, then the bytes go through untouched
+  // a websocket upgrade (the app's hot reload): the same check, then the bytes go through untouched
   server.on("upgrade", (req: IncomingMessage, client: Socket, head: Buffer) => {
     client.on("error", () => client.destroy());
     if (originForm(req.url) === null || !valid(cookieOf(req.headers))) {

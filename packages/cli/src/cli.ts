@@ -133,27 +133,38 @@ const help = (io: Io) => `Usage:
       at most 200 (50 without it); when more agents match, a note on stderr
       gives the --cursor for the next page, to pass with the same filters.
       A runs key sees only the agents it started; the admin key sees all.
-  sky agent preview <agent> --cmd=<command> --port=<n> [--ttl=<duration>]
-      [options]
+  sky agent preview <agent> --port=<n> [--build=<command|none>]
+      [--start=<command>] [--ttl=<duration>] [--no-wait] [options]
   sky agent preview <agent> --stop [options]
   sky agent preview <agent> [options]
-      Start the app's dev server from the agent's worktree on its
-      environment's sandbox (--cmd, listening on --port; it gets $PORT and
-      the environment's secrets) and print a link. Anyone who opens
-      the link in a browser sees the app at its root path, hot reload
-      included; no Sky or Fly login is needed. The link works until --ttl
-      (a duration such as 90m, 24h or 7d; 24h by default, 7d at most) or
-      --stop, which ends the preview (exit 0 when none is running). A
-      command that exits as it starts fails the start with its output
-      (exit 1). An environment has one preview: one started on another
-      agent replaces the running one, which a note on stderr names; a runs
-      key can't replace a preview another key started (preview_busy). The preview outlives the agent's runs. It ends when the
-      agent is archived or the environment is deleted. It uses the
-      sandbox's memory like anything else running there. Without flags, it
-      prints "<port> <expires> <app> <proxy>": the port, the expiry (UTC)
-      and how the dev server and the link's proxy are doing, or a note on
-      stderr when none is running. The link is shown only when the preview
-      starts.
+      Preview the agent's branch as a production build: build the app once
+      in the agent's worktree on its environment's sandbox, then serve it
+      (--start, listening on --port; both get $PORT, NODE_ENV=production
+      and the environment's secrets). --build and --start default from the
+      worktree's lockfile (pnpm build and pnpm start, yarn build and yarn
+      start, bun run build and bun run start, or npm run build and npm
+      start); with no lockfile, pass both. --build=none skips the build.
+      The build is stopped after 15 minutes. It prints the link at once
+      (anyone who opens it in a browser, with no Sky or Fly login, sees a
+      page saying it is building, then the app at its root path), then
+      waits, printing building, starting and ready on stderr as it changes
+      (exit 0 once ready). A build or start that fails prints the tail of
+      its output (exit 1); --no-wait returns at once, exit 0. The link
+      works until --ttl (a duration such as 90m, 24h or 7d; 24h by
+      default, 7d at most) or --stop, which ends the preview (exit 0 when
+      none is running). The server doesn't pick up worktree edits: a new
+      commit needs a new preview, so run the command again, which rebuilds
+      and replaces the running one. An environment has one preview: one
+      started on another agent replaces the running one, which a note on
+      stderr names; a runs key can't replace a preview another key started
+      (preview_busy). The preview outlives the agent's runs. It ends when
+      the agent is archived or the environment is deleted. A build is a
+      heavy job on the sandbox's memory: start a preview while no other
+      heavy job runs on the environment. Without flags, it prints
+      "<state> <port> <expires> <app> <proxy>": the state (building,
+      starting, ready), the port, the expiry (UTC) and how the app and the
+      link's proxy are doing, or a note on stderr when none is running.
+      The link is shown only when the preview starts.
   sky agent archive <agent> [options]
       Stop any active run and delete the agent's worktree; uncommitted work
       in it is lost.
@@ -409,7 +420,9 @@ async function runCommand(
     archived: values.archived === true,
     limit: text(values.limit),
     cursor: text(values.cursor),
-    cmd: text(values.cmd),
+    build: text(values.build),
+    start: text(values.start),
+    "no-wait": values["no-wait"] === true,
     port: text(values.port),
     ttl: text(values.ttl),
     stop: values.stop === true,

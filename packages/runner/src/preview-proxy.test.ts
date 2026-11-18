@@ -36,7 +36,7 @@ const listen = (server: Server) =>
 
 type Seen = { headers: IncomingHttpHeaders; url: string | undefined };
 
-/** A dev server: pages over HTTP, and a websocket-style upgrade that echoes what it is sent. */
+/** An app server: pages over HTTP, and a websocket-style upgrade that echoes what it is sent. */
 async function devServer() {
   const seen: Seen[] = [];
   const server = createServer((req, res) => {
@@ -101,7 +101,7 @@ test("a browser with no cookie gets a plain 404 that names nothing", async () =>
   expect(res.body).toBe(
     "<!doctype html><title>Not found</title><h1>Not found</h1>\n",
   );
-  // the same answer for any path, and the dev server was never asked
+  // the same answer for any path, and the app was never asked
   expect((await get(port, "/anything/else")).body).toBe(res.body);
   expect(app.seen).toEqual([]);
 });
@@ -155,7 +155,7 @@ test("a good token sets the cookie, HttpOnly, Secure and SameSite=Lax, and redir
   expect(app.seen).toEqual([]);
 });
 
-test("with the cookie, HTTP reaches the dev server at the root path, as if from localhost", async () => {
+test("with the cookie, HTTP reaches the app at the root path, as if from localhost", async () => {
   const app = await devServer();
   const { port } = await proxyTo(app.port);
   const res = await get(port, "/assets/main.js?v=1", {
@@ -188,7 +188,7 @@ test("a request target the WHATWG parser rejects gets the 404, and the proxy kee
   expect(app.seen.map((s) => s.url)).toEqual(["/after"]);
 });
 
-test("an absolute-form target gets the 404 even with the cookie, and never reaches the dev server", async () => {
+test("an absolute-form target gets the 404 even with the cookie, and never reaches the app", async () => {
   const app = await devServer();
   const { port } = await proxyTo(app.port);
   // a valid absolute URL: MSW's interceptor parses the test's own outgoing request, and throws on an
@@ -198,7 +198,7 @@ test("an absolute-form target gets the 404 even with the cookie, and never reach
   expect(app.seen.map((s) => s.url)).toEqual(["/after"]);
 });
 
-test("a dev server that dies mid-response ends the browser's response instead of leaving it open", async () => {
+test("an app server that dies mid-response ends the browser's response instead of leaving it open", async () => {
   const dying = createServer((_req, res) => {
     res.setHeader("content-type", "text/plain");
     res.write("part", () => res.socket?.destroy());
@@ -227,12 +227,46 @@ test("a dev server that dies mid-response ends the browser's response instead of
   expect(outcome).toBe("closed complete=false body=part");
 });
 
-test("a dev server that is down answers a signed-in browser 502", async () => {
+test("with the cookie and nothing listening yet, the browser gets a page that says it is building and refreshes itself", async () => {
   const dead = createServer();
   const deadPort = await listen(dead);
   await new Promise((r) => dead.close(r));
   const { port } = await proxyTo(deadPort);
-  expect((await get(port, "/", { cookie })).status).toBe(502);
+  const res = await get(port, "/some/page", { cookie });
+  expect(res.status).toBe(503);
+  expect(res.headers["content-type"]).toContain("text/html");
+  expect(res.headers["retry-after"]).toBe("3");
+  expect(res.body).toContain("Building preview…");
+  expect(res.body).toContain('<meta http-equiv="refresh" content="3">');
+  // every method and path gets it, so a reload of any page lands back where it was
+  expect((await get(port, "/", { cookie })).body).toBe(res.body);
+});
+
+test("without the cookie and nothing listening, it is still the plain 404", async () => {
+  const dead = createServer();
+  const deadPort = await listen(dead);
+  await new Promise((r) => dead.close(r));
+  const { port } = await proxyTo(deadPort);
+  for (const headers of [
+    {} as Record<string, string>,
+    { cookie: `${PREVIEW_COOKIE}=wrong` },
+  ]) {
+    const res = await get(port, "/", headers);
+    expect(res.status).toBe(404);
+    expect(res.body).not.toContain("Building");
+  }
+});
+
+test("the building page gives way to the app the moment it listens", async () => {
+  const late = createServer((_req, res) => res.end("the app"));
+  const latePort = await listen(late);
+  await new Promise((r) => late.close(r));
+  const { port } = await proxyTo(latePort);
+  expect((await get(port, "/", { cookie })).status).toBe(503);
+  await new Promise<void>((resolve) => late.listen(latePort, resolve));
+  const res = await get(port, "/", { cookie });
+  expect(res.status).toBe(200);
+  expect(res.body).toBe("the app");
 });
 
 function upgrade(
@@ -269,7 +303,7 @@ function upgrade(
   });
 }
 
-test("with the cookie a websocket upgrade reaches the dev server and carries data both ways", async () => {
+test("with the cookie a websocket upgrade reaches the app and carries data both ways", async () => {
   const app = await devServer();
   const { port } = await proxyTo(app.port);
   const out = await upgrade(port, `Cookie: ${cookie}\r\n`);
@@ -280,7 +314,7 @@ test("with the cookie a websocket upgrade reaches the dev server and carries dat
   expect(app.seen[0]?.headers.host).toBe(`localhost:${app.port}`);
 });
 
-test("a websocket upgrade without the cookie gets a 404 and never reaches the dev server", async () => {
+test("a websocket upgrade without the cookie gets a 404 and never reaches the app", async () => {
   const app = await devServer();
   const { port } = await proxyTo(app.port);
   expect((await upgrade(port, "")).head).toBe("HTTP/1.1 404 Not Found");
@@ -293,7 +327,7 @@ test("a websocket upgrade without the cookie gets a 404 and never reaches the de
 test("a websocket upgrade to an odd target gets a 404, even with the cookie, and the proxy keeps serving", async () => {
   const app = await devServer();
   const { port } = await proxyTo(app.port);
-  // `//a:99999/` is a path to the dev server, as the HTTP route treats it; absolute-form is never forwarded
+  // `//a:99999/` is a path to the app, as the HTTP route treats it; absolute-form is never forwarded
   for (const target of ["http://a/"]) {
     expect((await upgrade(port, "", target)).head).toBe(
       "HTTP/1.1 404 Not Found",

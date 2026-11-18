@@ -6,6 +6,7 @@ import type {
   EnvironmentStatus,
   EventType,
   PendingRequest,
+  PreviewState,
   RequestId,
   RunId,
   RunRollup,
@@ -203,9 +204,18 @@ export const previews = sqliteTable(
       .notNull()
       .references(() => agents.id),
     port: integer().notNull(),
-    cmd: text().notNull(),
+    // the commands as run; no build when null
+    buildCmd: text("build_cmd"),
+    startCmd: text("start_cmd").notNull(),
+    // how far the start is; the CHECK on `state` spells the shared `PreviewState` list
+    state: text().$type<PreviewState>().notNull(),
+    // why a failed preview failed (redacted, cut), and whose fault: "command" is the user's build or start
+    // command, "sprite" the platform's. Both null until it fails
+    detail: text(),
+    failure: text({ enum: ["command", "sprite"] }),
     // lowercase-hex sha-256 of the link's token; the token itself is never stored
     tokenHash: text("token_hash").notNull(),
+    // minutes while the start is under way, the TTL once it is ready, soon after it fails
     expiresAt: text("expires_at").notNull(),
     createdAt: createdAt(),
   },
@@ -213,6 +223,14 @@ export const previews = sqliteTable(
     // the archive's lookup by agent, and the FK lookup on every agents delete
     index("previews_agent_id").on(t.agentId),
     check("previews_port", sql`${c(t.port)} between 1 and 65535`),
+    check(
+      "previews_state",
+      sql`${c(t.state)} in ('building', 'starting', 'ready', 'failed')`,
+    ),
+    check(
+      "previews_failure",
+      sql`(${c(t.state)} = 'failed') = (${c(t.failure)} is not null)`,
+    ),
     check("previews_expires_at", isoUtc(t.expiresAt)),
     check("previews_created_at", isoUtc(t.createdAt)),
   ],

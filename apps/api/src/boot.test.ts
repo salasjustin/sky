@@ -451,7 +451,7 @@ test("boot's sweep ends a preview past its TTL: URL private, services and row go
   first.$client.exec(`
     insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a');
     insert into agents (id, env_id, branch, status) values ('agt_a', 'env_a', 'claude/agt_a', 'idle');
-    insert into previews (env_id, agent_id, port, cmd, token_hash, expires_at) values ('env_a', 'agt_a', 5173, 'pnpm dev', '${"0".repeat(64)}', '2026-01-01T00:00:00.000Z');
+    insert into previews (env_id, agent_id, port, build_cmd, start_cmd, state, token_hash, expires_at) values ('env_a', 'agt_a', 5173, 'pnpm build', 'pnpm start', 'ready', '${"0".repeat(64)}', '2026-01-01T00:00:00.000Z');
   `);
   first.$client.close();
 
@@ -465,6 +465,27 @@ test("boot's sweep ends a preview past its TTL: URL private, services and row go
   expect(wire.calls).toContain("label sky-env_a");
   const deletes = wire.calls.filter((c) => c.startsWith("service-delete"));
   expect(deletes).toHaveLength(2);
+});
+
+test("boot fails a preview a previous process left building and its sweep takes the sprite down", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-env_a");
+  const first = booted().db;
+  first.$client.exec(`
+    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a');
+    insert into agents (id, env_id, branch, status) values ('agt_a', 'env_a', 'claude/agt_a', 'idle');
+    insert into previews (env_id, agent_id, port, build_cmd, start_cmd, state, token_hash, expires_at) values ('env_a', 'agt_a', 5173, 'pnpm build', 'pnpm start', 'building', '${"0".repeat(64)}', '2999-01-01T00:00:00.000Z');
+  `);
+  first.$client.close();
+
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
+  // the build died with the old process, so the row can't stay building until its far-off expiry
+  await expect
+    .poll(() => lines)
+    .toContain("preview of agt_a ended: its TTL passed");
+  expect(db.$client.prepare("select * from previews").all()).toEqual([]);
+  expect(wire.calls).toContain("label sky-env_a");
 });
 
 test("a webhook delivery a previous process left pending is sent after boot", async () => {

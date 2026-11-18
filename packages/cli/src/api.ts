@@ -5,6 +5,7 @@ import {
   CreatedApiKey,
   Environment,
   type KeyInput,
+  PreviewState,
   RunStatus,
 } from "@sky/shared";
 import { z } from "zod";
@@ -93,6 +94,7 @@ export type ApiWebhook = z.infer<typeof ApiWebhook>;
 /** A preview as the API describes it; the link only comes with a start. */
 const ApiPreview = z.looseObject({
   agentId: z.string(),
+  state: PreviewState,
   port: z.number().int(),
   expiresAt: z.string(),
   replaced: z.string().nullish(),
@@ -249,7 +251,12 @@ export function createApi(config: Config) {
     },
     async startPreview(
       agentId: string,
-      body: { cmd: string; port: number; ttlSeconds?: number },
+      body: {
+        build?: string;
+        start?: string;
+        port: number;
+        ttlSeconds?: number;
+      },
     ) {
       const { status, json } = await request(
         "POST",

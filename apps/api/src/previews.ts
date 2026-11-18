@@ -9,15 +9,18 @@ import {
   type AgentId,
   type EnvironmentId,
   PREVIEW_APP_SERVICE,
+  PREVIEW_BUILD_NONE,
   PREVIEW_LINK_PATH,
   PREVIEW_PROXY_PORT,
   PREVIEW_PROXY_SERVICE,
   type PreviewStart,
+  type PreviewState,
 } from "@sky/shared";
-import { and, eq, lte } from "drizzle-orm";
+import { and, eq, inArray, lte } from "drizzle-orm";
 import { canUseEnv, ownAgents, type Principal } from "./auth.js";
 import type { Config } from "./config.js";
 import {
+  envFile,
   REPO_DIR,
   RUNNER,
   WITH_PACKAGE_MANAGERS,
@@ -26,22 +29,48 @@ import {
 import { cut, redact } from "./redact.js";
 import type { BundleInstaller } from "./runner-bundle.js";
 import { isReservedName, openEnvSecrets } from "./secrets.js";
-import { execInSprite, type SpriteOps, spriteCall } from "./sprites.js";
+import {
+  execInSprite,
+  execLogged,
+  type SpriteOps,
+  SpriteTimeoutError,
+  spriteCall,
+  writeSpriteFile,
+} from "./sprites.js";
 
-// how long a created service is watched for an immediate exit; a dev server that dies in this window
-// fails the start, with its last output
+// how long a created service is watched for an immediate exit; one that dies in this window fails the start,
+// with its last output
 const WATCH = "2s";
 const OUTPUT_TAIL = 1500;
-// how long a start's row lives before the start has succeeded and extends it to the TTL
+
+/** How long the one-off production build may run before it is stopped. */
+export const BUILD_CAP_MS = 15 * 60_000;
+// how long the app has, once its service exists, to listen on its port, and how often that is asked
+const READY_TIMEOUT_MS = 120_000;
+const READY_POLL_MS = 2_000;
+// a start's row outlives its build cap by this, until the start succeeds and extends it to the TTL
 const START_GRACE_MS = 5 * 60_000;
+// a failed preview stays readable this long, then the sweep removes it
+const FAILED_KEEP_MS = 10 * 60_000;
 
 // exits 10 when something listens on port $1: the kernel's table of listening TCP sockets (state 0A), v4 and v6
 const PORT_HELD = `hex=$(printf '%04X' "$1"); cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v p=":$hex" '$4 == "0A" && toupper($2) ~ p "$" { held = 1 } END { exit (held ? 10 : 0) }'`;
 const HELD = 10;
 
-// the user's command, whole, as $1 of a shell of its own: `cd web && pnpm dev` and `FOO=1 pnpm dev` run as
+// which package manager's lockfile the worktree holds, as the exit status: the first of pnpm, yarn, bun, npm; 0 for none
+const LOCKFILES = `for f in pnpm-lock.yaml:10 yarn.lock:11 bun.lock:12 bun.lockb:12 package-lock.json:13; do [ -e "\${f%%:*}" ] && exit "\${f##*:}"; done; exit 0`;
+const MANAGERS = {
+  10: { build: "pnpm build", start: "pnpm start" },
+  11: { build: "yarn build", start: "yarn start" },
+  12: { build: "bun run build", start: "bun run start" },
+  13: { build: "npm run build", start: "npm start" },
+} as const;
+
+// the user's command, whole, as $1 of a shell of its own: `cd web && pnpm start` and `FOO=1 pnpm start` run as
 // written, and a single program still replaces that shell as the service's process
-const RUN_DEV_SERVER = `${WITH_PACKAGE_MANAGERS} && exec bash -c "$1"`;
+const RUN_APP_SERVER = `${WITH_PACKAGE_MANAGERS} && exec bash -c "$1"`;
+// the build: the env file ($1) sourced for the app's own variables, then the command ($2), whole
+const RUN_BUILD = `${WITH_PACKAGE_MANAGERS} && set -a && . "$1" && set +a && exec bash -c "$2"`;
 
 const sha256Hex = (value: string) =>
   createHash("sha256").update(value).digest("hex");
@@ -60,6 +89,7 @@ const runningOf = (db: Db) =>
       agentId: previews.agentId,
       tokenHash: previews.tokenHash,
       port: previews.port,
+      state: previews.state,
       spriteName: environments.spriteName,
     })
     .from(previews)
@@ -84,23 +114,31 @@ function serialized<T>(
   return run;
 }
 
-/**
- * Ends a preview: the sprite's URL goes private first, so nothing is public a moment longer than it must
- * be, then both services go (the dev server before the proxy it needs), then the token's row, which is what makes the token dead to Sky. A sprite or
- * service already gone counts as removed; anything else throws and leaves the row, so a retry finishes it.
- */
-async function endPreview(
-  db: Db,
-  sprites: SpriteOps,
-  running: Running,
-): Promise<void> {
-  const { spriteName: name } = running;
+// the build and start of each environment's preview that is still under way, in this process
+type Job = {
+  tokenHash: string;
+  abort: AbortController;
+  /** Settles once the job has stopped touching the sprite. */
+  done: Promise<void>;
+};
+const jobs = new Map<EnvironmentId, Job>();
+
+/** Stops the environment's job for this preview, if it has one, and waits until it has let go of the sprite. */
+async function stopJob(envId: EnvironmentId, tokenHash: string) {
+  const job = jobs.get(envId);
+  if (job?.tokenHash !== tokenHash) return;
+  job.abort.abort();
+  await job.done;
+}
+
+/** The sprite's URL goes private first, so nothing is public a moment longer than it must be; then both services go. */
+async function takeDown(sprites: SpriteOps, name: string): Promise<void> {
   await spriteCall(sprites, name, { op: "url-private" }, () =>
     sprites.client.updateSprite(name, { urlSettings: { auth: "sprite" } }),
   ).catch((err: unknown) => {
     if (!isGone(err)) throw err;
   });
-  // the dev server first: it was created needing the proxy, which then outlives it
+  // the app first: it was created needing the proxy, which then outlives it
   for (const service of [PREVIEW_APP_SERVICE, PREVIEW_PROXY_SERVICE]) {
     await spriteCall(sprites, name, { op: "service-delete" }, () =>
       sprites.client.sprite(name).deleteService(service),
@@ -108,6 +146,20 @@ async function endPreview(
       if (!isGone(err)) throw err;
     });
   }
+}
+
+/**
+ * Ends a preview: its build or start is stopped, the sprite is taken down (see `takeDown`), then the token's row
+ * goes, which is what makes the token dead to Sky. A sprite or service already gone counts as removed; anything
+ * else throws and leaves the row, so a retry finishes it.
+ */
+async function endPreview(
+  db: Db,
+  sprites: SpriteOps,
+  running: Running,
+): Promise<void> {
+  await stopJob(running.envId, running.tokenHash);
+  await takeDown(sprites, running.spriteName);
   db.delete(previews)
     .where(
       and(
@@ -123,11 +175,11 @@ export type StartResult =
   | { kind: "archived" }
   | { kind: "not_ready" }
   | { kind: "no_worktree" }
+  /** The worktree holds no lockfile to choose commands from, and a command wasn't given. */
+  | { kind: "commands_needed"; missing: ("build" | "start")[] }
   | { kind: "port_busy"; port: number }
   /** Another principal's preview runs in the environment, and this one may not replace it. */
   | { kind: "preview_busy" }
-  /** The user's own command exited as it started; `detail` is its redacted output. */
-  | { kind: "command_failed"; detail: string }
   | { kind: "failed"; detail: string }
   | {
       kind: "started";
@@ -138,7 +190,12 @@ export type PresentedPreview = {
   agentId: AgentId;
   envId: EnvironmentId;
   port: number;
-  cmd: string;
+  /** The build command; null when there is none. */
+  build: string | null;
+  start: string;
+  state: PreviewState;
+  /** The redacted tail of the output of what failed, once `state` is `failed`. */
+  detail: string | null;
   startedAt: string;
   expiresAt: string;
 };
@@ -147,7 +204,10 @@ const present = (row: PreviewRow): PresentedPreview => ({
   agentId: row.agentId,
   envId: row.envId,
   port: row.port,
-  cmd: row.cmd,
+  build: row.buildCmd,
+  start: row.startCmd,
+  state: row.state,
+  detail: row.detail,
   startedAt: row.createdAt,
   expiresAt: row.expiresAt,
 });
@@ -158,12 +218,18 @@ type Deps = {
   sprites: SpriteOps;
   ensureBundle: BundleInstaller;
   log: (line: string) => void;
+  /** The build's bound; `BUILD_CAP_MS` unless a test shortens it. */
+  buildCapMs?: number;
+  /** How long the app has to listen once started; 2 minutes unless a test shortens it. */
+  readyTimeoutMs?: number;
+  /** How often the port is asked; 2 s unless a test shortens it. */
+  readyPollMs?: number;
 };
 
-/** The user's command exited as it started: the start's refusal, not a failure of the sprite. */
+/** The user's own build or start command failed; its message is the output, redacted. */
 class CommandFailed extends Error {}
 
-/** The services' own words for how one did, for a start that must say why it failed. */
+/** A service's own words for how it did, when it ended within the watch: `undefined` while it runs. */
 function failureOf(
   service: string,
   events: ServiceLogEvent[],
@@ -184,12 +250,43 @@ function failureOf(
   return redact(`${service} ${how}${tail}`, known);
 }
 
+const sleep = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+
+/** `work`'s result, or `undefined` once `signal` aborts first; `work` is left to settle on its own. */
+function unlessAborted<T>(
+  work: Promise<T>,
+  signal: AbortSignal,
+): Promise<T | undefined> {
+  if (signal.aborted) {
+    work.catch(() => {});
+    return Promise.resolve(undefined);
+  }
+  return new Promise<T | undefined>((resolve, reject) => {
+    signal.addEventListener("abort", () => resolve(undefined), { once: true });
+    work.then(resolve, reject);
+  });
+}
+
 export function createPreviews({
   db,
   config,
   sprites,
   ensureBundle,
   log,
+  buildCapMs = BUILD_CAP_MS,
+  readyTimeoutMs = READY_TIMEOUT_MS,
+  readyPollMs = READY_POLL_MS,
 }: Deps) {
   /** The agent and its env, when `principal` may act on it. */
   const find = (agentId: AgentId, principal: Principal) => {
@@ -229,8 +326,8 @@ export function createPreviews({
     );
     const failure = failureOf(service, events, known);
     if (!failure) return;
-    // only the dev server's own exit is the user's command; a proxy that dies, or a service the sprite
-    // can't spawn, is the sprite's
+    // only the app's own exit is the user's command; a proxy that dies, or a service the sprite can't spawn,
+    // is the sprite's
     const exited = events.some((e) => e.type === "exit");
     throw service === PREVIEW_APP_SERVICE && exited
       ? new CommandFailed(failure)
@@ -238,9 +335,10 @@ export function createPreviews({
   }
 
   /**
-   * What the dev server's commands get: the environment's secrets and its profile's session variables, never a
-   * Claude credential or one of Sky's tokens. `secretValues` are the secrets alone, what its output is redacted
-   * by: the session variables are switches and `PORT` a number the output must keep.
+   * What the app's commands get, build and server alike: the environment's secrets and its profile's session
+   * variables, in a production environment, never a Claude credential or one of Sky's tokens. `secretValues` are
+   * the secrets alone, what output is redacted by: the session variables are switches and `PORT` a number the
+   * output must keep.
    */
   function appEnv(envId: EnvironmentId, base: string | null, port: number) {
     const profile = base ? config.baseProfiles[base] : undefined;
@@ -256,20 +354,10 @@ export function createPreviews({
         ...Object.fromEntries(secrets),
         ...(profile?.sessionEnv ?? {}),
         PORT: String(port),
+        NODE_ENV: "production",
       },
       secretValues: [...secrets.values()],
     };
-  }
-
-  /** Whether `principal` may end the preview of `agentId`: the admin key may, a `runs` key only one on an agent it started. */
-  function mayReplace(principal: Principal, agentId: AgentId): boolean {
-    if (principal.role === "admin") return true;
-    const owner = db
-      .select({ ownerKeyId: agents.ownerKeyId })
-      .from(agents)
-      .where(eq(agents.id, agentId))
-      .get()?.ownerKeyId;
-    return owner === principal.keyId;
   }
 
   /** `port_busy` or `failed` when the port check refuses `port`; `undefined` when nothing listens on it. */
@@ -293,10 +381,254 @@ export function createPreviews({
     return undefined;
   }
 
+  /** Whether `principal` may end the preview of `agentId`: the admin key may, a `runs` key only one on an agent it started. */
+  function mayReplace(principal: Principal, agentId: AgentId): boolean {
+    if (principal.role === "admin") return true;
+    const owner = db
+      .select({ ownerKeyId: agents.ownerKeyId })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .get()?.ownerKeyId;
+    return owner === principal.keyId;
+  }
+
+  /** The commands to run: those given, the rest from the worktree's lockfile; the names still missing when it has none. */
+  async function commandsFor(
+    spriteName: string,
+    worktree: string,
+    input: PreviewStart,
+  ): Promise<
+    | { build: string | null; start: string }
+    | { missing: ("build" | "start")[] }
+    | { failed: string }
+  > {
+    let found: (typeof MANAGERS)[keyof typeof MANAGERS] | undefined;
+    if (input.build === undefined || input.start === undefined) {
+      const out = await execInSprite(
+        sprites,
+        spriteName,
+        ["sh", "-c", LOCKFILES],
+        { op: "preview-lockfile", cwd: worktree },
+      );
+      if (out.exitCode !== 0) {
+        found = MANAGERS[out.exitCode as keyof typeof MANAGERS];
+        if (!found) {
+          return {
+            failed: `looking for the worktree's lockfile exited ${out.exitCode}`,
+          };
+        }
+      }
+    }
+    const missing: ("build" | "start")[] = [];
+    if (input.build === undefined && !found) missing.push("build");
+    if (input.start === undefined && !found) missing.push("start");
+    if (missing.length > 0) return { missing };
+    const build = input.build ?? found?.build ?? null;
+    return {
+      build: build === PREVIEW_BUILD_NONE ? null : build,
+      start: input.start ?? (found?.start as string),
+    };
+  }
+
+  /** Writes a row's new state; `false` when the row is no longer this preview's (it was stopped or replaced). */
+  function setState(
+    envId: EnvironmentId,
+    tokenHash: string,
+    set: Partial<typeof previews.$inferInsert>,
+  ): boolean {
+    return (
+      db
+        .update(previews)
+        .set(set)
+        .where(
+          and(eq(previews.envId, envId), eq(previews.tokenHash, tokenHash)),
+        )
+        .run().changes > 0
+    );
+  }
+
+  type Start = {
+    agentId: AgentId;
+    envId: EnvironmentId;
+    spriteName: string;
+    tokenHash: string;
+    worktree: string;
+    port: number;
+    build: string | null;
+    start: string;
+    env: Record<string, string>;
+    /** Every value the output must not carry. */
+    known: string[];
+    /** When the link stops working. */
+    expiresAt: string;
+    signal: AbortSignal;
+  };
+
+  /** The one-off production build, in the worktree, with the app's own env; throws `CommandFailed` with its output tail when it fails or runs past its cap. */
+  async function build(s: Start & { build: string }): Promise<void> {
+    const envPath = `/tmp/sky-preview-${s.agentId}.env`;
+    const logPath = `/tmp/sky-preview-${s.agentId}.build.log`;
+    await writeSpriteFile(
+      sprites,
+      s.spriteName,
+      envPath,
+      envFile(Object.entries(s.env)),
+      { op: "write-preview-env", mode: 0o600, known: s.known },
+    );
+    const kill = () =>
+      void execInSprite(
+        sprites,
+        s.spriteName,
+        ["pkill", "-TERM", "-f", logPath],
+        { op: "preview-build-kill" },
+      ).catch(() => {});
+    try {
+      const out = await unlessAborted(
+        execLogged(
+          sprites,
+          s.spriteName,
+          ["bash", "-c", RUN_BUILD, "bash", envPath, s.build],
+          {
+            op: "preview-build",
+            cwd: s.worktree,
+            log: logPath,
+            tailBytes: OUTPUT_TAIL,
+            timeoutMs: buildCapMs,
+            known: s.known,
+          },
+        ),
+        s.signal,
+      );
+      if (out === undefined) return kill();
+      if (out.exitCode !== 0) {
+        const tail = redact(out.tail.trim(), s.known);
+        throw new CommandFailed(
+          `the build exited ${out.exitCode}${tail ? `: ${tail}` : ""}`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof SpriteTimeoutError) {
+        kill();
+        throw new CommandFailed(
+          `the build ran past its ${buildCapMs % 60_000 === 0 ? `${buildCapMs / 60_000}-minute` : `${Math.round(buildCapMs / 1000)}-second`} limit and was stopped`,
+        );
+      }
+      throw err;
+    } finally {
+      // the env holds the secrets, and the build is over
+      void execInSprite(sprites, s.spriteName, ["rm", "-f", envPath], {
+        op: "rm-preview-env",
+      }).catch(() => {});
+    }
+  }
+
+  /** The tail of the app service's output, redacted; empty when it can't be read. */
+  async function appOutput(s: Start): Promise<string> {
+    const text = await spriteCall(
+      sprites,
+      s.spriteName,
+      { op: "service-logs", known: s.known },
+      async () => {
+        const stream = await sprites.client
+          .sprite(s.spriteName)
+          .getServiceLogs(PREVIEW_APP_SERVICE, { lines: 40 });
+        let out = "";
+        for await (const event of stream) {
+          if (event.type === "stdout" || event.type === "stderr") {
+            out += event.data ?? "";
+          }
+        }
+        return out;
+      },
+    ).catch(() => "");
+    return redact(text.trim().slice(-OUTPUT_TAIL), s.known);
+  }
+
+  /** Polls until the app listens on its port; throws `CommandFailed` with its output when it doesn't in time. */
+  async function awaitListening(s: Start): Promise<void> {
+    const deadline = Date.now() + readyTimeoutMs;
+    for (;;) {
+      if (s.signal.aborted) return;
+      const held = await execInSprite(
+        sprites,
+        s.spriteName,
+        ["sh", "-c", PORT_HELD, "sh", String(s.port)],
+        { op: "preview-ready" },
+      );
+      if (held.exitCode === HELD) return;
+      if (held.exitCode !== 0) {
+        throw new Error(
+          `checking port ${s.port} on the sprite exited ${held.exitCode}`,
+        );
+      }
+      if (Date.now() >= deadline) {
+        const output = await appOutput(s);
+        throw new CommandFailed(
+          `the app didn't listen on port ${s.port} within ${readyTimeoutMs / 1000}s of starting${output ? `: ${output}` : ""}`,
+        );
+      }
+      await sleep(readyPollMs, s.signal);
+    }
+  }
+
+  /**
+   * Everything after the answer: the build, the app's service, the wait for its port. A failure takes the
+   * sprite down again and leaves the row `failed` with why; one that is the job being stopped leaves the row to
+   * whatever stopped it.
+   */
+  async function finish(s: Start): Promise<void> {
+    try {
+      if (s.build !== null) await build({ ...s, build: s.build });
+      if (s.signal.aborted) return;
+      if (!setState(s.envId, s.tokenHash, { state: "starting" })) return;
+      await createService(
+        s.spriteName,
+        PREVIEW_APP_SERVICE,
+        {
+          cmd: "bash",
+          args: ["-c", RUN_APP_SERVER, "bash", s.start],
+          dir: s.worktree,
+          env: s.env,
+          needs: [PREVIEW_PROXY_SERVICE],
+        },
+        s.known,
+      );
+      if (s.signal.aborted) return;
+      await awaitListening(s);
+      if (s.signal.aborted) return;
+      setState(s.envId, s.tokenHash, {
+        state: "ready",
+        expiresAt: s.expiresAt,
+      });
+    } catch (err) {
+      if (s.signal.aborted) return;
+      const detail = cut(
+        redact(err instanceof Error ? err.message : String(err), s.known),
+        2000,
+      );
+      const failure = err instanceof CommandFailed ? "command" : "sprite";
+      log(`the preview of ${s.agentId} failed (${failure}): ${detail}`);
+      // taken down first, so nothing stays public; a failed teardown is the sweep's to retry once the row expires
+      await takeDown(sprites, s.spriteName).catch((downErr: unknown) => {
+        log(
+          `taking down the failed preview of ${s.agentId} failed: ${downErr}`,
+        );
+      });
+      setState(s.envId, s.tokenHash, {
+        state: "failed",
+        failure,
+        detail,
+        expiresAt: new Date(Date.now() + FAILED_KEEP_MS).toISOString(),
+      });
+    }
+  }
+
   return {
     /**
-     * Starts the agent's preview: its dev server and the token proxy as two services on the env's sprite,
-     * then the sprite's URL goes public. Replaces the env's running preview, whichever agent's it is.
+     * Starts the agent's preview and answers as soon as the link works: the token proxy is up and the sprite's
+     * URL public, showing a page that says it is building. The production build, the app's service and the
+     * wait for its port go on in the background, `state` following them. Replaces the env's running preview,
+     * whichever agent's it is.
      */
     async start(
       agentId: AgentId,
@@ -312,8 +644,13 @@ export function createPreviews({
         const current = runningOf(db)
           .where(eq(previews.envId, agent.envId))
           .get();
-        // a key replaces its own previews and the admin key anyone's; before anything reaches the sprite
-        if (current && !mayReplace(principal, current.agentId)) {
+        // a key replaces its own previews and the admin key anyone's; a failed one runs nothing, so it is
+        // anyone's to replace. All before anything reaches the sprite
+        if (
+          current &&
+          current.state !== "failed" &&
+          !mayReplace(principal, current.agentId)
+        ) {
           return { kind: "preview_busy" };
         }
         const worktree = `${WORKTREES_DIR}/${agentId}`;
@@ -324,6 +661,13 @@ export function createPreviews({
           { op: "preview-worktree", cwd: REPO_DIR },
         );
         if (there.exitCode !== 0) return { kind: "no_worktree" };
+        const commands = await commandsFor(spriteName, worktree, input);
+        if ("failed" in commands) {
+          return { kind: "failed", detail: commands.failed };
+        }
+        if ("missing" in commands) {
+          return { kind: "commands_needed", missing: commands.missing };
+        }
         // every refusal that doesn't hinge on the running preview's own services comes before it is ended
         const url = (
           await spriteCall(sprites, spriteName, { op: "get-url" }, () =>
@@ -336,16 +680,16 @@ export function createPreviews({
             detail: "the sprite has no URL to preview on",
           };
         }
-        const devPortCheckedFirst =
+        const appPortCheckedFirst =
           current !== undefined && current.port !== input.port;
-        if (devPortCheckedFirst) {
+        if (appPortCheckedFirst) {
           const refused = await refusedPort(spriteName, input.port);
           if (refused) return refused;
         }
         if (current) await endPreview(db, sprites, current);
-        // a running preview's proxy holds 8080, and its dev server the dev port when this one asks for the same:
+        // a running preview's proxy holds 8080, and its app the app's port when this one asks for the same:
         // checked once its services are gone, so neither is counted
-        const afterTeardown = devPortCheckedFirst
+        const afterTeardown = appPortCheckedFirst
           ? [PREVIEW_PROXY_PORT]
           : [PREVIEW_PROXY_PORT, input.port];
         for (const port of afterTeardown) {
@@ -365,10 +709,15 @@ export function createPreviews({
             envId: agent.envId,
             agentId,
             port: input.port,
-            cmd: input.cmd,
+            buildCmd: commands.build,
+            startCmd: commands.start,
+            state: commands.build === null ? "starting" : "building",
             tokenHash,
             expiresAt: new Date(
-              Math.min(Date.parse(expiresAt), Date.now() + START_GRACE_MS),
+              Math.min(
+                Date.parse(expiresAt),
+                Date.now() + buildCapMs + START_GRACE_MS,
+              ),
             ).toISOString(),
           })
           .returning()
@@ -381,8 +730,9 @@ export function createPreviews({
         const known = [...secretValues, token];
         try {
           await ensureBundle(spriteName, `preview-${agentId}`);
-          // the proxy first, holding 8080 before the dev server opens a port of its own: a sprite's URL
-          // goes to 8080, or else to the first HTTP port opened
+          // the proxy and the public URL first: the link works from now on, showing a page that says the
+          // preview is building, and the proxy holds 8080 before the app opens a port of its own (a
+          // sprite's URL goes to 8080, or else to the first HTTP port opened)
           await createService(
             spriteName,
             PREVIEW_PROXY_SERVICE,
@@ -399,18 +749,6 @@ export function createPreviews({
                 PREVIEW_LISTEN_PORT: String(PREVIEW_PROXY_PORT),
               },
               httpPort: PREVIEW_PROXY_PORT,
-            },
-            known,
-          );
-          await createService(
-            spriteName,
-            PREVIEW_APP_SERVICE,
-            {
-              cmd: "bash",
-              args: ["-c", RUN_DEV_SERVER, "bash", input.cmd],
-              dir: worktree,
-              env,
-              needs: [PREVIEW_PROXY_SERVICE],
             },
             known,
           );
@@ -433,29 +771,46 @@ export function createPreviews({
           }).catch((endErr: unknown) => {
             log(`ending the failed preview of ${agentId} failed: ${endErr}`);
           });
-          return {
-            kind: err instanceof CommandFailed ? "command_failed" : "failed",
-            detail: cut(detail, 2000),
-          };
+          return { kind: "failed", detail: cut(detail, 2000) };
         }
-        const live = db
-          .update(previews)
-          .set({ expiresAt })
-          .where(
-            and(
-              eq(previews.envId, agent.envId),
-              eq(previews.tokenHash, tokenHash),
-            ),
-          )
-          .returning()
-          .get();
+        const abort = new AbortController();
+        const job: Job = {
+          tokenHash,
+          abort,
+          done: finish({
+            agentId,
+            envId: agent.envId,
+            spriteName,
+            tokenHash,
+            worktree,
+            port: input.port,
+            build: commands.build,
+            start: commands.start,
+            env,
+            known,
+            expiresAt,
+            signal: abort.signal,
+          }).catch((err: unknown) => {
+            log(`the preview job of ${agentId} failed: ${err}`);
+          }),
+        };
+        jobs.set(agent.envId, job);
+        void job.done.then(() => {
+          if (jobs.get(agent.envId) === job) jobs.delete(agent.envId);
+        });
         return {
           kind: "started",
           preview: {
-            ...present(live ?? row),
+            ...present(row),
+            // the TTL counts from this request, whatever the build takes
+            expiresAt,
             link: `${url.replace(/\/+$/, "")}${PREVIEW_LINK_PATH}?t=${token}`,
             replaced:
-              current && current.agentId !== agentId ? current.agentId : null,
+              current &&
+              current.state !== "failed" &&
+              current.agentId !== agentId
+                ? current.agentId
+                : null,
           },
         };
       });
@@ -485,7 +840,10 @@ export function createPreviews({
       });
     },
 
-    /** The agent's running preview, with how its two services are doing; `null` when it has none, `undefined` for an agent `principal` may not see. */
+    /**
+     * The agent's preview, its state included, with how its two services are doing; `null` when it has none,
+     * `undefined` for an agent `principal` may not see. `failure` is whose fault a failed one is.
+     */
     async state(agentId: AgentId, principal: Principal) {
       const found = find(agentId, principal);
       if (!found) return undefined;
@@ -512,15 +870,18 @@ export function createPreviews({
       const status = (name: string) =>
         services?.find((s) => s.name === name)?.state?.status ?? "missing";
       return {
-        ...present(row),
-        services: services && {
-          app: status(PREVIEW_APP_SERVICE),
-          proxy: status(PREVIEW_PROXY_SERVICE),
+        failure: row.failure,
+        preview: {
+          ...present(row),
+          services: services && {
+            app: status(PREVIEW_APP_SERVICE),
+            proxy: status(PREVIEW_PROXY_SERVICE),
+          },
         },
       };
     },
 
-    /** Ends the agent's preview (archive), or the environment's, whichever agent's it is (delete). Throws when it can't. */
+    /** Ends the preview of an agent (archive), or the environment's, whichever agent's (delete). Throws when it can't. */
     stopForAgent(agentId: AgentId, envId: EnvironmentId): Promise<void> {
       return serialized(envId, async () => {
         const row = runningOf(db).where(eq(previews.agentId, agentId)).get();
@@ -539,8 +900,31 @@ export function createPreviews({
 export type Previews = ReturnType<typeof createPreviews>;
 
 /**
- * Ends every preview past its TTL. Each failure is logged and left for the next sweep, since the row
- * stays until its services are gone; the proxy stops honouring the token at its expiry regardless.
+ * Fails the previews a previous process left building or starting: their job died with it. They expire at
+ * once, so the first sweep takes their services down.
+ */
+export function failInterruptedPreviews(
+  db: Db,
+  now: Date = new Date(),
+): number {
+  return db
+    .update(previews)
+    .set({
+      state: "failed",
+      failure: "sprite",
+      detail:
+        "interrupted: the API restarted during the start; start the preview again",
+      expiresAt: now.toISOString(),
+    })
+    .where(inArray(previews.state, ["building", "starting"]))
+    .run().changes;
+}
+
+/**
+ * Ends every preview past its expiry: a ready one at its TTL, a failed one once it has been readable long
+ * enough, one that never got ready past its start deadline. Each failure is logged and left for the next
+ * sweep, since the row stays until its services are gone; the proxy stops honouring the token at its expiry
+ * regardless.
  */
 export async function sweepExpiredPreviews(
   db: Db,

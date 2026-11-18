@@ -8,7 +8,7 @@ import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { createDispatcher } from "./deliveries.js";
 import { signalRunner } from "./launch.js";
-import { sweepExpiredPreviews } from "./previews.js";
+import { failInterruptedPreviews, sweepExpiredPreviews } from "./previews.js";
 import { createRunProber } from "./probe.js";
 import { failInterruptedProvisioning } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
@@ -85,6 +85,8 @@ export function boot(
       : `no migrations pending${blocked ? `; ${checkpoint}` : ""}`,
   );
   failInterruptedProvisioning(db);
+  // a preview's build and start ran in the process that has just ended; the first sweep takes its sprite down
+  failInterruptedPreviews(db);
   const dispatcher = createDispatcher({
     db,
     signingKey: config.webhookSigningKey,

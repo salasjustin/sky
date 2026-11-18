@@ -14,17 +14,31 @@ export const PREVIEW_MIN_TTL_SECONDS = 60;
 export const PREVIEW_DEFAULT_TTL_SECONDS = 24 * 3600;
 export const PREVIEW_MAX_TTL_SECONDS = 7 * 24 * 3600;
 
-/** The dev server's port: any unprivileged port but the proxy's own. */
+/** The app's port: any unprivileged port but the proxy's own. */
 export const PreviewPort = z
   .int()
   .min(1024)
   .max(65535)
   .refine((port) => port !== PREVIEW_PROXY_PORT, {
-    message: `${PREVIEW_PROXY_PORT} is the port the preview's proxy holds; the dev server needs another`,
+    message: `${PREVIEW_PROXY_PORT} is the port the preview's proxy holds; the app needs another`,
   });
 
+/** `build: "none"` skips the build. */
+export const PREVIEW_BUILD_NONE = "none";
+
+/** How far a preview is: its production build, its app server coming up, serving, or failed. */
+export const PreviewState = z.enum(["building", "starting", "ready", "failed"]);
+export type PreviewState = z.infer<typeof PreviewState>;
+
+const Command = z.string().trim().min(1).max(4000);
+
+/**
+ * The commands default from the worktree's lockfile (`pnpm build` and `pnpm start` for
+ * `pnpm-lock.yaml`, and so on), so a repo with one needs neither.
+ */
 export const PreviewStart = z.strictObject({
-  cmd: z.string().trim().min(1).max(4000),
+  build: Command.optional(),
+  start: Command.optional(),
   port: PreviewPort,
   ttlSeconds: z
     .int()

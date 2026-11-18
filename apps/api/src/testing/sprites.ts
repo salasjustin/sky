@@ -122,7 +122,7 @@ export function stubSprites() {
     /** WebSocket exec connections the client has not closed. */
     openSockets: 0,
     // answers `sha256sum <path>` and `mv -f <from> <to>` from `files`, as coreutils would
-    exec: (argv: string[]): ExecOutcome => {
+    exec: (argv: string[], _sprite?: string): ExecOutcome => {
       if (argv[0] === "sha256sum" && argv[1]) {
         const bytes = wire.files.get(argv[1]);
         return bytes
@@ -179,6 +179,11 @@ export function stubSprites() {
      * pass, then a 503), as a Sprites API that hangs.
      */
     hangs: (_call: string): boolean => false,
+    /**
+     * Awaited by each exec before it answers, after `hangs`: a test returns a promise for a call (matched by
+     * its `calls` line) to hold it, as a long build is held, and resolves it to let the exec finish.
+     */
+    gate: (_call: string): Promise<void> | undefined => undefined,
     /** How long a hung call waits before answering 503 when the client never aborts it. */
     hangMs: 5_000,
     /** Resolves once every call `hangs` caught has been answered, whether the client aborted it or not. */
@@ -194,10 +199,14 @@ export function stubSprites() {
     services: new Map<string, Map<string, ServiceRecord>>(),
     /**
      * The events a created service streams back before its stream ends; `started` then `complete`
-     * unless set. A test makes a dev server die at start with an `exit` event.
+     * unless set. A test makes an app server die at start with an `exit` event.
      */
     serviceEvents: undefined as
       | ((sprite: string, service: string) => object[])
+      | undefined,
+    /** The lines a service's log holds, for `GET …/services/:name/logs`; none unless set. */
+    serviceLogs: undefined as
+      | ((sprite: string, service: string) => string[])
       | undefined,
     serviceStatus: 200,
     serviceDeleteStatus: 204,
@@ -277,7 +286,7 @@ export function stubSprites() {
         { status: 201 },
       );
     }),
-    http.post(`${SPRITES}/:name/exec`, ({ request, params }) => {
+    http.post(`${SPRITES}/:name/exec`, async ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
       const name = String(params.name);
       const url = new URL(request.url);
@@ -307,7 +316,9 @@ export function stubSprites() {
       if (!wire.sprites.has(name)) {
         return HttpResponse.json({ error: "not found" }, { status: 404 });
       }
-      let outcome = wire.exec(logged?.argv ?? capped?.argv ?? argv);
+      // a long-running exec, as a build is: held here until the test lets it finish
+      await wire.gate(call);
+      let outcome = wire.exec(logged?.argv ?? capped?.argv ?? argv, name);
       if (capped) outcome = runCapped(capped, outcome);
       if (logged) {
         if (outcome.exitCode !== 0) {
@@ -551,6 +562,25 @@ export function stubSprites() {
         ];
         return new HttpResponse(
           `${events.map((e) => JSON.stringify(e)).join("\n")}\n`,
+          { headers: { "content-type": "application/x-ndjson" } },
+        );
+      },
+    ),
+    http.get(
+      `${SPRITES}/:name/services/:service/logs`,
+      ({ request, params }) => {
+        if (!authorized(request))
+          return new HttpResponse(null, { status: 401 });
+        const name = String(params.name);
+        const service = String(params.service);
+        wire.calls.push(`service-logs ${name} ${service}`);
+        const lines = wire.serviceLogs?.(name, service) ?? [];
+        return new HttpResponse(
+          lines
+            .map((data) =>
+              JSON.stringify({ type: "stdout", data, timestamp: 1 }),
+            )
+            .join("\n"),
           { headers: { "content-type": "application/x-ndjson" } },
         );
       },
