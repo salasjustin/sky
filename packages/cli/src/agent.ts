@@ -252,7 +252,9 @@ function previewAction(ref: string | undefined, values: Values): Action {
         raw,
         `${preview.state} ${preview.port} ${preview.expiresAt} ${services}`,
       );
-      return 0;
+      return preview.state === "failed"
+        ? previewFailed(out, ref, preview.detail)
+        : 0;
     };
   }
   if (port === undefined) {
@@ -302,10 +304,23 @@ function previewAction(ref: string | undefined, values: Values): Action {
 const STALE_NOTE = (ref: string) =>
   `it serves this build of the worktree: a new commit needs a new preview, so run sky agent preview ${ref} --port=… again, which rebuilds and replaces this one`;
 
+/** Exit 1 with what failed, worded as `failApi` words the API's own errors. */
+function previewFailed(
+  out: Output,
+  ref: string,
+  detail: string | null | undefined,
+): number {
+  const message = detail ?? `the preview of ${ref} failed`;
+  return out.fail(
+    "preview_failed",
+    out.json ? message : `${message} (preview_failed)`,
+  );
+}
+
 /**
- * Polls the preview until it is ready or failed, printing each state as it changes, then prints the link. A
- * failed one reaches `failApi` as the API's own `preview_failed`, with the tail of what failed. An
- * unreachable API or a 5xx that isn't that is retried with backoff, as `sky wait` does.
+ * Polls the preview until it is ready or failed, printing each state as it changes. A failed one exits 1
+ * with the tail of what failed; under --json its object still goes to stdout, as a ready one's does. An
+ * unreachable API or a 5xx is retried with backoff, as `sky wait` does.
  */
 async function waitUntilReady(
   api: Api,
@@ -314,9 +329,11 @@ async function waitUntilReady(
   ref: string,
   started: Awaited<ReturnType<Api["startPreview"]>>,
 ): Promise<number> {
-  // armed before the first request: a Ctrl-C at any point leaves the preview building
+  // armed before the first request: a Ctrl-C or SIGTERM at any point leaves the preview building. The
+  // link is never shown again (Sky keeps only its hash), so under --json the start's object goes out first
   const disarm = io.onInterrupt(
     `interrupted; the preview of ${ref} keeps building on the server. Run sky agent preview ${ref} to see when it is ready`,
+    out.json ? `${JSON.stringify(started.raw, null, 2)}\n` : undefined,
   );
   try {
     // the link is shown only now: printed before the wait, so an interrupted wait doesn't lose it. Under
@@ -324,13 +341,15 @@ async function waitUntilReady(
     if (!out.json) out.result(started.raw, started.preview.link);
     let shown: string | undefined;
     let latest: Record<string, unknown> = started.preview;
+    let detail = started.preview.detail;
     let failures = 0;
-    for (let state = started.preview.state; ; ) {
+    let state = started.preview.state;
+    for (;;) {
       if (state !== shown) {
         out.progress(`${ref} ${state}`);
         shown = state;
       }
-      if (state === "ready") break;
+      if (state === "ready" || state === "failed") break;
       await io.sleep(Math.min(pollIntervalMs * 2 ** failures, maxBackoffMs));
       try {
         const { preview } = await api.getPreview(ref);
@@ -343,7 +362,9 @@ async function waitUntilReady(
         failures = 0;
         latest = { ...latest, ...preview };
         state = preview.state;
+        detail = preview.detail;
       } catch (err) {
+        // a 502 `preview_failed` that came without its preview is still final, not the sprite being away
         const transient =
           err instanceof ApiError &&
           err.code !== "preview_failed" &&
@@ -366,6 +387,7 @@ async function waitUntilReady(
         "",
       );
     }
+    if (state === "failed") return previewFailed(out, ref, detail);
     out.progress(`the link works until ${latest.expiresAt}`);
     out.progress(STALE_NOTE(ref));
     return 0;

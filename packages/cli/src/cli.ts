@@ -28,8 +28,8 @@ export interface Io {
   };
   sleep(ms: number): Promise<void>;
   now(): number;
-  /** From return until the returned disarm runs, Ctrl-C prints `sky: <note>` on stderr before the process dies by SIGINT; arm before printing anything that invites a Ctrl-C. */
-  onInterrupt(note: string): () => void;
+  /** From return until the returned disarm runs, SIGINT or SIGTERM writes `stdout` (when given) to stdout and `sky: <note>` to stderr before the process dies by that signal; arm before printing anything that invites a Ctrl-C. */
+  onInterrupt(note: string, stdout?: string): () => void;
 }
 
 const help = (io: Io) => `Usage:
@@ -149,7 +149,10 @@ const help = (io: Io) => `Usage:
       page saying it is building, then the app at its root path), then
       waits, printing building, starting and ready on stderr as it changes
       (exit 0 once ready). A build or start that fails prints the tail of
-      its output (exit 1); --no-wait returns at once, exit 0. The link
+      its output (exit 1); --no-wait returns at once, exit 0. With --json,
+      the object goes to stdout once ready or failed, and also when the
+      wait is interrupted (Ctrl-C or SIGTERM), since the link is never
+      shown again; the preview keeps building on the server. The link
       works until --ttl (a duration such as 90m, 24h or 7d; 24h by
       default, 7d at most) or --stop, which ends the preview (exit 0 when
       none is running). The server doesn't pick up worktree edits: a new
@@ -162,9 +165,10 @@ const help = (io: Io) => `Usage:
       heavy job on the sandbox's memory: start a preview while no other
       heavy job runs on the environment. Without flags, it prints
       "<state> <port> <expires> <app> <proxy>": the state (building,
-      starting, ready), the port, the expiry (UTC) and how the app and the
-      link's proxy are doing, or a note on stderr when none is running.
-      The link is shown only when the preview starts.
+      starting, ready, failed), the port, the expiry (UTC) and how the app
+      and the link's proxy are doing, or a note on stderr when none is
+      running. A failed preview also prints what failed and exits 1. The
+      link is shown only when the preview starts.
   sky agent archive <agent> [options]
       Stop any active run and delete the agent's worktree; uncommitted work
       in it is lost.

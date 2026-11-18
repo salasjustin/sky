@@ -25,6 +25,23 @@ const provisioningEnv = {
   createdAt: "2026-10-30T00:00:00.000Z",
 };
 
+const previewLink =
+  "https://sky-abc-org.sprites.app/__sky/preview?t=tokentokentoken";
+const buildingPreview = {
+  preview: {
+    agentId: "agt_1",
+    envId: "env_1",
+    port: 5173,
+    state: "building",
+    detail: null,
+    failure: null,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: "2026-01-02T00:00:00.000Z",
+    link: previewLink,
+    replaced: null,
+  },
+};
+
 let api: Server;
 let apiUrl: string;
 const received: { url: string; body: string }[] = [];
@@ -47,6 +64,8 @@ beforeAll(async () => {
           data: [{ ...provisioningEnv, id: "env_1", status: "ready" }],
         },
         "/v1/environments/env_slow": provisioningEnv,
+        // the start and every poll: a preview that stays building
+        "/v1/agents/agt_1/preview": buildingPreview,
       };
       res.end(
         JSON.stringify(
@@ -174,3 +193,44 @@ test("Ctrl-C while waiting says the env keeps provisioning, then dies by SIGINT"
     "sky: interrupted; web (env_slow) keeps provisioning on the server. Re-run sky apply to pick it up\n",
   );
 });
+
+test.each(["SIGINT", "SIGTERM"] as const)(
+  "%s during a --json preview wait prints the start's object, link included, then dies by that signal",
+  async (signal) => {
+    const child = spawn(
+      process.execPath,
+      [bin, "agent", "preview", "agt_1", "--port=5173", "--json"],
+      {
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: mkdtempSync(join(tmpdir(), "sky-bin-")),
+          SKY_URL: apiUrl,
+          SKY_API_KEY: "k",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    let sent = false;
+    child.stdout.on("data", (c) => {
+      stdout += c;
+    });
+    child.stderr.on("data", (c) => {
+      stderr += c;
+      // once: a second signal finds the handler disarmed and kills before stdout drains
+      if (!sent && stderr.includes("agt_1 building")) {
+        sent = true;
+        child.kill(signal);
+      }
+    });
+    const [code, died] = await new Promise<[number | null, string | null]>(
+      (resolve) => child.on("close", (c, s) => resolve([c, s])),
+    );
+    expect({ code, signal: died }).toEqual({ code: null, signal });
+    expect(JSON.parse(stdout)).toEqual(buildingPreview);
+    expect(stderr).toContain(
+      "sky: interrupted; the preview of agt_1 keeps building on the server",
+    );
+  },
+);

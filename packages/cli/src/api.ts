@@ -98,6 +98,10 @@ const ApiPreview = z.looseObject({
   port: z.number().int(),
   expiresAt: z.string(),
   replaced: z.string().nullish(),
+  /** A failed preview's redacted error: the tail of what failed. */
+  detail: z.string().nullish(),
+  /** Whose side a failed preview failed on; absent from an older API. */
+  failure: z.enum(["command", "sprite"]).nullish(),
 });
 
 /** Keys are parsed, not loose: output is built from the parse, so a field the API adds (a hash) never reaches stdout. */
@@ -284,11 +288,22 @@ export function createApi(config: Config) {
       );
       return { raw: json, stopped: stopped !== null };
     },
+    /** A failed preview comes back as one, `state: "failed"`, whichever way the API answered it. */
     async getPreview(agentId: string) {
-      const { status, json } = await request(
-        "GET",
-        agentPath(agentId, "preview"),
-      );
+      let status: number;
+      let json: unknown;
+      try {
+        ({ status, json } = await request("GET", agentPath(agentId, "preview")));
+      } catch (err) {
+        // an older API answers a failed preview with 422/502 `preview_failed`, the preview beside the error
+        if (!(err instanceof ApiError) || err.code !== "preview_failed") {
+          throw err;
+        }
+        const old = err.details.preview;
+        if (typeof old !== "object" || old === null) throw err;
+        status = err.status;
+        json = { preview: { detail: err.message, ...old } };
+      }
       const { preview } = parseKey(
         z.object({
           preview: ApiPreview.extend({

@@ -16,10 +16,21 @@ const preview = (over: Record<string, unknown> = {}) => ({
   expiresAt: "2026-01-02T00:00:00.000Z",
   ...over,
 });
-const failure = (message: string) => ({
+/** How GET answers a failed preview. */
+const failed = (detail: string, failure: "command" | "sprite" = "command") =>
+  HttpResponse.json({
+    preview: {
+      ...preview({ state: "failed", detail, failure }),
+      services: { app: "fatal", proxy: "running" },
+    },
+  });
+/** How an older API answered it: an error status, the preview beside the error. */
+const oldFailure = (message: string) => ({
   error: { code: "preview_failed", message },
   preview: preview({ state: "failed", detail: message }),
 });
+/** The sweep deleting the failed row: what a wait that misses `failed` ends on. */
+const swept = () => HttpResponse.json({ preview: null });
 
 let sent: { method: string; body: unknown }[];
 /** What each GET answers, in turn; the last repeats. */
@@ -143,35 +154,102 @@ test("--no-wait returns at once, exit 0, with the link and the state it started 
   expect(r.sleeps).toEqual([]);
 });
 
-test("a build that fails ends the wait with the API's preview_failed and its output, exit 1", async () => {
+test("a build that fails ends the wait with preview_failed and its output, exit 1", async () => {
   reads = [
     ...answers("building"),
-    () =>
-      HttpResponse.json(
-        failure("the build exited 1: error TS2304: cannot find name"),
-        { status: 422 },
-      ),
+    () => failed("the build exited 1: error TS2304: cannot find name"),
+    swept,
   ];
   const r = await runCli(startArgs);
   expect(r.code).toBe(1);
+  expect(r.stderr).toContain("agt_1 failed\n");
   expect(r.stderr).toContain(
-    "the build exited 1: error TS2304: cannot find name (preview_failed)",
+    "sky: the build exited 1: error TS2304: cannot find name (preview_failed)\n",
   );
+  expect(r.stderr).not.toContain("stopped or replaced");
+  expect(r.stderr).not.toContain("the link works until");
   // the link was printed before the wait; the failure is the exit status
   expect(r.stdout).toBe(`${link}\n`);
+  // it ends on the failed answer, not on the row's sweep
+  expect(gets()).toHaveLength(2);
 });
 
 test("a preview that fails on the sprite's side also exits 1, and the wait does not retry it", async () => {
   reads = [
-    () =>
-      HttpResponse.json(failure("checking port 5173 on the sprite exited 2"), {
-        status: 502,
-      }),
+    () => failed("checking port 5173 on the sprite exited 2", "sprite"),
+    swept,
   ];
   const r = await runCli(startArgs);
   expect(r.code).toBe(1);
-  expect(r.stderr).toContain("(preview_failed)");
+  expect(r.stderr).toContain(
+    "checking port 5173 on the sprite exited 2 (preview_failed)",
+  );
   expect(gets()).toHaveLength(1);
+});
+
+test("an older API's 502 preview_failed still ends the wait, exit 1, without a retry", async () => {
+  reads = [
+    () =>
+      HttpResponse.json(
+        oldFailure("checking port 5173 on the sprite exited 2"),
+        { status: 502 },
+      ),
+    swept,
+  ];
+  const r = await runCli(startArgs);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "sky: checking port 5173 on the sprite exited 2 (preview_failed)\n",
+  );
+  expect(r.stderr).not.toContain("lost contact");
+  expect(gets()).toHaveLength(1);
+});
+
+test("a start the API answers already failed ends at once, exit 1, with no poll", async () => {
+  server.use(
+    http.post(`${apiUrl}/v1/agents/agt_1/preview`, () =>
+      HttpResponse.json(
+        {
+          preview: {
+            ...preview({ state: "failed", detail: "the build exited 1" }),
+            link,
+            replaced: null,
+          },
+        },
+        { status: 202 },
+      ),
+    ),
+  );
+  reads = [swept];
+  const r = await runCli(startArgs);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("sky: the build exited 1 (preview_failed)\n");
+  expect(gets()).toEqual([]);
+  expect(r.sleeps).toEqual([]);
+});
+
+test("--json: a failed wait prints the preview object on stdout and the error on stderr, exit 1", async () => {
+  reads = [
+    ...answers("building"),
+    () => failed("the build exited 1: boom"),
+    swept,
+  ];
+  const r = await runCli([...startArgs, "--json"]);
+  expect(r.code).toBe(1);
+  expect(JSON.parse(r.stdout)).toMatchObject({
+    preview: {
+      agentId: "agt_1",
+      state: "failed",
+      detail: "the build exited 1: boom",
+      failure: "command",
+      link,
+    },
+  });
+  expect(r.stderr.trim().split("\n").at(-1)).toBe(
+    JSON.stringify({
+      error: { code: "preview_failed", message: "the build exited 1: boom" },
+    }),
+  );
 });
 
 test("an unreachable API or a 5xx during the wait is retried with backoff, and the wait goes on", async () => {
@@ -271,14 +349,24 @@ test("with no flags it prints the state, port, expiry and how the two services a
   expect(gets()).toHaveLength(1);
 });
 
-test("with no flags and a failed preview it exits 1 with the failure", async () => {
-  reads = [
-    () =>
-      HttpResponse.json(failure("the build exited 1: boom"), { status: 422 }),
-  ];
+test("with no flags and a failed preview it prints its line and exits 1 with the failure", async () => {
+  reads = [() => failed("the build exited 1: boom")];
   const r = await runCli(["agent", "preview", "agt_1"]);
   expect(r.code).toBe(1);
-  expect(r.stderr).toContain("the build exited 1: boom (preview_failed)");
+  expect(r.stdout).toBe("failed 5173 2026-01-02T00:00:00.000Z fatal running\n");
+  expect(r.stderr).toBe("sky: the build exited 1: boom (preview_failed)\n");
+});
+
+test("with no flags, --json and a failed preview it prints the object and still exits 1", async () => {
+  reads = [() => failed("the build exited 1: boom")];
+  const r = await runCli(["agent", "preview", "agt_1", "--json"]);
+  expect(r.code).toBe(1);
+  expect(JSON.parse(r.stdout)).toMatchObject({
+    preview: { state: "failed", detail: "the build exited 1: boom" },
+  });
+  expect(JSON.parse(r.stderr)).toEqual({
+    error: { code: "preview_failed", message: "the build exited 1: boom" },
+  });
 });
 
 test("with no flags and nothing running it says so on stderr", async () => {
