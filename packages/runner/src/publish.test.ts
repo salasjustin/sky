@@ -2792,6 +2792,75 @@ test("a forced update made but answered 502 is found made on the read after the 
   expect(sleeps).toEqual([1000]);
 });
 
+test("a forced update answered 502 and not made is sent again once the ref is read still at the found head", async () => {
+  const gh = rewrittenBranch();
+  let patches = 0;
+  server.use(
+    http.patch(`${REPO}/git/refs/heads/claude/agt_1`, async ({ request }) => {
+      patches++;
+      if (patches === 1) return badGateway();
+      gh.ref = ((await request.json()) as { sha: string }).sha;
+      return HttpResponse.json({ object: { sha: gh.ref } });
+    }),
+  );
+
+  const { result, sleeps, lines } = retryRun();
+
+  expect((await result).sha).toBe("commit1");
+  expect(patches).toBe(2);
+  expect(gh.ref).toBe("commit1");
+  expect(sleeps).toEqual([1000]);
+  expect(lines).toEqual([
+    "GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 answered 502; retrying in 1 s (retry 1/3)",
+  ]);
+});
+
+test("a forced update whose ref read fails after the pause ends with that failure, without another PATCH", async () => {
+  const gh = rewrittenBranch();
+  let patches = 0;
+  server.use(
+    http.patch(`${REPO}/git/refs/heads/claude/agt_1`, () => {
+      patches++;
+      return badGateway();
+    }),
+    // the reads before the forced update answer; every read after its first PATCH is a 502
+    http.get(`${REPO}/git/ref/heads/claude/agt_1`, () =>
+      patches === 0
+        ? HttpResponse.json({ object: { sha: gh.ref, type: "commit" } })
+        : badGateway(),
+    ),
+  );
+
+  const { result, sleeps } = retryRun();
+
+  await expect(result).rejects.toThrow(
+    "GitHub gateway: GET /repos/acme/widgets/git/ref/heads/claude/agt_1 returned 502: Bad Gateway (after 3 retries)",
+  );
+  expect(patches).toBe(1);
+  // the forced update's own pause, then the read's three
+  expect(sleeps).toEqual([1000, 1000, 3000, 9000]);
+});
+
+test("a forced update answered 502 on every attempt with the ref unmoved fails after three retries", async () => {
+  rewrittenBranch();
+  let patches = 0;
+  server.use(
+    http.patch(`${REPO}/git/refs/heads/claude/agt_1`, () => {
+      patches++;
+      return badGateway();
+    }),
+  );
+
+  const { result, sleeps, lines } = retryRun();
+
+  await expect(result).rejects.toThrow(
+    "GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 502: Bad Gateway (after 3 retries)",
+  );
+  expect(patches).toBe(4);
+  expect(sleeps).toEqual([1000, 3000, 9000]);
+  expect(lines).toHaveLength(3);
+});
+
 test("a 502 on a GET is retried", async () => {
   fakeGitHub();
   writeFileSync(join(work, "a.txt"), "first\n");
