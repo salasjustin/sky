@@ -146,6 +146,37 @@ test_(
 );
 
 test_(
+  "leaves an agent's preview services running when its run ends",
+  async () => {
+    const runId = uniqueRun("preview");
+    // the dev server this run's own commands started: ended with the run
+    const leftover = await orphan({ RUN_ID: runId });
+    // what the sprite's service manager runs for a preview: the app server with the env's secrets and its
+    // port, and the token proxy with its hash; neither carries the run's id, and neither is the runner's child
+    const devServer = await orphan({ PORT: "5173", DATABASE_URL: "x" });
+    const proxy = await orphan({
+      PREVIEW_TOKEN_HASH: "0".repeat(64),
+      PREVIEW_UPSTREAM_PORT: "5173",
+    });
+    const { runner, worker } = await runnerWithChild({});
+    await settled(leftover, devServer, proxy, worker);
+
+    const ended = await endSessionProcesses({
+      runId,
+      pid: runner,
+      graceMs: 2_000,
+      warn: () => {},
+    });
+
+    expect(ended).toBe(2);
+    expect(await running(leftover)).toBe(false);
+    expect(await running(worker)).toBe(false);
+    expect(await running(devServer)).toBe(true);
+    expect(await running(proxy)).toBe(true);
+  },
+);
+
+test_(
   "kills a process that ignores SIGTERM once the grace runs out",
   async () => {
     const dir = mkdtempSync(join(tmpdir(), "sky-reap-"));

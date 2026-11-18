@@ -82,6 +82,19 @@ const invalidName = () =>
     { status: 400 },
   );
 
+/** A service as the Sprites API holds it: the request body of the PUT that made it. */
+export type ServiceRecord = {
+  cmd: string;
+  args?: string[];
+  env?: Record<string, string>;
+  dir?: string;
+  needs?: string[];
+  http_port?: number;
+};
+
+/** The sprite's URL as the API reports it: `<sprite>-<org>.sprites.app`. */
+export const spriteUrlOf = (name: string) => `https://${name}-test.sprites.app`;
+
 /** In-memory Sprites API speaking the wire format @fly/sprites reads. */
 export function stubSprites() {
   const wire = {
@@ -101,6 +114,8 @@ export function stubSprites() {
      * `rm <name> <path>`, `delete <name>`, `label <name>` (the PUT that sets labels).
      */
     calls: [] as string[],
+    /** The `calls` line of each HTTP exec the client aborted before it was answered, which the API sees as a dropped connection. */
+    cutExecs: [] as string[],
     /** The body of each sprite's last update, by name. */
     updates: new Map<string, { labels?: string[]; url_settings?: unknown }>(),
     /** Each sprite's labels and url settings as the API holds them; an update keeps the fields its body omits. */
@@ -109,7 +124,7 @@ export function stubSprites() {
     /** WebSocket exec connections the client has not closed. */
     openSockets: 0,
     // answers `sha256sum <path>` and `mv -f <from> <to>` from `files`, as coreutils would
-    exec: (argv: string[]): ExecOutcome => {
+    exec: (argv: string[], _sprite?: string): ExecOutcome => {
       if (argv[0] === "sha256sum" && argv[1]) {
         const bytes = wire.files.get(argv[1]);
         return bytes
@@ -166,6 +181,12 @@ export function stubSprites() {
      * pass, then a 503), as a Sprites API that hangs.
      */
     hangs: (_call: string): boolean => false,
+    /**
+     * Awaited after `hangs` by each exec before it answers, and by each service create before it stores the
+     * service: a test returns a promise for a call (matched by its `calls` line) to hold it, as a long build
+     * is held, and resolves it to let the call finish.
+     */
+    gate: (_call: string): Promise<void> | undefined => undefined,
     /** How long a hung call waits before answering 503 when the client never aborts it. */
     hangMs: 5_000,
     /** Resolves once every call `hangs` caught has been answered, whether the client aborted it or not. */
@@ -173,10 +194,33 @@ export function stubSprites() {
       Promise.all(inflightHangs).then(() => undefined),
     createStatus: 201,
     updateStatus: 200,
+    /**
+     * An update whose body this matches answers 503 and changes nothing, as an API that refuses one kind of
+     * change (the URL going private) while the rest work; `updateStatus` fails every update.
+     */
+    updateRefused: (_body: {
+      labels?: string[];
+      url_settings?: unknown;
+    }): boolean => false,
     writeStatus: 200,
     readStatus: 200,
     checkpointLines: undefined as object[] | undefined,
     deleteStatus: 204,
+    /** Each sprite's services by name, as `PUT …/services/:name` left them; a delete removes one. */
+    services: new Map<string, Map<string, ServiceRecord>>(),
+    /**
+     * The events a created service streams back before its stream ends; `started` then `complete`
+     * unless set. A test makes an app server die at start with an `exit` event.
+     */
+    serviceEvents: undefined as
+      | ((sprite: string, service: string) => object[])
+      | undefined,
+    /** The lines a service's log holds, for `GET …/services/:name/logs`; none unless set. */
+    serviceLogs: undefined as
+      | ((sprite: string, service: string) => string[])
+      | undefined,
+    serviceStatus: 200,
+    serviceDeleteStatus: 204,
   };
   let checkpoints = 0;
   const madeDirs = new Map<
@@ -253,7 +297,7 @@ export function stubSprites() {
         { status: 201 },
       );
     }),
-    http.post(`${SPRITES}/:name/exec`, ({ request, params }) => {
+    http.post(`${SPRITES}/:name/exec`, async ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
       const name = String(params.name);
       const url = new URL(request.url);
@@ -275,6 +319,14 @@ export function stubSprites() {
           : (capped?.argv ?? argv).join(" ")
       }`;
       wire.calls.push(call);
+      let answered = false;
+      request.signal.addEventListener(
+        "abort",
+        () => {
+          if (!answered) wire.cutExecs.push(call);
+        },
+        { once: true },
+      );
       if (wire.hangs(call)) {
         // a hung wrapper is still writing `full`
         if (capped) stageCapped(capped.dir, new Uint8Array());
@@ -283,7 +335,9 @@ export function stubSprites() {
       if (!wire.sprites.has(name)) {
         return HttpResponse.json({ error: "not found" }, { status: 404 });
       }
-      let outcome = wire.exec(logged?.argv ?? capped?.argv ?? argv);
+      // a long-running exec, as a build is: held here until the test lets it finish
+      await wire.gate(call);
+      let outcome = wire.exec(logged?.argv ?? capped?.argv ?? argv, name);
       if (capped) outcome = runCapped(capped, outcome);
       if (logged) {
         if (outcome.exitCode !== 0) {
@@ -327,6 +381,7 @@ export function stubSprites() {
           controller.enqueue(frame);
         },
       });
+      answered = true;
       return new HttpResponse(body, {
         headers: { "content-type": "application/octet-stream" },
       });
@@ -477,9 +532,98 @@ export function stubSprites() {
         id: `spr_${name}`,
         name,
         status: "warm",
+        url: spriteUrlOf(name),
         labels,
         url_settings,
       });
+    }),
+    http.get(`${SPRITES}/:name/services`, ({ request, params }) => {
+      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
+      const name = String(params.name);
+      wire.calls.push(`services-list ${name}`);
+      if (!wire.sprites.has(name)) {
+        return HttpResponse.json({ error: "not found" }, { status: 404 });
+      }
+      return HttpResponse.json(
+        [...(wire.services.get(name) ?? [])].map(([service, record]) => ({
+          name: service,
+          ...record,
+          state: { name: service, status: "running", pid: 100 },
+        })),
+      );
+    }),
+    http.put(
+      `${SPRITES}/:name/services/:service`,
+      async ({ request, params }) => {
+        if (!authorized(request))
+          return new HttpResponse(null, { status: 401 });
+        const name = String(params.name);
+        const service = String(params.service);
+        wire.calls.push(`service-create ${name} ${service}`);
+        if (wire.hangs(`service-create ${name} ${service}`)) {
+          return hang(request);
+        }
+        if (!wire.sprites.has(name)) {
+          return HttpResponse.json({ error: "not found" }, { status: 404 });
+        }
+        if (wire.serviceStatus !== 200) {
+          return HttpResponse.json(
+            { error: "service refused" },
+            { status: wire.serviceStatus },
+          );
+        }
+        await wire.gate(`service-create ${name} ${service}`);
+        const record = (await request.json()) as ServiceRecord;
+        const services = wire.services.get(name) ?? new Map();
+        services.set(service, record);
+        wire.services.set(name, services);
+        const events = wire.serviceEvents?.(name, service) ?? [
+          { type: "started", timestamp: 1 },
+          { type: "complete", timestamp: 2 },
+        ];
+        return new HttpResponse(
+          `${events.map((e) => JSON.stringify(e)).join("\n")}\n`,
+          { headers: { "content-type": "application/x-ndjson" } },
+        );
+      },
+    ),
+    http.get(
+      `${SPRITES}/:name/services/:service/logs`,
+      ({ request, params }) => {
+        if (!authorized(request))
+          return new HttpResponse(null, { status: 401 });
+        const name = String(params.name);
+        const service = String(params.service);
+        wire.calls.push(`service-logs ${name} ${service}`);
+        const lines = wire.serviceLogs?.(name, service) ?? [];
+        return new HttpResponse(
+          lines
+            .map((data) =>
+              JSON.stringify({ type: "stdout", data, timestamp: 1 }),
+            )
+            .join("\n"),
+          { headers: { "content-type": "application/x-ndjson" } },
+        );
+      },
+    ),
+    http.delete(`${SPRITES}/:name/services/:service`, ({ request, params }) => {
+      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
+      const name = String(params.name);
+      const service = String(params.service);
+      wire.calls.push(`service-delete ${name} ${service}`);
+      if (wire.serviceDeleteStatus !== 204) {
+        return HttpResponse.json(
+          { error: "upstream unavailable" },
+          { status: wire.serviceDeleteStatus },
+        );
+      }
+      if (!wire.services.get(name)?.delete(service)) {
+        return HttpResponse.json(
+          { error: "service not found" },
+          { status: 404 },
+        );
+      }
+      return new HttpResponse(null, { status: 204 });
     }),
     http.put(`${SPRITES}/:name`, async ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
@@ -499,6 +643,9 @@ export function stubSprites() {
         labels?: string[];
         url_settings?: unknown;
       };
+      if (wire.updateRefused(body)) {
+        return HttpResponse.json({ error: "update refused" }, { status: 503 });
+      }
       wire.updates.set(name, body);
       const before = storedOf(name);
       const after = {

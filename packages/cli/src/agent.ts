@@ -3,6 +3,10 @@ import {
   AGENT_LIST_MAX_LIMIT,
   AgentState,
   BranchName,
+  PREVIEW_MAX_TTL_SECONDS,
+  PREVIEW_MIN_TTL_SECONDS,
+  PREVIEW_PROXY_PORT,
+  PreviewPort,
   type RunStatus,
 } from "@sky/shared";
 import { type Api, ApiError, type ApiListedAgent, type ApiRun } from "./api.js";
@@ -27,6 +31,12 @@ type Values = {
   archived?: boolean;
   limit?: string;
   cursor?: string;
+  build?: string;
+  start?: string;
+  "no-wait"?: boolean;
+  port?: string;
+  ttl?: string;
+  stop?: boolean;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;
@@ -157,6 +167,234 @@ function agentLine(a: ApiListedAgent): string {
 }
 
 const listOnly = ["env", "status", "archived", "limit", "cursor"] as const;
+const previewOnly = [
+  "build",
+  "start",
+  "port",
+  "ttl",
+  "stop",
+  "no-wait",
+] as const;
+
+/** `90s`, `30m`, `2h`, `7d`; a bare number is seconds. Rejected here what the API's range would reject, so it exits 2. */
+function parseTtl(raw: string): number {
+  const match = /^(\d+)([smhd]?)$/.exec(raw);
+  const unit = { "": 1, s: 1, m: 60, h: 3600, d: 86_400 } as const;
+  const seconds = match
+    ? Number(match[1]) * unit[match[2] as keyof typeof unit]
+    : Number.NaN;
+  if (
+    !Number.isSafeInteger(seconds) ||
+    seconds < PREVIEW_MIN_TTL_SECONDS ||
+    seconds > PREVIEW_MAX_TTL_SECONDS
+  ) {
+    throw new UsageError(
+      `--ttl takes a duration like 90m, 24h or 7d, from 1m to 7d, not '${raw}'`,
+      true,
+    );
+  }
+  return seconds;
+}
+
+/** What `agent preview` was asked to do, checked before any request. */
+function previewAction(ref: string | undefined, values: Values): Action {
+  if (ref === undefined) {
+    throw new UsageError(
+      "agent preview takes <agent> [--build=<cmd>] [--start=<cmd>] --port=<n> [--ttl=<duration>] [--no-wait], or <agent> --stop",
+      true,
+    );
+  }
+  for (const flag of ["prompt", "branch"] as const) {
+    if (values[flag] !== undefined) {
+      throw new UsageError(`agent preview takes no --${flag}`, true);
+    }
+  }
+  const { build, start, port, ttl } = values;
+  const starting =
+    build !== undefined ||
+    start !== undefined ||
+    port !== undefined ||
+    ttl !== undefined;
+  if (values.stop) {
+    if (starting || values["no-wait"]) {
+      throw new UsageError(
+        "agent preview --stop takes no --build, --start, --port, --ttl or --no-wait",
+        true,
+      );
+    }
+    return async (api, _io, out) => {
+      const { raw, stopped } = await api.stopPreview(ref);
+      // exit 0 either way, so a retried stop or a cleanup trap doesn't fail
+      out.result(
+        raw,
+        stopped
+          ? `stopped the preview of ${ref}`
+          : `${ref} had no running preview`,
+      );
+      return 0;
+    };
+  }
+  if (!starting) {
+    if (values["no-wait"]) {
+      throw new UsageError("--no-wait only goes with starting a preview", true);
+    }
+    return async (api, _io, out) => {
+      const { raw, preview } = await api.getPreview(ref);
+      if (preview === null) {
+        out.result(raw, "");
+        out.progress(`${ref} has no running preview`);
+        return 0;
+      }
+      const services = preview.services
+        ? `${preview.services.app} ${preview.services.proxy}`
+        : "- -";
+      out.result(
+        raw,
+        `${preview.state} ${preview.port} ${preview.expiresAt} ${services}`,
+      );
+      return preview.state === "failed"
+        ? previewFailed(out, ref, preview.detail)
+        : 0;
+    };
+  }
+  if (port === undefined) {
+    throw new UsageError("agent preview needs --port=<n>", true);
+  }
+  for (const [flag, value] of [
+    ["--build", build],
+    ["--start", start],
+  ] as const) {
+    if (value !== undefined && value.trim() === "") {
+      throw new UsageError(`${flag} is empty`, true);
+    }
+  }
+  const parsedPort = /^\d+$/.test(port)
+    ? PreviewPort.safeParse(Number(port))
+    : undefined;
+  if (!parsedPort?.success) {
+    throw new UsageError(
+      `--port takes a whole number from 1024 to 65535, other than ${PREVIEW_PROXY_PORT} (the preview's own), not '${port}'`,
+      true,
+    );
+  }
+  const ttlSeconds = ttl === undefined ? undefined : parseTtl(ttl);
+  return async (api, io, out) => {
+    const started = await api.startPreview(ref, {
+      port: parsedPort.data,
+      ...(build === undefined ? {} : { build: build.trim() }),
+      ...(start === undefined ? {} : { start: start.trim() }),
+      ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
+    });
+    const { preview } = started;
+    if (preview.replaced) {
+      out.progress(`replaced the running preview of ${preview.replaced}`);
+    }
+    if (values["no-wait"]) {
+      out.result(started.raw, preview.link);
+      out.progress(
+        `${ref} ${preview.state}; the link works until ${preview.expiresAt}. Run sky agent preview ${ref} to see when it is ready`,
+      );
+      return 0;
+    }
+    return await waitUntilReady(api, io, out, ref, started);
+  };
+}
+
+/** What a preview that is up serves, and how to move it on. */
+const STALE_NOTE = (ref: string) =>
+  `it serves this build of the worktree: a new commit needs a new preview, so run sky agent preview ${ref} --port=… again, which rebuilds and replaces this one`;
+
+/** Exit 1 with what failed, worded as `failApi` words the API's own errors. */
+function previewFailed(
+  out: Output,
+  ref: string,
+  detail: string | null | undefined,
+): number {
+  const message = detail ?? `the preview of ${ref} failed`;
+  return out.fail(
+    "preview_failed",
+    out.json ? message : `${message} (preview_failed)`,
+  );
+}
+
+/**
+ * Polls the preview until it is ready or failed, printing each state as it changes. A failed one exits 1
+ * with the tail of what failed; under --json its object still goes to stdout, as a ready one's does. An
+ * unreachable API or a 5xx is retried with backoff, as `sky wait` does.
+ */
+async function waitUntilReady(
+  api: Api,
+  io: Io,
+  out: Output,
+  ref: string,
+  started: Awaited<ReturnType<Api["startPreview"]>>,
+): Promise<number> {
+  // armed before the first request: a Ctrl-C or SIGTERM at any point leaves the preview building. The
+  // link is never shown again (Sky keeps only its hash), so under --json the start's object goes out first
+  const disarm = io.onInterrupt(
+    `interrupted; the preview of ${ref} keeps building on the server. Run sky agent preview ${ref} to see when it is ready`,
+    out.json ? `${JSON.stringify(started.raw, null, 2)}\n` : undefined,
+  );
+  try {
+    // the link is shown only now: printed before the wait, so an interrupted wait doesn't lose it. Under
+    // --json the one object is printed at the end
+    if (!out.json) out.result(started.raw, started.preview.link);
+    let shown: string | undefined;
+    let latest: Record<string, unknown> = started.preview;
+    let detail = started.preview.detail;
+    let failures = 0;
+    let state = started.preview.state;
+    for (;;) {
+      if (state !== shown) {
+        out.progress(`${ref} ${state}`);
+        shown = state;
+      }
+      if (state === "ready" || state === "failed") break;
+      await io.sleep(Math.min(pollIntervalMs * 2 ** failures, maxBackoffMs));
+      try {
+        const { preview } = await api.getPreview(ref);
+        if (preview === null) {
+          return out.fail(
+            "preview_gone",
+            `the preview of ${ref} was stopped or replaced before it was ready`,
+          );
+        }
+        failures = 0;
+        latest = { ...latest, ...preview };
+        state = preview.state;
+        detail = preview.detail;
+      } catch (err) {
+        // a 502 `preview_failed` that came without its preview is still final, not the sprite being away
+        const transient =
+          err instanceof ApiError &&
+          err.code !== "preview_failed" &&
+          isTransient(err);
+        if (!transient) throw err;
+        if (failures === 0) {
+          out.progress(`lost contact with the API (${err.message}); retrying`);
+        }
+        failures++;
+      }
+    }
+    if (out.json) {
+      out.result(
+        {
+          preview: {
+            ...(started.raw as { preview: object }).preview,
+            ...latest,
+          },
+        },
+        "",
+      );
+    }
+    if (state === "failed") return previewFailed(out, ref, detail);
+    out.progress(`the link works until ${latest.expiresAt}`);
+    out.progress(STALE_NOTE(ref));
+    return 0;
+  } finally {
+    disarm();
+  }
+}
 
 const agentSub: AgentCommand = {
   options: {
@@ -167,6 +405,12 @@ const agentSub: AgentCommand = {
     archived: { type: "boolean" },
     limit: { type: "string" },
     cursor: { type: "string" },
+    build: { type: "string" },
+    start: { type: "string" },
+    "no-wait": { type: "boolean" },
+    port: { type: "string" },
+    ttl: { type: "string" },
+    stop: { type: "boolean" },
   },
   prepare(positionals, values) {
     const [sub, ref, ...extra] = positionals;
@@ -178,6 +422,15 @@ const agentSub: AgentCommand = {
         if (values[flag] !== undefined) {
           throw new UsageError(`agent list takes no --${flag}`, true);
         }
+      }
+      const previewFlag = previewOnly.find(
+        (flag) => values[flag] !== undefined && values[flag] !== false,
+      );
+      if (previewFlag !== undefined) {
+        throw new UsageError(
+          `--${previewFlag} only goes with agent preview`,
+          true,
+        );
       }
       const query = listQuery(values);
       return async (api, _io, out) => {
@@ -203,6 +456,21 @@ const agentSub: AgentCommand = {
     const stray = listOnly.find((flag) => values[flag] !== undefined);
     if (stray !== undefined && values[stray] !== false) {
       throw new UsageError(`--${stray} only goes with agent list`, true);
+    }
+    if (sub === "preview") {
+      if (extra.length > 0) {
+        throw new UsageError("agent preview takes one agent", true);
+      }
+      return previewAction(ref, values);
+    }
+    const previewStray = previewOnly.find(
+      (flag) => values[flag] !== undefined && values[flag] !== false,
+    );
+    if (previewStray !== undefined) {
+      throw new UsageError(
+        `--${previewStray} only goes with agent preview`,
+        true,
+      );
     }
     if (sub === "start" || sub === "follow-up") {
       const what = sub === "start" ? "<env> [--branch=<name>]" : "<agent>";
@@ -249,7 +517,7 @@ const agentSub: AgentCommand = {
     }
     throw new UsageError(
       sub === undefined
-        ? "agent needs a subcommand: start, follow-up, list or archive"
+        ? "agent needs a subcommand: start, follow-up, list, preview or archive"
         : `unknown agent subcommand '${sub}'`,
       true,
     );

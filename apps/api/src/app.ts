@@ -17,6 +17,7 @@ import { factory } from "./factory.js";
 import { internalRoutes } from "./internal.js";
 import { keyRoutes } from "./keys.js";
 import { createLauncher } from "./launch.js";
+import { createPreviews } from "./previews.js";
 import { wakeLaunch } from "./probe.js";
 import { createProvisioner } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
@@ -44,6 +45,12 @@ export type AppDeps = {
   spritesTimeoutMs?: number;
   /** How long the sprite calls before a launch may take (the follow-up's wait for the previous runner, the branch check); 20 s, inside the CLI's 30 s request timeout, unless a test shortens it. */
   preLaunchDeadlineMs?: number;
+  /** How long a preview's production build may run; 15 minutes unless a test shortens it. */
+  previewBuildCapMs?: number;
+  /** How long a preview's app has to listen on its port once started; 2 minutes unless a test shortens it. */
+  previewReadyTimeoutMs?: number;
+  /** How often a starting preview's port is asked; 2 s unless a test shortens it. */
+  previewReadyPollMs?: number;
   /** Called with a sprite's name when an exec on it exits 137; `boot` probes that sprite's running runs. */
   onExecKilled?: (spriteName: string) => void;
   /** The redaction registry, shared with whatever else purges from it; one from `config` by default. */
@@ -64,6 +71,9 @@ export function createApp({
   launchWakeMs = 90_000,
   spritesTimeoutMs = SPRITES_TIMEOUT_MS,
   preLaunchDeadlineMs = 20_000,
+  previewBuildCapMs,
+  previewReadyTimeoutMs,
+  previewReadyPollMs,
   onExecKilled,
   secrets = KnownSecrets.fromConfig(config),
   closing = new AbortController().signal,
@@ -112,6 +122,16 @@ export function createApp({
     ensureBundle,
     log,
   });
+  const previews = createPreviews({
+    db,
+    config,
+    sprites: spriteOps,
+    ensureBundle,
+    log,
+    buildCapMs: previewBuildCapMs,
+    readyTimeoutMs: previewReadyTimeoutMs,
+    readyPollMs: previewReadyPollMs,
+  });
   const guard = apiKeyGuard(db, config.apiKey);
   // the MCP tools call /v1 in-process through the whole app with the caller's own header, so its
   // guard checks them too and an issued key keeps its limits
@@ -121,7 +141,10 @@ export function createApp({
   });
   const v1 = factory
     .createApp()
-    .route("/environments", environmentRoutes(provisioner, spriteOps, log))
+    .route(
+      "/environments",
+      environmentRoutes(provisioner, spriteOps, log, previews),
+    )
     .route("/environments", secretRoutes())
     .route(
       "/agents",
@@ -132,6 +155,7 @@ export function createApp({
         log,
         heartbeatMs,
         preLaunchDeadlineMs,
+        previews,
       ),
     )
     .route("/webhooks", webhookRoutes())

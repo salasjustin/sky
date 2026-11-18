@@ -12,6 +12,12 @@ import {
   EnvironmentId,
   EventCursor,
   EventType,
+  PREVIEW_BUILD_NONE,
+  PREVIEW_DEFAULT_TTL_SECONDS,
+  PREVIEW_MAX_TTL_SECONDS,
+  PREVIEW_MIN_TTL_SECONDS,
+  PREVIEW_PROXY_PORT,
+  PreviewStart,
   RequestId,
   RunId,
 } from "@sky/shared";
@@ -35,7 +41,7 @@ type Outcome =
   | { ok: false; result: CallToolResult; error?: ApiError };
 
 type Call = (
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "DELETE",
   path: string,
   body?: unknown,
 ) => Promise<Outcome>;
@@ -202,6 +208,42 @@ const ListAgentsInput = z.strictObject({
     .optional()
     .describe("The nextCursor a previous page returned."),
 });
+
+const PreviewInput = z
+  .strictObject({
+    agentId: AgentId,
+    build: PreviewStart.shape.build.describe(
+      `The shell command that builds the app for production, run once in the agent's worktree with NODE_ENV=production and the environment's secrets, for at most 15 minutes. "${PREVIEW_BUILD_NONE}" skips the build. Defaults from the worktree's lockfile (pnpm build, yarn build, bun run build or npm run build). Goes with port.`,
+    ),
+    start: PreviewStart.shape.start.describe(
+      "The shell command that starts the app's production server from the worktree. It must listen on port (it is also given $PORT) on all interfaces. Defaults from the worktree's lockfile (pnpm start, yarn start, bun run start or npm start). Goes with port.",
+    ),
+    port: PreviewStart.shape.port
+      .optional()
+      .describe(
+        `The port the app listens on: ${PreviewStart.shape.port.minValue} to ${PreviewStart.shape.port.maxValue}, and not ${PREVIEW_PROXY_PORT}, which the preview's own proxy holds. Starts the preview.`,
+      ),
+    // unwrap() drops the default: the API applies it to an omitted TTL
+    ttlSeconds: PreviewStart.shape.ttlSeconds
+      .unwrap()
+      .optional()
+      .describe(
+        `How long the link works, ${PREVIEW_MIN_TTL_SECONDS} to ${PREVIEW_MAX_TTL_SECONDS} seconds; ${PREVIEW_DEFAULT_TTL_SECONDS} (${PREVIEW_DEFAULT_TTL_SECONDS / 3600} hours) when omitted. Goes with port.`,
+      ),
+    stop: z.boolean().optional().describe("true: end the agent's preview."),
+  })
+  .refine(
+    (i) =>
+      i.port !== undefined ||
+      (i.build === undefined &&
+        i.start === undefined &&
+        i.ttlSeconds === undefined),
+    { message: "build, start and ttlSeconds go with port", path: ["port"] },
+  )
+  .refine((i) => !i.stop || i.port === undefined, {
+    message: "stop takes no port, build, start or ttlSeconds",
+    path: ["stop"],
+  });
 
 const WaitForEventsInput = z.strictObject({
   after: EventCursor.optional().describe(
@@ -393,6 +435,29 @@ function buildServer(call: Call) {
         ...(cursor && { cursor }),
       });
       return api("GET", `/v1/agents${query.size > 0 ? `?${query}` : ""}`);
+    },
+  );
+  server.registerTool(
+    "preview",
+    {
+      description: `Preview an agent's branch in a browser, as a production build. With port: builds the app once in the agent's worktree on its environment's sprite (build, defaulting from the lockfile), then serves it with start, using the environment's secrets. It answers at once, 202, with { preview: { link, state, expiresAt, replaced, failure, … } }: give the link to a person; opening it in any browser, with no login, shows a page that says it is building until the app is up, then the app at its root path. The link is shown only in this answer. state is building, starting, ready or failed: call preview again with only agentId, waiting about 15 to 30 seconds between reads since a build can take minutes, until it is ready or failed. Reading a failed preview is a normal answer, not an error: its state is failed, detail is the redacted tail of the failing output, and failure is command when the build or start command failed (fix that command and start again with port) or sprite when the sprite failed (start again unchanged); failure is null in every other state. A start itself can still be refused with 502 preview_failed when the sprite failed while starting it (start again). A start is also refused with 400 preview_commands_needed when the worktree has no lockfile and no build or start was given (send them); 409 no_worktree when the agent has no worktree yet (launch or followup a run first); 409 env_not_ready while the environment provisions (wait until status with envId says ready); 409 port_busy when port is taken on the sprite (start on another port; when it names ${PREVIEW_PROXY_PORT}, something else holds the sprite's URL port and another port won't help, so tell a person); 502 sprite_unreachable when the sprite could not be reached (start again); 502 preview_stop_failed when the environment's running preview could not be torn down to make room (start again). A production server doesn't pick up worktree edits: after a followup's commit, call preview again with port to rebuild, which replaces this agent's running preview. An environment has one preview: starting one replaces the environment's running preview, and replaced names the agent whose it was (null when none). With a runs key, a start while another key's preview runs in the environment is refused with 409 preview_busy, naming no agent. The preview outlives the agent's runs; it ends at the TTL, with stop: true, when the agent is archived or the environment is deleted. A build is a heavy job on the sprite's memory, so start a preview while no other heavy job runs on the environment. With stop: true: ends it, or answers preview: null when none runs. With only agentId: returns the agent's preview (port, build, start, state, detail, failure, expiresAt, and the status of its app and proxy services; preview is null when none runs), never the link. A runs key can preview only the agents it started.`,
+      inputSchema: PreviewInput,
+      annotations: {
+        destructiveHint: true,
+        idempotentHint: false,
+        readOnlyHint: false,
+      },
+    },
+    ({ agentId, build, start, port, ttlSeconds, stop }) => {
+      const path = `/v1/agents/${agentId}/preview`;
+      if (stop) return api("DELETE", path);
+      if (port === undefined) return api("GET", path);
+      return api("POST", path, {
+        port,
+        ...(build !== undefined && { build }),
+        ...(start !== undefined && { start }),
+        ...(ttlSeconds !== undefined && { ttlSeconds }),
+      });
     },
   );
   server.registerTool(

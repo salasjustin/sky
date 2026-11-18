@@ -7,6 +7,8 @@ import {
   type Decision,
   EnvironmentId,
   type EventType,
+  PREVIEW_PROXY_PORT,
+  PreviewStart,
   RequestId,
   RunId,
 } from "@sky/shared";
@@ -27,6 +29,7 @@ import {
   signalRunner,
   stopLingeringRunner,
 } from "./launch.js";
+import type { Previews, StartResult } from "./previews.js";
 import { REPO_DIR } from "./provision.js";
 import { redact } from "./redact.js";
 import { decideRequest, openRequestOf, requestDecisions } from "./requests.js";
@@ -426,6 +429,7 @@ export function agentRoutes(
   log: (line: string) => void,
   heartbeatMs: number,
   preLaunchDeadlineMs: number,
+  previews: Previews,
 ) {
   return factory
     .createApp()
@@ -704,6 +708,18 @@ export function agentRoutes(
         c.var.nudgeDeliveries();
         await signalRunner(sprites, spriteName, run.id, log);
       }
+      // the app runs in the worktree, so it ends first, and so does the public URL it holds open
+      try {
+        await previews.stopForAgent(id, agent.envId);
+      } catch (err) {
+        log(`stopping the preview of ${id} failed: ${err}`);
+        return apiError(
+          c,
+          502,
+          "preview_stop_failed",
+          "the agent is archived but its preview could not be stopped; retry archive",
+        );
+      }
       try {
         await removeWorktree(sprites, spriteName, id, run?.id ?? null);
       } catch (err) {
@@ -716,6 +732,109 @@ export function agentRoutes(
         );
       }
       return c.json({ agent: presentAgent(agent) }, 200);
+    })
+    .post(
+      "/:id/preview",
+      agentParam,
+      jsonBody,
+      body(PreviewStart),
+      async (c) => {
+        const { id } = c.req.valid("param");
+        let result: StartResult;
+        try {
+          result = await previews.start(
+            id,
+            c.var.principal,
+            c.req.valid("json"),
+          );
+        } catch (err) {
+          log(`starting the preview of ${id} failed: ${err}`);
+          return apiError(
+            c,
+            502,
+            "sprite_unreachable",
+            "could not reach the environment's sprite to start the preview; retry",
+          );
+        }
+        switch (result.kind) {
+          case "not_found":
+            return apiError(c, 404, "not_found", "no such agent");
+          case "archived":
+            return archived(c);
+          case "not_ready":
+            return refuseEnv(c, "not_ready");
+          case "no_worktree":
+            return apiError(
+              c,
+              409,
+              "no_worktree",
+              "the agent has no worktree on its sprite yet; start a run first",
+            );
+          case "port_busy":
+            return apiError(
+              c,
+              409,
+              "port_busy",
+              result.port === PREVIEW_PROXY_PORT
+                ? `something on the environment's sprite already holds port ${PREVIEW_PROXY_PORT}, which a sprite's URL is routed to; the preview would break it, so nothing was started`
+                : `port ${result.port} is already in use on the environment's sprite; start the preview on another port`,
+            );
+          case "preview_busy":
+            return apiError(
+              c,
+              409,
+              "preview_busy",
+              "a preview started by another key is running in this environment, and one environment has one preview; it must stop or expire before this agent's can start",
+            );
+          case "commands_needed":
+            return apiError(
+              c,
+              400,
+              "preview_commands_needed",
+              `the agent's worktree has no lockfile (pnpm-lock.yaml, yarn.lock, bun.lock or package-lock.json) to choose commands from; send ${result.missing.map((m) => `\`${m}\``).join(" and ")} (build may be "none" to skip the build; the CLI's flags are --build and --start)`,
+            );
+          case "replace_failed":
+            return apiError(
+              c,
+              502,
+              "preview_stop_failed",
+              "the environment's running preview could not be stopped, so this one was not started; retry",
+            );
+          case "failed":
+            return apiError(c, 502, "preview_failed", result.detail);
+        }
+        // answered once the link works; the build and the app's start go on, `state` following them
+        return c.json({ preview: result.preview }, 202);
+      },
+    )
+    .delete("/:id/preview", agentParam, async (c) => {
+      const { id } = c.req.valid("param");
+      let stopped: Awaited<ReturnType<Previews["stop"]>>;
+      try {
+        stopped = await previews.stop(id, c.var.principal);
+      } catch (err) {
+        log(`stopping the preview of ${id} failed: ${err}`);
+        return apiError(
+          c,
+          502,
+          "preview_stop_failed",
+          "could not stop the preview on the environment's sprite; retry",
+        );
+      }
+      if (stopped === undefined) {
+        return apiError(c, 404, "not_found", "no such agent");
+      }
+      // nothing running is a stop that has nothing to do, so a retried stop or a cleanup trap succeeds
+      return c.json({ preview: null, stopped }, 200);
+    })
+    .get("/:id/preview", agentParam, async (c) => {
+      const { id } = c.req.valid("param");
+      const preview = await previews.state(id, c.var.principal);
+      if (preview === undefined)
+        return apiError(c, 404, "not_found", "no such agent");
+      // a failed preview is read like any other: `state` failed, why in `detail`, whose fault in `failure`,
+      // and `expiresAt` when the sweep removes it
+      return c.json({ preview }, 200);
     })
     .post("/:id/answers", agentParam, jsonBody, body(AnswerInput), (c) => {
       const { id } = c.req.valid("param");

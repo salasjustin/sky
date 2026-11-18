@@ -176,19 +176,23 @@ const isStreamDecodeError = (err: unknown): err is Error =>
 /**
  * Runs `argv` in the sprite over the SDK's HTTP exec (no WebSocket, no TTY) and waits for it to
  * exit. A nonzero exit resolves with its outcome; only transport and API errors throw, the bound
- * running out included, which also cuts the request (and with it the process).
+ * running out included, which also cuts the request (and with it the process). `signal` cuts it the
+ * same way, early, and the call then rejects with its abort.
  */
 export function execInSprite(
   ops: SpriteOps,
   name: string,
   [file, ...args]: [string, ...string[]],
-  options: CallOptions & { cwd?: string },
+  options: CallOptions & { cwd?: string; signal?: AbortSignal },
 ): Promise<ExecOutcome> {
   return spriteCall(
     ops,
     name,
     options,
-    async (signal) => {
+    async (bound) => {
+      const signal = options.signal
+        ? AbortSignal.any([bound, options.signal])
+        : bound;
       try {
         const result = await ops.client
           .sprite(name)
@@ -247,6 +251,7 @@ export async function execLogged(
     ...options
   }: CallOptions & {
     cwd?: string;
+    signal?: AbortSignal;
     log: string;
     tailBytes: number;
   },

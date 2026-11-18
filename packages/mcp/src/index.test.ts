@@ -109,7 +109,7 @@ test("an upstream error echoing the caller's key comes back without it", async (
 
 /** Answers one route, recording the bearer and JSON body it received. */
 function route(
-  method: "get" | "post",
+  method: "get" | "post" | "delete",
   path: string,
   status: number,
   body: JsonBodyType,
@@ -981,5 +981,276 @@ test("list_agents passes the API's refusal through, such as a bad cursor", async
       code: "invalid_cursor",
       message: "the cursor is not one this API returned",
     },
+  });
+});
+
+const previewLink =
+  "https://sky-abc-org.sprites.app/__sky/preview?t=tokentokentoken";
+
+test("preview with a port starts it and returns the API's answer, link and state included", async () => {
+  const answer = {
+    preview: {
+      agentId: "agt_1",
+      link: previewLink,
+      state: "building",
+      replaced: "agt_0",
+    },
+  };
+  const seen = route("post", "/v1/agents/agt_1/preview", 202, answer);
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "preview",
+    arguments: {
+      agentId: "agt_1",
+      build: "pnpm build",
+      start: "pnpm start --host",
+      port: 5173,
+    },
+  });
+
+  expect(result.isError).toBeUndefined();
+  expect(textOf(result)).toEqual(answer);
+  expect(seen).toEqual([
+    {
+      auth: `Bearer ${KEY}`,
+      body: { build: "pnpm build", start: "pnpm start --host", port: 5173 },
+    },
+  ]);
+});
+
+test("preview with only a port sends neither command, so the API chooses them from the lockfile", async () => {
+  const seen = route("post", "/v1/agents/agt_1/preview", 202, { preview: {} });
+  const client = await connect();
+
+  await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_1", port: 5173 },
+  });
+
+  expect(seen.map((s) => s.body)).toEqual([{ port: 5173 }]);
+});
+
+test('preview takes "none" as a build that skips it', async () => {
+  const seen = route("post", "/v1/agents/agt_1/preview", 202, { preview: {} });
+  const client = await connect();
+
+  await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_1", build: "none", port: 5173 },
+  });
+
+  expect(seen.map((s) => s.body)).toEqual([{ build: "none", port: 5173 }]);
+});
+
+test("preview reads a failed preview as a successful call carrying its state, detail and failure", async () => {
+  const answer = {
+    preview: {
+      agentId: "agt_1",
+      port: 5173,
+      state: "failed",
+      detail: "the build exited 1: boom",
+      failure: "command",
+    },
+  };
+  route("get", "/v1/agents/agt_1/preview", 200, answer);
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_1" },
+  });
+
+  expect(result.isError).toBeUndefined();
+  expect(textOf(result)).toEqual(answer);
+});
+
+test("preview tells the model how to pace its reads and what a failed one asks of it", async () => {
+  const client = await connect();
+
+  const { tools } = await client.listTools();
+  const description = tools.find((t) => t.name === "preview")?.description;
+
+  expect(description).not.toMatch(/beside the error/);
+  expect(description).toMatch(/waiting about 15 to 30 seconds between reads/);
+  expect(description).toMatch(/normal answer, not an error/);
+  expect(description).toMatch(/failure is command .*fix that command/);
+  expect(description).toMatch(/sprite .*\(start again unchanged\)/);
+  expect(description).toMatch(/refused with 502 preview_failed/);
+});
+
+test.each([
+  ["409 no_worktree", /a run first/],
+  ["409 env_not_ready", /status with envId/],
+  ["409 port_busy", /another port/],
+  ["502 sprite_unreachable", /start again/],
+  ["502 preview_stop_failed", /start again/],
+])(
+  "preview's description names the start's %s refusal and what to do",
+  async (refusal, action) => {
+    const client = await connect();
+
+    const { tools } = await client.listTools();
+    const description = tools.find((t) => t.name === "preview")?.description;
+
+    const clause = description?.split(refusal)[1]?.split(";")[0];
+    expect(clause).toMatch(action);
+  },
+);
+
+test("preview passes ttlSeconds along", async () => {
+  const seen = route("post", "/v1/agents/agt_1/preview", 200, { preview: {} });
+  const client = await connect();
+
+  await client.callTool({
+    name: "preview",
+    arguments: {
+      agentId: "agt_1",
+      start: "npm start",
+      port: 3000,
+      ttlSeconds: 7200,
+    },
+  });
+
+  expect(seen.map((s) => s.body)).toEqual([
+    { start: "npm start", port: 3000, ttlSeconds: 7200 },
+  ]);
+});
+
+test("preview without ttlSeconds sends none, so the API applies its default", async () => {
+  const seen = route("post", "/v1/agents/agt_1/preview", 200, { preview: {} });
+  const client = await connect();
+
+  await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_1", start: "npm start", port: 3000 },
+  });
+
+  expect(seen).toHaveLength(1);
+  expect(seen[0]?.body).not.toHaveProperty("ttlSeconds");
+});
+
+test("preview with stop ends it", async () => {
+  const seen = route("delete", "/v1/agents/agt_1/preview", 200, {
+    preview: null,
+    stopped: { agentId: "agt_1" },
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_1", stop: true },
+  });
+
+  expect(textOf(result)).toEqual({
+    preview: null,
+    stopped: { agentId: "agt_1" },
+  });
+  expect(seen.map((s) => s.auth)).toEqual([`Bearer ${KEY}`]);
+});
+
+test("preview with only an agent reads its state", async () => {
+  const seen = route("get", "/v1/agents/agt_1/preview", 200, { preview: null });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_1" },
+  });
+
+  expect(textOf(result)).toEqual({ preview: null });
+  expect(seen).toHaveLength(1);
+});
+
+test.each([
+  ["a start command with no port", { agentId: "agt_1", start: "pnpm start" }],
+  ["a build command with no port", { agentId: "agt_1", build: "pnpm build" }],
+  ["the proxy's own port", { agentId: "agt_1", port: 8080 }],
+  ["a port under 1024", { agentId: "agt_1", port: 80 }],
+  ["a blank start command", { agentId: "agt_1", start: "   ", port: 5173 }],
+  ["a blank build command", { agentId: "agt_1", build: "   ", port: 5173 }],
+  ["the retired cmd", { agentId: "agt_1", cmd: "pnpm dev", port: 5173 }],
+  [
+    "a command over 4000 characters",
+    { agentId: "agt_1", start: "x".repeat(4001), port: 5173 },
+  ],
+  ["a TTL past 7 days", { agentId: "agt_1", port: 5173, ttlSeconds: 604801 }],
+  ["a TTL with no port", { agentId: "agt_1", ttlSeconds: 3600 }],
+  ["stop with a port", { agentId: "agt_1", stop: true, port: 5173 }],
+  ["stop with a build", { agentId: "agt_1", stop: true, build: "x" }],
+  ["an unknown field", { agentId: "agt_1", public: true }],
+])("preview rejects %s before any API call", async (_, args) => {
+  const seen = [
+    route("post", "/v1/agents/agt_1/preview", 200, {}),
+    route("delete", "/v1/agents/agt_1/preview", 200, {}),
+    route("get", "/v1/agents/agt_1/preview", 200, {}),
+  ];
+  const client = await connect();
+
+  const result = await client.callTool({ name: "preview", arguments: args });
+
+  expect(result.isError).toBe(true);
+  expect(seen.flat()).toEqual([]);
+});
+
+test("preview passes the API's refusal through, such as a runs key outside its agents", async () => {
+  route("post", "/v1/agents/agt_9/preview", 404, {
+    error: { code: "not_found", message: "no such agent" },
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_9", port: 5173 },
+  });
+
+  expect(result.isError).toBe(true);
+  expect(textOf(result)).toEqual({
+    status: 404,
+    error: { code: "not_found", message: "no such agent" },
+  });
+});
+
+test("preview is listed with what the link gives and the one-per-environment rule", async () => {
+  const client = await connect();
+
+  const { tools } = await client.listTools();
+  const tool = tools.find((t) => t.name === "preview");
+
+  expect(tool?.description).toMatch(/only in this answer/);
+  expect(tool?.description).toMatch(/answers at once, 202/);
+  expect(tool?.description).toMatch(/building, starting, ready or failed/);
+  expect(tool?.description).toMatch(/400 preview_commands_needed/);
+  expect(tool?.description).toMatch(/rebuild, which replaces/);
+  expect(tool?.description).toMatch(/no other heavy job runs/);
+  expect(tool?.description).not.toMatch(/dev server/);
+  expect(tool?.description).toMatch(/409 preview_busy, naming no agent/);
+  expect(tool?.description).toMatch(/answers preview: null when none runs/);
+  expect(tool?.description).toMatch(/one preview/);
+  expect(tool?.description).toMatch(
+    /runs key can preview only the agents it started/,
+  );
+  expect(tool?.inputSchema.properties).toMatchObject({
+    agentId: { type: "string" },
+    build: { type: "string", minLength: 1, maxLength: 4000 },
+    start: { type: "string", minLength: 1, maxLength: 4000 },
+    port: { type: "integer", minimum: 1024, maximum: 65535 },
+    ttlSeconds: { type: "integer", minimum: 60, maximum: 604800 },
+    stop: { type: "boolean" },
+  });
+  expect(tool?.inputSchema.properties?.ttlSeconds).not.toHaveProperty(
+    "default",
+  );
+  const port = tool?.inputSchema.properties?.port as {
+    minimum: number;
+    maximum: number;
+    description: string;
+  };
+  expect(port.description).toContain(`${port.minimum} to ${port.maximum}`);
+  expect(tool?.inputSchema.required).toEqual(["agentId"]);
+  expect(tool?.annotations).toEqual({
+    destructiveHint: true,
+    idempotentHint: false,
+    readOnlyHint: false,
   });
 });

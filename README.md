@@ -115,7 +115,7 @@ setup: |
 
 Provisioning fails at the setup step, naming the plugin and its marketplace, if a plugin's marketplace is neither declared nor added.
 
-**Memory and `concurrency`.** Every agent of an environment runs on its one sprite, and a sprite has a fixed amount of memory and no swap. A large monorepo (thousands of files, with a typecheck or test run per agent) can use several GB at a time, so set `concurrency` to 1-2 there; the default of 3 suits small repos. When a sprite runs out of memory the kernel kills processes, often the runner, and the run is lost with the work since its last commit. Sky guards against this two ways. Before it starts a run, it reads the sprite's available memory (`free -m`) and, below `SPRITE_MIN_FREE_MB` (an environment variable of the API; default `1024`, `0` turns the check off), refuses the launch with `sprite_low_memory`. And when a run ends, the runner ends every process the run's session started (dev servers, watchers, test workers, a nested `claude -p`), so they don't hold memory for the next run; other runs' processes on the sprite are left alone.
+**Memory and `concurrency`.** Every agent of an environment runs on its one sprite, and a sprite has a fixed amount of memory and no swap. A large monorepo (thousands of files, with a typecheck or test run per agent) can use several GB at a time, so set `concurrency` to 1-2 there; the default of 3 suits small repos. When a sprite runs out of memory the kernel kills processes, often the runner, and the run is lost with the work since its last commit. Sky guards against this two ways. Before it starts a run, it reads the sprite's available memory (`free -m`) and, below `SPRITE_MIN_FREE_MB` (an environment variable of the API; default `1024`, `0` turns the check off), refuses the launch with `sprite_low_memory`. And when a run ends, the runner ends every process the run's session started (dev servers, watchers, test workers, a nested `claude -p`), so they don't hold memory for the next run; other runs' processes on the sprite are left alone. A [preview](#previews) is the exception to that cleanup, and it counts against the same memory: its production build is a heavy job, and its app and proxy stay up past the run, so budget for them in `concurrency` and in `SPRITE_MIN_FREE_MB` like another agent's run, start a preview while no other heavy job runs on the environment, and stop a preview you no longer need.
 
 ```
 sky secret set web NPM_TOKEN < token.txt
@@ -365,6 +365,30 @@ Sandboxes hold no GitHub credential, so `git push` and any fetch of a private re
 - **Shared branch.** Two agents may target the same branch, and `publish` refuses to overwrite commits the branch never had.
 - **Commits pushed from outside.** Follow-up runs fetch the agent's GitHub branch first. A clean worktree takes the commits pushed there by someone else (fast-forward, or a cherry-pick when `publish` gave its commits new shas). Diverged histories change nothing; the agent's prompt says what is on GitHub and `publish` refuses to overwrite it. Mid-run, `runner.mjs sync` (above) brings such commits in, rebasing the agent's unpublished commits onto them.
 
+## Previews
+
+Check an agent's work by using it. A preview serves the app's production build, so it shows what will ship:
+
+```
+sky agent preview <agent> --port=5173 [--build=<cmd|none>] [--start=<cmd>] [--ttl=24h] [--no-wait]
+sky agent preview <agent> --stop
+sky agent preview <agent>
+```
+
+The first builds the app once in the agent's worktree on the environment's sprite, then serves it, and prints a link. `--build` and `--start` default from the worktree's lockfile (`pnpm build` and `pnpm start` for `pnpm-lock.yaml`, `yarn build` and `yarn start`, `bun run build` and `bun run start`, or `npm run build` and `npm start`), so most repos need no flags; with no lockfile and no flags the start is refused (`400 preview_commands_needed`). `--build=none` skips the build. The build is a one-off command, not part of the app's service: it runs once, with the environment's secrets, its base profile's `sessionEnv`, `PORT` and `NODE_ENV=production`, its output logged, and is stopped after 15 minutes. The app's service then runs only the start command (with the same environment), so a sprite that wakes restarts the server in seconds without building again. Neither gets a Claude credential or a Sky token. The app should listen on `--port` on all interfaces.
+
+The API answers at once (`202`), as soon as the link works, and the build goes on. Opening the link in any browser, with no Sky or Fly login, shows a small "Building preview…" page that refreshes itself until the app is up, then the app at its root path, so root-relative assets and client-side routing work. The preview's `state` is `building`, then `starting`, then `ready` once the app listens on its port (it has two minutes to), or `failed`. `sky agent preview` prints the link, then waits, printing each state as it changes, and exits 0 once `ready` or 1 on `failed`, with the tail of the failed build's or start's output (secrets redacted); `--no-wait` returns at once. Over REST, `GET` reports the state with `200`; a failed preview carries its redacted `detail` and a `failure` of `command` when the build or start command failed, or `sprite` when the sprite did. The proxy in front of the app rewrites `Host` to `localhost:<port>`, so the app's allowed-hosts check doesn't turn the sprite's address away.
+
+**A new commit needs a new preview.** A production server serves the build it started with and doesn't pick up worktree edits, including a follow-up run's. Run `sky agent preview` again on the same agent: it rebuilds from the worktree and replaces the running preview, with a new link.
+
+**Memory.** A production build is a heavy job on the sprite's memory, and the preview then keeps the app and its proxy running. Start a preview while no other heavy job runs on the environment.
+
+- **One per environment.** A sprite has one HTTP port, so an environment has one preview. Starting one on another agent replaces the running one; the answer (`replaced`, and a note on stderr) names the agent it replaced. Starting again on the same agent rebuilds and replaces it, with a new link; starting while a build is still running stops that build. A `runs` key can replace only previews on agents it started: while another key's preview runs in the environment, the start is refused with `409 preview_busy`, which doesn't name that agent. The admin key replaces any.
+- **Private to whoever holds the link.** The sprite's URL is public only while a preview runs, and everything it serves goes through a small proxy (from the runner bundle) on the sprite's HTTP port, 8080. The proxy answers 404, with a page that names nothing, to any browser without the preview's cookie. The link is the sprite's URL plus `/__sky/preview?t=<token>`: the token is 32 random bytes, Sky and the proxy keep only its hash, and a valid token sets an HttpOnly, Secure, SameSite=Lax cookie that lasts as long as the preview, then redirects to `/`. The link is shown once, when the preview starts; `sky agent preview <agent>` without flags reports its state, port, expiry and how the app and proxy are doing. Anyone who has the link can use the app until the preview ends, so share it like a password. A browser with the cookie sees the "Building preview…" page while nothing listens yet; any other gets the plain 404. If something already listens on 8080 or on `--port` on the sprite, the start is refused (`port_busy`) and nothing on the sprite is touched. Stopping when nothing runs succeeds (`200`, `preview: null`; `sky agent preview <agent> --stop` exits 0), so a retried stop or a cleanup trap doesn't fail.
+- **How it ends.** At `--ttl` (24 hours by default, 7 days at most), on `--stop`, when the agent is archived and when the environment is deleted. Each removes both sprite services, sets the sprite's URL back to private and invalidates the token. Anything else leaves it running: the agent's runs ending, or a follow-up starting, do not touch it, and the follow-up's edits don't reach it until a new preview is started. The proxy and the app are sprite services, so they restart when a sleeping sprite wakes. A failed preview stays readable for ten minutes, then goes.
+
+Over REST it is `POST`, `GET` and `DELETE /v1/agents/:id/preview` (`{ "port", "build"?, "start"?, "ttlSeconds"? }` to start), and over MCP the `preview` tool. A `runs` key can preview only the agents it started.
+
 ## REST API
 
 All routes live under `/v1`. Ids are prefixed: `env_…`, `agent_…`, `run_…`.
@@ -389,6 +413,7 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | `GET /v1/agents/:id/runs/:runId` · `…/stream`                           | a run's result, or its events as SSE                   |
 | `POST /v1/agents/:id/answers` · `…/approvals`                           | answer a waiting question; approve or deny a tool call |
 | `POST /v1/agents/:id/stop` · `…/archive`                                | stop the current run; archive the agent                |
+| `POST`, `GET`, `DELETE /v1/agents/:id/preview`                          | start, read and stop the agent's [preview](#previews)  |
 | `POST`, `GET /v1/webhooks` · `GET`, `DELETE /v1/webhooks/:id`           | subscribe an https URL to events; list, read, remove   |
 | `POST`, `GET /v1/keys` · `DELETE /v1/keys/:id`                          | admin only: mint, list and revoke `runs` keys          |
 | `GET /v1/claude-credentials`                                            | admin only: the Claude credentials, by name            |
@@ -493,7 +518,7 @@ Runs on one sprite share its repo, so a run's worktree setup takes the repo lock
 
 ## MCP
 
-`POST /mcp` (streamable HTTP, same bearer keys) exposes `create_env`, `launch`, `followup`, `status`, `list_agents`, `answer`, `approve`, `stop`, `archive` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents. Every tool call runs with the caller's own key, so a `runs` key gets the same limits as over REST.
+`POST /mcp` (streamable HTTP, same bearer keys) exposes `create_env`, `launch`, `followup`, `status`, `list_agents`, `answer`, `approve`, `stop`, `archive`, `preview` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents. Every tool call runs with the caller's own key, so a `runs` key gets the same limits as over REST.
 
 `list_agents` is `GET /v1/agents` ([Listing agents](#listing-agents)): it takes `env` (ids or names) and `status` (states) as arrays, `archived` (`false`, `true` or `all`), `limit` and `cursor`, and returns the page the API sends, with `nextCursor` when more agents match. Use it to find an agent whose id you lost, or to see which are running or waiting on you.
 

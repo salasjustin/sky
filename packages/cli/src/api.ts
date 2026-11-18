@@ -5,6 +5,7 @@ import {
   CreatedApiKey,
   Environment,
   type KeyInput,
+  PreviewState,
   RunStatus,
 } from "@sky/shared";
 import { z } from "zod";
@@ -89,6 +90,19 @@ const ApiWebhook = z
   })
   .loose();
 export type ApiWebhook = z.infer<typeof ApiWebhook>;
+
+/** A preview as the API describes it; the link only comes with a start. */
+const ApiPreview = z.looseObject({
+  agentId: z.string(),
+  state: PreviewState,
+  port: z.number().int(),
+  expiresAt: z.string(),
+  replaced: z.string().nullish(),
+  /** A failed preview's redacted error: the tail of what failed. */
+  detail: z.string().nullish(),
+  /** Whose side a failed preview failed on; absent from an older API. */
+  failure: z.enum(["command", "sprite"]).nullish(),
+});
 
 /** Keys are parsed, not loose: output is built from the parse, so a field the API adds (a hash) never reaches stdout. */
 const KeyList = z.object({ data: z.array(ApiKey) });
@@ -238,6 +252,74 @@ export function createApi(config: Config) {
     async archiveAgent(agentId: string) {
       const { json } = await request("POST", agentPath(agentId, "archive"));
       return json;
+    },
+    async startPreview(
+      agentId: string,
+      body: {
+        build?: string;
+        start?: string;
+        port: number;
+        ttlSeconds?: number;
+      },
+    ) {
+      const { status, json } = await request(
+        "POST",
+        agentPath(agentId, "preview"),
+        body,
+      );
+      const { preview } = parseKey(
+        z.object({ preview: ApiPreview.extend({ link: z.string() }) }),
+        status,
+        json,
+        "a preview",
+      );
+      return { raw: json, preview };
+    },
+    async stopPreview(agentId: string) {
+      const { status, json } = await request(
+        "DELETE",
+        agentPath(agentId, "preview"),
+      );
+      const { stopped } = parseKey(
+        z.object({ stopped: z.looseObject({}).nullable() }),
+        status,
+        json,
+        "a preview",
+      );
+      return { raw: json, stopped: stopped !== null };
+    },
+    /** A failed preview comes back as one, `state: "failed"`, whichever way the API answered it. */
+    async getPreview(agentId: string) {
+      let status: number;
+      let json: unknown;
+      try {
+        ({ status, json } = await request(
+          "GET",
+          agentPath(agentId, "preview"),
+        ));
+      } catch (err) {
+        // an older API answers a failed preview with 422/502 `preview_failed`, the preview beside the error
+        if (!(err instanceof ApiError) || err.code !== "preview_failed") {
+          throw err;
+        }
+        const old = err.details.preview;
+        if (typeof old !== "object" || old === null) throw err;
+        status = err.status;
+        json = { preview: { detail: err.message, ...old } };
+      }
+      const { preview } = parseKey(
+        z.object({
+          preview: ApiPreview.extend({
+            services: z
+              .object({ app: z.string(), proxy: z.string() })
+              .nullish(),
+          }).nullable(),
+        }),
+        status,
+        json,
+        "a preview",
+      );
+      return { raw: json, preview };
     },
     /** One page, newest activity first; `cursor` is the previous page's `nextCursor`. */
     async listAgents(query: URLSearchParams) {

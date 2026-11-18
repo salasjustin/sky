@@ -4,6 +4,7 @@ import {
   type Db,
   environments,
   events,
+  previews as previewRows,
   runRequests,
   runs,
   webhookDeliveries,
@@ -23,6 +24,7 @@ import { poolProblem } from "./claude-pool.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
+import type { Previews } from "./previews.js";
 import type { Provisioner } from "./provision.js";
 import { activeRunStatuses, type Tx } from "./runs.js";
 import { destroySprite, type SpriteOps, spriteNameFor } from "./sprites.js";
@@ -184,6 +186,7 @@ export function environmentRoutes(
   provisioner: Provisioner,
   sprites: SpriteOps,
   log: (line: string) => void,
+  previews: Previews,
 ) {
   return factory
     .createApp()
@@ -451,6 +454,18 @@ export function environmentRoutes(
           409,
         );
       }
+      // the preview's public URL and services end with the env, and its token with them
+      try {
+        await previews.stopForEnv(id);
+      } catch (err) {
+        log(`stopping the preview of ${id} failed: ${err}`);
+        return apiError(
+          c,
+          502,
+          "preview_stop_failed",
+          "could not stop the environment's preview; retry the delete",
+        );
+      }
       try {
         await destroySprite(sprites, env.spriteName);
       } catch (err) {
@@ -489,6 +504,7 @@ export function environmentRoutes(
             .where(inArray(runRequests.runId, envRuns))
             .run();
           tx.delete(events).where(inArray(events.runId, envRuns)).run();
+          tx.delete(previewRows).where(eq(previewRows.envId, id)).run();
           tx.delete(runs).where(inArray(runs.agentId, envAgents)).run();
           tx.delete(agents).where(eq(agents.envId, id)).run();
           tx.delete(environments).where(eq(environments.id, id)).run();

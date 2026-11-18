@@ -8,6 +8,7 @@ import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { createDispatcher } from "./deliveries.js";
 import { signalRunner } from "./launch.js";
+import { failInterruptedPreviews, sweepExpiredPreviews } from "./previews.js";
 import { createRunProber } from "./probe.js";
 import { failInterruptedProvisioning } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
@@ -84,6 +85,8 @@ export function boot(
       : `no migrations pending${blocked ? `; ${checkpoint}` : ""}`,
   );
   failInterruptedProvisioning(db);
+  // a preview's build and start ran in the process that has just ended; the first sweep takes its sprite down
+  failInterruptedPreviews(db);
   const dispatcher = createDispatcher({
     db,
     signingKey: config.webhookSigningKey,
@@ -130,6 +133,10 @@ export function boot(
     // after the timeout sweep, so a run it just failed isn't probed; not awaited, so a sprite
     // that is slow to wake never holds up the sweep (the prober logs, never throws)
     void prober.sweep();
+    // not awaited, like the probe: a sprite slow to answer never holds up the sweep; a failure is logged and retried on the next sweep
+    void sweepExpiredPreviews(db, spriteOps, log).catch((err: unknown) => {
+      log(`sweeping expired previews failed: ${err}`);
+    });
     const abandoned = failAbandonedWaits(db, config.waitTimeoutMs);
     for (const id of abandoned) log(`run ${id} failed: waiting_timeout`);
     signalAll(spritesOfRuns(db, abandoned));

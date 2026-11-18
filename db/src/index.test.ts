@@ -111,6 +111,7 @@ const TABLES = [
   "claude_usage",
   "environments",
   "events",
+  "previews",
   "run_env_vars",
   "run_requests",
   "runs",
@@ -264,7 +265,8 @@ test("migrating a populated 0000 file keeps every row, cascade children included
       t !== "run_env_vars" &&
       t !== "api_keys" &&
       t !== "claude_limits" &&
-      t !== "claude_usage",
+      t !== "claude_usage" &&
+      t !== "previews",
   );
   for (const table of atInit) expect([table, count(table)]).toEqual([table, 1]);
   // the columns added since hold what an existing row should: the key as the fallback, nothing assigned
@@ -1344,7 +1346,7 @@ test("the refusal names the pending migrations, the sizes in MB and the fix, on 
     message = err instanceof Error ? err.message : String(err);
   }
   expect(message).toBe(
-    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals needs ${mb(needed)} (${mb(2 * events)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
+    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine needs ${mb(needed)} (${mb(2 * events)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
   );
 });
 

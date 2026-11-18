@@ -83,15 +83,25 @@ try {
     },
     sleep: (ms) => sleep(ms),
     now: () => Date.now(),
-    onInterrupt: (note) => {
-      const onSigint = () => {
-        // `once` has already removed this listener, so the re-raise takes the default death
-        process.stderr.write(`sky: ${note}\n`, () =>
-          process.kill(process.pid, "SIGINT"),
-        );
+    onInterrupt: (note, stdout) => {
+      const disarm = () => {
+        process.off("SIGINT", onSignal);
+        process.off("SIGTERM", onSignal);
       };
-      process.once("SIGINT", onSigint);
-      return () => process.off("SIGINT", onSigint);
+      const onSignal = (signal: NodeJS.Signals) => {
+        // disarmed first, so the re-raise takes the default death
+        disarm();
+        // each write's callback waits for the one before: a pipe is written asynchronously, and the death is immediate
+        const die = () =>
+          process.stderr.write(`sky: ${note}\n`, () =>
+            process.kill(process.pid, signal),
+          );
+        if (stdout === undefined) die();
+        else process.stdout.write(stdout, die);
+      };
+      process.on("SIGINT", onSignal);
+      process.on("SIGTERM", onSignal);
+      return disarm;
     },
   });
 } catch (err) {
