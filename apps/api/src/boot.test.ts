@@ -444,6 +444,29 @@ test("boot's sweep carries on past a probe whose sprite hangs, without waiting o
     .toBe(true);
 });
 
+test("boot's sweep ends a preview past its TTL: URL private, services and row gone", async () => {
+  const wire = stubSprites();
+  wire.sprites.add("sky-env_a");
+  const first = booted().db;
+  first.$client.exec(`
+    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a');
+    insert into agents (id, env_id, branch, status) values ('agt_a', 'env_a', 'claude/agt_a', 'idle');
+    insert into previews (env_id, agent_id, port, cmd, token_hash, expires_at) values ('env_a', 'agt_a', 5173, 'pnpm dev', '${"0".repeat(64)}', '2026-01-01T00:00:00.000Z');
+  `);
+  first.$client.close();
+
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
+  // logged once the row is gone, so the sweep has settled before teardown closes the DB
+  await expect
+    .poll(() => lines)
+    .toContain("preview of agt_a ended: its TTL passed");
+  expect(db.$client.prepare("select * from previews").all()).toEqual([]);
+  expect(wire.calls).toContain("label sky-env_a");
+  const deletes = wire.calls.filter((c) => c.startsWith("service-delete"));
+  expect(deletes).toHaveLength(2);
+});
+
 test("a webhook delivery a previous process left pending is sent after boot", async () => {
   const first = booted();
   const envId = "env_boot" as EnvironmentId;

@@ -1,5 +1,13 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
@@ -23,7 +31,9 @@ import {
   type RunId,
 } from "@sky/shared";
 import { eq } from "drizzle-orm";
+import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test } from "vitest";
+import { server } from "../../../test/msw.js";
 import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
@@ -161,6 +171,23 @@ const tokenOf = (link: string) => new URL(link).searchParams.get("t") ?? "";
 const sha256 = (value: string) =>
   createHash("sha256").update(value).digest("hex");
 
+/** Of the calls since `wire.calls` was last cleared: the env's URL went private before either service was deleted. */
+function expectPrivateBeforeServicesGo(envId: string) {
+  const label = `label ${sprite(envId)}`;
+  const teardown = wire.calls.filter(
+    (c) => c === label || c.startsWith(`service-delete ${sprite(envId)} `),
+  );
+  // either service may go first; both go after the URL
+  expect(teardown).toHaveLength(3);
+  expect(teardown[0]).toBe(label);
+  for (const service of [PREVIEW_APP_SERVICE, PREVIEW_PROXY_SERVICE]) {
+    expect(teardown).toContain(`service-delete ${sprite(envId)} ${service}`);
+  }
+  expect(wire.updates.get(sprite(envId))).toEqual({
+    url_settings: { auth: "sprite" },
+  });
+}
+
 test("starting a preview creates the proxy and the dev server, flips the URL public and returns the link", async () => {
   const envId = readyEnv();
   const agentId = seedAgent(envId);
@@ -190,8 +217,13 @@ test("starting a preview creates the proxy and the dev server, flips the URL pub
     needs: [PREVIEW_PROXY_SERVICE],
     env: { PORT: "5173" },
   });
-  expect(appService?.args?.[0]).toBe("-c");
-  expect(appService?.args?.[1]).toMatch(/&& exec pnpm dev --host$/);
+  // the command is the shell's $1, run by a shell of its own, never spliced into the script
+  expect(appService?.args).toEqual([
+    "-c",
+    expect.stringMatching(/&& exec bash -c "\$1"$/),
+    "bash",
+    "pnpm dev --host",
+  ]);
 
   // the proxy holds 8080 before the dev server opens its own port
   const created = wire.calls.filter((c) => c.startsWith("service-create"));
@@ -209,6 +241,30 @@ test("starting a preview creates the proxy and the dev server, flips the URL pub
   );
   expect(preview.replaced).toBeNull();
 });
+
+test.each([
+  ["a cd first", "cd web && pwd > ../ran", (dir: string) => `${dir}/web\n`],
+  ["a variable set for it", `FOO=1 sh -c 'echo "$FOO"' > ran`, () => "1\n"],
+  ["two commands", "echo one > ran && echo two >> ran", () => "one\ntwo\n"],
+  ["quotes", `echo "it's" 'a "test"' > ran`, () => `it's a "test"\n`],
+])(
+  "a command with %s runs whole, as written, in the worktree",
+  async (_, cmd, expected) => {
+    const envId = readyEnv();
+    const agentId = seedAgent(envId);
+    await started(agentId, { cmd, port: 5173 });
+    const service = servicesOf(envId).get(PREVIEW_APP_SERVICE);
+    expect(service?.cmd).toBe("bash");
+    // what the sprite would run, run here by a real bash in a stand-in worktree
+    mkdirSync(join(dir, "worktree", "web"), { recursive: true });
+    // as `pwd` prints it, where the temp dir is behind a symlink
+    const worktree = realpathSync(join(dir, "worktree"));
+    execFileSync("bash", service?.args ?? [], { cwd: worktree });
+    expect(readFileSync(join(worktree, "ran"), "utf8")).toBe(
+      expected(worktree),
+    );
+  },
+);
 
 test("only the token's hash is kept: in the row and on the proxy, never the token", async () => {
   const envId = readyEnv();
@@ -470,8 +526,10 @@ test("an expired preview is ended by the sweep: services removed, URL private, t
   expect(await sweepExpiredPreviews(db, ops, ops.log, new Date())).toBe(0);
   expect(servicesOf(envId).size).toBe(2);
 
+  wire.calls.length = 0;
   const later = new Date(Date.parse(preview.expiresAt) + 1000);
   expect(await sweepExpiredPreviews(db, ops, ops.log, later)).toBe(1);
+  expectPrivateBeforeServicesGo(envId);
   expect(servicesOf(envId).size).toBe(0);
   expect(authOf(envId)).toEqual({ auth: "sprite" });
   expect(
@@ -495,6 +553,7 @@ test("archiving the agent ends its preview before its worktree goes", async () =
     headers: headers(),
   });
   expect(res.status).toBe(200);
+  expectPrivateBeforeServicesGo(envId);
   expect(servicesOf(envId).size).toBe(0);
   expect(authOf(envId)).toEqual({ auth: "sprite" });
   expect(db.select().from(previews).all()).toEqual([]);
@@ -524,11 +583,13 @@ test("deleting the environment ends its preview, the URL, the services and the t
   const envId = readyEnv();
   const agentId = seedAgent(envId);
   await started(agentId);
+  wire.calls.length = 0;
   const res = await app.request(`/v1/environments/${envId}`, {
     method: "DELETE",
     headers: headers(),
   });
   expect(res.status).toBe(204);
+  expectPrivateBeforeServicesGo(envId);
   expect(servicesOf(envId).size).toBe(0);
   expect(authOf(envId)).toEqual({ auth: "sprite" });
   expect(db.select().from(previews).all()).toEqual([]);
@@ -677,6 +738,63 @@ test("the port check runs after the replaced preview's services are gone, so it 
   expect(check).toBeGreaterThan(firstDelete);
 });
 
+/** Starts `agentId`'s preview; the check returned asserts that a start refused since left it as it was. */
+async function runningPreviewOf(envId: EnvironmentId, agentId: AgentId) {
+  await started(agentId);
+  const row = db.select().from(previews).get();
+  wire.calls.length = 0;
+  return async () => {
+    expect(db.select().from(previews).all()).toEqual([row]);
+    expect(servicesOf(envId).size).toBe(2);
+    expect(servicesOf(envId).get(PREVIEW_APP_SERVICE)?.dir).toBe(
+      `/workspace/worktrees/${agentId}`,
+    );
+    expect(authOf(envId)).toEqual({ auth: "public" });
+    const touched = wire.calls.filter((c) => /^(service-|label )/.test(c));
+    expect(touched).toEqual([]);
+    expect(await (await state(agentId)).json()).toMatchObject({
+      preview: { agentId, services: { app: "running", proxy: "running" } },
+    });
+  };
+}
+
+test("a start refused for a busy port other than the running preview's leaves that preview running", async () => {
+  const envId = readyEnv();
+  const a = seedAgent(envId);
+  const b = seedAgent(envId);
+  const untouched = await runningPreviewOf(envId, a);
+  wire.exec = (argv) =>
+    argv[0] === "sh" && argv.at(-1) === "4000"
+      ? { exitCode: 10 }
+      : { exitCode: 0 };
+  const res = await start(b, { cmd: "npm run dev", port: 4000 });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({
+    error: { code: "port_busy", message: expect.stringContaining("4000") },
+  });
+  await untouched();
+});
+
+test("a start refused because the sprite has no URL leaves the running preview running", async () => {
+  const envId = readyEnv();
+  const a = seedAgent(envId);
+  const b = seedAgent(envId);
+  const untouched = await runningPreviewOf(envId, a);
+  server.use(
+    http.get("https://api.sprites.dev/v1/sprites/:name", ({ params }) =>
+      HttpResponse.json({
+        id: `spr_${String(params.name)}`,
+        name: String(params.name),
+        status: "warm",
+      }),
+    ),
+  );
+  const res = await start(b, { cmd: "npm run dev", port: 4000 });
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({ error: { code: "preview_failed" } });
+  await untouched();
+});
+
 test("a dev server that dies at start fails the start with its output, redacted, and leaves nothing running", async () => {
   const envId = readyEnv();
   const agentId = seedAgent(envId);
@@ -718,6 +836,42 @@ test("a dev server that dies at start fails the start with its output, redacted,
   expect(servicesOf(envId).size).toBe(0);
   expect(authOf(envId)).toEqual({ auth: "sprite" });
   expect(db.select().from(previews).all()).toEqual([]);
+});
+
+test("a dev server's failure output keeps the port and the profile's switches; only secrets are redacted", async () => {
+  const envId = readyEnv({ base: "team" });
+  const agentId = seedAgent(envId);
+  db.insert(secrets)
+    .values({
+      envId,
+      name: "STRIPE_KEY",
+      kind: "value",
+      connector: null,
+      ...seal(
+        config.secretEncryptionKey,
+        "stripe-value-9f8e7d",
+        envSecretAad(envId, "STRIPE_KEY"),
+      ),
+    })
+    .run();
+  wire.serviceEvents = (_, service) =>
+    service === PREVIEW_APP_SERVICE
+      ? [
+          {
+            type: "stderr",
+            data: "attempt 1: listen EADDRINUSE :::5173 (key stripe-value-9f8e7d)\n",
+            timestamp: 1,
+          },
+          { type: "exit", exit_code: 1, timestamp: 2 },
+        ]
+      : [{ type: "complete", timestamp: 1 }];
+  const res = await start(agentId, { cmd: "pnpm dev", port: 5173 });
+  expect(res.status).toBe(502);
+  const { error } = (await res.json()) as { error: { message: string } };
+  expect(error.message).toContain(
+    "attempt 1: listen EADDRINUSE :::5173 (key [redacted])",
+  );
+  expect(error.message).not.toContain("stripe-value-9f8e7d");
 });
 
 test("a sprite that refuses the service fails the start and the URL never went public", async () => {

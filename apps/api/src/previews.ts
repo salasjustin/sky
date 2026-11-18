@@ -37,6 +37,10 @@ const OUTPUT_TAIL = 1500;
 const PORT_HELD = `hex=$(printf '%04X' "$1"); cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v p=":$hex" '$4 == "0A" && toupper($2) ~ p "$" { held = 1 } END { exit (held ? 10 : 0) }'`;
 const HELD = 10;
 
+// the user's command, whole, as $1 of a shell of its own: `cd web && pnpm dev` and `FOO=1 pnpm dev` run as
+// written, and a single program still replaces that shell as the service's process
+const RUN_DEV_SERVER = `${WITH_PACKAGE_MANAGERS} && exec bash -c "$1"`;
+
 const sha256Hex = (value: string) =>
   createHash("sha256").update(value).digest("hex");
 
@@ -53,6 +57,7 @@ const runningOf = (db: Db) =>
       envId: previews.envId,
       agentId: previews.agentId,
       tokenHash: previews.tokenHash,
+      port: previews.port,
       spriteName: environments.spriteName,
     })
     .from(previews)
@@ -216,7 +221,11 @@ export function createPreviews({
     if (failure) throw new Error(failure);
   }
 
-  /** What the dev server's commands get: the environment's secrets and its profile's session variables, never a Claude credential or one of Sky's tokens. */
+  /**
+   * What the dev server's commands get: the environment's secrets and its profile's session variables, never a
+   * Claude credential or one of Sky's tokens. `secretValues` are the secrets alone, what its output is redacted
+   * by: the session variables are switches and `PORT` a number the output must keep.
+   */
   function appEnv(envId: EnvironmentId, base: string | null, port: number) {
     const profile = base ? config.baseProfiles[base] : undefined;
     const secrets = new Map(
@@ -227,10 +236,34 @@ export function createPreviews({
       if (isReservedName(name)) secrets.delete(name);
     }
     return {
-      ...Object.fromEntries(secrets),
-      ...(profile?.sessionEnv ?? {}),
-      PORT: String(port),
+      env: {
+        ...Object.fromEntries(secrets),
+        ...(profile?.sessionEnv ?? {}),
+        PORT: String(port),
+      },
+      secretValues: [...secrets.values()],
     };
+  }
+
+  /** `port_busy` or `failed` when the port check refuses `port`; `undefined` when nothing listens on it. */
+  async function refusedPort(
+    spriteName: string,
+    port: number,
+  ): Promise<StartResult | undefined> {
+    const held = await execInSprite(
+      sprites,
+      spriteName,
+      ["sh", "-c", PORT_HELD, "sh", String(port)],
+      { op: "preview-port" },
+    );
+    if (held.exitCode === HELD) return { kind: "port_busy", port };
+    if (held.exitCode !== 0) {
+      return {
+        kind: "failed",
+        detail: `checking port ${port} on the sprite exited ${held.exitCode}`,
+      };
+    }
+    return undefined;
   }
 
   return {
@@ -260,23 +293,7 @@ export function createPreviews({
         const current = runningOf(db)
           .where(eq(previews.envId, agent.envId))
           .get();
-        if (current) await endPreview(db, sprites, current);
-        // what holds a port now is not ours: this preview's own services are gone
-        for (const port of [PREVIEW_PROXY_PORT, input.port]) {
-          const held = await execInSprite(
-            sprites,
-            spriteName,
-            ["sh", "-c", PORT_HELD, "sh", String(port)],
-            { op: "preview-port" },
-          );
-          if (held.exitCode === HELD) return { kind: "port_busy", port };
-          if (held.exitCode !== 0) {
-            return {
-              kind: "failed",
-              detail: `checking port ${port} on the sprite exited ${held.exitCode}`,
-            };
-          }
-        }
+        // every refusal that doesn't hinge on the running preview's own services comes before it is ended
         const url = (
           await spriteCall(sprites, spriteName, { op: "get-url" }, () =>
             sprites.client.getSprite(spriteName),
@@ -287,6 +304,22 @@ export function createPreviews({
             kind: "failed",
             detail: "the sprite has no URL to preview on",
           };
+        }
+        const devPortCheckedFirst =
+          current !== undefined && current.port !== input.port;
+        if (devPortCheckedFirst) {
+          const refused = await refusedPort(spriteName, input.port);
+          if (refused) return refused;
+        }
+        if (current) await endPreview(db, sprites, current);
+        // a running preview's proxy holds 8080, and its dev server the dev port when this one asks for the same:
+        // checked once its services are gone, so neither is counted
+        const afterTeardown = devPortCheckedFirst
+          ? [PREVIEW_PROXY_PORT]
+          : [PREVIEW_PROXY_PORT, input.port];
+        for (const port of afterTeardown) {
+          const refused = await refusedPort(spriteName, port);
+          if (refused) return refused;
         }
         const token = randomBytes(32).toString("base64url");
         const tokenHash = sha256Hex(token);
@@ -306,8 +339,12 @@ export function createPreviews({
           })
           .returning()
           .get();
-        const env = appEnv(agent.envId, found.base, input.port);
-        const known = [...Object.values(env), token];
+        const { env, secretValues } = appEnv(
+          agent.envId,
+          found.base,
+          input.port,
+        );
+        const known = [...secretValues, token];
         try {
           await ensureBundle(spriteName, `preview-${agentId}`);
           // the proxy first, holding 8080 before the dev server opens a port of its own: a sprite's URL
@@ -336,7 +373,7 @@ export function createPreviews({
             PREVIEW_APP_SERVICE,
             {
               cmd: "bash",
-              args: ["-c", `${WITH_PACKAGE_MANAGERS} && exec ${input.cmd}`],
+              args: ["-c", RUN_DEV_SERVER, "bash", input.cmd],
               dir: worktree,
               env,
               needs: [PREVIEW_PROXY_SERVICE],
