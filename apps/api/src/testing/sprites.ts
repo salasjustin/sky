@@ -114,7 +114,7 @@ export function stubSprites() {
      * `rm <name> <path>`, `delete <name>`, `label <name>` (the PUT that sets labels).
      */
     calls: [] as string[],
-    /** The `calls` line of each HTTP exec the client cut before it was answered, as dropping its connection. */
+    /** The `calls` line of each HTTP exec the client aborted before it was answered, which the API sees as a dropped connection. */
     cutExecs: [] as string[],
     /** The body of each sprite's last update, by name. */
     updates: new Map<string, { labels?: string[]; url_settings?: unknown }>(),
@@ -182,9 +182,9 @@ export function stubSprites() {
      */
     hangs: (_call: string): boolean => false,
     /**
-     * Awaited by each exec, and by each service create before it stores the service, before it answers and
-     * after `hangs`: a test returns a promise for a call (matched by its `calls` line) to hold it, as a long
-     * build is held, and resolves it to let the call finish.
+     * Awaited after `hangs` by each exec before it answers, and by each service create before it stores the
+     * service: a test returns a promise for a call (matched by its `calls` line) to hold it, as a long build
+     * is held, and resolves it to let the call finish.
      */
     gate: (_call: string): Promise<void> | undefined => undefined,
     /** How long a hung call waits before answering 503 when the client never aborts it. */

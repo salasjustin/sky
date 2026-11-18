@@ -1076,7 +1076,7 @@ test("preview tells the model how to pace its reads and what a failed one asks o
   expect(description).toMatch(/normal answer, not an error/);
   expect(description).toMatch(/failure is command .*fix that command/);
   expect(description).toMatch(/sprite .*\(start again unchanged\)/);
-  expect(description).toMatch(/refused with 422 or 502 preview_failed/);
+  expect(description).toMatch(/refused with 502 preview_failed/);
 });
 
 test.each([
