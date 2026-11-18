@@ -294,6 +294,24 @@ test("openRequests counts only requests still unresolved", async () => {
   expect(counts).toEqual({ [open.id]: 1, [resolved.id]: 0, [none.id]: 0 });
 });
 
+test("a run stopped while it waits lists as stopped with no open requests", async () => {
+  const env = readyEnv("trail");
+  const a = seed(env, {
+    runs: [{ status: "waiting", createdAt: 1, request: { kind: "question" } }],
+  });
+  const res = await app.request(`/v1/agents/${a.id}/stop`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${admin}` },
+  });
+  expect(res.status).toBe(200);
+  const [row] = (await page()).data;
+  expect(row?.run).toMatchObject({
+    id: a.runIds[0],
+    state: "stopped",
+    openRequests: 0,
+  });
+});
+
 test("an agent with no runs lists with a null run, and no state filter matches it", async () => {
   const env = readyEnv("trail");
   const bare = seed(env);

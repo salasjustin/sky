@@ -78,7 +78,11 @@ const lastEventAt = sql<
 // when the agent last did anything: its latest run's last event, else its creation
 const activityAt = sql<string>`coalesce(${lastEventAt}, ${agents.createdAt})`;
 
-const openRequests = sql<number>`(select count(*) from run_requests q where q.run_id = ${runs.id} and q.decided_at is null)`;
+// an ended run's undecided request waits on no one: ending a run leaves its row undecided
+const openRequests = sql<number>`case when ${runs.status} = 'waiting'
+  then (select count(*) from run_requests q where q.run_id = ${runs.id} and q.decided_at is null)
+  else 0
+end`;
 
 /**
  * A waiting run is `waiting_approval` or `waiting_answer` by the kind of its open request; one with
