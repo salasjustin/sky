@@ -123,10 +123,20 @@ test("the filters reach the API: --env and --status repeat or take a comma list,
   });
 });
 
-test("no agent matching prints nothing on stdout", async () => {
+test("no agent matching prints nothing on stdout and says so on stderr", async () => {
   const r = await runCli(["agent", "list"]);
   expect(r.code).toBe(0);
   expect(r.stdout).toBe("");
+  expect(r.stderr).toBe("no agents match\n");
+});
+
+test("no agent matching an --env says a name the key can't use matches nothing", async () => {
+  const r = await runCli(["agent", "list", "--env=trial"]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toBe(
+    "no agents match (an env name this key can't use matches nothing)\n",
+  );
 });
 
 test("a page with more behind it gives the next page's --cursor on stderr, not stdout", async () => {

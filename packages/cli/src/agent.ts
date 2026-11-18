@@ -184,6 +184,13 @@ const agentSub: AgentCommand = {
         const page = await api.listAgents(query);
         if (out.json || page.data.length > 0) {
           out.result(page.raw, page.data.map(agentLine).join("\n"));
+        } else {
+          // the API answers an env it can't resolve, or one the key may not use, with an empty page
+          out.progress(
+            values.env === undefined
+              ? "no agents match"
+              : "no agents match (an env name this key can't use matches nothing)",
+          );
         }
         if (page.nextCursor !== undefined) {
           out.progress(
