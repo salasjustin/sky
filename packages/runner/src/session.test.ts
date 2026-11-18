@@ -32,6 +32,7 @@ import {
   autoApproveVerdict,
   RUNNER_TEXT_MAX,
   RunnerEventPost,
+  TOOL_INPUT_POST_MAX,
 } from "@sky/shared";
 import { delay, HttpResponse, http } from "msw";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -3141,6 +3142,32 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
     "run.waiting",
     "run.finished",
   ]);
+});
+
+test("a held call's input past the stored cap posts up to the redaction margin, so the API redacts before it cuts", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const longPush = {
+    ...gitPush,
+    tool_input: {
+      command: `git push origin main ${"x".repeat(TOOL_INPUT_POST_MAX)}`,
+    },
+  };
+  const query = scripted([
+    init,
+    async (options: Options) =>
+      void (await fire(options, "PreToolUse", longPush)),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  const waiting = sent.find((e) => e.type === "run.waiting");
+  const request =
+    waiting?.type === "run.waiting" ? waiting.payload.request : undefined;
+  expect(request?.kind === "approval" && request.toolInput).toBe(
+    JSON.stringify(longPush.tool_input).slice(0, TOOL_INPUT_POST_MAX),
+  );
 });
 
 test("an approval with a reason lets the tool run the same, and hands Claude the reason as a note", async () => {

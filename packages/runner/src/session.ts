@@ -27,7 +27,7 @@ import {
   RUNNER_TEXT_MAX,
   type RunnerEventPost,
   type RunRollup,
-  TOOL_INPUT_MAX,
+  TOOL_INPUT_POST_MAX,
   type Usage,
   type WithdrawalReason,
 } from "@sky/shared";
@@ -994,7 +994,7 @@ export async function runSession(
             toolSummary: bound(read.path),
             toolInput: JSON.stringify(input.tool_input).slice(
               0,
-              TOOL_INPUT_MAX,
+              TOOL_INPUT_POST_MAX,
             ),
           },
           signal,
@@ -1085,9 +1085,10 @@ export async function runSession(
           toolHint(input.tool_input) ??
             (JSON.stringify(input.tool_input) || input.tool_name),
         ),
-        // the whole input, for the person who reads it where the summary is cut
+        // the whole input, for the person who reads it where the summary is cut; past the stored cap
+        // by the API's redaction margin, so the API redacts before it cuts and marks the cut
         ...(inputJson !== undefined && {
-          toolInput: inputJson.slice(0, TOOL_INPUT_MAX),
+          toolInput: inputJson.slice(0, TOOL_INPUT_POST_MAX),
         }),
       },
       signal,
