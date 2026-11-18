@@ -1,6 +1,13 @@
 import { SpritesClient } from "@fly/sprites";
 import { agents, type Db, environments, migrate, openDb, runs } from "@sky/db";
-import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
+import {
+  type AgentId,
+  type EnvironmentId,
+  type RunId,
+  TOOL_INPUT_MAX,
+  TOOL_INPUT_POST_MAX,
+  truncationMarker,
+} from "@sky/shared";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -586,21 +593,17 @@ test("an approval's full tool input is kept on the request, not on its event or 
   expect(JSON.stringify(received[0])).not.toContain("xxxxxxxxxx");
 });
 
-test("an approval's tool input is redacted, and cut at 64 KiB with the truncation marker", async () => {
-  const secret = `sk-${"a".repeat(30)}`;
-  const toolInput = JSON.stringify({
-    command: `curl -H "x: ${secret}" ${"y".repeat(70_000)}`,
-  });
-  // the runner bounds it to 64 KiB itself; the API cuts after redaction
-  const request = {
-    ...approval(),
-    toolInput: toolInput.slice(0, 65_536),
-  };
-  await waitingOn(request);
-  const pending = (await pendingOf()) as { toolInput: string };
-  expect(pending.toolInput).not.toContain(secret);
-  expect(pending.toolInput).toContain("[redacted]");
-  expect(pending.toolInput.length).toBeLessThanOrEqual(65_536 + 64);
+test("an approval's tool input is redacted, then cut at 64 KiB with the truncation marker", async () => {
+  const secret = config.webhookSigningKey;
+  // the secret straddles the cut, so cutting before redacting would store its first 20 chars
+  const toolInput = `${"y".repeat(TOOL_INPUT_MAX - 20)}${secret}${"y".repeat(4_000)}`;
+  expect(toolInput.length).toBeLessThanOrEqual(TOOL_INPUT_POST_MAX);
+  await waitingOn({ ...approval(), toolInput });
+  const stored = ((await pendingOf()) as { toolInput: string }).toolInput;
+  expect(stored).not.toContain(secret.slice(0, 8));
+  const droppedAfterRedaction = 4_000 - "[redacted]".length;
+  expect(stored.endsWith(truncationMarker(droppedAfterRedaction))).toBe(true);
+  expect(stored.length).toBeLessThanOrEqual(TOOL_INPUT_MAX + 64);
 });
 
 test("a token on its own line of an approval's tool input is redacted", async () => {
@@ -613,12 +616,17 @@ test("a token on its own line of an approval's tool input is redacted", async ()
   expect(pending.toolInput).toBe(JSON.stringify({ command: "x\n[redacted]" }));
 });
 
-test("a tool input past 64 KiB is refused", async () => {
+test("a tool input past the post cap is refused", async () => {
   runningRun();
   const res = await postEvent({
     runId,
     type: "run.waiting",
-    payload: { request: { ...approval(), toolInput: "x".repeat(65_537) } },
+    payload: {
+      request: {
+        ...approval(),
+        toolInput: "x".repeat(TOOL_INPUT_POST_MAX + 1),
+      },
+    },
   });
   expect(res.status).toBe(400);
 });

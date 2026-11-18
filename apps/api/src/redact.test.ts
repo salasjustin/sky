@@ -1,5 +1,11 @@
+import { TOOL_INPUT_MAX, TOOL_INPUT_POST_MAX } from "@sky/shared";
 import { expect, test } from "vitest";
-import { KnownSecrets, redact, redactDeep } from "./redact.js";
+import {
+  KnownSecrets,
+  REDACTION_MARGIN,
+  redact,
+  redactDeep,
+} from "./redact.js";
 
 const secrets = {
   apiKey: "k".repeat(40),
@@ -119,4 +125,8 @@ test("a removed value is no longer scrubbed", () => {
   expect(redact("held-for-a-while", registry.values())).toBe(
     "held-for-a-while",
   );
+});
+
+test("a runner's tool input post cap is the stored cap plus the redaction margin", () => {
+  expect(REDACTION_MARGIN).toBe(TOOL_INPUT_POST_MAX - TOOL_INPUT_MAX);
 });
