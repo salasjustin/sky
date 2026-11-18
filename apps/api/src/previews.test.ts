@@ -66,6 +66,8 @@ let lockfile: number;
 // whether the app, once its service exists, listens on its port; and ports something else holds
 let appUp: boolean;
 let busy: Set<number>;
+// lets go of the calls a test holds with `holdCalls`
+let releaseHeld = () => {};
 
 /** The sprite as the preview's checks see it: its lockfile, and which ports listen (the proxy's 8080 while its service exists). */
 function modelSprite(argv: string[], sprite = "") {
@@ -117,6 +119,9 @@ beforeEach(() => {
   app = makeApp();
 });
 afterEach(async () => {
+  // a test that failed before it released its held calls must not leave the wait below to time out in its place
+  releaseHeld();
+  releaseHeld = () => {};
   // a start's build and wait for its port go on after its answer: let each finish before the stub goes
   await vi.waitFor(() =>
     expect(
@@ -536,6 +541,17 @@ test("restarting an agent's own preview replaces it without naming anyone", asyn
   expect(db.select().from(previews).all()).toHaveLength(1);
 });
 
+test("replacing a preview sets the old one's URL private before its services go", async () => {
+  const envId = readyEnv();
+  const first = seedAgent(envId);
+  const second = seedAgent(envId);
+  await started(first);
+  wire.calls.length = 0;
+  await started(second);
+  // the first `label` after the clear is the old preview's teardown, the new URL going public comes last
+  expectPrivateFirst(envId);
+});
+
 test("a preview in another environment is not replaced", async () => {
   const a = readyEnv();
   const b = readyEnv();
@@ -618,6 +634,33 @@ test("a stop the sprite can't finish keeps the preview, so a retry finishes it",
   wire.serviceDeleteStatus = 204;
   expect((await stop(agentId)).status).toBe(200);
   expect(servicesOf(envId).size).toBe(0);
+  expect(db.select().from(previews).all()).toEqual([]);
+});
+
+test("a stop that can't set the URL private deletes no service and keeps the preview, so a retry finishes it", async () => {
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  await started(agentId);
+  refusePrivate();
+  wire.calls.length = 0;
+  const res = await stop(agentId);
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: { code: "preview_stop_failed" },
+  });
+  // the update was tried, and nothing that could leave the URL public with no app behind it ran after it
+  expect(callsMatching(/^label /).length).toBeGreaterThan(0);
+  expect(callsMatching(/^service-delete /)).toEqual([]);
+  expect(callsMatching(/kill -TERM/)).toEqual([]);
+  expect(callsMatching(/^rm /)).toEqual([]);
+  expect(servicesOf(envId).size).toBe(2);
+  expect(authOf(envId)).toEqual({ auth: "public" });
+  expect(db.select().from(previews).all()).toHaveLength(1);
+
+  wire.updateRefused = () => false;
+  expect((await stop(agentId)).status).toBe(200);
+  expect(servicesOf(envId).size).toBe(0);
+  expect(authOf(envId)).toEqual({ auth: "sprite" });
   expect(db.select().from(previews).all()).toEqual([]);
 });
 
@@ -798,6 +841,35 @@ test("a runs key can't preview, read or stop an agent outside its own", async ()
   expect(ok.preview.agentId).toBe(mine);
   expect((await state(mine, key.secret)).status).toBe(200);
   expect((await stop(mine, key.secret)).status).toBe(200);
+});
+
+// the other guard of `find`, `canUseEnv`, has no input here: an agent is created in an environment its key may use, and a
+// key's environments are fixed when it is minted, so a key never owns an agent in an environment it can't use
+test("a runs key can't read or stop an agent it didn't start, in an environment it may use", async () => {
+  const envId = readyEnv();
+  const key = await mintKey([envId]);
+  const mine = seedAgent(envId, { ownerKeyId: key.id });
+  const theirs = seedAgent(envId);
+  await started(theirs);
+  wire.calls.length = 0;
+
+  expect((await state(theirs, key.secret)).status).toBe(404);
+  expect((await stop(theirs, key.secret)).status).toBe(404);
+  expect(wire.calls).toEqual([]);
+  expect(rowOf(theirs)?.state).toBe("ready");
+  expect(servicesOf(envId).size).toBe(2);
+  expect(authOf(envId)).toEqual({ auth: "public" });
+
+  // its own agent has no preview: nothing to read or stop, and the other agent's is left running
+  expect(await (await state(mine, key.secret)).json()).toEqual({
+    preview: null,
+  });
+  const own = await stop(mine, key.secret);
+  expect(own.status).toBe(200);
+  expect(await own.json()).toEqual({ preview: null, stopped: null });
+  expect(wire.calls).toEqual([]);
+  expect(servicesOf(envId).size).toBe(2);
+  expect(rowOf(theirs)?.state).toBe("ready");
 });
 
 test("a runs key can't replace a preview another key started, and the refusal names no agent", async () => {
@@ -1041,15 +1113,18 @@ const filesRemoved = (envId: string, tokenHash: string) =>
       [...wire.files.keys()].filter((p) => p.startsWith(`${dir}/`)),
     ).toEqual([]);
   });
-/** Holds every build until `release()`. */
-function holdBuilds() {
+/** Holds every call `matches` until `release()`, which the test's end does too. */
+function holdCalls(matches: (call: string) => boolean) {
   let release = () => {};
   const held = new Promise<void>((resolve) => {
     release = resolve;
   });
-  wire.gate = (call) => (call.includes("/build.log") ? held : undefined);
+  wire.gate = (call) => (matches(call) ? held : undefined);
+  releaseHeld = release;
   return release;
 }
+/** Holds every build until `release()`. */
+const holdBuilds = () => holdCalls((call) => call.includes("/build.log"));
 const sweepOps = () => ({
   client: new SpritesClient(spritesToken),
   log: (line: string) => logs.push(line),
@@ -1071,6 +1146,40 @@ const stateBody = async (agentId: string, key?: string) => {
   const res = await state(agentId, key);
   return { status: res.status, body: (await res.json()) as StateBody };
 };
+
+/** Of `calls`: the env's URL is set private, and before any of its services is deleted. */
+function expectPrivateFirst(envId: string, calls: string[] = wire.calls) {
+  const privateAt = calls.indexOf(`label ${sprite(envId)}`);
+  const firstDelete = calls.findIndex((c) =>
+    c.startsWith(`service-delete ${sprite(envId)} `),
+  );
+  expect(privateAt).toBeGreaterThanOrEqual(0);
+  expect(firstDelete).toBeGreaterThan(privateAt);
+}
+/** The sprite refuses the URL going private; going public, and anything else, still works. */
+const refusePrivate = () => {
+  wire.updateRefused = (body) =>
+    (body.url_settings as { auth?: string } | undefined)?.auth === "sprite";
+};
+/**
+ * Records each state any preview row is written to from now on, by whichever writer, as the returned
+ * function reads it: a write that lands on a row the same instant it is deleted can't be seen from its end state.
+ */
+function watchStateWrites() {
+  db.$client.exec(`
+    CREATE TABLE state_writes (n INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT NOT NULL);
+    CREATE TRIGGER state_written AFTER UPDATE ON previews
+    BEGIN INSERT INTO state_writes (state) VALUES (NEW.state); END;
+  `);
+  return () =>
+    (
+      db.$client
+        .prepare("SELECT state FROM state_writes ORDER BY n")
+        .all() as { state: string }[]
+    ).map((row) => row.state);
+}
+const appCreateOf = (envId: string) =>
+  `service-create ${sprite(envId)} ${PREVIEW_APP_SERVICE}`;
 
 test.each([
   [10, "pnpm build", "pnpm start"],
@@ -1253,8 +1362,7 @@ test("the app's service runs only the start command, so a sprite that wakes rest
   ]);
   expect(JSON.stringify(service)).not.toContain("build:prod");
   expect(service?.env).toMatchObject({ NODE_ENV: "production", PORT: "5173" });
-  // and nothing built again since: one build, whatever happens after it is ready
-  await new Promise((r) => setTimeout(r, 100));
+  // the job is over once the preview is ready, so the one build is all there will be
   expect(buildsOn(envId)).toHaveLength(1);
 });
 
@@ -1488,6 +1596,19 @@ test("a proxy that exits fails the start itself, 502, and nothing is left", asyn
   expect(buildsOn(envId)).toEqual([]);
 });
 
+test("a start that fails after its proxy is up sets the URL private before it deletes either service", async () => {
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  wire.serviceEvents = (_, service) =>
+    service === PREVIEW_PROXY_SERVICE
+      ? [{ type: "exit", exit_code: 1, timestamp: 1 }]
+      : [{ type: "complete", timestamp: 1 }];
+  wire.calls.length = 0;
+  expect((await start(agentId)).status).toBe(502);
+  expectPrivateFirst(envId);
+  expect(servicesOf(envId).size).toBe(0);
+});
+
 test("a sprite that refuses the service fails the start and the URL never went public", async () => {
   const envId = readyEnv();
   const agentId = seedAgent(envId);
@@ -1633,8 +1754,7 @@ test("starting again while the first is still building stops its build and build
   release();
   await reaches(agentId, "ready");
   expect(rowOf(agentId)?.tokenHash).toBe(sha256(tokenOf(two.preview.link)));
-  // only the second preview's app was ever created
-  await new Promise((r) => setTimeout(r, 50));
+  // only the second preview's app was ever created: the first's job let go of the sprite before the second began
   expect(
     callsMatching(new RegExp(`service-create .* ${PREVIEW_APP_SERVICE}$`)),
   ).toHaveLength(1);
@@ -1658,7 +1778,7 @@ test("stopping a preview that is still building stops its build, and its app is 
   expect(killsOf(envId, previewDir(tokenHash))).toHaveLength(1);
   await filesRemoved(envId, tokenHash);
   release();
-  await new Promise((r) => setTimeout(r, 100));
+  // the stop answered only once the job had let go of the sprite, so the released build starts nothing
   expect(
     callsMatching(new RegExp(`service-create .* ${PREVIEW_APP_SERVICE}$`)),
   ).toEqual([]);
@@ -1740,6 +1860,144 @@ test("stopping a build ends every process the build started, not only the wrappe
   }
 }, 20_000);
 
+/** A build that exits 1, every other command as the sprite model answers it. */
+const failingBuild = () => {
+  wire.exec = (argv, s) =>
+    argv.at(-1) === "pnpm build"
+      ? { exitCode: 1, stderr: "boom\n" }
+      : modelSprite(argv, s);
+};
+
+test("a job that fails sets the URL private before it deletes either service", async () => {
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  failingBuild();
+  const release = holdBuilds();
+  await startedBuilding(agentId);
+  // the start is over: its proxy is up and its URL public; what follows is the job's own teardown
+  const afterStart = wire.calls.length;
+  release();
+  await reaches(agentId, "failed");
+  expectPrivateFirst(envId, wire.calls.slice(afterStart));
+  expect(authOf(envId)).toEqual({ auth: "sprite" });
+});
+
+test("a job that fails with the URL unable to go private deletes nothing, is read as failed, and is finished by the sweep", async () => {
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  failingBuild();
+  const release = holdBuilds();
+  await startedBuilding(agentId);
+  const tokenHash = rowOf(agentId)?.tokenHash ?? "";
+  refusePrivate();
+  release();
+  await reaches(agentId, "failed");
+  expect(rowOf(agentId)).toMatchObject({ failure: "command" });
+  expect(logs.join("\n")).toContain(
+    `taking down the failed preview of ${agentId} failed`,
+  );
+  // the teardown stopped at the URL: the public proxy and its link are still there for the sweep
+  expect(callsMatching(/^service-delete /)).toEqual([]);
+  expect(callsMatching(/kill -TERM/)).toEqual([]);
+  expect(callsMatching(/^rm /)).toEqual([]);
+  expect(authOf(envId)).toEqual({ auth: "public" });
+  expect(servicesOf(envId).has(PREVIEW_PROXY_SERVICE)).toBe(true);
+
+  wire.updateRefused = () => false;
+  const ops = sweepOps();
+  const later = new Date(Date.now() + 11 * 60_000);
+  expect(await sweepExpiredPreviews(db, ops, ops.log, later)).toBe(1);
+  expect(authOf(envId)).toEqual({ auth: "sprite" });
+  expect(servicesOf(envId).size).toBe(0);
+  expect(db.select().from(previews).all()).toEqual([]);
+  await filesRemoved(envId, tokenHash);
+});
+
+test("the sweep of an expired preview still building stops its job, sets the URL private first and leaves nothing started", async () => {
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  const release = holdBuilds();
+  const writes = watchStateWrites();
+  const { preview } = await startedBuilding(agentId);
+  const tokenHash = sha256(tokenOf(preview.link));
+  await vi.waitFor(() => expect(buildsOn(envId)).toHaveLength(1));
+  const before = wire.calls.length;
+
+  // past the row's own expiry, the build's cap and a grace, not the TTL
+  const ops = sweepOps();
+  const later = new Date(Date.now() + 21 * 60_000);
+  expect(await sweepExpiredPreviews(db, ops, ops.log, later)).toBe(1);
+  expectPrivateFirst(envId, wire.calls.slice(before));
+  await vi.waitFor(() => expect(wire.cutExecs).toEqual(buildsOn(envId)));
+  expect(killsOf(envId, previewDir(tokenHash))).toHaveLength(1);
+  await filesRemoved(envId, tokenHash);
+
+  release();
+  // the sweep went on only once the job had let go of the sprite: the released build starts and writes nothing
+  expect(wire.calls).not.toContain(appCreateOf(envId));
+  expect(writes()).toEqual([]);
+  expect(servicesOf(envId).size).toBe(0);
+  expect(authOf(envId)).toEqual({ auth: "sprite" });
+  expect(db.select().from(previews).all()).toEqual([]);
+});
+
+test("stopping while the app's service is being created: the job writes nothing more and the service it made is torn down", async () => {
+  // the app never listens, so a job that outlives its stop could only end by writing `failed` or timing out
+  app = makeApp({ previewReadyTimeoutMs: 30_000 });
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  appUp = false;
+  const release = holdCalls((call) => call === appCreateOf(envId));
+  const writes = watchStateWrites();
+  try {
+    await startedBuilding(agentId, { ...BODY, build: "none" });
+    await vi.waitFor(() => expect(wire.calls).toContain(appCreateOf(envId)));
+    const stopping = stop(agentId);
+    release();
+    const res = await stopping;
+    expect(res.status).toBe(200);
+    // `starting` is the job's own write before the create; neither `ready` nor `failed` follows the stop
+    expect(writes()).toEqual(["starting"]);
+    expect(servicesOf(envId).size).toBe(0);
+    expect(authOf(envId)).toEqual({ auth: "sprite" });
+    expect(db.select().from(previews).all()).toEqual([]);
+  } finally {
+    // a job left polling by a failed assertion ends here instead of outliving the test
+    appUp = true;
+  }
+});
+
+test("stopping while the app's port is polled: the job writes neither ready nor failed and no service is left", async () => {
+  app = makeApp({ previewReadyTimeoutMs: 30_000 });
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  appUp = false;
+  const writes = watchStateWrites();
+  try {
+    await startedBuilding(agentId, { ...BODY, build: "none" });
+    await vi.waitFor(() => expect(wire.calls).toContain(appCreateOf(envId)));
+    // polling is live: port checks keep coming after the app's service exists, and it is still `starting`
+    const polls = () =>
+      wire.calls
+        .slice(wire.calls.indexOf(appCreateOf(envId)) + 1)
+        .filter((c) => c.includes("/proc/net/tcp")).length;
+    await vi.waitFor(() => expect(polls()).toBeGreaterThan(1));
+    expect(rowOf(agentId)?.state).toBe("starting");
+
+    const res = await stop(agentId);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      stopped: { agentId, state: "starting" },
+    });
+    expect(writes()).toEqual(["starting"]);
+    expect(servicesOf(envId).size).toBe(0);
+    expect(authOf(envId)).toEqual({ auth: "sprite" });
+    expect(db.select().from(previews).all()).toEqual([]);
+  } finally {
+    appUp = true;
+  }
+});
+
 test("previews a restart interrupted are failed at boot and taken down by the sweep", async () => {
   const envId = readyEnv();
   const agentId = seedAgent(envId);
@@ -1766,9 +2024,12 @@ test("previews a restart interrupted are failed at boot and taken down by the sw
   expect(rowOf(agentId)?.detail).toContain("interrupted");
   expect(rowOf(ready)).toBeUndefined();
   const ops = sweepOps();
+  wire.calls.length = 0;
   expect(
     await sweepExpiredPreviews(db, ops, ops.log, new Date(Date.now() + 1000)),
   ).toBe(1);
+  // the dead process may have left the URL public: it goes private before any service is touched
+  expectPrivateFirst(envId);
   expect(db.select().from(previews).all()).toEqual([]);
   expect(authOf(envId)).toEqual({ auth: "sprite" });
   await filesRemoved(envId, sha256("t"));
@@ -1811,7 +2072,12 @@ test("a follow-up run on the agent leaves its preview running", async () => {
     body: JSON.stringify({ prompt: "tweak the header" }),
   });
   expect(res.status).toBe(202);
-  await new Promise((r) => setTimeout(r, 300));
+  // the follow-up has reached the sprite and opened its session: whatever it was going to do to the preview, it has done
+  await vi.waitFor(() =>
+    expect(
+      wire.calls.filter((c) => c.startsWith(`session ${sprite(envId)} `)),
+    ).toHaveLength(1),
+  );
   // no service was touched and the URL was not made private; the follow-up's edits reach the running
   // app service through the worktree they share
   expect(wire.calls.filter((c) => /^(service-|label )/.test(c))).toEqual([]);

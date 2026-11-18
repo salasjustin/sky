@@ -182,8 +182,9 @@ export function stubSprites() {
      */
     hangs: (_call: string): boolean => false,
     /**
-     * Awaited by each exec before it answers, after `hangs`: a test returns a promise for a call (matched by
-     * its `calls` line) to hold it, as a long build is held, and resolves it to let the exec finish.
+     * Awaited by each exec, and by each service create before it stores the service, before it answers and
+     * after `hangs`: a test returns a promise for a call (matched by its `calls` line) to hold it, as a long
+     * build is held, and resolves it to let the call finish.
      */
     gate: (_call: string): Promise<void> | undefined => undefined,
     /** How long a hung call waits before answering 503 when the client never aborts it. */
@@ -193,6 +194,14 @@ export function stubSprites() {
       Promise.all(inflightHangs).then(() => undefined),
     createStatus: 201,
     updateStatus: 200,
+    /**
+     * An update whose body this matches answers 503 and changes nothing, as an API that refuses one kind of
+     * change (the URL going private) while the rest work; `updateStatus` fails every update.
+     */
+    updateRefused: (_body: {
+      labels?: string[];
+      url_settings?: unknown;
+    }): boolean => false,
     writeStatus: 200,
     readStatus: 200,
     checkpointLines: undefined as object[] | undefined,
@@ -563,6 +572,7 @@ export function stubSprites() {
             { status: wire.serviceStatus },
           );
         }
+        await wire.gate(`service-create ${name} ${service}`);
         const record = (await request.json()) as ServiceRecord;
         const services = wire.services.get(name) ?? new Map();
         services.set(service, record);
@@ -633,6 +643,9 @@ export function stubSprites() {
         labels?: string[];
         url_settings?: unknown;
       };
+      if (wire.updateRefused(body)) {
+        return HttpResponse.json({ error: "update refused" }, { status: 503 });
+      }
       wire.updates.set(name, body);
       const before = storedOf(name);
       const after = {
