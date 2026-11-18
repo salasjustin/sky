@@ -1,0 +1,50 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      background: #16181d;
+    }
+    #close-lockup {
+      position: absolute;
+      left: 610px;
+      top: 300px;
+      width: 700px;
+      height: 327px;
+    }
+    #close-url {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 700px;
+      text-align: center;
+      font-family: "Inter", sans-serif;
+      font-weight: 400;
+      font-size: 44px;
+      color: #f7f6f2;
+    }
+    #close-note {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 880px;
+      text-align: center;
+      font-family: "Inter", sans-serif;
+      font-weight: 400;
+      font-size: 28px;
+      color: #9a9a9a;
+    }
+  </style>
+  <div id="root" data-composition-id="close" data-width="1920" data-height="1080">
+    <img id="close-lockup" src="assets/sky-header-dark.svg" alt="sky" />
+    <div id="close-url">github.com/salasjustin/sky</div>
+    <div id="close-note">Not affiliated with Anthropic.</div>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#close-lockup", { opacity: 0, scale: 0.94 }, { opacity: 1, scale: 1, duration: 0.7, ease: "power3.out" }, 0.1);
+    tl.fromTo("#close-url", { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.7);
+    tl.fromTo("#close-note", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 1.1);
+    window.__timelines["close"] = tl;
+  </script>
+</template>

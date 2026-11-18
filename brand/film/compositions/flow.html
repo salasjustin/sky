@@ -1,0 +1,160 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      background: #16181d;
+    }
+    #flow-art {
+      position: absolute;
+      inset: 0;
+    }
+    #flow-label {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 900px;
+      text-align: center;
+      font-family: "Inter", sans-serif;
+      font-weight: 400;
+      font-size: 40px;
+      color: #9a9a9a;
+    }
+    .card {
+      fill: #2a2a2a;
+      stroke: #5e5e5e;
+      stroke-width: 2;
+    }
+    .ink {
+      fill: none;
+      stroke: #f7f6f2;
+      stroke-width: 6;
+      stroke-linecap: butt;
+      stroke-linejoin: round;
+    }
+    .thin {
+      fill: none;
+      stroke: #f7f6f2;
+      stroke-width: 4;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .grey {
+      fill: none;
+      stroke: #5e5e5e;
+      stroke-width: 6;
+      stroke-linecap: butt;
+    }
+    .draw {
+      stroke-dasharray: 1;
+      stroke-dashoffset: 1;
+    }
+    .commit {
+      fill: #16181d;
+      stroke: #f7f6f2;
+      stroke-width: 4;
+    }
+  </style>
+  <div id="root" data-composition-id="flow" data-width="1920" data-height="1080">
+    <svg id="flow-art" viewBox="0 0 1920 1080" width="1920" height="1080">
+      <title>A repo and a prompt go into a sandbox; a pull request comes out</title>
+      <g id="flow-repo">
+        <rect class="card" x="180" y="330" width="160" height="160" rx="28" />
+        <circle class="thin" cx="235" cy="380" r="10" />
+        <circle class="thin" cx="235" cy="445" r="10" />
+        <circle class="thin" cx="285" cy="402" r="10" />
+        <path class="thin" d="M235 390V435M285 412Q285 430 235 435" />
+      </g>
+      <g id="flow-prompt">
+        <rect class="card" x="180" y="590" width="160" height="160" rx="28" />
+        <path class="thin" d="M222 640H298M222 670H280M222 700H262" />
+      </g>
+      <path id="flow-in-a" class="grey draw" pathLength="1" d="M340 410C480 410 480 540 620 540" />
+      <path id="flow-in-b" class="grey draw" pathLength="1" d="M340 670C480 670 480 540 620 540" />
+
+      <rect id="flow-box" x="620" y="330" width="680" height="420" rx="36" fill="none" stroke="#5e5e5e" stroke-width="3" stroke-dasharray="14 12" />
+      <path id="flow-main" class="grey draw" pathLength="1" d="M680 430H1240" />
+      <path id="flow-branch-base" class="grey" d="M760 430L830 600H1240" opacity="0.35" />
+      <line id="flow-t1" class="ink" x1="760" y1="430" x2="760" y2="430" />
+      <line id="flow-t2" class="ink" x1="830" y1="600" x2="830" y2="600" />
+      <circle id="flow-c1" class="commit" cx="900" cy="600" r="12" />
+      <circle id="flow-c2" class="commit" cx="1010" cy="600" r="12" />
+      <circle id="flow-c3" class="commit" cx="1120" cy="600" r="12" />
+      <g id="flow-agent">
+        <circle id="flow-ring" r="22" fill="none" stroke="#f7f6f2" stroke-width="3" />
+        <circle r="14" fill="#f7f6f2" />
+      </g>
+
+      <g id="flow-person">
+        <circle class="thin" cx="1010" cy="130" r="26" />
+        <path class="thin" d="M962 222Q962 172 1010 172Q1058 172 1058 222Z" />
+      </g>
+      <path id="flow-ask-line" class="thin draw" pathLength="1" d="M1010 232V572" stroke-dasharray="0.012 0.02" opacity="0.6" />
+      <g id="flow-bubble">
+        <circle cx="1130" cy="120" r="38" fill="#16181d" stroke="#f7f6f2" stroke-width="4" />
+        <text id="flow-q" x="1130" y="136" text-anchor="middle" font-family="Inter, sans-serif" font-weight="700" font-size="48" fill="#f7f6f2">?</text>
+        <path id="flow-tick" class="thin" d="M1113 120l13 14l24 -28" />
+      </g>
+
+      <path id="flow-out" class="ink draw" pathLength="1" d="M1300 600C1420 600 1440 540 1560 540" />
+      <g id="flow-pr">
+        <rect class="card" x="1560" y="460" width="160" height="160" rx="28" />
+        <circle class="thin" cx="1605" cy="500" r="10" />
+        <circle class="thin" cx="1605" cy="580" r="10" />
+        <circle class="thin" cx="1675" cy="580" r="10" />
+        <path class="thin" d="M1605 510V570M1675 570V528Q1675 514 1661 514H1636M1646 504L1634 514L1646 524" />
+        <circle cx="1720" cy="460" r="24" fill="#f7f6f2" />
+        <path id="flow-pr-tick" d="M1708 460l9 9l16 -19" fill="none" stroke="#16181d" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" />
+      </g>
+    </svg>
+    <div id="flow-label">Prompt in, pull request out</div>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    const draw = (sel, at, dur, ease) =>
+      tl.fromTo(sel, { strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: dur, ease: ease || "none" }, at);
+    const pop = (sel, at) =>
+      tl.fromTo(sel, { opacity: 0, scale: 0.6, transformOrigin: "50% 50%" }, { opacity: 1, scale: 1, duration: 0.4, ease: "back.out(2)" }, at);
+
+    tl.fromTo("#flow-repo", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.3);
+    tl.fromTo("#flow-prompt", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.5);
+    tl.fromTo("#flow-label", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0.6);
+    draw("#flow-in-a", 1.0, 0.8, "power2.inOut");
+    draw("#flow-in-b", 1.0, 0.8, "power2.inOut");
+    tl.fromTo("#flow-box", { opacity: 0 }, { opacity: 1, duration: 0.6 }, 1.5);
+    draw("#flow-main", 1.6, 0.5);
+    tl.fromTo("#flow-branch-base", { opacity: 0 }, { opacity: 0.35, duration: 0.3 }, 1.9);
+
+    // agent walks the branch: stroke and dot share one clock
+    tl.set("#flow-agent", { x: 760, y: 430 }, 0);
+    tl.fromTo("#flow-agent", { opacity: 0 }, { opacity: 1, duration: 0.3 }, 1.7);
+    tl.to("#flow-agent", { x: 830, y: 600, duration: 0.6, ease: "none" }, 2.0);
+    tl.to("#flow-agent", { x: 900, duration: 0.4, ease: "none" }, 2.6);
+    tl.to("#flow-agent", { x: 1010, duration: 0.5, ease: "none" }, 3.0);
+    tl.to("#flow-agent", { x: 1120, duration: 0.5, ease: "none" }, 5.5);
+    tl.to("#flow-agent", { x: 1240, duration: 0.5, ease: "none" }, 6.0);
+    tl.fromTo("#flow-t1", { attr: { x2: 760, y2: 430 } }, { attr: { x2: 830, y2: 600 }, duration: 0.6, ease: "none" }, 2.0);
+    tl.fromTo("#flow-t2", { attr: { x2: 830 } }, { attr: { x2: 900 }, duration: 0.4, ease: "none" }, 2.6);
+    tl.fromTo("#flow-t2", { attr: { x2: 900 } }, { attr: { x2: 1010 }, duration: 0.5, ease: "none", immediateRender: false }, 3.0);
+    tl.fromTo("#flow-t2", { attr: { x2: 1010 } }, { attr: { x2: 1240 }, duration: 1.0, ease: "none", immediateRender: false }, 5.5);
+    pop("#flow-c1", 2.8);
+    pop("#flow-c2", 3.35);
+    pop("#flow-c3", 5.95);
+
+    // pause: the agent waits while a person answers
+    tl.fromTo("#flow-ring", { scale: 1, opacity: 0.9, transformOrigin: "50% 50%" }, { scale: 2.2, opacity: 0, duration: 0.7, ease: "power1.out", repeat: 3 }, 3.5);
+    tl.fromTo("#flow-person", { opacity: 0, y: -16 }, { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 3.7);
+    draw("#flow-ask-line", 3.9, 0.7, "power1.inOut");
+    pop("#flow-bubble", 4.3);
+    tl.fromTo("#flow-tick", { opacity: 0 }, { opacity: 0, duration: 0.01 }, 0);
+    tl.to("#flow-q", { opacity: 0, duration: 0.2 }, 5.1);
+    tl.to("#flow-tick", { opacity: 1, duration: 0.25 }, 5.2);
+    tl.to(["#flow-person", "#flow-bubble", "#flow-ask-line"], { opacity: 0.2, duration: 0.5 }, 5.6);
+
+    draw("#flow-out", 6.5, 0.6, "power1.inOut");
+    tl.fromTo("#flow-pr", { opacity: 0, x: -20 }, { opacity: 1, x: 0, duration: 0.5, ease: "power2.out" }, 7.0);
+    tl.fromTo("#flow-pr-tick", { opacity: 0 }, { opacity: 1, duration: 0.3 }, 7.5);
+    tl.to("#root", { opacity: 0, duration: 0.35, ease: "power1.in" }, 9.1);
+    window.__timelines["flow"] = tl;
+  </script>
+</template>

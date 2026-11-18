@@ -1,0 +1,93 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      background: #16181d;
+    }
+    #many-grid {
+      position: absolute;
+      inset: 0;
+    }
+    #many-label {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 900px;
+      text-align: center;
+      font-family: "Inter", sans-serif;
+      font-weight: 400;
+      font-size: 40px;
+      color: #9a9a9a;
+    }
+    .many-tile {
+      position: absolute;
+      width: 240px;
+      height: 150px;
+      border-radius: 28px;
+      background: #2a2a2a;
+      border: 2px solid #5e5e5e;
+    }
+    .many-glyph {
+      position: absolute;
+      left: 22px;
+      top: 20px;
+      width: 36px;
+      height: 36px;
+    }
+    .many-dots {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 26px;
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+    }
+    .many-dot {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: #f7f6f2;
+    }
+  </style>
+  <div id="root" data-composition-id="many" data-width="1920" data-height="1080">
+    <div id="many-grid"></div>
+    <div id="many-label">One environment per repo</div>
+  </div>
+  <script>
+    // 19 environments: rows of 5, 5, 5, 4; agent counts per environment are illustrative
+    const agents = [3, 2, 4, 1, 3, 2, 4, 2, 1, 3, 4, 2, 3, 1, 2, 4, 3, 2, 1];
+    const grid = document.getElementById("many-grid");
+    const glyph =
+      '<svg class="many-glyph" viewBox="0 0 36 36" fill="none" stroke="#f7f6f2" stroke-width="3" stroke-linecap="round"><circle cx="9" cy="8" r="4"/><circle cx="9" cy="28" r="4"/><circle cx="27" cy="14" r="4"/><path d="M9 12V24M27 18Q27 24 9 24"/></svg>';
+    for (let i = 0; i < 19; i++) {
+      const row = Math.floor(i / 5);
+      const col = i % 5;
+      const inRow = row === 3 ? 4 : 5;
+      const x = (1920 - (inRow * 240 + (inRow - 1) * 40)) / 2 + col * 280;
+      const y = 120 + row * 186;
+      const tile = document.createElement("div");
+      tile.className = "many-tile";
+      tile.id = "many-t" + i;
+      tile.style.left = x + "px";
+      tile.style.top = y + "px";
+      const dots = Array.from({ length: agents[i] }, (_, d) => '<div class="many-dot" id="many-d' + i + "-" + d + '"></div>').join("");
+      tile.innerHTML = glyph + '<div class="many-dots">' + dots + "</div>";
+      grid.appendChild(tile);
+    }
+
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#many-label", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0.6);
+    for (let i = 0; i < 19; i++) {
+      const at = 0.4 + i * 0.17;
+      tl.fromTo("#many-t" + i, { opacity: 0, scale: 0.7, y: 16 }, { opacity: 1, scale: 1, y: 0, duration: 0.4, ease: "back.out(1.8)" }, at);
+      for (let d = 0; d < agents[i]; d++) {
+        const start = 3.9 + ((i * 3 + d * 5) % 7) * 0.12;
+        tl.fromTo("#many-d" + i + "-" + d, { opacity: 0.25, scale: 0.7 }, { opacity: 1, scale: 1, duration: 0.35, ease: "sine.inOut", repeat: 7, yoyo: true }, start);
+      }
+    }
+    tl.to("#root", { opacity: 0, duration: 0.35, ease: "power1.in" }, 7.15);
+    window.__timelines["many"] = tl;
+  </script>
+</template>

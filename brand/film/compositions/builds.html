@@ -1,0 +1,97 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      background: #16181d;
+    }
+    #builds-art {
+      position: absolute;
+      inset: 0;
+    }
+    #builds-label {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 900px;
+      text-align: center;
+      font-family: "Inter", sans-serif;
+      font-weight: 400;
+      font-size: 40px;
+      color: #9a9a9a;
+    }
+    #builds-mark {
+      position: absolute;
+      left: 700px;
+      top: 420px;
+      width: 120px;
+      height: 120px;
+    }
+  </style>
+  <div id="root" data-composition-id="builds" data-width="1920" data-height="1080">
+    <svg id="builds-art" viewBox="0 0 1920 1080" width="1920" height="1080">
+      <title>Agent work flows into Sky's repo and fills a grid of merged pull requests</title>
+      <g id="builds-lines" fill="none" stroke="#5e5e5e" stroke-width="5">
+        <path d="M262 340L650 440" />
+        <path d="M262 480L650 480" />
+        <path d="M262 620L650 520" />
+        <path d="M870 480H1130" />
+      </g>
+      <g id="builds-agents" fill="#f7f6f2">
+        <circle cx="240" cy="340" r="22" />
+        <circle cx="240" cy="480" r="22" />
+        <circle cx="240" cy="620" r="22" />
+      </g>
+      <rect id="builds-tile" x="650" y="370" width="220" height="220" rx="40" fill="#2a2a2a" stroke="#5e5e5e" stroke-width="2" />
+      <g id="builds-packets" fill="#f7f6f2">
+        <circle id="builds-pk0" r="9" />
+        <circle id="builds-pk1" r="9" />
+        <circle id="builds-pk2" r="9" />
+        <circle id="builds-pko" r="9" />
+      </g>
+      <g id="builds-dots"></g>
+    </svg>
+    <img id="builds-mark" src="assets/sky-mark-dark.svg" alt="sky" />
+    <div id="builds-label">Sky builds Sky</div>
+  </div>
+  <script>
+    // 82 merged pull requests: 8 rows of 10, then 2
+    const dotsHost = document.getElementById("builds-dots");
+    const NS = "http://www.w3.org/2000/svg";
+    for (let j = 0; j < 82; j++) {
+      const c = document.createElementNS(NS, "circle");
+      c.setAttribute("id", "builds-d" + j);
+      c.setAttribute("cx", 1200 + (j % 10) * 56);
+      c.setAttribute("cy", 270 + Math.floor(j / 10) * 56);
+      c.setAttribute("r", 14);
+      c.setAttribute("fill", "#f7f6f2");
+      dotsHost.appendChild(c);
+    }
+
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#builds-label", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 0.4);
+    tl.fromTo(["#builds-lines", "#builds-agents", "#builds-tile", "#builds-mark"], { opacity: 0 }, { opacity: 1, duration: 0.5, stagger: 0.08 }, 0.2);
+
+    const ends = [440, 480, 520];
+    for (let k = 0; k < 3; k++) {
+      const y0 = [340, 480, 620][k];
+      for (let n = 0; n < 6; n++) {
+        const at = 0.8 + n * 0.55 + k * 0.17;
+        tl.fromTo("#builds-pk" + k, { x: 262, y: y0, opacity: 1 }, { x: 650, y: ends[k], duration: 0.5, ease: "none" }, at);
+        tl.set("#builds-pk" + k, { opacity: 0 }, at + 0.5);
+      }
+      tl.set("#builds-pk" + k, { opacity: 0 }, 0);
+    }
+    tl.set("#builds-pko", { opacity: 0 }, 0);
+    for (let n = 0; n < 7; n++) {
+      const at = 1.0 + n * 0.45;
+      tl.fromTo("#builds-pko", { x: 870, y: 480, opacity: 1 }, { x: 1130, y: 480, duration: 0.4, ease: "none" }, at);
+      tl.set("#builds-pko", { opacity: 0 }, at + 0.4);
+    }
+
+    // dots fill in order, one per merged pull request
+    tl.fromTo("#builds-dots circle", { opacity: 0.18 }, { opacity: 1, duration: 0.15, stagger: 0.034, ease: "none" }, 1.3);
+    tl.to("#root", { opacity: 0, duration: 0.35, ease: "power1.in" }, 5.15);
+    window.__timelines["builds"] = tl;
+  </script>
+</template>
