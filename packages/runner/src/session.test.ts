@@ -7617,9 +7617,12 @@ describe("the instructions on commands that run without a person", () => {
 
   test("tell the run what runs unasked, where edits go and how much of a command is shown", () => {
     const line = quietCommands(undefined);
-    expect(line).toContain("One plain command per Bash call runs without");
-    expect(line).toContain("Edit or Write tools");
-    expect(line).toContain("over about 1,000 characters");
+    expect(line).toContain("Most plain single commands in the worktree");
+    expect(line).toContain(
+      "pushes, network tools and commands that touch secret paths still wait",
+    );
+    expect(line).toContain("an environment's policy can hold them");
+    expect(line).toContain("its first 2,000 characters");
   });
 
   test("name the environment's store when its base profile has one", async () => {
