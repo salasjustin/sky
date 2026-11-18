@@ -284,6 +284,26 @@ describe("test and lint runners through pnpm exec", () => {
     expect(verdict(command)).toBe(reason);
   });
 
+  test.each([
+    "pnpm exec vitest --inspect=0.0.0.0:9229",
+    "pnpm exec vitest --inspect",
+    "pnpm exec vitest --inspect-brk",
+    "pnpm exec vitest --ui --api.host=0.0.0.0",
+    "pnpm exec vitest --ui",
+    "pnpm exec vitest --api 51204",
+    "pnpm exec vitest --api.port=51204",
+    "pnpm exec vitest --browser",
+    "pnpm exec vitest --browser.enabled",
+    "pnpm exec vitest --open",
+    "pnpm --filter @sky/api exec vitest run src --ui",
+    // script arguments already ask on any option outside a few inert ones
+    "pnpm test --ui",
+    "pnpm test --inspect=0.0.0.0:9229",
+    "pnpm test -- --api.host=0.0.0.0",
+  ])("%s asks: it opens a network listener", (command) => {
+    expect(verdict(command)).toBe("unsafe-option");
+  });
+
   test("a single-quoted $ is text to these programs only", () => {
     expect(verdict("pnpm test 'a$b'")).toBe("syntax");
     expect(verdict("pnpm lint 'a$b'")).toBe("syntax");

@@ -1176,6 +1176,14 @@ function guard(words: string[], complete = true, piped = false): boolean {
       // follows forever: `f`/`F` anywhere in a bundle (`-fn1`, obsolete `-5f`/`+5f`), and
       // `--f…`, since getopt expands every prefix of `--follow`
       return !args.some((a) => /^([-+](?!-)\S*[fF]|--f)/.test(a));
+    case "pnpm":
+      // vitest's Node inspector, UI and API servers and browser mode listen on whatever host the
+      // option names, and `--open` starts a browser on them
+      return !(
+        args[0] === "exec" &&
+        args[1] === "vitest" &&
+        args.some((a) => /^--(inspect|ui|api|browser|open)/.test(a))
+      );
     case "node":
       return (
         (complete ? args.length === 1 : args.length <= 1) &&
