@@ -10,6 +10,8 @@ import {
   Rollup,
   RUNNER_TEXT_MAX,
   RunnerEventPost,
+  TOOL_INPUT_MAX,
+  TOOL_INPUT_POST_MAX,
   truncationMarker,
 } from "./event.js";
 
@@ -599,6 +601,30 @@ test("a posted approval's toolSummary is bounded at RUNNER_TEXT_MAX", () => {
   );
   expect(
     RunnerEventPost.safeParse(waiting("x".repeat(RUNNER_TEXT_MAX + 1))).success,
+  ).toBe(false);
+});
+
+test("a posted approval's toolInput may run past TOOL_INPUT_MAX by the redaction margin, so the API cuts after redacting", () => {
+  const waiting = (toolInput: string) => ({
+    runId: "run_1",
+    type: "run.waiting",
+    payload: {
+      request: {
+        kind: "approval",
+        requestId: "req_1",
+        toolName: "Bash",
+        toolSummary: "x",
+        toolInput,
+      },
+    },
+  });
+  expect(TOOL_INPUT_POST_MAX).toBe(TOOL_INPUT_MAX + 8_192);
+  expect(
+    RunnerEventPost.safeParse(waiting("x".repeat(TOOL_INPUT_POST_MAX))).success,
+  ).toBe(true);
+  expect(
+    RunnerEventPost.safeParse(waiting("x".repeat(TOOL_INPUT_POST_MAX + 1)))
+      .success,
   ).toBe(false);
 });
 

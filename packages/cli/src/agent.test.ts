@@ -353,6 +353,27 @@ test("inbox --json prints the newest run as the API returned it", async () => {
   expect(JSON.parse(r.stdout)).toEqual(newest);
 });
 
+test("wait --json and inbox --json carry an approval's full tool input; the text form prints the summary", async () => {
+  const toolInput = JSON.stringify({
+    command: `rm -rf dist ${"x".repeat(2_000)}`,
+  });
+  const waiting = run({
+    status: "waiting",
+    pendingRequest: { ...approval, toolInput },
+  });
+  server.use(runs(waiting));
+  for (const command of ["wait", "inbox"]) {
+    const json = await runCli([command, agentId, "--json"]);
+    expect(json.code, command).toBe(3);
+    expect(JSON.parse(json.stdout).pendingRequest, command).toEqual({
+      ...approval,
+      toolInput,
+    });
+    const text = await runCli([command, agentId]);
+    expect(text.stdout, command).toBe("approval req_a Bash\nrm -rf dist\n");
+  }
+});
+
 test("an agent with no runs fails no_runs", async () => {
   server.use(runs());
   for (const command of ["inbox", "status", "wait"]) {

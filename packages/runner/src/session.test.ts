@@ -32,6 +32,7 @@ import {
   autoApproveVerdict,
   RUNNER_TEXT_MAX,
   RunnerEventPost,
+  TOOL_INPUT_POST_MAX,
 } from "@sky/shared";
 import { delay, HttpResponse, http } from "msw";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -3125,6 +3126,7 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
         requestId: expect.stringMatching(/^req_[0-9A-Za-z]+$/),
         toolName: "Bash",
         toolSummary: "git push origin main",
+        toolInput: JSON.stringify(gitPush.tool_input),
       },
     },
   });
@@ -3140,6 +3142,32 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
     "run.waiting",
     "run.finished",
   ]);
+});
+
+test("a held call's input past the stored cap posts up to the redaction margin, so the API redacts before it cuts", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const longPush = {
+    ...gitPush,
+    tool_input: {
+      command: `git push origin main ${"x".repeat(TOOL_INPUT_POST_MAX)}`,
+    },
+  };
+  const query = scripted([
+    init,
+    async (options: Options) =>
+      void (await fire(options, "PreToolUse", longPush)),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  const waiting = sent.find((e) => e.type === "run.waiting");
+  const request =
+    waiting?.type === "run.waiting" ? waiting.payload.request : undefined;
+  expect(request?.kind === "approval" && request.toolInput).toBe(
+    JSON.stringify(longPush.tool_input).slice(0, TOOL_INPUT_POST_MAX),
+  );
 });
 
 test("an approval with a reason lets the tool run the same, and hands Claude the reason as a note", async () => {
@@ -7585,6 +7613,16 @@ describe("the instructions on commands that run without a person", () => {
 
   test("are in the prompt when the policy holds Bash", async () => {
     expect(await withPolicy(["Bash"])).toContain(quietCommands(undefined));
+  });
+
+  test("tell the run what runs unasked, where edits go and how much of a command is shown", () => {
+    const line = quietCommands(undefined);
+    expect(line).toContain("Most plain single commands in the worktree");
+    expect(line).toContain(
+      "pushes, network tools and commands that touch secret paths still wait",
+    );
+    expect(line).toContain("an environment's policy can hold them");
+    expect(line).toContain("its first 2,000 characters");
   });
 
   test("name the environment's store when its base profile has one", async () => {

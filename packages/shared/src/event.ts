@@ -2,7 +2,17 @@ import { z } from "zod";
 import { AgentId, EnvironmentId, EventId, RequestId, RunId } from "./ids.js";
 import { Usage } from "./run.js";
 
-const pendingRequest = (toolSummary: z.ZodString) =>
+/** Most of an approval's full tool input the API stores, before the truncation marker: 64 KiB. */
+export const TOOL_INPUT_MAX = 65_536;
+
+/**
+ * Most of an approval's tool input a runner may post: past `TOOL_INPUT_MAX` by `REDACTION_MARGIN`
+ * in apps/api/src/redact.ts (8 KiB), so the API redacts before it cuts and adds the truncation
+ * marker, and a secret straddling the cut is never stored half-redacted.
+ */
+export const TOOL_INPUT_POST_MAX = TOOL_INPUT_MAX + 8_192;
+
+const pendingRequest = (toolSummary: z.ZodString, toolInput: z.ZodString) =>
   z.discriminatedUnion("kind", [
     z.object({
       kind: z.literal("question"),
@@ -14,11 +24,17 @@ const pendingRequest = (toolSummary: z.ZodString) =>
       requestId: RequestId,
       toolName: z.string().min(1),
       toolSummary,
+      /** The tool call's whole input as JSON text, where `toolSummary` is bounded for events and webhooks; stored on the request, never on its events. */
+      toolInput: toolInput.optional(),
     }),
   ]);
 
 /** What a run is blocked on: a question from Claude, or a tool call the environment's approval policy holds. */
-export const PendingRequest = pendingRequest(z.string().min(1));
+export const PendingRequest = pendingRequest(
+  z.string().min(1),
+  // the extra 64 admits the truncation marker after a trimmed input
+  z.string().max(TOOL_INPUT_MAX + 64),
+);
 export type PendingRequest = z.infer<typeof PendingRequest>;
 
 /** Where an event read resumes: `evt_<n>` as events carry it, or the bare row id SSE frames carry. */
@@ -272,7 +288,10 @@ const runnerPayloads = (textMax: number) => ({
 const postPayloads = {
   ...runPayloads,
   "run.waiting": z.object({
-    request: pendingRequest(z.string().min(1).max(RUNNER_TEXT_MAX)),
+    request: pendingRequest(
+      z.string().min(1).max(RUNNER_TEXT_MAX),
+      z.string().max(TOOL_INPUT_POST_MAX),
+    ),
   }),
   ...runnerPayloads(RUNNER_TEXT_MAX),
   ...claudePayloads(RUNNER_TEXT_MAX),

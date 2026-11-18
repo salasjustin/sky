@@ -1,5 +1,11 @@
+import { TOOL_INPUT_MAX, TOOL_INPUT_POST_MAX } from "@sky/shared";
 import { expect, test } from "vitest";
-import { KnownSecrets, redact, redactDeep } from "./redact.js";
+import {
+  KnownSecrets,
+  REDACTION_MARGIN,
+  redact,
+  redactDeep,
+} from "./redact.js";
 
 const secrets = {
   apiKey: "k".repeat(40),
@@ -61,6 +67,23 @@ test.each(credentials)(
   },
 );
 
+const tokenShaped = credentials.filter(([, token]) => !known.includes(token));
+
+test.each(tokenShaped)(
+  "scrubs %s at the start of a line in JSON text, after its escaped newline",
+  (_, token) => {
+    const toolInput = JSON.stringify({ command: `cat <<EOF\n${token}\nEOF` });
+    expect(redact(toolInput, known)).toBe(
+      JSON.stringify({ command: "cat <<EOF\n[redacted]\nEOF" }),
+    );
+  },
+);
+
+test("leaves a near-miss alone after an escaped newline in JSON text", () => {
+  const toolInput = JSON.stringify({ content: "- a\ntask-list\nsky_config" });
+  expect(redact(toolInput, known)).toBe(toolInput);
+});
+
 test.each([
   ["words containing sk-", "task-list and disk-usage-report"],
   ["an sk- prefix too short for a key", "sk-short123"],
@@ -102,4 +125,8 @@ test("a removed value is no longer scrubbed", () => {
   expect(redact("held-for-a-while", registry.values())).toBe(
     "held-for-a-while",
   );
+});
+
+test("a runner's tool input post cap is the stored cap plus the redaction margin", () => {
+  expect(REDACTION_MARGIN).toBe(TOOL_INPUT_POST_MAX - TOOL_INPUT_MAX);
 });

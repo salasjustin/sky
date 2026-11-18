@@ -11,6 +11,7 @@ import {
   RunRollup,
   type RunStatus,
   type StoredDecision,
+  TOOL_INPUT_MAX,
 } from "@sky/shared";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
@@ -80,10 +81,16 @@ function trimText<T extends object>(payload: T): T {
   ) as T;
 }
 
-/** `request` with an approval's `toolSummary` cut to `TOOL_SUMMARY_MAX`. */
+/** `request` with an approval's `toolSummary` cut to `TOOL_SUMMARY_MAX` and its `toolInput` to `TOOL_INPUT_MAX`. */
 const trimRequest = (request: PendingRequest): PendingRequest =>
   request.kind === "approval"
-    ? { ...request, toolSummary: cut(request.toolSummary, TOOL_SUMMARY_MAX) }
+    ? {
+        ...request,
+        toolSummary: cut(request.toolSummary, TOOL_SUMMARY_MAX),
+        ...(request.toolInput !== undefined && {
+          toolInput: cut(request.toolInput, TOOL_INPUT_MAX),
+        }),
+      }
     : request;
 
 const bearer = (header: string | undefined) =>
@@ -260,8 +267,13 @@ export function internalRoutes(
           }
           // trimmed only after redaction, so a cut can't split a secret out of its match
           if (redacted.type === "run.waiting") {
-            redacted.payload.request = trimRequest(redacted.payload.request);
-            openRequest(tx, run.id, redacted.payload.request);
+            const request = trimRequest(redacted.payload.request);
+            // the request row keeps the full input; the event, and so the webhooks, carry only the summary
+            openRequest(tx, run.id, request);
+            if (request.kind === "approval") {
+              const { toolInput: _full, ...summarized } = request;
+              redacted.payload.request = summarized;
+            } else redacted.payload.request = request;
           }
           // a chain of retries gets one challenge retry: a challenge after one is final
           if (

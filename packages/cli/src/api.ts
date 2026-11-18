@@ -36,6 +36,8 @@ export const ApiRun = z
           requestId: z.string(),
           toolName: z.string(),
           toolSummary: z.string(),
+          /** The tool call's whole input as JSON text, cut at 64 KiB; absent from an older API. */
+          toolInput: z.string().optional(),
         }),
       ])
       .nullable(),

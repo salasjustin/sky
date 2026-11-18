@@ -1,6 +1,13 @@
 import { SpritesClient } from "@fly/sprites";
 import { agents, type Db, environments, migrate, openDb, runs } from "@sky/db";
-import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
+import {
+  type AgentId,
+  type EnvironmentId,
+  type RunId,
+  TOOL_INPUT_MAX,
+  TOOL_INPUT_POST_MAX,
+  truncationMarker,
+} from "@sky/shared";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -561,6 +568,75 @@ const pendingOf = async () => {
   expect(res.status).toBe(200);
   return ((await res.json()) as { pendingRequest: unknown }).pendingRequest;
 };
+
+const eventPayloads = () =>
+  (
+    db.$client
+      .prepare("select payload from events where type = 'run.waiting'")
+      .all() as { payload: string }[]
+  ).map((r) => JSON.parse(r.payload));
+
+test("an approval's full tool input is kept on the request, not on its event or webhook", async () => {
+  await subscribe(["run.waiting"]);
+  const received = subscriber();
+  const toolInput = JSON.stringify({
+    command: `echo ${"x".repeat(3_000)}`,
+    description: "long",
+  });
+  const request = { ...approval(), toolSummary: "echo xxx", toolInput };
+  await waitingOn(request);
+  expect(await pendingOf()).toEqual(request);
+  const { toolInput: _kept, ...summary } = request;
+  expect(eventPayloads()).toEqual([{ request: summary }]);
+  await expect.poll(() => received.length).toBe(1);
+  expect(received[0]).toMatchObject({ payload: { request: summary } });
+  expect(JSON.stringify(received[0])).not.toContain("xxxxxxxxxx");
+});
+
+test("an approval's tool input is redacted, then cut at 64 KiB with the truncation marker", async () => {
+  const secret = config.webhookSigningKey;
+  // the secret straddles the cut, so cutting before redacting would store its first 20 chars
+  const toolInput = `${"y".repeat(TOOL_INPUT_MAX - 20)}${secret}${"y".repeat(4_000)}`;
+  expect(toolInput.length).toBeLessThanOrEqual(TOOL_INPUT_POST_MAX);
+  await waitingOn({ ...approval(), toolInput });
+  const stored = ((await pendingOf()) as { toolInput: string }).toolInput;
+  expect(stored).not.toContain(secret.slice(0, 8));
+  const droppedAfterRedaction = 4_000 - "[redacted]".length;
+  expect(stored.endsWith(truncationMarker(droppedAfterRedaction))).toBe(true);
+  expect(stored.length).toBeLessThanOrEqual(TOOL_INPUT_MAX + 64);
+});
+
+test("a token on its own line of an approval's tool input is redacted", async () => {
+  const secret = `ghp_${"a1B2".repeat(9)}`;
+  await waitingOn({
+    ...approval(),
+    toolInput: JSON.stringify({ command: `x\n${secret}` }),
+  });
+  const pending = (await pendingOf()) as { toolInput: string };
+  expect(pending.toolInput).toBe(JSON.stringify({ command: "x\n[redacted]" }));
+});
+
+test("a tool input past the post cap is refused", async () => {
+  runningRun();
+  const res = await postEvent({
+    runId,
+    type: "run.waiting",
+    payload: {
+      request: {
+        ...approval(),
+        toolInput: "x".repeat(TOOL_INPUT_POST_MAX + 1),
+      },
+    },
+  });
+  expect(res.status).toBe(400);
+});
+
+test("an approval without a tool input has none on GET run", async () => {
+  const request = approval();
+  await waitingOn(request);
+  expect(await pendingOf()).toEqual(request);
+  expect(await pendingOf()).not.toHaveProperty("toolInput");
+});
 
 test.each([
   ["a question", question, { answer: "main" }, "answers"],
