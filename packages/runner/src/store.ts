@@ -147,7 +147,7 @@ type StoreOptions = {
   connectorId: string;
   /** The commit message for what this call pushes. */
   message: string;
-  /** Gets a line (no trailing newline) as a pull downloads blobs; silent when none are missing. */
+  /** Gets a line (no trailing newline) as a pull downloads blobs and on each retried GitHub call. */
   progress?: Progress;
 };
 
@@ -589,6 +589,7 @@ function callFor(options: StoreOptions) {
     connectorId: options.connectorId,
     owner,
     repo,
+    progress: options.progress,
   });
 }
 

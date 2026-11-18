@@ -287,12 +287,20 @@ test("an answer whose bytes stop arriving fails naming the call, never the conne
     }),
   );
   const idle = manualIdle();
+  const slept: number[] = [];
+  const lines: string[] = [];
   const call = gateway({
     gatewayUrl: GATEWAY,
     connectorId: CONNECTOR,
     owner: "acme",
     repo: "private",
     timeout: { arm: idle.arm },
+    progress: (line) => lines.push(line),
+    rateLimit: {
+      sleep: async (ms) => {
+        slept.push(ms);
+      },
+    },
   });
   const pending = call.bytes(`/tarball/${"a".repeat(40)}`).catch((e) => e);
   await reached;
@@ -307,6 +315,9 @@ test("an answer whose bytes stop arriving fails naming the call, never the conne
   expect((error as Error).message).not.toContain(CONNECTOR);
   expect((error as Error).message).not.toContain(GATEWAY);
   expect(idle.armed.size).toBe(0);
+  // our own timeout is never retried: the call may still be running at the far end
+  expect(slept).toEqual([]);
+  expect(lines).toEqual([]);
 });
 
 test("a call sends no credential, and a failure never names the connector", async () => {

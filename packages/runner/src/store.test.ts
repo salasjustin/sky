@@ -724,7 +724,7 @@ test("the store is pulled through the connector with SKY_ANON_GIT unset, even wh
 });
 
 test("a sync that fails is logged and never thrown", async () => {
-  server.use(http.get(REPO, () => new HttpResponse("down", { status: 500 })));
+  server.use(http.get(REPO, () => new HttpResponse("down", { status: 501 })));
   const env = {
     SKY_STORE_HOME: ".store",
     SKY_STORE_LAYOUT: JSON.stringify(layout),

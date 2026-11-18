@@ -955,7 +955,7 @@ test("start branch missing fails the run with a clear message", async () => {
 test("sync failure is a note, not a failed run", async () => {
   server.use(
     http.get(`${REPO}/git/ref/heads/trunk`, () =>
-      HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
+      HttpResponse.json({ message: "Bad Gateway" }, { status: 501 }),
     ),
   );
 
@@ -964,10 +964,10 @@ test("sync failure is a note, not a failed run", async () => {
   expect(code).toBe(0);
   expect(posted.map((e) => e.type)).toEqual(["run.started", "run.finished"]);
   const note =
-    "The runner couldn't refresh from GitHub: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 502: Bad Gateway; working from the commit the sandbox last had.";
+    "The runner couldn't refresh from GitHub: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 501: Bad Gateway; working from the commit the sandbox last had.";
   expect(append).toContain(`\n- ${note}`);
   expect(warnings).toEqual([
-    "runner: refresh from GitHub failed: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 502: Bad Gateway",
+    "runner: refresh from GitHub failed: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 501: Bad Gateway",
   ]);
 });
 
@@ -1107,13 +1107,13 @@ test.each([
 test("branch-check when GitHub fails otherwise exits 1, saying why", async () => {
   server.use(
     http.get(`${REPO}/git/ref/heads/*`, () =>
-      HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
+      HttpResponse.json({ message: "Bad Gateway" }, { status: 501 }),
     ),
   );
   expect(await branchCheck(["feature/login"])).toEqual({
     code: 1,
     out: "",
-    err: "branch-check: GitHub gateway: GET /repos/acme/private/git/ref/heads/feature/login returned 502: Bad Gateway\n",
+    err: "branch-check: GitHub gateway: GET /repos/acme/private/git/ref/heads/feature/login returned 501: Bad Gateway\n",
   });
 });
 
@@ -1512,7 +1512,7 @@ test("a failed refresh of the default branch doesn't stop a start branch being f
   const tip = pushToGitHub("feature/login", "login.txt", "1\n");
   server.use(
     http.get(`${REPO}/git/ref/heads/trunk`, () =>
-      HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
+      HttpResponse.json({ message: "Bad Gateway" }, { status: 501 }),
     ),
   );
 
@@ -1520,7 +1520,7 @@ test("a failed refresh of the default branch doesn't stop a start branch being f
 
   expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
   expect(notes).toEqual([
-    "The runner couldn't refresh from GitHub: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 502: Bad Gateway; working from the commit the sandbox last had.",
+    "The runner couldn't refresh from GitHub: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 501: Bad Gateway; working from the commit the sandbox last had.",
     START_NOTE,
   ]);
 });
@@ -1936,7 +1936,7 @@ test("a run whose refresh failed claims no refreshed tip, and still says git is 
   const origin = git(repoDir, "rev-parse", "origin/trunk");
   server.use(
     http.get(`${REPO}/git/ref/heads/trunk`, () =>
-      HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
+      HttpResponse.json({ message: "Bad Gateway" }, { status: 501 }),
     ),
   );
 
@@ -2162,7 +2162,7 @@ test("sync relays the gateway's error plainly on stderr, exits 1 and prints noth
   const old = git(repoDir, "rev-parse", "origin/trunk");
   server.use(
     http.get(`${REPO}/git/ref/heads/trunk`, () =>
-      HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
+      HttpResponse.json({ message: "Bad Gateway" }, { status: 501 }),
     ),
   );
 
@@ -2171,7 +2171,7 @@ test("sync relays the gateway's error plainly on stderr, exits 1 and prints noth
   expect(result).toEqual({
     code: 1,
     out: "",
-    err: "sky sync: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 502: Bad Gateway\n",
+    err: "sky sync: GitHub gateway: GET /repos/acme/private/git/ref/heads/trunk returned 501: Bad Gateway\n",
   });
   expect(git(repoDir, "rev-parse", "origin/trunk")).toBe(old);
 });
@@ -3124,7 +3124,7 @@ test("sync whose lookup of the branch fails other than by a 404 reports it, keep
   server.use(
     http.get(
       `${REPO}/git/ref/heads/claude/agt_1`,
-      () => new HttpResponse(null, { status: 500 }),
+      () => new HttpResponse(null, { status: 501 }),
     ),
   );
   const unchanged = untouched(cwd);
@@ -3134,7 +3134,7 @@ test("sync whose lookup of the branch fails other than by a 404 reports it, keep
   expect(result.code).toBe(1);
   expect(result.out).toBe(`${TRUNK_CURRENT()}\n`);
   expect(result.err).toContain(
-    "sky sync: bringing in the branch's commits failed: GitHub gateway: GET /repos/acme/private/git/ref/heads/claude/agt_1 returned 500",
+    "sky sync: bringing in the branch's commits failed: GitHub gateway: GET /repos/acme/private/git/ref/heads/claude/agt_1 returned 501",
   );
   unchanged();
 });

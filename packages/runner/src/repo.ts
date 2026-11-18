@@ -147,6 +147,7 @@ export async function pullRepo(options: {
     connectorId: options.connectorId,
     owner,
     repo: name,
+    progress: options.progress,
   });
   const progress = options.progress ?? (() => {});
   const remote = await remoteHead(call).catch((error: unknown) => {

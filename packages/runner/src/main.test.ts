@@ -513,7 +513,7 @@ async function apiAndGateway() {
     req.on("end", () => {
       seen.push(req.url?.startsWith("/gateway/") ? "store" : "api");
       // the gateway is down, so every store sync fails
-      res.writeHead(req.url?.startsWith("/gateway/") ? 502 : 204).end();
+      res.writeHead(req.url?.startsWith("/gateway/") ? 501 : 204).end();
     });
   });
   server.listen(0, "127.0.0.1");

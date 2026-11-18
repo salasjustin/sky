@@ -22,6 +22,8 @@ export class GatewayError extends Error {
     readonly status?: number,
     /** True for GitHub's primary or secondary rate limit, which answer 403 as well as 429. */
     readonly rateLimited = false,
+    /** True for a failure that says nothing about the call itself: a 5xx answer or a lost connection. */
+    readonly transient = false,
   ) {
     super(message);
   }
@@ -213,6 +215,10 @@ const MAX_RETRY_AFTER_S = 60;
 // GitHub's minimum wait for a secondary limit that sends neither `retry-after` nor a spent quota
 const SECONDARY_WAIT_S = 60;
 const RETRIES = 3;
+// the gateway's own 5xx answers and dropped connections pass within seconds, so each retry waits
+// the matching TRANSIENT_BACKOFF_MS pause
+const TRANSIENT_STATUSES = new Set([500, 502, 503, 504]);
+const TRANSIENT_BACKOFF_MS = [1000, 3000, 9000];
 // the primary rate limit resets on the hour at the latest; a reset this near is waited out, a farther one fails naming its time
 const MAX_RESET_WAIT_S = 300;
 // under this many calls left in the hour, calls are spaced out rather than spent as fast as they go
@@ -355,8 +361,27 @@ const failedCall = (where: string, thrown: unknown, signal: AbortSignal) => {
   const cause = error instanceof Error ? error.cause : undefined;
   return new GatewayError(
     `GitHub gateway: ${where} failed: ${messageOf(error)}${cause ? ` (${messageOf(cause)})` : ""}`,
+    undefined,
+    false,
+    // our own inactivity timeout is never retried: the call may still be running at the far end
+    !signal.aborted && connectionLost(error),
   );
 };
+
+// the connection reset or closed by the other side, as undici words it, at the call or in its body
+const LOST_CODES = new Set(["ECONNRESET", "EPIPE", "UND_ERR_SOCKET"]);
+const LOST_MESSAGE =
+  /other side closed|socket hang up|terminated|econnreset|connection (?:was )?(?:reset|closed)/i;
+function connectionLost(error: unknown): boolean {
+  let current = error;
+  for (let depth = 0; current instanceof Error && depth < 4; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && LOST_CODES.has(code)) return true;
+    if (LOST_MESSAGE.test(current.message)) return true;
+    current = current.cause;
+  }
+  return false;
+}
 
 const detailOf = (body: Buffer, statusText: string) => {
   const text = body.toString("utf8");
@@ -383,6 +408,8 @@ export function gateway(options: {
   repo: string;
   rateLimit?: Partial<RateLimitPolicy>;
   timeout?: Partial<TimeoutPolicy>;
+  /** Told of each retry of a 5xx answer or a lost connection. */
+  progress?: (line: string) => void;
 }) {
   const policy = { ...DEFAULT_POLICY, ...options.rateLimit };
   const timeout = { ...DEFAULT_TIMEOUT, ...options.timeout };
@@ -498,17 +525,40 @@ export function gateway(options: {
       `GitHub gateway: ${where} returned ${response.status}: ${detail}`,
       response.status,
       rateLimited,
+      TRANSIENT_STATUSES.has(response.status),
     );
   }
-  const request = async (method: string, path: string, body?: unknown) =>
-    settle(await open(method, path, body));
-  const call = async function call<T>(
-    method: string,
-    path: string,
-    body?: unknown,
-  ): Promise<T> {
-    const where = whereOf(method, path);
-    const answer = await request(method, path, body);
+  /**
+   * Runs one attempt of a call again, after a growing pause, while it fails transiently; the
+   * final error names the last status or failure and how many retries were spent.
+   */
+  async function retrying<T>(where: string, attempt: () => Promise<T>) {
+    for (let retry = 0; ; retry++) {
+      try {
+        return await attempt();
+      } catch (error) {
+        if (!(error instanceof GatewayError) || !error.transient) throw error;
+        const wait = TRANSIENT_BACKOFF_MS[retry];
+        if (wait === undefined) {
+          throw new GatewayError(
+            `${error.message} (after ${retry} retries)`,
+            error.status,
+            error.rateLimited,
+            true,
+          );
+        }
+        options.progress?.(
+          `GitHub gateway: ${where} ${error.status ? `answered ${error.status}` : "lost the connection"}; retrying in ${wait / 1000} s (retry ${retry + 1}/${TRANSIENT_BACKOFF_MS.length})`,
+        );
+        await policy.sleep(wait);
+      }
+    }
+  }
+  const request = (method: string, path: string, body?: unknown) =>
+    retrying(whereOf(method, path), async () =>
+      settle(await open(method, path, body)),
+    );
+  const parsed = <T>(where: string, answer: Buffer): T => {
     try {
       return JSON.parse(answer.toString("utf8")) as T;
     } catch (error) {
@@ -517,6 +567,25 @@ export function gateway(options: {
       );
     }
   };
+  const call = async function call<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<T> {
+    return parsed<T>(whereOf(method, path), await request(method, path, body));
+  };
+  /** One attempt of a call, never sent again on a 5xx or a lost connection. */
+  call.once = async <T>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<T> =>
+    parsed<T>(
+      whereOf(method, path),
+      await settle(await open(method, path, body)),
+    );
+  /** The retries `call` makes, around attempts its caller makes itself. */
+  call.retrying = retrying;
   /** The bytes a GET answers with, such as a repo's tarball; only silence times it out. */
   call.bytes = (path: string): Promise<Buffer> => request("GET", path);
   /**
@@ -524,13 +593,16 @@ export function gateway(options: {
    * stopping early cancels the download. Anything but success throws a `GatewayError` before a chunk.
    */
   call.stream = async (path: string): Promise<AsyncGenerator<Buffer>> => {
-    const opened = await open("GET", path);
-    if (!opened.response.ok || opened.limitBody) {
-      await settle(opened);
-      throw new GatewayError(
-        `GitHub gateway: ${opened.where} answered with an unexpected body`,
-      );
-    }
+    const opened = await retrying(whereOf("GET", path), async () => {
+      const attempt = await open("GET", path);
+      if (!attempt.response.ok || attempt.limitBody) {
+        await settle(attempt);
+        throw new GatewayError(
+          `GitHub gateway: ${attempt.where} answered with an unexpected body`,
+        );
+      }
+      return attempt;
+    });
     return chunksOf(opened.response, opened.idle, opened.where);
   };
   call.where = whereOf;
@@ -721,6 +793,10 @@ export async function publish(options: {
   defaultBranch?: string;
   /** Replaces the author and committer of each commit sent; their dates stay. */
   identity?: { author: PersonName; committer: PersonName };
+  /** Told of each retry of a gateway call. */
+  progress?: (line: string) => void;
+  /** The gateway's rate-limit policy, whose `sleep` also paces retries; a test sets its own. */
+  rateLimit?: Partial<RateLimitPolicy>;
 }): Promise<PublishResult> {
   // `ls-files` takes its implicit pathspec relative to the directory it runs in, while
   // `<rev>:<path>` is from the top, so every call runs from the top
@@ -1084,8 +1160,13 @@ export async function publish(options: {
   // GitHub refuses a ref update that changes .github/workflows/ when the token lacks the `workflow`
   // scope, with a 404 or 403 that reads, bare, as lost repo access; this publish's object writes
   // have succeeded by now, so the workflow files the sent commits change are named as the likely cause
-  const writeRef = (method: string, path: string, body: unknown) =>
-    call(method, path, body).catch(async (error: unknown) => {
+  const writeRef = (
+    method: string,
+    path: string,
+    body: unknown,
+    send: typeof call.once = call,
+  ) =>
+    send(method, path, body).catch(async (error: unknown) => {
       if (
         !(error instanceof GatewayError) ||
         error.rateLimited ||
@@ -1105,32 +1186,65 @@ export async function publish(options: {
       );
     });
 
+  // a ref create or fast-forward GitHub made, but whose answer was a 5xx or a lost connection, can
+  // fail its retry with a 422; the ref already at `parent` is success
+  const refIsAtParent = async (error: unknown) =>
+    error instanceof GatewayError &&
+    error.status === 422 &&
+    (
+      await call<{ object: { sha: string } }>(
+        "GET",
+        `/git/ref/${refPath}`,
+      ).catch(() => undefined)
+    )?.object.sha === parent;
   if (remote === null) {
     await writeRef("POST", "/git/refs", {
       ref: `refs/heads/${remoteBranch}`,
       sha: parent,
+    }).catch(async (error: unknown) => {
+      if (!(await refIsAtParent(error))) throw error;
     });
   } else if (rewritten) {
     // GitHub's ref update takes no expected old value: it is read again just before the forced
     // update, so a write since the lookup above isn't overwritten
-    const now = await call<{ object: { sha: string } }>(
-      "GET",
-      `/git/ref/${refPath}`,
-    );
-    if (now.object.sha !== remote) {
-      throw new PublishError(
-        `${remoteBranch} moved on GitHub to ${now.object.sha} while this publish ran; nothing was overwritten, publish again`,
+    const refAt = async () => {
+      const ref = await call<{ object: { sha: string } }>(
+        "GET",
+        `/git/ref/${refPath}`,
       );
-    }
-    await writeRef("PATCH", `/git/refs/${refPath}`, {
-      sha: parent,
-      force: true,
+      return ref.object.sha;
+    };
+    const moved = (sha: string) =>
+      new PublishError(
+        `${remoteBranch} moved on GitHub to ${sha} while this publish ran; nothing was overwritten, publish again`,
+      );
+    const now = await refAt();
+    if (now !== remote) throw moved(now);
+    // a forced update answered 5xx or cut off may have been made or not, and the branch may have
+    // moved since, so it is never sent again blind: the ref is read after each pause, and the
+    // update goes again only while the ref still holds `remote`
+    const patch = `/git/refs/${refPath}`;
+    let sent = false;
+    await call.retrying(call.where("PATCH", patch), async () => {
+      if (sent) {
+        const at = await refAt().catch((error: unknown) => {
+          // the read already spent its own retries, so its failure ends the forced update's too
+          throw error instanceof GatewayError && error.transient
+            ? new GatewayError(error.message, error.status, error.rateLimited)
+            : error;
+        });
+        if (at === parent) return;
+        if (at !== remote) throw moved(at);
+      }
+      sent = true;
+      await writeRef("PATCH", patch, { sha: parent, force: true }, call.once);
     });
   } else if (remote !== parent) {
     await writeRef("PATCH", `/git/refs/${refPath}`, {
       sha: parent,
       force: false,
-    }).catch((error: unknown) => {
+    }).catch(async (error: unknown) => {
+      if (await refIsAtParent(error)) return;
       if (error instanceof GatewayError && error.status === 422) {
         throw new PublishError(`${notFastForward} (${error.message})`);
       }
@@ -1168,7 +1282,17 @@ export async function publish(options: {
       head: remoteBranch,
       base,
     },
-  );
+  ).catch(async (error: unknown) => {
+    // a pull request GitHub made but answered 5xx for is refused as a duplicate on the retry, so
+    // on any 422 a pull request already open for this head is taken as this publish's
+    if (!(error instanceof GatewayError) || error.status !== 422) throw error;
+    const [made] = await call<{ number: number; html_url: string }[]>(
+      "GET",
+      `/pulls?state=open&head=${encodeURIComponent(`${owner}:${remoteBranch}`)}`,
+    ).catch(() => []);
+    if (!made) throw error;
+    return made;
+  });
   return {
     branch: remoteBranch,
     base,
@@ -1273,6 +1397,7 @@ export async function publishMain(
       ...(values.branch !== undefined && { branch: values.branch }),
       defaultBranch: env[BRANCH_ENV] || undefined,
       identity: configuredIdentity(env),
+      progress: (line) => io.stderr(`${line}\n`),
     });
     io.stderr(
       result.created
