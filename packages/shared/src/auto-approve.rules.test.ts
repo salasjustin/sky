@@ -26,6 +26,9 @@ describe("rg globs", () => {
     "rg -n x src --glob='**/*.ts'",
     "rg -n x src --iglob '!dist'",
     "rg -n x src -g'!dist'",
+    "rg -n x -g '*.ts'",
+    "rg -n x -g '**/*.md'",
+    "rg -n x -g '!node_modules'",
   ])("%s runs: a glob filters, the paths are still checked", (command) => {
     expect(verdict(command)).toBe("approved");
   });
@@ -34,6 +37,12 @@ describe("rg globs", () => {
     ["rg x src -g '*'", "unsafe-option"],
     ["rg x src -g '.env'", "unsafe-option"],
     ["rg x src -g '*.pem'", "unsafe-option"],
+    // rg's `*` matches a leading dot, and a matching glob beats the hidden and gitignore filters
+    ["rg -n . -g '*.env'", "unsafe-option"],
+    ["rg -n . -g '*.local'", "unsafe-option"],
+    ["rg -n . --iglob '*.NPMRC'", "unsafe-option"],
+    ["rg -n . -g '**/*.vars'", "unsafe-option"],
+    ["rg -n . -g '*.TS'", "unsafe-option"],
     ["rg x src -g", "unsafe-option"],
     ["rg x src -ng '*.ts'", "unsafe-option"],
     ["rg x ../ -g '*.ts'", "outside-root"],

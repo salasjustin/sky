@@ -815,11 +815,16 @@ function jqArgs(
 // the environment, and modules jq would read off its search path
 const JQ_UNSAFE = /\b(env|ENV|import|include|modulemeta)\b/;
 
-/** A glob `rg` filters by: any exclusion, or an inclusion of one plain extension (never a name that widens to dotfiles). */
+/**
+ * A glob `rg` filters by: any exclusion, or an inclusion of one source or doc extension. rg's `*`
+ * matches a leading dot and a matching glob beats its hidden and gitignore filters, so `*.env`
+ * would read `.env`. Matched case-sensitively, so `--iglob '*.NPMRC'` can't reach `.npmrc`.
+ */
 const rgGlobOk = (glob: string) =>
-  glob.startsWith("!")
-    ? true
-    : /^(\*\*\/)?\*\.[A-Za-z0-9]{1,10}$/.test(glob) && !namesSecret(glob);
+  glob.startsWith("!") ||
+  /^(\*\*\/)?\*\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|json|jsonc|md|mdx|css|scss|html|svelte|vue|astro|yml|yaml|toml|sql|go|py|rs|zig|sh|txt|graphql|prisma)$/.test(
+    glob,
+  );
 
 /**
  * `rg`'s arguments with each `-g`, `--glob` and `--iglob` and its pattern taken out, or undefined
