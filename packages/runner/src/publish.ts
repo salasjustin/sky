@@ -1186,8 +1186,8 @@ export async function publish(options: {
       );
     });
 
-  // a ref create or fast-forward that GitHub made but answered 5xx for can fail its retry with a
-  // 422; the ref already at `parent` is success
+  // a ref create or fast-forward GitHub made, but whose answer was a 5xx or a lost connection, can
+  // fail its retry with a 422; the ref already at `parent` is success
   const refIsAtParent = async (error: unknown) =>
     error instanceof GatewayError &&
     error.status === 422 &&
