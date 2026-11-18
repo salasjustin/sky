@@ -5,6 +5,13 @@ import { Usage } from "./run.js";
 /** Most of an approval's full tool input a runner sends, and the API stores before the truncation marker: 64 KiB. */
 export const TOOL_INPUT_MAX = 65_536;
 
+/**
+ * Most of an approval's tool input a runner may post: past `TOOL_INPUT_MAX` by `REDACTION_MARGIN`
+ * in apps/api/src/redact.ts (8 KiB), so the API redacts before it cuts and adds the truncation
+ * marker, and a secret straddling the cut is never stored half-redacted.
+ */
+export const TOOL_INPUT_POST_MAX = TOOL_INPUT_MAX + 8_192;
+
 const pendingRequest = (toolSummary: z.ZodString, toolInput: z.ZodString) =>
   z.discriminatedUnion("kind", [
     z.object({
@@ -283,7 +290,7 @@ const postPayloads = {
   "run.waiting": z.object({
     request: pendingRequest(
       z.string().min(1).max(RUNNER_TEXT_MAX),
-      z.string().max(TOOL_INPUT_MAX),
+      z.string().max(TOOL_INPUT_POST_MAX),
     ),
   }),
   ...runnerPayloads(RUNNER_TEXT_MAX),
