@@ -154,13 +154,13 @@ sky agent list        # every live agent with its latest run's state
 sky agent list --env=web --status=waiting_answer,waiting_approval
 ```
 
-`sky agent list [--env=<id|name>,...] [--status=<state>,...] [--archived] [--limit=N] [--json]` finds an agent whose id you lost and shows what is running or stuck. It prints one line per agent, newest activity first:
+`sky agent list [--env=<id|name>,...] [--status=<state>,...] [--archived] [--limit=N] [--cursor=<c>] [--json]` finds an agent whose id you lost and shows what is running or stuck. It prints one line per agent, newest activity first:
 
 ```
 <agent id> <env name> <state> <run id> <last event, UTC ISO> <open requests> <branch>
 ```
 
-`<state>` is that of the agent's latest run (see [Listing agents](#listing-agents)), and `<branch>` is the GitHub branch the agent works on, or its own `claude/<agent id>` branch when it was started without one. An agent with no run yet shows `-` for the state, run and last event. `--env` and `--status` repeat or take a comma list. Archived agents are left out unless you pass `--archived`, which lists every agent, archived ones too. `--limit` is at most 200 (50 without it); when more agents match, a note on stderr says so. `--json` prints the API's page, `{ "data": [...], "nextCursor"?: ... }`.
+`<state>` is that of the agent's latest run (see [Listing agents](#listing-agents)), and `<branch>` is the GitHub branch the agent works on, or its own `claude/<agent id>` branch when it was started without one. An agent with no run yet shows `-` for the state, run and last event. `--env` and `--status` repeat or take a comma list. Archived agents are left out unless you pass `--archived`, which lists every agent, archived ones too. `--limit` is at most 200 (50 without it); when more agents match, a note on stderr gives the `--cursor=<c>` that fetches the next page: pass it with the same filters. `--json` prints the API's page, `{ "data": [...], "nextCursor"?: ... }`.
 
 A deny's `--reason` is what the agent is told. `approve` takes one too: it is recorded with the decision and passed to the agent as a note.
 

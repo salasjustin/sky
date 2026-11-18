@@ -84,7 +84,7 @@ test("--json prints the page the API returned", async () => {
   expect(JSON.parse(r.stdout)).toEqual(page);
 });
 
-test("the filters reach the API: --env and --status repeat or take a comma list, --archived lists every agent, --limit sets the page size", async () => {
+test("the filters reach the API: --env and --status repeat or take a comma list, --archived lists every agent, --limit sets the page size, --cursor picks the page", async () => {
   const r = await runCli([
     "agent",
     "list",
@@ -94,6 +94,7 @@ test("the filters reach the API: --env and --status repeat or take a comma list,
     "--status=waiting_approval,running",
     "--archived",
     "--limit=25",
+    "--cursor=c_next",
   ]);
   expect(r.code).toBe(0);
   const [query] = queries;
@@ -102,6 +103,7 @@ test("the filters reach the API: --env and --status repeat or take a comma list,
     status: "waiting_answer,waiting_approval,running",
     archived: "all",
     limit: "25",
+    cursor: "c_next",
   });
 });
 
@@ -111,12 +113,14 @@ test("no agent matching prints nothing on stdout", async () => {
   expect(r.stdout).toBe("");
 });
 
-test("a page with more behind it says so on stderr, not stdout", async () => {
+test("a page with more behind it gives the next page's --cursor on stderr, not stdout", async () => {
   page = { data: [row()], nextCursor: "abc" };
-  const r = await runCli(["agent", "list"]);
+  const r = await runCli(["agent", "list", "--limit=200"]);
   expect(r.code).toBe(0);
   expect(r.stdout.trim().split("\n")).toHaveLength(1);
-  expect(r.stderr).toContain("more agents match; raise --limit");
+  expect(r.stderr).toContain(
+    "more agents match; for the next page pass --cursor=abc with the same filters",
+  );
 });
 
 test("a bad --status, --limit or argument exits 2 before any request", async () => {
@@ -126,6 +130,7 @@ test("a bad --status, --limit or argument exits 2 before any request", async () 
     [["--limit=0"], "--limit takes a whole number from 1 to 200"],
     [["--limit=201"], "--limit takes a whole number from 1 to 200"],
     [["--limit=ten"], "--limit takes a whole number from 1 to 200"],
+    [["--cursor="], "--cursor is empty"],
     [["agt_1"], "agent list takes no arguments"],
     [["--prompt=x"], "agent list takes no --prompt"],
   ];
@@ -155,7 +160,7 @@ test("--help documents agent list", async () => {
   const r = await runCli(["--help"]);
   const text = r.stdout.replace(/\s+/g, " ");
   expect(text).toContain(
-    "sky agent list [--env=<id|name>,...] [--status=<state>,...] [--archived] [--limit=N]",
+    "sky agent list [--env=<id|name>,...] [--status=<state>,...] [--archived] [--limit=N] [--cursor=<c>]",
   );
   expect(text).toContain(
     "States: starting, running, waiting_approval, waiting_answer, finished, failed, stopped.",

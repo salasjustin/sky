@@ -26,6 +26,7 @@ type Values = {
   status?: string;
   archived?: boolean;
   limit?: string;
+  cursor?: string;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;
@@ -130,6 +131,11 @@ function listQuery(values: Values): URLSearchParams {
     }
     query.set("limit", String(n));
   }
+  if (values.cursor !== undefined) {
+    // empty would read as no cursor, so a script's `--cursor=$next` would loop on the first page
+    if (values.cursor === "") throw new UsageError("--cursor is empty", true);
+    query.set("cursor", values.cursor);
+  }
   return query;
 }
 
@@ -147,7 +153,7 @@ function agentLine(a: ApiListedAgent): string {
   ].join(" ");
 }
 
-const listOnly = ["env", "status", "archived", "limit"] as const;
+const listOnly = ["env", "status", "archived", "limit", "cursor"] as const;
 
 const agentSub: AgentCommand = {
   options: {
@@ -157,6 +163,7 @@ const agentSub: AgentCommand = {
     status: { type: "string", multiple: true },
     archived: { type: "boolean" },
     limit: { type: "string" },
+    cursor: { type: "string" },
   },
   prepare(positionals, values) {
     const [sub, ref, ...extra] = positionals;
@@ -177,7 +184,7 @@ const agentSub: AgentCommand = {
         }
         if (page.nextCursor !== undefined) {
           out.progress(
-            `more agents match; raise --limit (at most ${AGENT_LIST_MAX_LIMIT}) or narrow with --env and --status`,
+            `more agents match; for the next page pass --cursor=${page.nextCursor} with the same filters`,
           );
         }
         return 0;

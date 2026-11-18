@@ -120,7 +120,7 @@ const help = (io: Io) => `Usage:
       connector when each run starts, and the agent runs runner.mjs only
       for publish.
   sky agent list [--env=<id|name>,...] [--status=<state>,...] [--archived]
-      [--limit=N] [options]
+      [--limit=N] [--cursor=<c>] [options]
       Print "<agent> <env> <state> <run> <last event> <open requests>
       <branch>" per agent, newest activity first: the state, run and last
       event (UTC) of its latest run, the requests that run still has open,
@@ -129,7 +129,8 @@ const help = (io: Io) => `Usage:
       --env and --status repeat or take a comma list. States: starting,
       running, waiting_approval, waiting_answer, finished, failed, stopped.
       Archived agents are left out unless --archived. --limit is at most
-      200 (50 without it); when more agents match, a note on stderr says so.
+      200 (50 without it); when more agents match, a note on stderr gives
+      the --cursor for the next page, to pass with the same filters.
       A key sees only the agents it started.
   sky agent archive <agent> [options]
       Stop any active run and delete the agent's worktree; uncommitted work
@@ -383,6 +384,7 @@ async function runCommand(
     status: list(values.status),
     archived: values.archived === true,
     limit: text(values.limit),
+    cursor: text(values.cursor),
   });
   return await withApi(values, io, (api, out) => action(api, io, out));
 }
