@@ -160,7 +160,7 @@ sky agent list --env=web --status=waiting_answer,waiting_approval
 <agent id> <state> <run id> <last event, UTC ISO> <open requests> <branch> <env name>
 ```
 
-`<state>` is that of the agent's latest run (see [Listing agents](#listing-agents)), and `<branch>` is the GitHub branch the agent works on, or its own `claude/<agent id>` branch when it was started without one. `<env name>` comes last because a name may contain spaces: everything after the sixth field is the name. An agent with no run yet shows `-` for the state, run and last event. `--env` and `--status` repeat or take a comma list. Archived agents are left out unless you pass `--archived`, which lists every agent, archived ones too. When no agent matches, stdout stays empty, the exit status is 0, and stderr says `no agents match`. The API can't tell an env that doesn't exist apart from one your key may not use, so a mistyped `--env` also matches nothing. `--limit` is at most 200 (50 without it); when more agents match, a note on stderr gives the `--cursor=<c>` that fetches the next page: pass it with the same filters. `--json` prints the API's page, `{ "data": [...], "nextCursor"?: ... }`.
+`<state>` is that of the agent's latest run (see [Listing agents](#listing-agents)), and `<branch>` is the GitHub branch the agent works on, or its own `claude/<agent id>` branch when it was started without one. `<env name>` comes last because a name may contain spaces: everything after the sixth field is the name. An agent with no run yet shows `-` for the state, run and last event. `--env` and `--status` repeat or take a comma list. Only live agents are listed unless you pass `--archived`, which lists archived agents too. When no agent matches, the exit status is still 0: stdout stays empty and stderr says `no agents match` (with `--json`, stdout gets the empty page). The API can't tell an env that doesn't exist apart from one your key may not use, so a mistyped `--env` also matches nothing. `--limit` is at most 200 (50 without it); when more agents match, a note on stderr gives the `--cursor=<c>` that fetches the next page: pass it with the same filters. `--json` prints the API's page, `{ "data": [...], "nextCursor"?: ... }`.
 
 A deny's `--reason` is what the agent is told. `approve` takes one too: it is recorded with the decision and passed to the agent as a note.
 
@@ -435,9 +435,9 @@ Newest activity first, where an agent's activity is the last event of its latest
 }
 ```
 
-`run` is `null` for an agent that hasn't started one, and `nextCursor` is present only when more agents match. `lastEventAt` is the run's latest event, or the run's creation before its first; `endedAt` is when a finished, failed or stopped run ended, else `null`. `openRequests` counts the run's unresolved questions and tool-call requests. `remoteBranch` is the GitHub branch the agent was started on, `null` otherwise.
+`run` is `null` for an agent that hasn't started one, and `nextCursor` is present only when more agents match. `lastEventAt` is the run's latest event, or the run's creation before its first; `endedAt` is when a finished, failed or stopped run ended, else `null`. `openRequests` counts the questions and tool-call requests a `waiting` run has open, and is `0` for a run in any other state. `remoteBranch` is the GitHub branch the agent was started on, `null` otherwise.
 
-`state` is the run's `status`, except that a `waiting` run is split by what it waits on: `waiting_approval` for a tool call to approve or deny, `waiting_answer` for a question. A waiting run whose request was already decided (the runner hasn't resumed yet) is `running`. So the states are `starting`, `running`, `waiting_approval`, `waiting_answer`, `finished`, `failed` and `stopped`.
+`state` is the run's `status`, except that a `waiting` run is split by what it waits on: `waiting_approval` for a tool call to approve or deny, `waiting_answer` for a question. So the states are `starting`, `running`, `waiting_approval`, `waiting_answer`, `finished`, `failed` and `stopped`.
 
 A `runs` key lists only the agents it started, and `env` names it may not use match nothing; the admin key lists every agent.
 
