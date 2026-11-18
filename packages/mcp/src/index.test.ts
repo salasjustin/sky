@@ -1043,11 +1043,17 @@ test('preview takes "none" as a build that skips it', async () => {
   expect(seen.map((s) => s.body)).toEqual([{ build: "none", port: 5173 }]);
 });
 
-test("preview answers a failed preview's state read with the API's 422 and the preview beside the error", async () => {
-  route("get", "/v1/agents/agt_1/preview", 422, {
-    error: { code: "preview_failed", message: "the build exited 1: boom" },
-    preview: { state: "failed" },
-  });
+test("preview reads a failed preview as a successful call carrying its state, detail and failure", async () => {
+  const answer = {
+    preview: {
+      agentId: "agt_1",
+      port: 5173,
+      state: "failed",
+      detail: "the build exited 1: boom",
+      failure: "command",
+    },
+  };
+  route("get", "/v1/agents/agt_1/preview", 200, answer);
   const client = await connect();
 
   const result = await client.callTool({
@@ -1055,11 +1061,38 @@ test("preview answers a failed preview's state read with the API's 422 and the p
     arguments: { agentId: "agt_1" },
   });
 
-  expect(result.isError).toBe(true);
-  expect(textOf(result)).toMatchObject({
-    status: 422,
-    error: { code: "preview_failed", message: "the build exited 1: boom" },
-  });
+  expect(result.isError).toBeUndefined();
+  expect(textOf(result)).toEqual(answer);
+});
+
+test("preview tells the model how to pace its reads and what a failed one asks of it", async () => {
+  const client = await connect();
+
+  const { tools } = await client.listTools();
+  const description = tools.find((t) => t.name === "preview")?.description;
+
+  expect(description).not.toMatch(/beside the error/);
+  expect(description).toMatch(/waiting about 15 to 30 seconds between reads/);
+  expect(description).toMatch(/normal answer, not an error/);
+  expect(description).toMatch(/failure is command .*fix that command/);
+  expect(description).toMatch(/sprite .*\(start again unchanged\)/);
+  expect(description).toMatch(/refused with 422 or 502 preview_failed/);
+});
+
+test.each([
+  ["409 no_worktree", /a run first/],
+  ["409 env_not_ready", /status with envId/],
+  ["409 port_busy", /another port/],
+  ["502 sprite_unreachable", /start again/],
+  ["502 preview_stop_failed", /start again/],
+])("preview's description names the start's %s refusal and what to do", async (refusal, action) => {
+  const client = await connect();
+
+  const { tools } = await client.listTools();
+  const description = tools.find((t) => t.name === "preview")?.description;
+
+  const clause = description?.split(refusal)[1]?.split(";")[0];
+  expect(clause).toMatch(action);
 });
 
 test("preview passes ttlSeconds along", async () => {
@@ -1188,7 +1221,6 @@ test("preview is listed with what the link gives and the one-per-environment rul
   expect(tool?.description).toMatch(/rebuild, which replaces/);
   expect(tool?.description).toMatch(/no other heavy job runs/);
   expect(tool?.description).not.toMatch(/dev server/);
-  expect(tool?.description).toMatch(/422 preview_failed/);
   expect(tool?.description).toMatch(/409 preview_busy, naming no agent/);
   expect(tool?.description).toMatch(/answers preview: null when none runs/);
   expect(tool?.description).toMatch(/one preview/);
@@ -1206,6 +1238,12 @@ test("preview is listed with what the link gives and the one-per-environment rul
   expect(tool?.inputSchema.properties?.ttlSeconds).not.toHaveProperty(
     "default",
   );
+  const port = tool?.inputSchema.properties?.port as {
+    minimum: number;
+    maximum: number;
+    description: string;
+  };
+  expect(port.description).toContain(`${port.minimum} to ${port.maximum}`);
   expect(tool?.inputSchema.required).toEqual(["agentId"]);
   expect(tool?.annotations).toEqual({
     destructiveHint: true,
