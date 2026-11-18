@@ -936,6 +936,7 @@ test("list_agents is listed read-only with its filters and the states", async ()
   expect(tool?.annotations?.readOnlyHint).toBe(true);
   expect(tool?.description).toMatch(/waiting_approval/);
   expect(tool?.description).toMatch(/nextCursor/);
+  expect(tool?.description).toMatch(/the admin key sees every agent/);
   expect(tool?.inputSchema.properties).toMatchObject({
     env: { type: "array" },
     status: {
