@@ -114,6 +114,8 @@ export function stubSprites() {
      * `rm <name> <path>`, `delete <name>`, `label <name>` (the PUT that sets labels).
      */
     calls: [] as string[],
+    /** The `calls` line of each HTTP exec the client cut before it was answered, as dropping its connection. */
+    cutExecs: [] as string[],
     /** The body of each sprite's last update, by name. */
     updates: new Map<string, { labels?: string[]; url_settings?: unknown }>(),
     /** Each sprite's labels and url settings as the API holds them; an update keeps the fields its body omits. */
@@ -308,6 +310,14 @@ export function stubSprites() {
           : (capped?.argv ?? argv).join(" ")
       }`;
       wire.calls.push(call);
+      let answered = false;
+      request.signal.addEventListener(
+        "abort",
+        () => {
+          if (!answered) wire.cutExecs.push(call);
+        },
+        { once: true },
+      );
       if (wire.hangs(call)) {
         // a hung wrapper is still writing `full`
         if (capped) stageCapped(capped.dir, new Uint8Array());
@@ -362,6 +372,7 @@ export function stubSprites() {
           controller.enqueue(frame);
         },
       });
+      answered = true;
       return new HttpResponse(body, {
         headers: { "content-type": "application/octet-stream" },
       });

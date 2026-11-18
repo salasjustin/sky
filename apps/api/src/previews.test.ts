@@ -1,15 +1,16 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import {
   agents,
@@ -41,7 +42,7 @@ import { envSecretAad, seal } from "./crypto.js";
 import { failInterruptedPreviews, sweepExpiredPreviews } from "./previews.js";
 import { RUNNER } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
-import { spriteNameFor } from "./sprites.js";
+import { LOGGED_EXEC, spriteNameFor } from "./sprites.js";
 import {
   type ServiceRecord,
   type SpritesWire,
@@ -239,6 +240,9 @@ const authOf = (envId: string) => wire.stored.get(sprite(envId))?.url_settings;
 const tokenOf = (link: string) => new URL(link).searchParams.get("t") ?? "";
 const sha256 = (value: string) =>
   createHash("sha256").update(value).digest("hex");
+/** The sprite directory of one preview's build files (env, log, pid), named by its token's hash, never its agent. */
+const previewDir = (tokenHash: string) =>
+  `/tmp/sky-preview-${tokenHash.slice(0, 16)}`;
 
 /** Of the calls since `wire.calls` was last cleared: the env's URL went private before either service was deleted. */
 function expectPrivateBeforeServicesGo(envId: string) {
@@ -579,16 +583,21 @@ test("stopping with no preview running succeeds, changes nothing and says so", a
   expect((await stop("agt_nope")).status).toBe(404);
 });
 
-test("the URL goes private before the services go, and the app goes before the proxy it needs", async () => {
+test("the URL goes private before the services go, the app before the proxy it needs, then the build and its files", async () => {
   const envId = readyEnv();
   const agentId = seedAgent(envId);
-  await started(agentId);
+  const { preview } = await started(agentId);
+  const filesDir = previewDir(sha256(tokenOf(preview.link)));
   wire.calls.length = 0;
   await stop(agentId);
+  const kills = killsOf(envId, filesDir);
+  expect(kills).toHaveLength(1);
   expect(wire.calls).toEqual([
     `label ${sprite(envId)}`,
     `service-delete ${sprite(envId)} ${PREVIEW_APP_SERVICE}`,
     `service-delete ${sprite(envId)} ${PREVIEW_PROXY_SERVICE}`,
+    kills[0],
+    `rm ${sprite(envId)} ${filesDir}`,
   ]);
   expect(wire.updates.get(sprite(envId))).toEqual({
     url_settings: { auth: "sprite" },
@@ -610,6 +619,25 @@ test("a stop the sprite can't finish keeps the preview, so a retry finishes it",
   expect((await stop(agentId)).status).toBe(200);
   expect(servicesOf(envId).size).toBe(0);
   expect(db.select().from(previews).all()).toEqual([]);
+});
+
+test("a start whose running preview can't be ended is refused as preview_stop_failed, not as an unreachable sprite", async () => {
+  const envId = readyEnv();
+  const first = seedAgent(envId);
+  const second = seedAgent(envId);
+  const { preview } = await started(first);
+  wire.serviceDeleteStatus = 503;
+  wire.calls.length = 0;
+  const res = await start(second);
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: { code: "preview_stop_failed" },
+  });
+  // nothing new was started, and the old row stays for a retry to finish
+  expect(callsMatching(/^service-create /)).toEqual([]);
+  expect(db.select().from(previews).all()).toMatchObject([
+    { agentId: first, tokenHash: sha256(tokenOf(preview.link)) },
+  ]);
 });
 
 test("an expired preview is ended by the sweep: services removed, URL private, token dead", async () => {
@@ -996,13 +1024,30 @@ const buildsOn = (envId: string) =>
   );
 const callsMatching = (pattern: RegExp) =>
   wire.calls.filter((c) => pattern.test(c));
+/** The execs that signal the process group of the build whose files are in `dir`. */
+const killsOf = (envId: string, dir: string) =>
+  wire.calls.filter(
+    (c) =>
+      c.startsWith(`exec ${sprite(envId)} - bash -c `) &&
+      c.includes('kill -TERM -- "-$pid"') &&
+      c.endsWith(` bash ${dir}`),
+  );
+/** Waits until the preview's directory, the env file of secrets with it, has been removed from the sprite. */
+const filesRemoved = (envId: string, tokenHash: string) =>
+  vi.waitFor(() => {
+    const dir = previewDir(tokenHash);
+    expect(wire.calls).toContain(`rm ${sprite(envId)} ${dir}`);
+    expect(
+      [...wire.files.keys()].filter((p) => p.startsWith(`${dir}/`)),
+    ).toEqual([]);
+  });
 /** Holds every build until `release()`. */
 function holdBuilds() {
   let release = () => {};
   const held = new Promise<void>((resolve) => {
     release = resolve;
   });
-  wire.gate = (call) => (call.includes(".build.log") ? held : undefined);
+  wire.gate = (call) => (call.includes("/build.log") ? held : undefined);
   return release;
 }
 const sweepOps = () => ({
@@ -1013,10 +1058,10 @@ const sweepOps = () => ({
   longTimeoutMs: 5_000,
 });
 type StateBody = {
-  error?: { code: string; message: string };
   preview: {
     state: string;
     detail: string | null;
+    failure: string | null;
     build: string | null;
     start: string;
     services?: { app: string; proxy: string };
@@ -1150,23 +1195,27 @@ test("the build runs once, as a one-off exec in the worktree with the app's env,
   const envId = readyEnv({ base: "team" });
   const agentId = seedAgent(envId);
   seedSecret(envId, "DATABASE_URL", "postgres://user:pw-9f8e7d@db.test/app");
-  await started(agentId, {
+  // held, so the env file is read while the build would be reading it
+  const release = holdBuilds();
+  const { preview } = await startedBuilding(agentId, {
     build: "pnpm build",
     start: "pnpm start",
     port: 3000,
   });
-  await new Promise((r) => setTimeout(r, 100));
+  const tokenHash = sha256(tokenOf(preview.link));
+  const filesDir = previewDir(tokenHash);
+  await vi.waitFor(() => expect(buildsOn(envId)).toHaveLength(1));
 
   const builds = buildsOn(envId);
-  expect(builds).toHaveLength(1);
-  // in the worktree, as a script given the env file and the command, whole
+  // in the worktree, in a session of its own, as a script given the preview's directory and the command, whole
   expect(builds[0]).toMatch(
     new RegExp(
-      `^exec ${sprite(envId)} /workspace/worktrees/${agentId} bash -c .* bash /tmp/sky-preview-${agentId}\\.env pnpm build &> /tmp/sky-preview-${agentId}\\.build\\.log$`,
+      `^exec ${sprite(envId)} /workspace/worktrees/${agentId} setsid -w bash -c .* bash ${filesDir} pnpm build &> ${filesDir}/build\\.log$`,
     ),
   );
   // the env file holds the app's env, in production, and is private to its owner
-  const envPath = `/tmp/sky-preview-${agentId}.env`;
+  const envPath = `${filesDir}/env`;
+  expect(wire.calls).toContain(`write ${sprite(envId)} ${envPath}`);
   const written = new TextDecoder().decode(wire.files.get(envPath));
   expect(written).toContain("export NODE_ENV='production'");
   expect(written).toContain("export PORT='3000'");
@@ -1175,10 +1224,11 @@ test("the build runs once, as a one-off exec in the worktree with the app's env,
     "export DATABASE_URL='postgres://user:pw-9f8e7d@db.test/app'",
   );
   expect(wire.modes.get(envPath)).toMatch(/600$/);
-  // and removed once the build is over
-  expect(
-    callsMatching(new RegExp(`exec ${sprite(envId)} - rm -f ${envPath}$`)),
-  ).toHaveLength(1);
+  // and removed, with the rest of the preview's files, once the build is over
+  release();
+  await reaches(agentId, "ready");
+  await filesRemoved(envId, tokenHash);
+  expect(buildsOn(envId)).toHaveLength(1);
   // an exec's argv and env reach the sprite as URL query params, which no secret rides in
   expect(wire.execUrls.join("\n")).not.toContain("pw-9f8e7d");
   expect(wire.execUrls.join("\n")).not.toContain("hunter");
@@ -1254,7 +1304,7 @@ test("the state follows the build: building, starting, ready", async () => {
   });
 });
 
-test("a build that fails leaves the preview failed, 422, with the redacted tail of its output, and nothing public", async () => {
+test("a build that fails leaves the preview failed, read back 200 with the redacted tail of its output, and nothing public", async () => {
   const envId = readyEnv();
   const agentId = seedAgent(envId);
   seedSecret(
@@ -1274,25 +1324,24 @@ test("a build that fails leaves the preview failed, 422, with the redacted tail 
   await reaches(agentId, "failed");
 
   const { status, body } = await stateBody(agentId);
-  expect(status).toBe(422);
-  expect(body.error?.code).toBe("preview_failed");
-  expect(body.error?.message).toContain("the build exited 1");
-  expect(body.error?.message).toContain("error TS2304: cannot find name");
-  expect(body.error?.message).toContain("connecting to [redacted]");
-  expect(body.error?.message).not.toContain("hunter2");
-  // the state sits beside the error
-  expect(body.preview).toMatchObject({
-    state: "failed",
-    detail: body.error?.message,
-  });
+  // the read succeeded; what failed is the preview, which says so itself
+  expect(status).toBe(200);
+  expect(body).not.toHaveProperty("error");
+  expect(body.preview).toMatchObject({ state: "failed", failure: "command" });
+  const detail = body.preview?.detail ?? "";
+  expect(detail).toContain("the build exited 1");
+  expect(detail).toContain("error TS2304: cannot find name");
+  expect(detail).toContain("connecting to [redacted]");
+  expect(detail).not.toContain("hunter2");
   expect(logs.join("\n")).not.toContain("hunter2");
-  // the app was never started, the proxy and the public URL are gone
+  // the app was never started, the proxy and the public URL are gone, and so are the build's files
   expect(servicesOf(envId).size).toBe(0);
   expect(authOf(envId)).toEqual({ auth: "sprite" });
   expect(rowOf(agentId)?.failure).toBe("command");
+  await filesRemoved(envId, rowOf(agentId)?.tokenHash ?? "");
 });
 
-test("an app that exits as it starts leaves the preview failed, 422, with its redacted output", async () => {
+test("an app that exits as it starts leaves the preview failed, read back 200 with its redacted output", async () => {
   const envId = readyEnv({ base: "team" });
   const agentId = seedAgent(envId);
   seedSecret(envId, "STRIPE_KEY", "stripe-value-9f8e7d");
@@ -1310,18 +1359,20 @@ test("an app that exits as it starts leaves the preview failed, 422, with its re
   await startedBuilding(agentId);
   await reaches(agentId, "failed");
   const { status, body } = await stateBody(agentId);
-  expect(status).toBe(422);
-  expect(body.error?.message).toContain(PREVIEW_APP_SERVICE);
+  expect(status).toBe(200);
+  expect(body.preview).toMatchObject({ state: "failed", failure: "command" });
+  const detail = body.preview?.detail ?? "";
+  expect(detail).toContain(PREVIEW_APP_SERVICE);
   // the port and the profile's switches are not redacted; the secret is
-  expect(body.error?.message).toContain(
+  expect(detail).toContain(
     "attempt 1: listen EADDRINUSE :::5173 (key [redacted])",
   );
-  expect(body.error?.message).not.toContain("stripe-value-9f8e7d");
+  expect(detail).not.toContain("stripe-value-9f8e7d");
   expect(servicesOf(envId).size).toBe(0);
   expect(authOf(envId)).toEqual({ auth: "sprite" });
 });
 
-test("an app that never listens fails the preview, 422, with the tail of its output", async () => {
+test("an app that never listens fails the preview, read back 200 with the tail of its output", async () => {
   const envId = readyEnv();
   const agentId = seedAgent(envId);
   seedSecret(
@@ -1337,37 +1388,39 @@ test("an app that never listens fails the preview, 422, with the tail of its out
   await startedBuilding(agentId);
   await reaches(agentId, "failed");
   const { status, body } = await stateBody(agentId);
-  expect(status).toBe(422);
-  expect(body.error?.message).toContain("the app didn't listen on port 5173");
-  expect(body.error?.message).toContain("starting up");
-  expect(body.error?.message).toContain("cannot reach [redacted]");
-  expect(body.error?.message).not.toContain("hunter2");
+  expect(status).toBe(200);
+  expect(body.preview).toMatchObject({ state: "failed", failure: "command" });
+  const detail = body.preview?.detail ?? "";
+  expect(detail).toContain("the app didn't listen on port 5173");
+  expect(detail).toContain("starting up");
+  expect(detail).toContain("cannot reach [redacted]");
+  expect(detail).not.toContain("hunter2");
   expect(servicesOf(envId).size).toBe(0);
   expect(authOf(envId)).toEqual({ auth: "sprite" });
 });
 
-test("a build that runs past its cap is stopped and fails the preview, 422", async () => {
+test("a build that runs past its cap is stopped, its process group signalled, and fails the preview", async () => {
   app = makeApp({ previewBuildCapMs: 1000 });
   const envId = readyEnv();
   const agentId = seedAgent(envId);
-  wire.hangs = (call) => call.includes(".build.log");
-  await startedBuilding(agentId);
+  wire.hangs = (call) => call.includes("/build.log");
+  const { preview } = await startedBuilding(agentId);
+  const tokenHash = sha256(tokenOf(preview.link));
   await vi.waitFor(() => expect(rowOf(agentId)?.state).toBe("failed"), {
     timeout: 5000,
   });
   const { status, body } = await stateBody(agentId);
-  expect(status).toBe(422);
-  expect(body.error?.message).toBe(
-    "the build ran past its 1-second limit and was stopped",
-  );
-  // what was left running on the sprite is told to stop
-  expect(
-    callsMatching(
-      new RegExp(`pkill -TERM -f /tmp/sky-preview-${agentId}\\.build\\.log$`),
-    ).length,
-  ).toBeGreaterThan(0);
+  expect(status).toBe(200);
+  expect(body.preview).toMatchObject({
+    state: "failed",
+    failure: "command",
+    detail: "the build ran past its 1-second limit and was stopped",
+  });
+  // what was left running on the sprite, the whole of it, is told to stop
+  expect(killsOf(envId, previewDir(tokenHash))).toHaveLength(1);
   expect(servicesOf(envId).size).toBe(0);
   expect(authOf(envId)).toEqual({ auth: "sprite" });
+  await filesRemoved(envId, tokenHash);
 });
 
 test("the build is bounded at 15 minutes", async () => {
@@ -1384,7 +1437,7 @@ test.each([
         : [{ type: "complete", timestamp: 1 }],
   ],
 ])(
-  "a preview that fails because %s fails 502: the sprite's, not the user's",
+  "a preview that fails because %s is the sprite's failure, not the user's",
   async (_, events) => {
     const envId = readyEnv();
     const agentId = seedAgent(envId);
@@ -1392,14 +1445,14 @@ test.each([
     await startedBuilding(agentId);
     await reaches(agentId, "failed");
     const { status, body } = await stateBody(agentId);
-    expect(status).toBe(502);
-    expect(body.error?.code).toBe("preview_failed");
+    expect(status).toBe(200);
+    expect(body.preview).toMatchObject({ state: "failed", failure: "sprite" });
     expect(rowOf(agentId)?.failure).toBe("sprite");
     expect(servicesOf(envId).size).toBe(0);
   },
 );
 
-test("checking the app's port failing is the sprite's failure, 502", async () => {
+test("checking the app's port failing is the sprite's failure", async () => {
   const agentId = seedAgent(readyEnv());
   let checks = 0;
   wire.exec = (argv, s) => {
@@ -1413,7 +1466,10 @@ test("checking the app's port failing is the sprite's failure, 502", async () =>
   appUp = false;
   await startedBuilding(agentId);
   await reaches(agentId, "failed");
-  expect((await stateBody(agentId)).status).toBe(502);
+  expect(await stateBody(agentId)).toMatchObject({
+    status: 200,
+    body: { preview: { state: "failed", failure: "sprite" } },
+  });
 });
 
 test("a proxy that exits fails the start itself, 502, and nothing is left", async () => {
@@ -1566,12 +1622,14 @@ test("starting again while the first is still building stops its build and build
   await vi.waitFor(() => expect(buildsOn(envId)).toHaveLength(1));
   const two = await startedBuilding(agentId);
   expect(tokenOf(two.preview.link)).not.toBe(tokenOf(one.preview.link));
-  // the first build is told to stop
-  expect(
-    callsMatching(
-      new RegExp(`pkill -TERM -f /tmp/sky-preview-${agentId}\\.build\\.log$`),
-    ).length,
-  ).toBeGreaterThan(0);
+  // the first build is cut and its process group told to stop, by its own files: the second's are not touched
+  const first = sha256(tokenOf(one.preview.link));
+  const second = sha256(tokenOf(two.preview.link));
+  expect(killsOf(envId, previewDir(first))).toHaveLength(1);
+  expect(killsOf(envId, previewDir(second))).toEqual([]);
+  await vi.waitFor(() => expect(wire.cutExecs).toEqual([buildsOn(envId)[0]]));
+  await filesRemoved(envId, first);
+  expect(wire.calls).not.toContain(`rm ${sprite(envId)} ${previewDir(second)}`);
   release();
   await reaches(agentId, "ready");
   expect(rowOf(agentId)?.tokenHash).toBe(sha256(tokenOf(two.preview.link)));
@@ -1587,18 +1645,18 @@ test("stopping a preview that is still building stops its build, and its app is 
   const envId = readyEnv();
   const agentId = seedAgent(envId);
   const release = holdBuilds();
-  await startedBuilding(agentId);
+  const { preview } = await startedBuilding(agentId);
+  const tokenHash = sha256(tokenOf(preview.link));
   await vi.waitFor(() => expect(buildsOn(envId)).toHaveLength(1));
   const res = await stop(agentId);
   expect(res.status).toBe(200);
   expect(await res.json()).toMatchObject({
     stopped: { agentId, state: "building" },
   });
-  expect(
-    callsMatching(
-      new RegExp(`pkill -TERM -f /tmp/sky-preview-${agentId}\\.build\\.log$`),
-    ).length,
-  ).toBeGreaterThan(0);
+  // the build's exec is cut, as the cap cuts it, and its whole process group is told to stop
+  await vi.waitFor(() => expect(wire.cutExecs).toEqual(buildsOn(envId)));
+  expect(killsOf(envId, previewDir(tokenHash))).toHaveLength(1);
+  await filesRemoved(envId, tokenHash);
   release();
   await new Promise((r) => setTimeout(r, 100));
   expect(
@@ -1608,6 +1666,79 @@ test("stopping a preview that is still building stops its build, and its app is 
   expect(authOf(envId)).toEqual({ auth: "sprite" });
   expect(db.select().from(previews).all()).toEqual([]);
 });
+
+/** The pids of this machine's live processes whose argv is exactly `argv`, read off /proc; a zombie's is empty. */
+function pidsOf(argv: string[]): number[] {
+  const cmdline = `${argv.join("\0")}\0`;
+  return readdirSync("/proc")
+    .filter((entry) => /^\d+$/.test(entry))
+    .filter((pid) => {
+      try {
+        return readFileSync(`/proc/${pid}/cmdline`, "utf8") === cmdline;
+      } catch {
+        return false;
+      }
+    })
+    .map(Number);
+}
+
+test("stopping a build ends every process the build started, not only the wrapper that logs it", async () => {
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  const release = holdBuilds();
+  // a duration nothing else here sleeps, to find the build's own process by
+  const duration = `300.${process.pid}`;
+  await startedBuilding(agentId, { ...BODY, build: `sleep ${duration}` });
+  await vi.waitFor(() => expect(buildsOn(envId)).toHaveLength(1));
+  const argvOf = (href: string) => new URL(href).searchParams.getAll("cmd");
+  const build = wire.execUrls.map(argvOf).find((a) => a[2] === LOGGED_EXEC);
+  if (!build) throw new Error("no logged build exec");
+
+  // what the sprite would run, run here by a real shell: the preview's files where the build looks for
+  // them, then the exec's argv as the sprite was sent it
+  const log = build[4] ?? "";
+  const made = new Set<string>([log, `${log}.tail`]);
+  for (const [path, bytes] of wire.files) {
+    if (!path.startsWith("/tmp/sky-preview-")) continue;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, bytes);
+    made.add(path);
+    if (dirname(path) !== "/tmp") made.add(dirname(path));
+  }
+  const sleeper = ["sleep", duration];
+  const wrapper = spawn(build[0] ?? "", build.slice(1), {
+    cwd: dir,
+    stdio: "ignore",
+  });
+  try {
+    await vi.waitFor(() => expect(pidsOf(sleeper)).toHaveLength(1), {
+      timeout: 5000,
+    });
+    const before = wire.execUrls.length;
+    expect((await stop(agentId)).status).toBe(200);
+    // the execs the stop sent the sprite, other than removing files, run here as the sprite would run them
+    const kills = wire.execUrls
+      .slice(before)
+      .map(argvOf)
+      .filter((a) => a[0] !== "rm");
+    expect(kills).not.toEqual([]);
+    for (const [file = "", ...args] of kills) {
+      execFileSync(file, args, { stdio: "ignore" });
+    }
+    await vi.waitFor(() => expect(pidsOf(sleeper)).toEqual([]), {
+      timeout: 5000,
+    });
+  } finally {
+    for (const pid of pidsOf(sleeper)) process.kill(pid, "SIGKILL");
+    wrapper.kill("SIGKILL");
+    release();
+    for (const path of made) {
+      if (path.startsWith("/tmp/sky-preview-")) {
+        rmSync(path, { recursive: true, force: true });
+      }
+    }
+  }
+}, 20_000);
 
 test("previews a restart interrupted are failed at boot and taken down by the sweep", async () => {
   const envId = readyEnv();
@@ -1624,6 +1755,11 @@ test("previews a restart interrupted are failed at boot and taken down by the sw
       expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
     })
     .run();
+  // the env file the interrupted build was given, which no `finally` of the dead process will remove
+  wire.files.set(
+    `${previewDir(sha256("t"))}/env`,
+    new TextEncoder().encode("export DATABASE_URL='postgres://x'\n"),
+  );
   const ready = seedAgent(readyEnv());
   expect(failInterruptedPreviews(db, new Date())).toBe(1);
   expect(rowOf(agentId)).toMatchObject({ state: "failed", failure: "sprite" });
@@ -1635,6 +1771,7 @@ test("previews a restart interrupted are failed at boot and taken down by the sw
   ).toBe(1);
   expect(db.select().from(previews).all()).toEqual([]);
   expect(authOf(envId)).toEqual({ auth: "sprite" });
+  await filesRemoved(envId, sha256("t"));
 });
 
 test("state reports the preview's commands, state and the two services' status", async () => {
@@ -1652,6 +1789,7 @@ test("state reports the preview's commands, state and the two services' status",
       start: "pnpm start --host",
       state: "ready",
       detail: null,
+      failure: null,
       startedAt: expect.any(String),
       expiresAt: preview.expiresAt,
       services: { app: "running", proxy: "running" },

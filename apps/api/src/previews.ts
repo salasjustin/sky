@@ -69,8 +69,16 @@ const MANAGERS = {
 // the user's command, whole, as $1 of a shell of its own: `cd web && pnpm start` and `FOO=1 pnpm start` run as
 // written, and a single program still replaces that shell as the service's process
 const RUN_APP_SERVER = `${WITH_PACKAGE_MANAGERS} && exec bash -c "$1"`;
-// the build: the env file ($1) sourced for the app's own variables, then the command ($2), whole
-const RUN_BUILD = `${WITH_PACKAGE_MANAGERS} && set -a && . "$1" && set +a && exec bash -c "$2"`;
+// the build, run under `setsid` so it and everything it starts are one process group: $1 the preview's
+// directory, where it leaves the group's id for `KILL_BUILD` and finds the env file it sources for the app's
+// own variables; $2 the command, whole
+const RUN_BUILD = `echo $$ >"$1/pid" && ${WITH_PACKAGE_MANAGERS} && set -a && . "$1/env" && set +a && exec bash -c "$2"`;
+// TERM to the build's process group, KILL to what of it outlives 5 s; a group never recorded has nothing to end
+const KILL_BUILD = `pid=$(cat "$1/pid" 2>/dev/null) || exit 0; case $pid in ''|*[!0-9]*) exit 0;; esac; [ "$pid" -gt 1 ] || exit 0; kill -TERM -- "-$pid" 2>/dev/null || exit 0; for _ in 1 2 3 4 5; do kill -0 -- "-$pid" 2>/dev/null || exit 0; sleep 1; done; kill -KILL -- "-$pid" 2>/dev/null; exit 0`;
+
+/** One preview's build files in the sprite (`env`, `build.log`, `pid`): by its token's hash, so no other preview's teardown or late kill reaches them. */
+const previewDir = (tokenHash: string) =>
+  `/tmp/sky-preview-${tokenHash.slice(0, 16)}`;
 
 const sha256Hex = (value: string) =>
   createHash("sha256").update(value).digest("hex");
@@ -131,8 +139,29 @@ async function stopJob(envId: EnvironmentId, tokenHash: string) {
   await job.done;
 }
 
-/** The sprite's URL goes private first, so nothing is public a moment longer than it must be; then both services go. */
-async function takeDown(sprites: SpriteOps, name: string): Promise<void> {
+/** Removes the preview's build files from the sprite; under `force`, a 404 (sprite or directory gone) counts as removed. */
+function removeFiles(
+  sprites: SpriteOps,
+  name: string,
+  tokenHash: string,
+): Promise<void> {
+  return spriteCall(sprites, name, { op: "rm-preview-files" }, () =>
+    sprites.client
+      .sprite(name)
+      .filesystem("/")
+      .rm(previewDir(tokenHash), { recursive: true, force: true }),
+  );
+}
+
+/**
+ * The sprite's URL goes private first, so nothing is public a moment longer than it must be; then both
+ * services go, then a build still running (its process group, which outlives its exec and this process),
+ * then the build's files, whose env holds the app's secrets.
+ */
+async function takeDown(
+  sprites: SpriteOps,
+  { spriteName: name, tokenHash }: Pick<Running, "spriteName" | "tokenHash">,
+): Promise<void> {
   await spriteCall(sprites, name, { op: "url-private" }, () =>
     sprites.client.updateSprite(name, { urlSettings: { auth: "sprite" } }),
   ).catch((err: unknown) => {
@@ -146,6 +175,16 @@ async function takeDown(sprites: SpriteOps, name: string): Promise<void> {
       if (!isGone(err)) throw err;
     });
   }
+  // before the files go: the group's id is in them
+  await execInSprite(
+    sprites,
+    name,
+    ["bash", "-c", KILL_BUILD, "bash", previewDir(tokenHash)],
+    { op: "preview-build-kill" },
+  ).catch((err: unknown) => {
+    if (!isGone(err)) throw err;
+  });
+  await removeFiles(sprites, name, tokenHash);
 }
 
 /**
@@ -159,7 +198,7 @@ async function endPreview(
   running: Running,
 ): Promise<void> {
   await stopJob(running.envId, running.tokenHash);
-  await takeDown(sprites, running.spriteName);
+  await takeDown(sprites, running);
   db.delete(previews)
     .where(
       and(
@@ -180,6 +219,8 @@ export type StartResult =
   | { kind: "port_busy"; port: number }
   /** Another principal's preview runs in the environment, and this one may not replace it. */
   | { kind: "preview_busy" }
+  /** The running preview could not be ended, so this one was not started; its row stays for a retry. */
+  | { kind: "replace_failed" }
   | { kind: "failed"; detail: string }
   | {
       kind: "started";
@@ -196,7 +237,10 @@ export type PresentedPreview = {
   state: PreviewState;
   /** The redacted tail of the output of what failed, once `state` is `failed`. */
   detail: string | null;
+  /** Whose a failed preview's failure is: `command` the user's build or start, `sprite` the sprite's; null unless `failed`. */
+  failure: PreviewRow["failure"];
   startedAt: string;
+  /** When the link stops working; on a `failed` preview, when the sweep removes it instead. */
   expiresAt: string;
 };
 
@@ -208,6 +252,7 @@ const present = (row: PreviewRow): PresentedPreview => ({
   start: row.startCmd,
   state: row.state,
   detail: row.detail,
+  failure: row.failure,
   startedAt: row.createdAt,
   expiresAt: row.expiresAt,
 });
@@ -466,60 +511,51 @@ export function createPreviews({
 
   /** The one-off production build, in the worktree, with the app's own env; throws `CommandFailed` with its output tail when it fails or runs past its cap. */
   async function build(s: Start & { build: string }): Promise<void> {
-    const envPath = `/tmp/sky-preview-${s.agentId}.env`;
-    const logPath = `/tmp/sky-preview-${s.agentId}.build.log`;
+    // a throw or a stop from here on ends in `takeDown`, which ends the build and removes these files
+    const dir = previewDir(s.tokenHash);
     await writeSpriteFile(
       sprites,
       s.spriteName,
-      envPath,
+      `${dir}/env`,
       envFile(Object.entries(s.env)),
       { op: "write-preview-env", mode: 0o600, known: s.known },
     );
-    const kill = () =>
-      void execInSprite(
-        sprites,
-        s.spriteName,
-        ["pkill", "-TERM", "-f", logPath],
-        { op: "preview-build-kill" },
-      ).catch(() => {});
+    if (s.signal.aborted) return;
+    let out: { exitCode: number; tail: string } | undefined;
     try {
-      const out = await unlessAborted(
+      out = await unlessAborted(
         execLogged(
           sprites,
           s.spriteName,
-          ["bash", "-c", RUN_BUILD, "bash", envPath, s.build],
+          ["setsid", "-w", "bash", "-c", RUN_BUILD, "bash", dir, s.build],
           {
             op: "preview-build",
             cwd: s.worktree,
-            log: logPath,
+            log: `${dir}/build.log`,
             tailBytes: OUTPUT_TAIL,
             timeoutMs: buildCapMs,
             known: s.known,
+            // a stop drops the exec's connection, as the cap does
+            signal: s.signal,
           },
         ),
         s.signal,
       );
-      if (out === undefined) return kill();
-      if (out.exitCode !== 0) {
-        const tail = redact(out.tail.trim(), s.known);
-        throw new CommandFailed(
-          `the build exited ${out.exitCode}${tail ? `: ${tail}` : ""}`,
-        );
-      }
     } catch (err) {
-      if (err instanceof SpriteTimeoutError) {
-        kill();
-        throw new CommandFailed(
-          `the build ran past its ${buildCapMs % 60_000 === 0 ? `${buildCapMs / 60_000}-minute` : `${Math.round(buildCapMs / 1000)}-second`} limit and was stopped`,
-        );
-      }
-      throw err;
-    } finally {
-      // the env holds the secrets, and the build is over
-      void execInSprite(sprites, s.spriteName, ["rm", "-f", envPath], {
-        op: "rm-preview-env",
-      }).catch(() => {});
+      if (!(err instanceof SpriteTimeoutError)) throw err;
+      throw new CommandFailed(
+        `the build ran past its ${buildCapMs % 60_000 === 0 ? `${buildCapMs / 60_000}-minute` : `${Math.round(buildCapMs / 1000)}-second`} limit and was stopped`,
+      );
     }
+    if (out === undefined) return;
+    if (out.exitCode !== 0) {
+      const tail = redact(out.tail.trim(), s.known);
+      throw new CommandFailed(
+        `the build exited ${out.exitCode}${tail ? `: ${tail}` : ""}`,
+      );
+    }
+    // the env holds the secrets, and the build is over; what this misses, the preview's teardown removes
+    await removeFiles(sprites, s.spriteName, s.tokenHash).catch(() => {});
   }
 
   /** The tail of the app service's output, redacted; empty when it can't be read. */
@@ -609,7 +645,7 @@ export function createPreviews({
       const failure = err instanceof CommandFailed ? "command" : "sprite";
       log(`the preview of ${s.agentId} failed (${failure}): ${detail}`);
       // taken down first, so nothing stays public; a failed teardown is the sweep's to retry once the row expires
-      await takeDown(sprites, s.spriteName).catch((downErr: unknown) => {
+      await takeDown(sprites, s).catch((downErr: unknown) => {
         log(
           `taking down the failed preview of ${s.agentId} failed: ${downErr}`,
         );
@@ -686,7 +722,16 @@ export function createPreviews({
           const refused = await refusedPort(spriteName, input.port);
           if (refused) return refused;
         }
-        if (current) await endPreview(db, sprites, current);
+        if (current) {
+          try {
+            await endPreview(db, sprites, current);
+          } catch (err) {
+            log(
+              `ending the preview of ${current.agentId} to start ${agentId}'s failed: ${err}`,
+            );
+            return { kind: "replace_failed" };
+          }
+        }
         // a running preview's proxy holds 8080, and its app the app's port when this one asks for the same:
         // checked once its services are gone, so neither is counted
         const afterTeardown = appPortCheckedFirst
@@ -842,7 +887,7 @@ export function createPreviews({
 
     /**
      * The agent's preview, its state included, with how its two services are doing; `null` when it has none,
-     * `undefined` for an agent `principal` may not see. `failure` is whose fault a failed one is.
+     * `undefined` for an agent `principal` may not see.
      */
     async state(agentId: AgentId, principal: Principal) {
       const found = find(agentId, principal);
@@ -870,13 +915,10 @@ export function createPreviews({
       const status = (name: string) =>
         services?.find((s) => s.name === name)?.state?.status ?? "missing";
       return {
-        failure: row.failure,
-        preview: {
-          ...present(row),
-          services: services && {
-            app: status(PREVIEW_APP_SERVICE),
-            proxy: status(PREVIEW_PROXY_SERVICE),
-          },
+        ...present(row),
+        services: services && {
+          app: status(PREVIEW_APP_SERVICE),
+          proxy: status(PREVIEW_PROXY_SERVICE),
         },
       };
     },

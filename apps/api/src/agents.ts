@@ -793,6 +793,13 @@ export function agentRoutes(
               "preview_commands_needed",
               `the agent's worktree has no lockfile (pnpm-lock.yaml, yarn.lock, bun.lock or package-lock.json) to choose commands from; send ${result.missing.map((m) => `\`${m}\``).join(" and ")} (build may be "none" to skip the build; the CLI's flags are --build and --start)`,
             );
+          case "replace_failed":
+            return apiError(
+              c,
+              502,
+              "preview_stop_failed",
+              "the environment's running preview could not be stopped, so this one was not started; retry",
+            );
           case "failed":
             return apiError(c, 502, "preview_failed", result.detail);
         }
@@ -822,25 +829,11 @@ export function agentRoutes(
     })
     .get("/:id/preview", agentParam, async (c) => {
       const { id } = c.req.valid("param");
-      const found = await previews.state(id, c.var.principal);
-      if (found === undefined)
+      const preview = await previews.state(id, c.var.principal);
+      if (preview === undefined)
         return apiError(c, 404, "not_found", "no such agent");
-      if (found === null) return c.json({ preview: null }, 200);
-      const { preview, failure } = found;
-      // a failed preview answers as its start would have: 422 when the user's own build or start command
-      // failed, 502 when the sprite did, with the state beside the error
-      if (preview.state === "failed") {
-        return c.json(
-          {
-            error: {
-              code: "preview_failed",
-              message: preview.detail ?? "the preview failed",
-            },
-            preview,
-          },
-          failure === "command" ? 422 : 502,
-        );
-      }
+      // a failed preview is read like any other: `state` failed, why in `detail`, whose fault in `failure`,
+      // and `expiresAt` when the sweep removes it
       return c.json({ preview }, 200);
     })
     .post("/:id/answers", agentParam, jsonBody, body(AnswerInput), (c) => {
