@@ -965,14 +965,14 @@ test("a failed ref lookup surfaces instead of reading as a new branch", async ()
   const gh = fakeGitHub();
   server.use(
     http.get(`${REPO}/git/ref/heads/claude/agt_1`, () =>
-      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+      HttpResponse.json({ message: "Server Error" }, { status: 501 }),
     ),
   );
   writeFileSync(join(work, "a.txt"), "first\n");
   commit("Add a");
 
   await expect(run()).rejects.toThrow(
-    "GitHub gateway: GET /repos/acme/widgets/git/ref/heads/claude/agt_1 returned 500: Server Error",
+    "GitHub gateway: GET /repos/acme/widgets/git/ref/heads/claude/agt_1 returned 501: Server Error",
   );
   expect(gh.refWrites).toEqual([]);
 });
@@ -2121,7 +2121,7 @@ test("a GitHub error other than not-found on a merge's parent lookup is raised a
   const other = nextBase({ "x.txt": "from another branch\n" });
   server.use(
     http.get(`${REPO}/git/commits/${other}`, () =>
-      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+      HttpResponse.json({ message: "Server Error" }, { status: 501 }),
     ),
   );
   merge(other);
@@ -2129,7 +2129,7 @@ test("a GitHub error other than not-found on a merge's parent lookup is raised a
   const error = await run().catch((e: unknown) => e);
 
   expect(String(error)).toContain(
-    `GET /repos/acme/widgets/git/commits/${other} returned 500: Server Error`,
+    `GET /repos/acme/widgets/git/commits/${other} returned 501: Server Error`,
   );
   expect(String(error)).not.toContain("doesn't have");
   expectNothingSent(gh);
@@ -2652,4 +2652,239 @@ test("the command prints a refused ref update's workflow_files_blocked on stderr
   expect(stderr).toBe(
     `sky publish: ${blocked("GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 404: Not Found")}\n`,
   );
+});
+
+/** A run whose retry pauses are recorded, not waited, and whose progress lines are kept. */
+const retryRun = (extra: Partial<Parameters<typeof publish>[0]> = {}) => {
+  const sleeps: number[] = [];
+  const lines: string[] = [];
+  const result = run({
+    progress: (line) => lines.push(line),
+    rateLimit: {
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    },
+    ...extra,
+  });
+  return { result, sleeps, lines };
+};
+
+const badGateway = () =>
+  HttpResponse.json({ message: "Bad Gateway" }, { status: 502 });
+
+test.each([
+  ["POST", "/git/blobs"],
+  ["POST", "/git/trees"],
+  ["POST", "/git/commits"],
+  ["POST", "/git/refs"],
+] as const)(
+  "a 502 on %s %s is retried once and the publish succeeds, the retry in progress",
+  async (method, path) => {
+    const gh = fakeGitHub();
+    writeFileSync(join(work, "a.txt"), "first\n");
+    commit("Add a");
+    server.use(http.post(`${REPO}${path}`, () => badGateway(), { once: true }));
+
+    const { result, sleeps, lines } = retryRun();
+
+    expect((await result).created).toBe(true);
+    expect(sleeps).toEqual([1000]);
+    expect(lines).toEqual([
+      `GitHub gateway: ${method} /repos/acme/widgets${path} answered 502; retrying in 1 s (retry 1/3)`,
+    ]);
+    expect(gh.refWrites).toHaveLength(1);
+  },
+);
+
+test("a 502 on the fast-forward of an existing ref is retried and succeeds", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Add b");
+  const gh = fakeGitHub({ ref: first });
+  server.use(
+    http.patch(`${REPO}/git/refs/heads/claude/agt_1`, () => badGateway(), {
+      once: true,
+    }),
+  );
+
+  const { result, lines } = retryRun();
+
+  expect((await result).sha).toBe("commit1");
+  expect(lines).toHaveLength(1);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("a 502 on a GET is retried", async () => {
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  server.use(http.get(`${REPO}/pulls`, () => badGateway(), { once: true }));
+
+  const { result, lines } = retryRun();
+
+  expect((await result).created).toBe(true);
+  expect(lines[0]).toContain("GET /repos/acme/widgets/pulls?");
+});
+
+test("a connection closed by the other side is retried", async () => {
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const real = globalThis.fetch;
+  let dropped = false;
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    if (
+      !dropped &&
+      init?.method === "POST" &&
+      String(input).endsWith("/git/trees")
+    ) {
+      dropped = true;
+      throw new TypeError("terminated", {
+        cause: Object.assign(new Error("other side closed"), {
+          code: "UND_ERR_SOCKET",
+        }),
+      });
+    }
+    return real(input, init);
+  });
+
+  const { result, sleeps, lines } = retryRun();
+
+  expect((await result).created).toBe(true);
+  expect(dropped).toBe(true);
+  expect(sleeps).toEqual([1000]);
+  expect(lines).toEqual([
+    "GitHub gateway: POST /repos/acme/widgets/git/trees lost the connection; retrying in 1 s (retry 1/3)",
+  ]);
+});
+
+test("a 502 on every attempt fails after three retries, naming the last status", async () => {
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  let attempts = 0;
+  server.use(
+    http.post(`${REPO}/git/blobs`, () => {
+      attempts++;
+      return badGateway();
+    }),
+  );
+
+  const { result, sleeps, lines } = retryRun();
+
+  await expect(result).rejects.toThrow(
+    "GitHub gateway: POST /repos/acme/widgets/git/blobs returned 502: Bad Gateway (after 3 retries)",
+  );
+  expect(attempts).toBe(4);
+  expect(sleeps).toEqual([1000, 3000, 9000]);
+  expect(lines).toHaveLength(3);
+});
+
+test("a pull request made but answered 502 is found on the retry, not opened twice", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  let creates = 0;
+  // GitHub makes the pull request, loses the answer, and refuses a second one for the same head
+  server.use(
+    http.post(`${REPO}/pulls`, async ({ request }) => {
+      const body = (await request.json()) as { head: string; base: string };
+      if (++creates > 1) {
+        return HttpResponse.json(
+          { message: "Validation Failed" },
+          { status: 422 },
+        );
+      }
+      gh.pullCreates.push(body);
+      gh.pulls.push({
+        number: 7,
+        html_url: "https://github.com/acme/widgets/pull/7",
+        head: body.head,
+        base: body.base,
+      });
+      return badGateway();
+    }),
+  );
+
+  const { result } = retryRun();
+
+  expect(await result).toMatchObject({
+    created: true,
+    pullRequest: { number: 7, url: "https://github.com/acme/widgets/pull/7" },
+  });
+  expect(creates).toBe(2);
+  expect(gh.pullCreates).toHaveLength(1);
+  expect(gh.pulls).toHaveLength(1);
+});
+
+test("a ref created but answered 502 is accepted on the retry's 422 when it holds the commit", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  let creates = 0;
+  server.use(
+    http.post(`${REPO}/git/refs`, async ({ request }) => {
+      const body = (await request.json()) as { sha: string };
+      if (++creates > 1) {
+        return HttpResponse.json(
+          { message: "Reference already exists" },
+          { status: 422 },
+        );
+      }
+      gh.ref = body.sha;
+      return badGateway();
+    }),
+  );
+
+  const { result } = retryRun();
+
+  expect((await result).created).toBe(true);
+  expect(creates).toBe(2);
+});
+
+test("a ref that exists at another commit is still refused", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  server.use(
+    http.post(`${REPO}/git/refs`, () => {
+      gh.ref = "someone-else";
+      return HttpResponse.json(
+        { message: "Reference already exists" },
+        { status: 422 },
+      );
+    }),
+  );
+
+  const { result, sleeps } = retryRun();
+
+  await expect(result).rejects.toThrow("returned 422");
+  expect(sleeps).toEqual([]);
+});
+
+test.each([
+  [404, "Not Found"],
+  [422, "Validation Failed"],
+])("a %s is not retried", async (status, message) => {
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  let attempts = 0;
+  server.use(
+    http.post(`${REPO}/git/blobs`, () => {
+      attempts++;
+      return HttpResponse.json({ message }, { status });
+    }),
+  );
+
+  const { result, sleeps, lines } = retryRun();
+
+  await expect(result).rejects.toThrow(`returned ${status}: ${message}`);
+  expect(attempts).toBe(1);
+  expect(sleeps).toEqual([]);
+  expect(lines).toEqual([]);
 });

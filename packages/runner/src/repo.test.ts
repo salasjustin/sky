@@ -676,14 +676,14 @@ test("the base ref answering a gateway error that isn't a 404 fails the publish 
   advanceRemote("other.txt", "someone else\n");
   server.use(
     http.get(`${REPO}/git/ref/heads/trunk`, () =>
-      HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
+      HttpResponse.json({ message: "Bad Gateway" }, { status: 501 }),
     ),
   );
 
   const failure = publishFrom(tree);
 
   await expect(failure).rejects.toThrow(
-    /GET \/repos\/acme\/private\/git\/ref\/heads\/trunk returned 502: Bad Gateway/,
+    /GET \/repos\/acme\/private\/git\/ref\/heads\/trunk returned 501: Bad Gateway/,
   );
   await expect(failure).rejects.not.toThrow(/doesn't exist on GitHub/);
   expect(seen.commits).toEqual([]);
@@ -708,13 +708,13 @@ test.each([
     const fresh = advanceRemote("other.txt", "someone else\n");
     server.use(
       http.get(`${REPO}/git/${endpoint}/:sha`, () =>
-        HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+        HttpResponse.json({ message: "Server Error" }, { status: 501 }),
       ),
     );
 
     await expect(publishFrom(tree)).rejects.toThrow(
       new RegExp(
-        `GET /repos/acme/private/git/${endpoint}/[0-9a-f]{40}.* returned 500`,
+        `GET /repos/acme/private/git/${endpoint}/[0-9a-f]{40}.* returned 501`,
       ),
     );
 
@@ -1773,10 +1773,10 @@ test("a re-run removes the index of a dead fetch and keeps that of one still run
 const gatewayDown = () =>
   server.use(
     http.get(`${REPO}/tarball/:ref`, () =>
-      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+      HttpResponse.json({ message: "Server Error" }, { status: 501 }),
     ),
     http.get(`${REPO}/git/blobs/:sha`, () =>
-      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+      HttpResponse.json({ message: "Server Error" }, { status: 501 }),
     ),
   );
 
@@ -1788,7 +1788,7 @@ test("a pull that fails onto an existing checkout keeps it, and a later run fini
     writeFileSync(join(work, "new.txt"), "n\n"),
   );
   gatewayDown();
-  await expect(pull(dir)).rejects.toThrow("returned 500");
+  await expect(pull(dir)).rejects.toThrow("returned 501");
   expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
   expect(git(dir, "status", "--porcelain")).toBe("");
 
@@ -1804,13 +1804,13 @@ test("a pull that fails part-way removes the checkout it started, so the next ru
   gatewayDown();
   const parent = join(root, "fresh");
   const dir = join(parent, "repo");
-  await expect(pull(dir)).rejects.toThrow("returned 500");
+  await expect(pull(dir)).rejects.toThrow("returned 501");
   expect(existsSync(parent)).toBe(false);
 
   const kept = join(root, "kept");
   mkdirSync(kept);
   writeFileSync(join(kept, "notes.txt"), "mine\n");
-  await expect(pull(kept)).rejects.toThrow("returned 500");
+  await expect(pull(kept)).rejects.toThrow("returned 501");
   expect(existsSync(join(kept, ".git"))).toBe(false);
   expect(readFileSync(join(kept, "notes.txt"), "utf8")).toBe("mine\n");
 });
@@ -1860,7 +1860,7 @@ test("an archive GitHub answers 500 for is named on one line, and every file is 
   fakeGitHub();
   server.use(
     http.get(`${REPO}/tarball/:ref`, () =>
-      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+      HttpResponse.json({ message: "Server Error" }, { status: 501 }),
     ),
   );
   const lines: string[] = [];
@@ -1879,7 +1879,7 @@ test("an archive GitHub answers 500 for is named on one line, and every file is 
 
   const failed = lines.filter((line) => line.includes("archive"));
   expect(failed).toContain(
-    `repo pull: the archive failed (GitHub gateway: GET /repos/acme/private/tarball/${headSha} returned 500: Server Error); fetching 4 blobs one by one`,
+    `repo pull: the archive failed (GitHub gateway: GET /repos/acme/private/tarball/${headSha} returned 501: Server Error); fetching 4 blobs one by one`,
   );
   expect(lines.join("\n")).not.toContain(CONNECTOR);
   expect(lines.join("\n")).not.toContain(GATEWAY);
