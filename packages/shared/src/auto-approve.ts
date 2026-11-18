@@ -313,6 +313,10 @@ const PLAIN_VALUE = /^[A-Za-z0-9_./@%+,:-][A-Za-z0-9_./@%+,:=-]*$/;
 // names the shell, the toolchain or the runner read from the environment: `PATH=… ls` runs another ls
 const SPECIAL_VARIABLE =
   /^(PATH|HOME|IFS|CDPATH|ENV|SHELL|PWD|OLDPWD|USER|LOGNAME|TMPDIR|TERM|EDITOR|VISUAL|PAGER|PS\d|PROMPT.*|BASH.*|ZSH.*|ZDOTDIR|FPATH|FIGNORE|GLOBIGNORE|HIST.*|LANG|LC_.*|LD_.*|DYLD_.*|NODE.*|NPM_.*|PNPM_.*|GIT_.*|SSH_.*|GH_.*|GITHUB_.*|SKY_.*|CLAUDE.*|ANTHROPIC.*|.*PROXY|XDG_.*|SUDO.*|PYTHON.*|TZ|TIMEFMT|MANPATH|CC|CXX|CFLAGS|LDFLAGS)$/i;
+// names bash or zsh sets on its own or ignores an assignment to, so a later `$NAME` doesn't read
+// what the command wrote: `$_` is the previous command's last argument, `FUNCNAME=src` has no effect
+const SHELL_SET_VARIABLE =
+  /^(_|FUNCNAME|GROUPS|DIRSTACK|S?RANDOM|SECONDS|LINENO|EPOCH.*|E?UID|E?GID|USERNAME|PPID|OPTIND|OPTARG|REPLY|PIPESTATUS|HOST.*|MACHTYPE|OSTYPE|SHLVL|MAIL.*|COMP_.*|COMPREPLY|READLINE_.*|SHELLOPTS|COLUMNS|LINES|funcstack|functrace|funcfiletrace|funcsourcetrace|argv|ARGC|status|ERRNO|TTY.*|psvar|TMPPREFIX|WORDCHARS|KEYTIMEOUT|module_path|parameters|commands|functions(_source)?|[gs]?aliases|builtins|options|modules|dis_.*|jobtexts|jobstates|jobdirs|nameddirs|userdirs|reswords|patchars|signals)$/i;
 
 // `cat > target <<'DELIM'` closing a command line; `pre` is empty or ends in an operator
 const HEREDOC_HEAD =
@@ -433,7 +437,8 @@ function parsePipelines(command: string): Pipeline[] | undefined {
       after !== "&&" &&
       after !== "||" &&
       PLAIN_VALUE.test(assignment[2] ?? "") &&
-      !SPECIAL_VARIABLE.test(assignment[1] ?? "")
+      !SPECIAL_VARIABLE.test(assignment[1] ?? "") &&
+      !SHELL_SET_VARIABLE.test(assignment[1] ?? "")
     ) {
       vars.set(assignment[1] ?? "", assignment[2] ?? "");
       only.words = ["true"];

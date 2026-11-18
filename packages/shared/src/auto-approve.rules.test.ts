@@ -127,6 +127,23 @@ describe("a variable the command set", () => {
   ])("%s asks (%s)", (command, reason) => {
     expect(verdict(command)).toBe(reason);
   });
+
+  test.each([
+    // bash resets `$_` to the previous command's last argument
+    ["_=src; echo /proc/self/environ; cat $_", "syntax"],
+    [
+      "_=src/a.ts; echo /home/u/.bashrc; cat >> $_ <<'EOF'\nx\nEOF",
+      "syntax",
+    ],
+    // bash ignores an assignment to FUNCNAME, so `$FUNCNAME` stays empty
+    ["FUNCNAME=src; cat $FUNCNAME/etc/passwd", "syntax"],
+    ["RANDOM=src; cat $RANDOM", "syntax"],
+    ["SECONDS=src; cat $SECONDS", "syntax"],
+    ["funcstack=src; cat $funcstack", "syntax"],
+    ["status=src; cat $status", "syntax"],
+  ])("%j asks: the shell sets that name itself (%s)", (command, reason) => {
+    expect(verdict(command)).toBe(reason);
+  });
 });
 
 describe("date, true and sleep", () => {
