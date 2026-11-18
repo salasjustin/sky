@@ -1025,6 +1025,19 @@ test("preview passes ttlSeconds along", async () => {
   ]);
 });
 
+test("preview without ttlSeconds sends none, so the API applies its default", async () => {
+  const seen = route("post", "/v1/agents/agt_1/preview", 200, { preview: {} });
+  const client = await connect();
+
+  await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_1", cmd: "npm start", port: 3000 },
+  });
+
+  expect(seen).toHaveLength(1);
+  expect(seen[0]?.body).not.toHaveProperty("ttlSeconds");
+});
+
 test("preview with stop ends it", async () => {
   const seen = route("delete", "/v1/agents/agt_1/preview", 200, {
     preview: null,
@@ -1062,6 +1075,11 @@ test.each([
   ["a port with no command", { agentId: "agt_1", port: 5173 }],
   ["the proxy's own port", { agentId: "agt_1", cmd: "x", port: 8080 }],
   ["a port under 1024", { agentId: "agt_1", cmd: "x", port: 80 }],
+  ["a blank command", { agentId: "agt_1", cmd: "   ", port: 5173 }],
+  [
+    "a command over 4000 characters",
+    { agentId: "agt_1", cmd: "x".repeat(4001), port: 5173 },
+  ],
   [
     "a TTL past 7 days",
     { agentId: "agt_1", cmd: "x", port: 5173, ttlSeconds: 604801 },
@@ -1117,10 +1135,18 @@ test("preview is listed with what the link gives and the one-per-environment rul
   );
   expect(tool?.inputSchema.properties).toMatchObject({
     agentId: { type: "string" },
-    cmd: { type: "string" },
+    cmd: { type: "string", minLength: 1, maxLength: 4000 },
     port: { type: "integer", minimum: 1024, maximum: 65535 },
     ttlSeconds: { type: "integer", minimum: 60, maximum: 604800 },
     stop: { type: "boolean" },
   });
+  expect(tool?.inputSchema.properties?.ttlSeconds).not.toHaveProperty(
+    "default",
+  );
   expect(tool?.inputSchema.required).toEqual(["agentId"]);
+  expect(tool?.annotations).toEqual({
+    destructiveHint: true,
+    idempotentHint: false,
+    readOnlyHint: false,
+  });
 });

@@ -15,7 +15,8 @@ import {
   PREVIEW_DEFAULT_TTL_SECONDS,
   PREVIEW_MAX_TTL_SECONDS,
   PREVIEW_MIN_TTL_SECONDS,
-  PreviewPort,
+  PREVIEW_PROXY_PORT,
+  PreviewStart,
   RequestId,
   RunId,
 } from "@sky/shared";
@@ -210,19 +211,19 @@ const ListAgentsInput = z.strictObject({
 const PreviewInput = z
   .strictObject({
     agentId: AgentId,
-    cmd: nonEmpty
+    cmd: PreviewStart.shape.cmd
       .optional()
       .describe(
         "The shell command that starts the app's dev server, run from the agent's worktree, for example `pnpm dev --host`. It must listen on port (it is also given $PORT) and on all interfaces; `--host` for Vite. Needs port.",
       ),
-    port: PreviewPort.optional().describe(
-      "The port the dev server listens on: 1024 to 65535, and not 8080, which the preview's own proxy holds. Needs cmd.",
-    ),
-    ttlSeconds: z
-      .number()
-      .int()
-      .min(PREVIEW_MIN_TTL_SECONDS)
-      .max(PREVIEW_MAX_TTL_SECONDS)
+    port: PreviewStart.shape.port
+      .optional()
+      .describe(
+        `The port the dev server listens on: 1024 to 65535, and not ${PREVIEW_PROXY_PORT}, which the preview's own proxy holds. Needs cmd.`,
+      ),
+    // unwrap() drops the default: the API applies it to an omitted TTL
+    ttlSeconds: PreviewStart.shape.ttlSeconds
+      .unwrap()
       .optional()
       .describe(
         `How long the link works, ${PREVIEW_MIN_TTL_SECONDS} to ${PREVIEW_MAX_TTL_SECONDS} seconds; ${PREVIEW_DEFAULT_TTL_SECONDS} (24 hours) when omitted. Goes with cmd and port.`,
@@ -440,6 +441,11 @@ function buildServer(call: Call) {
       description:
         "Preview an agent's branch in a browser. With cmd and port: starts the app's dev server from the agent's worktree on its environment's sprite (with the environment's secrets) and returns { preview: { link, expiresAt, replaced, … } }. Give the link to a person; opening it in any browser, with no login, shows the app at its root path with hot reload, and the link is shown only in this answer. An environment has one preview: starting one replaces the environment's running preview, and replaced names the agent whose it was (null when none). The preview outlives the agent's runs, so a followup's edits reach it; it ends at the TTL, with stop: true, when the agent is archived or the environment is deleted. With stop: true: ends it. With neither: returns the agent's preview state (port, expiresAt, and the status of its app and proxy services; preview is null when none runs), never the link. The preview uses the sprite's memory like anything else running there. A runs key can preview only the agents it started.",
       inputSchema: PreviewInput,
+      annotations: {
+        destructiveHint: true,
+        idempotentHint: false,
+        readOnlyHint: false,
+      },
     },
     ({ agentId, cmd, port, ttlSeconds, stop }) => {
       const path = `/v1/agents/${agentId}/preview`;
