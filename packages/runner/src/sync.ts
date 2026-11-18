@@ -1112,6 +1112,7 @@ export async function branchCheckMain(
       connectorId,
       owner,
       repo,
+      progress: (line) => io.stderr(`${line}\n`),
     });
     const tip = await remoteTip(call, branch).catch((error: unknown) => {
       if (error instanceof BranchNotFoundError) return null;
@@ -1239,6 +1240,7 @@ export async function syncMain(
       connectorId,
       owner,
       repo,
+      progress: (line) => io.stderr(`${line}\n`),
     });
     // both halves write the shared repo, so they hold the lock together
     const { synced, own } = await withRepoLock(
@@ -1537,6 +1539,7 @@ async function prepareLocked(
       connectorId,
       owner,
       repo,
+      progress: (line) => deps.warn(`runner: ${line}`),
     });
     let synced: DefaultSync | undefined;
     if (overGit) {
