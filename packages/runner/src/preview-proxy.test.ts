@@ -191,7 +191,9 @@ test("a request target the WHATWG parser rejects gets the 404, and the proxy kee
 test("an absolute-form target gets the 404 even with the cookie, and never reaches the dev server", async () => {
   const app = await devServer();
   const { port } = await proxyTo(app.port);
-  expect((await get(port, "http://a:99999/", { cookie })).status).toBe(404);
+  // a valid absolute URL: MSW's interceptor parses the test's own outgoing request, and throws on an
+  // invalid one (a port past 65535) before it is sent
+  expect((await get(port, "http://a/", { cookie })).status).toBe(404);
   expect((await get(port, "/after", { cookie })).status).toBe(200);
   expect(app.seen.map((s) => s.url)).toEqual(["/after"]);
 });
@@ -291,13 +293,14 @@ test("a websocket upgrade without the cookie gets a 404 and never reaches the de
 test("a websocket upgrade to an odd target gets a 404, even with the cookie, and the proxy keeps serving", async () => {
   const app = await devServer();
   const { port } = await proxyTo(app.port);
-  for (const target of ["//a:99999/", "http://a:99999/"]) {
+  // `//a:99999/` is a path to the dev server, as the HTTP route treats it; absolute-form is never forwarded
+  for (const target of ["http://a/"]) {
     expect((await upgrade(port, "", target)).head).toBe(
       "HTTP/1.1 404 Not Found",
     );
-    expect(
-      (await upgrade(port, `Cookie: ${cookie}\r\n`, target)).head,
-    ).toBe("HTTP/1.1 404 Not Found");
+    expect((await upgrade(port, `Cookie: ${cookie}\r\n`, target)).head).toBe(
+      "HTTP/1.1 404 Not Found",
+    );
   }
   expect(app.seen).toEqual([]);
   expect((await upgrade(port, `Cookie: ${cookie}\r\n`)).echoed).toBe(

@@ -129,23 +129,74 @@ test("--stop ends the preview", async () => {
   expect(sent).toEqual([{ method: "DELETE", body: undefined }]);
 });
 
-test("--stop with nothing running is the API's error, exit 1", async () => {
+test("--stop with nothing running exits 0 and says so, so a retried stop or a cleanup trap doesn't fail", async () => {
   server.use(
     http.delete(`${apiUrl}/v1/agents/agt_1/preview`, () =>
-      HttpResponse.json(
-        {
-          error: {
-            code: "no_preview",
-            message: "the agent has no running preview",
-          },
-        },
-        { status: 404 },
-      ),
+      HttpResponse.json({ preview: null, stopped: null }),
     ),
   );
   const r = await runCli(["agent", "preview", "agt_1", "--stop"]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("agt_1 had no running preview\n");
+  expect(r.stderr).toBe("");
+  const json = await runCli(["agent", "preview", "agt_1", "--stop", "--json"]);
+  expect(json.code).toBe(0);
+  expect(JSON.parse(json.stdout)).toEqual({ preview: null, stopped: null });
+});
+
+test("a command that dies at start prints the API's 422 with its output and exits 1", async () => {
+  server.use(
+    http.post(`${apiUrl}/v1/agents/agt_1/preview`, () =>
+      HttpResponse.json(
+        {
+          error: {
+            code: "preview_failed",
+            message:
+              "sky-preview-app exited 1 within 2s of starting: sh: pnpm: not found",
+          },
+        },
+        { status: 422 },
+      ),
+    ),
+  );
+  const r = await runCli([
+    "agent",
+    "preview",
+    "agt_1",
+    "--cmd=pnpm dev",
+    "--port=5173",
+  ]);
   expect(r.code).toBe(1);
-  expect(r.stderr).toContain("the agent has no running preview (no_preview)");
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toContain(
+    "exited 1 within 2s of starting: sh: pnpm: not found",
+  );
+  expect(r.stderr).toContain("(preview_failed)");
+});
+
+test("a start refused because another key's preview runs exits 1 with preview_busy", async () => {
+  server.use(
+    http.post(`${apiUrl}/v1/agents/agt_1/preview`, () =>
+      HttpResponse.json(
+        {
+          error: {
+            code: "preview_busy",
+            message: "a preview started by another key is running",
+          },
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  const r = await runCli([
+    "agent",
+    "preview",
+    "agt_1",
+    "--cmd=pnpm dev",
+    "--port=5173",
+  ]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("(preview_busy)");
 });
 
 test("with no flags it prints the port, expiry and how the two services are doing", async () => {

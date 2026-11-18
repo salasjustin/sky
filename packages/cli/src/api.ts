@@ -265,8 +265,17 @@ export function createApi(config: Config) {
       return { raw: json, preview };
     },
     async stopPreview(agentId: string) {
-      const { json } = await request("DELETE", agentPath(agentId, "preview"));
-      return json;
+      const { status, json } = await request(
+        "DELETE",
+        agentPath(agentId, "preview"),
+      );
+      const { stopped } = parseKey(
+        z.object({ stopped: z.looseObject({}).nullable() }),
+        status,
+        json,
+        "a preview",
+      );
+      return { raw: json, stopped: stopped !== null };
     },
     async getPreview(agentId: string) {
       const { status, json } = await request(

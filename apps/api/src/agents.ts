@@ -779,6 +779,15 @@ export function agentRoutes(
                 ? `something on the environment's sprite already holds port ${PREVIEW_PROXY_PORT}, which a sprite's URL is routed to; the preview would break it, so nothing was started`
                 : `port ${result.port} is already in use on the environment's sprite; start the preview on another port`,
             );
+          case "preview_busy":
+            return apiError(
+              c,
+              409,
+              "preview_busy",
+              "a preview started by another key is running in this environment, and one environment has one preview; it must stop or expire before this agent's can start",
+            );
+          case "command_failed":
+            return apiError(c, 422, "preview_failed", result.detail);
           case "failed":
             return apiError(c, 502, "preview_failed", result.detail);
         }
@@ -799,14 +808,10 @@ export function agentRoutes(
           "could not stop the preview on the environment's sprite; retry",
         );
       }
-      if (!stopped) {
-        return apiError(
-          c,
-          404,
-          "no_preview",
-          "the agent has no running preview",
-        );
+      if (stopped === undefined) {
+        return apiError(c, 404, "not_found", "no such agent");
       }
+      // nothing running is a stop that has nothing to do, so a retried stop or a cleanup trap succeeds
       return c.json({ preview: null, stopped }, 200);
     })
     .get("/:id/preview", agentParam, async (c) => {

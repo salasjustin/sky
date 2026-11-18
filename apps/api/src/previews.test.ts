@@ -40,6 +40,7 @@ import type { Config } from "./config.js";
 import { envSecretAad, seal } from "./crypto.js";
 import { sweepExpiredPreviews } from "./previews.js";
 import { RUNNER } from "./provision.js";
+import { KnownSecrets } from "./redact.js";
 import { spriteNameFor } from "./sprites.js";
 import {
   type ServiceRecord,
@@ -424,7 +425,11 @@ test("a second preview in the environment replaces the first and names the agent
   expect(authOf(envId)).toEqual({ auth: "public" });
   // the first agent has none now
   expect(await (await state(first)).json()).toEqual({ preview: null });
-  expect((await stop(first)).status).toBe(404);
+  const stopFirst = await stop(first);
+  expect(stopFirst.status).toBe(200);
+  expect(await stopFirst.json()).toEqual({ preview: null, stopped: null });
+  // and stopping it did not touch the second's
+  expect(servicesOf(envId).size).toBe(2);
 });
 
 test("restarting an agent's own preview replaces it without naming anyone", async () => {
@@ -464,13 +469,27 @@ test("stopping removes both services, sets the URL back to sprite auth and ends 
   expect(authOf(envId)).toEqual({ auth: "sprite" });
   expect(db.select().from(previews).all()).toEqual([]);
   expect(await (await state(agentId)).json()).toEqual({ preview: null });
-  // nothing left to stop
-  const again = await stop(agentId);
-  expect(again.status).toBe(404);
-  expect(await again.json()).toMatchObject({ error: { code: "no_preview" } });
 });
 
-test("the URL goes private before the services go, so it is public no longer than it must be", async () => {
+test("stopping with no preview running succeeds, changes nothing and says so", async () => {
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  const res = await stop(agentId);
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ preview: null, stopped: null });
+  // a retried stop after a real one is the same
+  await started(agentId);
+  expect((await stop(agentId)).status).toBe(200);
+  wire.calls.length = 0;
+  const again = await stop(agentId);
+  expect(again.status).toBe(200);
+  expect(await again.json()).toEqual({ preview: null, stopped: null });
+  expect(wire.calls).toEqual([]);
+  // an agent that doesn't exist is still a 404
+  expect((await stop("agt_nope")).status).toBe(404);
+});
+
+test("the URL goes private before the services go, and the dev server goes before the proxy it needs", async () => {
   const envId = readyEnv();
   const agentId = seedAgent(envId);
   await started(agentId);
@@ -478,8 +497,8 @@ test("the URL goes private before the services go, so it is public no longer tha
   await stop(agentId);
   expect(wire.calls).toEqual([
     `label ${sprite(envId)}`,
-    `service-delete ${sprite(envId)} ${PREVIEW_PROXY_SERVICE}`,
     `service-delete ${sprite(envId)} ${PREVIEW_APP_SERVICE}`,
+    `service-delete ${sprite(envId)} ${PREVIEW_PROXY_SERVICE}`,
   ]);
   expect(wire.updates.get(sprite(envId))).toEqual({
     url_settings: { auth: "sprite" },
@@ -517,7 +536,7 @@ test("an expired preview is ended by the sweep: services removed, URL private, t
   const ops = {
     client: new SpritesClient(spritesToken),
     log: (line: string) => logs.push(line),
-    secrets: new (await import("./redact.js")).KnownSecrets(),
+    secrets: new KnownSecrets(),
     timeoutMs: 5_000,
     longTimeoutMs: 5_000,
   };
@@ -660,6 +679,68 @@ test("a runs key can't preview, read or stop an agent outside its own", async ()
   expect(ok.preview.agentId).toBe(mine);
   expect((await state(mine, key.secret)).status).toBe(200);
   expect((await stop(mine, key.secret)).status).toBe(200);
+});
+
+test("a runs key can't replace a preview another key started, and the refusal names no agent", async () => {
+  const envId = readyEnv();
+  const first = await mintKey([envId]);
+  const second = await mintKey([envId]);
+  const a = seedAgent(envId, { ownerKeyId: first.id });
+  const b = seedAgent(envId, { ownerKeyId: second.id });
+  const { preview } = await started(a, undefined, first.secret);
+  wire.calls.length = 0;
+
+  const res = await start(b, undefined, second.secret);
+  expect(res.status).toBe(409);
+  const body = (await res.json()) as {
+    error: { code: string; message: string };
+  };
+  expect(body.error.code).toBe("preview_busy");
+  expect(JSON.stringify(body)).not.toContain(a);
+  // nothing reached the sprite, and the first key's preview is exactly as it was
+  expect(wire.calls).toEqual([]);
+  expect(servicesOf(envId).size).toBe(2);
+  expect(authOf(envId)).toEqual({ auth: "public" });
+  expect(db.select().from(previews).get()).toMatchObject({
+    agentId: a,
+    tokenHash: sha256(tokenOf(preview.link)),
+  });
+});
+
+test("a preview the admin key started is not replaceable by a runs key either", async () => {
+  const envId = readyEnv();
+  const key = await mintKey([envId]);
+  const theirs = seedAgent(envId);
+  const mine = seedAgent(envId, { ownerKeyId: key.id });
+  await started(theirs);
+  const res = await start(mine, undefined, key.secret);
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({ error: { code: "preview_busy" } });
+  expect(db.select().from(previews).get()?.agentId).toBe(theirs);
+});
+
+test("the admin key replaces any key's preview and the answer names the agent replaced", async () => {
+  const envId = readyEnv();
+  const key = await mintKey([envId]);
+  const a = seedAgent(envId, { ownerKeyId: key.id });
+  const b = seedAgent(envId);
+  await started(a, undefined, key.secret);
+  const two = await started(b);
+  expect(two.preview.replaced).toBe(a);
+  expect(db.select().from(previews).get()?.agentId).toBe(b);
+});
+
+test("a runs key replaces its own preview, on the same agent or another of its own", async () => {
+  const envId = readyEnv();
+  const key = await mintKey([envId]);
+  const a = seedAgent(envId, { ownerKeyId: key.id });
+  const b = seedAgent(envId, { ownerKeyId: key.id });
+  await started(a, undefined, key.secret);
+  const again = await started(a, undefined, key.secret);
+  expect(again.preview.replaced).toBeNull();
+  const other = await started(b, undefined, key.secret);
+  expect(other.preview.replaced).toBe(a);
+  expect(db.select().from(previews).get()?.agentId).toBe(b);
 });
 
 test("an agent that doesn't exist, or is archived, can't be previewed", async () => {
@@ -824,7 +905,8 @@ test("a dev server that dies at start fails the start with its output, redacted,
         ]
       : [{ type: "complete", timestamp: 1 }];
   const res = await start(agentId);
-  expect(res.status).toBe(502);
+  // the user's own command dying is a refusal of the start, not a sprite failure
+  expect(res.status).toBe(422);
   const { error } = (await res.json()) as {
     error: { code: string; message: string };
   };
@@ -866,12 +948,108 @@ test("a dev server's failure output keeps the port and the profile's switches; o
         ]
       : [{ type: "complete", timestamp: 1 }];
   const res = await start(agentId, { cmd: "pnpm dev", port: 5173 });
-  expect(res.status).toBe(502);
+  expect(res.status).toBe(422);
   const { error } = (await res.json()) as { error: { message: string } };
   expect(error.message).toContain(
     "attempt 1: listen EADDRINUSE :::5173 (key [redacted])",
   );
   expect(error.message).not.toContain("stripe-value-9f8e7d");
+});
+
+test.each([
+  [
+    "the proxy exits",
+    (_: string, service: string) =>
+      service === PREVIEW_PROXY_SERVICE
+        ? [{ type: "exit", exit_code: 1, timestamp: 1 }]
+        : [{ type: "complete", timestamp: 1 }],
+  ],
+  [
+    "the sprite can't spawn the dev server",
+    (_: string, service: string) =>
+      service === PREVIEW_APP_SERVICE
+        ? [{ type: "error", data: "spawn failed", timestamp: 1 }]
+        : [{ type: "complete", timestamp: 1 }],
+  ],
+])(
+  "a start that fails because %s is the sprite's failure, 502, not the user's 422",
+  async (_, events) => {
+    const envId = readyEnv();
+    const agentId = seedAgent(envId);
+    wire.serviceEvents = events;
+    const res = await start(agentId);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({
+      error: { code: "preview_failed" },
+    });
+    expect(servicesOf(envId).size).toBe(0);
+    expect(authOf(envId)).toEqual({ auth: "sprite" });
+  },
+);
+
+test("a start writes its row with minutes to live and extends it to the TTL only once it has succeeded", async () => {
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  // what the row holds while the start is under way: read when the dev server's service is created
+  const during: string[] = [];
+  wire.serviceEvents = (_, service) => {
+    if (service === PREVIEW_APP_SERVICE) {
+      during.push(db.select().from(previews).get()?.expiresAt ?? "none");
+    }
+    return [{ type: "complete", timestamp: 1 }];
+  };
+  const before = Date.now();
+  const { preview } = await started(agentId, {
+    cmd: "pnpm dev",
+    port: 5173,
+    ttlSeconds: 7 * 24 * 3600,
+  });
+  const mid = Date.parse(during[0] ?? "");
+  expect(mid).toBeGreaterThan(before);
+  expect(mid).toBeLessThanOrEqual(Date.now() + 5 * 60_000);
+  // then the full TTL, in the row and in the answer
+  expect(db.select().from(previews).get()?.expiresAt).toBe(preview.expiresAt);
+  expect(Date.parse(preview.expiresAt)).toBeGreaterThan(
+    before + 6.9 * 24 * 3600_000,
+  );
+});
+
+test("a start that dies and can't clean up leaves a row the sweep ends within minutes, not days", async () => {
+  const envId = readyEnv();
+  const agentId = seedAgent(envId);
+  wire.serviceEvents = (_, service) =>
+    service === PREVIEW_APP_SERVICE
+      ? [{ type: "exit", exit_code: 1, timestamp: 1 }]
+      : [{ type: "complete", timestamp: 1 }];
+  // the cleanup's own calls fail too
+  wire.serviceDeleteStatus = 503;
+  const before = Date.now();
+  const res = await start(agentId, {
+    cmd: "pnpm dev",
+    port: 5173,
+    ttlSeconds: 7 * 24 * 3600,
+  });
+  expect(res.status).toBe(422);
+  const [row] = db.select().from(previews).all();
+  expect(row).toBeDefined();
+  expect(Date.parse(row?.expiresAt ?? "")).toBeLessThanOrEqual(
+    Date.now() + 5 * 60_000,
+  );
+  expect(Date.parse(row?.expiresAt ?? "")).toBeGreaterThan(before);
+
+  wire.serviceDeleteStatus = 204;
+  const ops = {
+    client: new SpritesClient(spritesToken),
+    log: (line: string) => logs.push(line),
+    secrets: new KnownSecrets(),
+    timeoutMs: 5_000,
+    longTimeoutMs: 5_000,
+  };
+  const later = new Date(Date.now() + 6 * 60_000);
+  expect(await sweepExpiredPreviews(db, ops, ops.log, later)).toBe(1);
+  expect(db.select().from(previews).all()).toEqual([]);
+  expect(servicesOf(envId).size).toBe(0);
+  expect(authOf(envId)).toEqual({ auth: "sprite" });
 });
 
 test("a sprite that refuses the service fails the start and the URL never went public", async () => {

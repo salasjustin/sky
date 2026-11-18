@@ -1129,6 +1129,9 @@ test("preview is listed with what the link gives and the one-per-environment rul
   const tool = tools.find((t) => t.name === "preview");
 
   expect(tool?.description).toMatch(/only in this answer/);
+  expect(tool?.description).toMatch(/422 preview_failed/);
+  expect(tool?.description).toMatch(/409 preview_busy, naming no agent/);
+  expect(tool?.description).toMatch(/answers preview: null when none runs/);
   expect(tool?.description).toMatch(/one preview/);
   expect(tool?.description).toMatch(
     /runs key can preview only the agents it started/,

@@ -143,9 +143,11 @@ const help = (io: Io) => `Usage:
       the link in a browser sees the app at its root path, hot reload
       included; no Sky or Fly login is needed. The link works until --ttl
       (a duration such as 90m, 24h or 7d; 24h by default, 7d at most) or
-      --stop, which ends the preview. An environment has one preview: one
-      started on another agent replaces the running one, which a note on
-      stderr names. The preview outlives the agent's runs. It ends when the
+      --stop, which ends the preview (exit 0 when none is running). A
+      command that exits as it starts fails the start with its output
+      (exit 1). An environment has one preview: one started on another
+      agent replaces the running one, which a note on stderr names; a runs
+      key can't replace a preview another key started (preview_busy). The preview outlives the agent's runs. It ends when the
       agent is archived or the environment is deleted. It uses the
       sandbox's memory like anything else running there. Without flags, it
       prints "<port> <expires> <app> <proxy>": the port, the expiry (UTC)
@@ -189,7 +191,7 @@ Options:
                          {"data": [keys]}, never a secret; agent list: the
                          page {"data": [agents], "nextCursor"?: …};
                          agent preview: {"preview": {…, "link"}}, or
-                         {"preview": null, "stopped": {…}} for --stop;
+                         {"preview": null, "stopped": {…}|null} for --stop;
                          key revoke: {"id": …, "revoked": true})
   -h, --help             show this help
   -v, --version          print the version (on its own: sky --version)

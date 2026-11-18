@@ -209,7 +209,14 @@ function previewAction(ref: string | undefined, values: Values): Action {
       );
     }
     return async (api, _io, out) => {
-      out.result(await api.stopPreview(ref), `stopped the preview of ${ref}`);
+      const { raw, stopped } = await api.stopPreview(ref);
+      // exit 0 either way, so a retried stop or a cleanup trap doesn't fail
+      out.result(
+        raw,
+        stopped
+          ? `stopped the preview of ${ref}`
+          : `${ref} had no running preview`,
+      );
       return 0;
     };
   }

@@ -32,6 +32,8 @@ import { execInSprite, type SpriteOps, spriteCall } from "./sprites.js";
 // fails the start, with its last output
 const WATCH = "2s";
 const OUTPUT_TAIL = 1500;
+// how long a start's row lives before the start has succeeded and extends it to the TTL
+const START_GRACE_MS = 5 * 60_000;
 
 // exits 10 when something listens on port $1: the kernel's table of listening TCP sockets (state 0A), v4 and v6
 const PORT_HELD = `hex=$(printf '%04X' "$1"); cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v p=":$hex" '$4 == "0A" && toupper($2) ~ p "$" { held = 1 } END { exit (held ? 10 : 0) }'`;
@@ -84,7 +86,7 @@ function serialized<T>(
 
 /**
  * Ends a preview: the sprite's URL goes private first, so nothing is public a moment longer than it must
- * be, then both services go, then the token's row, which is what makes the token dead to Sky. A sprite or
+ * be, then both services go (the dev server before the proxy it needs), then the token's row, which is what makes the token dead to Sky. A sprite or
  * service already gone counts as removed; anything else throws and leaves the row, so a retry finishes it.
  */
 async function endPreview(
@@ -98,7 +100,8 @@ async function endPreview(
   ).catch((err: unknown) => {
     if (!isGone(err)) throw err;
   });
-  for (const service of [PREVIEW_PROXY_SERVICE, PREVIEW_APP_SERVICE]) {
+  // the dev server first: it was created needing the proxy, which then outlives it
+  for (const service of [PREVIEW_APP_SERVICE, PREVIEW_PROXY_SERVICE]) {
     await spriteCall(sprites, name, { op: "service-delete" }, () =>
       sprites.client.sprite(name).deleteService(service),
     ).catch((err: unknown) => {
@@ -121,6 +124,10 @@ export type StartResult =
   | { kind: "not_ready" }
   | { kind: "no_worktree" }
   | { kind: "port_busy"; port: number }
+  /** Another principal's preview runs in the environment, and this one may not replace it. */
+  | { kind: "preview_busy" }
+  /** The user's own command exited as it started; `detail` is its redacted output. */
+  | { kind: "command_failed"; detail: string }
   | { kind: "failed"; detail: string }
   | {
       kind: "started";
@@ -152,6 +159,9 @@ type Deps = {
   ensureBundle: BundleInstaller;
   log: (line: string) => void;
 };
+
+/** The user's command exited as it started: the start's refusal, not a failure of the sprite. */
+class CommandFailed extends Error {}
 
 /** The services' own words for how one did, for a start that must say why it failed. */
 function failureOf(
@@ -218,7 +228,13 @@ export function createPreviews({
       },
     );
     const failure = failureOf(service, events, known);
-    if (failure) throw new Error(failure);
+    if (!failure) return;
+    // only the dev server's own exit is the user's command; a proxy that dies, or a service the sprite
+    // can't spawn, is the sprite's
+    const exited = events.some((e) => e.type === "exit");
+    throw service === PREVIEW_APP_SERVICE && exited
+      ? new CommandFailed(failure)
+      : new Error(failure);
   }
 
   /**
@@ -243,6 +259,17 @@ export function createPreviews({
       },
       secretValues: [...secrets.values()],
     };
+  }
+
+  /** Whether `principal` may end the preview of `agentId`: the admin key may, a `runs` key only one on an agent it started. */
+  function mayReplace(principal: Principal, agentId: AgentId): boolean {
+    if (principal.role === "admin") return true;
+    const owner = db
+      .select({ ownerKeyId: agents.ownerKeyId })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .get()?.ownerKeyId;
+    return owner === principal.keyId;
   }
 
   /** `port_busy` or `failed` when the port check refuses `port`; `undefined` when nothing listens on it. */
@@ -282,6 +309,13 @@ export function createPreviews({
       if (found.envStatus !== "ready") return { kind: "not_ready" };
       const { agent, spriteName } = found;
       return serialized(agent.envId, async (): Promise<StartResult> => {
+        const current = runningOf(db)
+          .where(eq(previews.envId, agent.envId))
+          .get();
+        // a key replaces its own previews and the admin key anyone's; before anything reaches the sprite
+        if (current && !mayReplace(principal, current.agentId)) {
+          return { kind: "preview_busy" };
+        }
         const worktree = `${WORKTREES_DIR}/${agentId}`;
         const there = await execInSprite(
           sprites,
@@ -290,9 +324,6 @@ export function createPreviews({
           { op: "preview-worktree", cwd: REPO_DIR },
         );
         if (there.exitCode !== 0) return { kind: "no_worktree" };
-        const current = runningOf(db)
-          .where(eq(previews.envId, agent.envId))
-          .get();
         // every refusal that doesn't hinge on the running preview's own services comes before it is ended
         const url = (
           await spriteCall(sprites, spriteName, { op: "get-url" }, () =>
@@ -326,7 +357,8 @@ export function createPreviews({
         const expiresAt = new Date(
           Date.now() + input.ttlSeconds * 1000,
         ).toISOString();
-        // the row first: a start that dies midway leaves one for the sweep and a retry to clean up
+        // the row first, and with only minutes to live until the start succeeds: a start that dies midway,
+        // and then can't clean up after itself, leaves a row the sweep ends soon rather than at the full TTL
         const row = db
           .insert(previews)
           .values({
@@ -335,7 +367,9 @@ export function createPreviews({
             port: input.port,
             cmd: input.cmd,
             tokenHash,
-            expiresAt,
+            expiresAt: new Date(
+              Math.min(Date.parse(expiresAt), Date.now() + START_GRACE_MS),
+            ).toISOString(),
           })
           .returning()
           .get();
@@ -399,12 +433,26 @@ export function createPreviews({
           }).catch((endErr: unknown) => {
             log(`ending the failed preview of ${agentId} failed: ${endErr}`);
           });
-          return { kind: "failed", detail: cut(detail, 2000) };
+          return {
+            kind: err instanceof CommandFailed ? "command_failed" : "failed",
+            detail: cut(detail, 2000),
+          };
         }
+        const live = db
+          .update(previews)
+          .set({ expiresAt })
+          .where(
+            and(
+              eq(previews.envId, agent.envId),
+              eq(previews.tokenHash, tokenHash),
+            ),
+          )
+          .returning()
+          .get();
         return {
           kind: "started",
           preview: {
-            ...present(row),
+            ...present(live ?? row),
             link: `${url.replace(/\/+$/, "")}${PREVIEW_LINK_PATH}?t=${token}`,
             replaced:
               current && current.agentId !== agentId ? current.agentId : null,
@@ -413,11 +461,11 @@ export function createPreviews({
       });
     },
 
-    /** Ends the agent's preview; `undefined` when it has none, or `principal` may not act on the agent. */
+    /** Ends the agent's preview and returns it; `null` when it had none, `undefined` when `principal` may not act on the agent. */
     async stop(
       agentId: AgentId,
       principal: Principal,
-    ): Promise<PresentedPreview | undefined> {
+    ): Promise<PresentedPreview | null | undefined> {
       const found = find(agentId, principal);
       if (!found) return undefined;
       return serialized(found.agent.envId, async () => {
@@ -431,7 +479,7 @@ export function createPreviews({
             ),
           )
           .get();
-        if (!row) return undefined;
+        if (!row) return null;
         await endPreview(db, sprites, { ...row, spriteName: found.spriteName });
         return present(row);
       });
