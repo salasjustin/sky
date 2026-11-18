@@ -265,7 +265,7 @@ test("state is the run status, a waiting run split by the kind of its open reque
     [one("running")]: "running",
     [one("waiting", { kind: "approval" })]: "waiting_approval",
     [one("waiting", { kind: "question" })]: "waiting_answer",
-    // its request decided and the runner not yet back: nothing is being waited on
+    // seeded directly, since deciding a request also moves its run to running: the fallback state
     [one("waiting", { kind: "question", decided: true })]: "running",
     [one("finished")]: "finished",
     [one("failed")]: "failed",
