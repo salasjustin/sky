@@ -1085,15 +1085,18 @@ test.each([
   ["409 port_busy", /another port/],
   ["502 sprite_unreachable", /start again/],
   ["502 preview_stop_failed", /start again/],
-])("preview's description names the start's %s refusal and what to do", async (refusal, action) => {
-  const client = await connect();
+])(
+  "preview's description names the start's %s refusal and what to do",
+  async (refusal, action) => {
+    const client = await connect();
 
-  const { tools } = await client.listTools();
-  const description = tools.find((t) => t.name === "preview")?.description;
+    const { tools } = await client.listTools();
+    const description = tools.find((t) => t.name === "preview")?.description;
 
-  const clause = description?.split(refusal)[1]?.split(";")[0];
-  expect(clause).toMatch(action);
-});
+    const clause = description?.split(refusal)[1]?.split(";")[0];
+    expect(clause).toMatch(action);
+  },
+);
 
 test("preview passes ttlSeconds along", async () => {
   const seen = route("post", "/v1/agents/agt_1/preview", 200, { preview: {} });

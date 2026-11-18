@@ -1173,9 +1173,9 @@ function watchStateWrites() {
   `);
   return () =>
     (
-      db.$client
-        .prepare("SELECT state FROM state_writes ORDER BY n")
-        .all() as { state: string }[]
+      db.$client.prepare("SELECT state FROM state_writes ORDER BY n").all() as {
+        state: string;
+      }[]
     ).map((row) => row.state);
 }
 const appCreateOf = (envId: string) =>

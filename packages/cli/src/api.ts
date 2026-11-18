@@ -293,7 +293,10 @@ export function createApi(config: Config) {
       let status: number;
       let json: unknown;
       try {
-        ({ status, json } = await request("GET", agentPath(agentId, "preview")));
+        ({ status, json } = await request(
+          "GET",
+          agentPath(agentId, "preview"),
+        ));
       } catch (err) {
         // an older API answers a failed preview with 422/502 `preview_failed`, the preview beside the error
         if (!(err instanceof ApiError) || err.code !== "preview_failed") {
