@@ -2,7 +2,7 @@ import { z } from "zod";
 import { AgentId, EnvironmentId, EventId, RequestId, RunId } from "./ids.js";
 import { Usage } from "./run.js";
 
-/** Most of an approval's full tool input a runner sends, and the API stores before the truncation marker: 64 KiB. */
+/** Most of an approval's full tool input the API stores, before the truncation marker: 64 KiB. */
 export const TOOL_INPUT_MAX = 65_536;
 
 /**

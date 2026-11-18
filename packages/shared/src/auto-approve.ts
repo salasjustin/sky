@@ -47,7 +47,7 @@ export const DEFAULT_AUTO_APPROVE_COMMANDS: readonly string[] = [
   "biome check",
   "biome lint",
   "biome format",
-  // writes inside the worktree or the run's scratch directory, as the Edit and Write tools make
+  // writes inside the worktree or the run's scratch directory, the kind the Edit and Write tools make
   "git add",
   "git commit",
   "git restore",
