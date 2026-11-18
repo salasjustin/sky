@@ -171,14 +171,15 @@ const stateOf = (p: AgentPage) =>
 
 test("each agent lists with its env, branch and latest run, newest activity first", async () => {
   const env = readyEnv("trail");
+  // created after busy but idle since: only ordering by activity puts busy first
   const quiet = seed(env, {
-    createdAt: 1,
+    createdAt: 5,
     runs: [
       {
         status: "finished",
-        createdAt: 2,
+        createdAt: 6,
         events: [
-          { type: "run.started", at: 3 },
+          { type: "run.started", at: 7 },
           { type: "run.finished", at: 9 },
         ],
       },
@@ -236,7 +237,7 @@ test("each agent lists with its env, branch and latest run, newest activity firs
     id: quiet.runIds[0],
     status: "finished",
     state: "finished",
-    createdAt: at(2),
+    createdAt: at(6),
     lastEventAt: at(9),
     endedAt: at(9),
     openRequests: 0,
@@ -398,6 +399,120 @@ test("a cursor pages through every agent exactly once, ties on activity included
   expect(new Set(seen)).toEqual(new Set(seeded));
   // the same order as one page
   expect(seen).toEqual(ids(await page()));
+});
+
+test("the latest run is the newest by creation, not by insert order, and a tie goes to the later insert", async () => {
+  const env = readyEnv("trail");
+  // inserted second but created earlier: the first-inserted run is the latest
+  const backfilled = seed(env, {
+    runs: [
+      { status: "finished", createdAt: 10 },
+      { status: "failed", createdAt: 5 },
+    ],
+  });
+  const tied = seed(env, {
+    runs: [
+      { status: "finished", createdAt: 7 },
+      { status: "failed", createdAt: 7 },
+    ],
+  });
+
+  const listed = Object.fromEntries(
+    (await page()).data.map((a) => [a.id, a.run?.id]),
+  );
+  expect(listed[backfilled.id]).toBe(backfilled.runIds[0]);
+  expect(listed[tied.id]).toBe(tied.runIds[1]);
+
+  // the run history orders them the same way
+  for (const a of [backfilled, tied]) {
+    const res = await app.request(`/v1/agents/${a.id}/runs`, {
+      headers: { Authorization: `Bearer ${admin}` },
+    });
+    expect(res.status).toBe(200);
+    const { data } = (await res.json()) as { data: { id: RunId }[] };
+    expect(data[0]?.id).toBe(listed[a.id]);
+  }
+});
+
+test("endedAt is the terminal event's time even when a later event follows it", async () => {
+  const env = readyEnv("trail");
+  const finished = seed(env, {
+    runs: [
+      {
+        status: "finished",
+        createdAt: 1,
+        events: [
+          { type: "run.started", at: 2 },
+          { type: "run.finished", at: 9 },
+          { type: "runner.warning", at: 12 },
+        ],
+      },
+    ],
+  });
+  const stopped = seed(env, {
+    runs: [
+      {
+        status: "stopped",
+        createdAt: 1,
+        events: [
+          { type: "run.started", at: 2 },
+          { type: "run.stopped", at: 8 },
+          { type: "runner.warning", at: 11 },
+        ],
+      },
+    ],
+  });
+  const runOf = Object.fromEntries(
+    (await page()).data.map((a) => [a.id, a.run]),
+  );
+  expect(runOf[finished.id]).toMatchObject({
+    lastEventAt: at(12),
+    endedAt: at(9),
+  });
+  expect(runOf[stopped.id]).toMatchObject({
+    lastEventAt: at(11),
+    endedAt: at(8),
+  });
+});
+
+test("a cursor carries the activity time of runs' events, paging in activity order with ties split across pages", async () => {
+  const env = readyEnv("trail");
+  // every agent is created at the same time; only run events set the order
+  const active = (activityAt: number) =>
+    seed(env, {
+      runs: [
+        {
+          status: "running",
+          createdAt: 1,
+          events: [{ type: "run.started", at: activityAt }],
+        },
+      ],
+    }).id;
+  const newest = active(50);
+  const second = active(40);
+  const tiedA = active(30);
+  const tiedB = active(30);
+  const oldest = active(20);
+  // agents tied on activity list by id, descending
+  const [tiedFirst, tiedLast] = [tiedA, tiedB].sort().reverse() as [
+    AgentId,
+    AgentId,
+  ];
+  const expected = [newest, second, tiedFirst, tiedLast, oldest];
+
+  // limit 3 ends page one inside the tie
+  const pages: AgentId[][] = [];
+  let cursor: string | undefined;
+  do {
+    const p = await page(`?limit=3${cursor ? `&cursor=${cursor}` : ""}`);
+    pages.push(ids(p));
+    cursor = p.nextCursor;
+  } while (cursor && pages.length < 5);
+  expect(pages).toEqual([
+    [newest, second, tiedFirst],
+    [tiedLast, oldest],
+  ]);
+  expect(pages.flat()).toEqual(expected);
 });
 
 test("a page that ends exactly at the last agent has no cursor", async () => {
