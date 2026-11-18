@@ -11,7 +11,14 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { HttpResponse, http } from "msw";
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  expect,
+  onTestFinished,
+  test,
+  vi,
+} from "vitest";
 import { server } from "../../../test/msw.js";
 import {
   GatewayError,
@@ -2670,28 +2677,36 @@ const retryRun = (extra: Partial<Parameters<typeof publish>[0]> = {}) => {
   return { result, sleeps, lines };
 };
 
-const badGateway = () =>
-  HttpResponse.json({ message: "Bad Gateway" }, { status: 502 });
+const badGateway = (status = 502) =>
+  HttpResponse.json({ message: "Bad Gateway" }, { status });
 
-test.each([
-  ["POST", "/git/blobs"],
-  ["POST", "/git/trees"],
-  ["POST", "/git/commits"],
-  ["POST", "/git/refs"],
-] as const)(
-  "a 502 on %s %s is retried once and the publish succeeds, the retry in progress",
-  async (method, path) => {
+test.each(
+  [500, 502, 503, 504].flatMap((status) =>
+    (
+      [
+        ["POST", "/git/blobs"],
+        ["POST", "/git/trees"],
+        ["POST", "/git/commits"],
+        ["POST", "/git/refs"],
+      ] as const
+    ).map(([method, path]) => [status, method, path] as const),
+  ),
+)(
+  "a %s on %s %s is retried once and the publish succeeds, the retry in progress",
+  async (status, method, path) => {
     const gh = fakeGitHub();
     writeFileSync(join(work, "a.txt"), "first\n");
     commit("Add a");
-    server.use(http.post(`${REPO}${path}`, () => badGateway(), { once: true }));
+    server.use(
+      http.post(`${REPO}${path}`, () => badGateway(status), { once: true }),
+    );
 
     const { result, sleeps, lines } = retryRun();
 
     expect((await result).created).toBe(true);
     expect(sleeps).toEqual([1000]);
     expect(lines).toEqual([
-      `GitHub gateway: ${method} /repos/acme/widgets${path} answered 502; retrying in 1 s (retry 1/3)`,
+      `GitHub gateway: ${method} /repos/acme/widgets${path} answered ${status}; retrying in 1 s (retry 1/3)`,
     ]);
     expect(gh.refWrites).toHaveLength(1);
   },
@@ -2736,7 +2751,9 @@ test("a connection closed by the other side is retried", async () => {
   commit("Add a");
   const real = globalThis.fetch;
   let dropped = false;
-  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+  const fetchSpy = vi.spyOn(globalThis, "fetch");
+  onTestFinished(() => fetchSpy.mockRestore());
+  fetchSpy.mockImplementation(async (input, init) => {
     if (
       !dropped &&
       init?.method === "POST" &&
@@ -2864,6 +2881,67 @@ test("a ref that exists at another commit is still refused", async () => {
 
   await expect(result).rejects.toThrow("returned 422");
   expect(sleeps).toEqual([]);
+});
+
+test("a pull request refused with a 422 while none is open for the head fails with that 422", async () => {
+  fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  server.use(
+    http.post(`${REPO}/pulls`, () =>
+      HttpResponse.json({ message: "Validation Failed" }, { status: 422 }),
+    ),
+  );
+
+  const { result } = retryRun();
+
+  await expect(result).rejects.toThrow(
+    "GitHub gateway: POST /repos/acme/widgets/pulls returned 422: Validation Failed",
+  );
+});
+
+/** A fast-forward GitHub answers 502 after moving the ref to `landsAt`, then refuses the retry with 422. */
+const fastForwardLostAnswer = (landsAt: (sent: string) => string) => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Add b");
+  const gh = fakeGitHub({ ref: first });
+  let patches = 0;
+  server.use(
+    http.patch(`${REPO}/git/refs/heads/claude/agt_1`, async ({ request }) => {
+      const body = (await request.json()) as { sha: string };
+      if (++patches > 1) {
+        return HttpResponse.json(
+          { message: "Update is not a fast forward" },
+          { status: 422 },
+        );
+      }
+      gh.ref = landsAt(body.sha);
+      return badGateway();
+    }),
+  );
+  const { result } = retryRun();
+  return { result, patches: () => patches };
+};
+
+test("a fast-forward made but answered 502 is accepted on the retry's 422 when the ref holds the commit", async () => {
+  const { result, patches } = fastForwardLostAnswer((sent) => sent);
+
+  expect((await result).sha).toBe("commit1");
+  expect(patches()).toBe(2);
+});
+
+test("a fast-forward answered 502 with the ref elsewhere is still refused as not a fast-forward on the retry's 422", async () => {
+  const { result, patches } = fastForwardLostAnswer(() => "someone-else");
+
+  const error = await result.catch((e: unknown) => e);
+
+  expect(error).toBeInstanceOf(PublishError);
+  expect((error as Error).message).toContain(
+    "isn't an ancestor of this branch",
+  );
+  expect(patches()).toBe(2);
 });
 
 test.each([

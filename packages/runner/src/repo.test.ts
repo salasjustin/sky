@@ -1856,7 +1856,7 @@ test("a truncated tree fails the pull as too large, and leaves nothing behind", 
   expect(existsSync(join(root, "fresh"))).toBe(false);
 });
 
-test("an archive GitHub answers 500 for is named on one line, and every file is fetched by itself into an intact checkout", async () => {
+test("an archive GitHub answers 501 for is named on one line, and every file is fetched by itself into an intact checkout", async () => {
   fakeGitHub();
   server.use(
     http.get(`${REPO}/tarball/:ref`, () =>
