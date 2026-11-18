@@ -603,6 +603,16 @@ test("an approval's tool input is redacted, and cut at 64 KiB with the truncatio
   expect(pending.toolInput.length).toBeLessThanOrEqual(65_536 + 64);
 });
 
+test("a token on its own line of an approval's tool input is redacted", async () => {
+  const secret = `ghp_${"a1B2".repeat(9)}`;
+  await waitingOn({
+    ...approval(),
+    toolInput: JSON.stringify({ command: `x\n${secret}` }),
+  });
+  const pending = (await pendingOf()) as { toolInput: string };
+  expect(pending.toolInput).toBe(JSON.stringify({ command: "x\n[redacted]" }));
+});
+
 test("a tool input past 64 KiB is refused", async () => {
   runningRun();
   const res = await postEvent({

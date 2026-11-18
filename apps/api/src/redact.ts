@@ -6,14 +6,18 @@ const REDACTED = "[redacted]";
 // shorter values would shred ordinary text wherever they happen to occur
 const MIN_KNOWN_LENGTH = 8;
 
-// \b keeps words like "task-list" (which contains "sk-") out of the sk- match
+// a token starts after a non-word character, which keeps words like "task-list" (which contains "sk-")
+// out of the sk- match, or after a JSON escape such as `\n`: in JSON text, such as a tool's `input`, a
+// token at the start of a line follows `\n`, and `\b` sees no boundary between that `n` and the token
+const tokenStart = String.raw`(?:(?<![0-9A-Za-z_])|(?<=\\[nrt]))`;
+const token = (body: string) => new RegExp(tokenStart + body, "g");
 const tokenPatterns = [
-  /\bsk-ant-oat[0-9A-Za-z_-]+/g,
-  /\bsk-[0-9A-Za-z_-]{16,}/g,
-  /\bgh[pousr]_[0-9A-Za-z]{20,}/g,
-  /\bgithub_pat_[0-9A-Za-z_]{20,}/g,
-  /\bsky_[0-9A-Za-z_-]{20,}/g,
-  /\beyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+/g,
+  token(String.raw`sk-ant-oat[0-9A-Za-z_-]+`),
+  token(String.raw`sk-[0-9A-Za-z_-]{16,}`),
+  token(String.raw`gh[pousr]_[0-9A-Za-z]{20,}`),
+  token(String.raw`github_pat_[0-9A-Za-z_]{20,}`),
+  token(String.raw`sky_[0-9A-Za-z_-]{20,}`),
+  token(String.raw`eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+`),
 ];
 
 /** The exact secret values this process holds, which `redact` scrubs wherever they appear. */

@@ -61,6 +61,23 @@ test.each(credentials)(
   },
 );
 
+const tokenShaped = credentials.filter(([, token]) => !known.includes(token));
+
+test.each(tokenShaped)(
+  "scrubs %s at the start of a line in JSON text, after its escaped newline",
+  (_, token) => {
+    const toolInput = JSON.stringify({ command: `cat <<EOF\n${token}\nEOF` });
+    expect(redact(toolInput, known)).toBe(
+      JSON.stringify({ command: "cat <<EOF\n[redacted]\nEOF" }),
+    );
+  },
+);
+
+test("leaves a near-miss alone after an escaped newline in JSON text", () => {
+  const toolInput = JSON.stringify({ content: "- a\ntask-list\nsky_config" });
+  expect(redact(toolInput, known)).toBe(toolInput);
+});
+
 test.each([
   ["words containing sk-", "task-list and disk-usage-report"],
   ["an sk- prefix too short for a key", "sk-short123"],
