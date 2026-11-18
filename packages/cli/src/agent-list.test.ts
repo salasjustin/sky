@@ -40,7 +40,7 @@ beforeEach(() => {
   );
 });
 
-test("agent list prints one line per agent: id, env, state, run, last event, open requests, branch", async () => {
+test("agent list prints one line per agent: id, state, run, last event, open requests, branch, env", async () => {
   page = {
     data: [
       row(),
@@ -66,15 +66,31 @@ test("agent list prints one line per agent: id, env, state, run, last event, ope
   expect(r.code).toBe(0);
   expect(r.stdout).toBe(
     [
-      "agt_1 trail waiting_answer run_1 2026-01-01T00:05:00.000Z 1 claude/agt_1",
-      "agt_2 sky running run_2 2026-01-01T00:09:00.000Z 0 feature/login",
-      "agt_3 trail - - - 0 claude/agt_3",
+      "agt_1 waiting_answer run_1 2026-01-01T00:05:00.000Z 1 claude/agt_1 trail",
+      "agt_2 running run_2 2026-01-01T00:09:00.000Z 0 feature/login sky",
+      "agt_3 - - - 0 claude/agt_3 trail",
       "",
     ].join("\n"),
   );
   expect(r.stderr).toBe("");
   // no filter given, so none is sent
   expect(queries.map((q) => q.toString())).toEqual([""]);
+});
+
+test("an env name with a space comes last, so the fields before it keep their places", async () => {
+  page = { data: [row({ envName: "web staging" })] };
+  const r = await runCli(["agent", "list"]);
+  expect(r.code).toBe(0);
+  const fields = r.stdout.trim().split(" ");
+  expect(fields.slice(0, 6)).toEqual([
+    "agt_1",
+    "waiting_answer",
+    "run_1",
+    "2026-01-01T00:05:00.000Z",
+    "1",
+    "claude/agt_1",
+  ]);
+  expect(fields.slice(6).join(" ")).toBe("web staging");
 });
 
 test("--json prints the page the API returned", async () => {

@@ -139,17 +139,20 @@ function listQuery(values: Values): URLSearchParams {
   return query;
 }
 
-/** `-` stands for a field the agent has no value for yet, so a line always splits into seven. */
+/**
+ * `-` stands for a field the agent has no value for yet. The env name goes last because it may
+ * contain spaces, so the first six fields always split cleanly and the rest of the line is the name.
+ */
 function agentLine(a: ApiListedAgent): string {
   const { run } = a;
   return [
     a.id,
-    a.envName,
     run?.state ?? "-",
     run?.id ?? "-",
     run?.lastEventAt ?? "-",
     run?.openRequests ?? 0,
     a.remoteBranch ?? a.branch,
+    a.envName,
   ].join(" ");
 }
 

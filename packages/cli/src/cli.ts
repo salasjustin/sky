@@ -121,11 +121,12 @@ const help = (io: Io) => `Usage:
       for publish.
   sky agent list [--env=<id|name>,...] [--status=<state>,...] [--archived]
       [--limit=N] [--cursor=<c>] [options]
-      Print "<agent> <env> <state> <run> <last event> <open requests>
-      <branch>" per agent, newest activity first: the state, run and last
+      Print "<agent> <state> <run> <last event> <open requests> <branch>
+      <env>" per agent, newest activity first: the state, run and last
       event (UTC) of its latest run, the requests that run still has open,
       and the GitHub branch it works on (its own claude/ branch when it was
-      started without one). An agent with no run yet shows - in their place.
+      started without one), then the env name, last since it may contain
+      spaces. An agent with no run yet shows - in their place.
       --env and --status repeat or take a comma list. States: starting,
       running, waiting_approval, waiting_answer, finished, failed, stopped.
       Archived agents are left out unless --archived. --limit is at most
