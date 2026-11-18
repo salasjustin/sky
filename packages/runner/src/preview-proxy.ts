@@ -33,6 +33,9 @@ const NOT_FOUND = "<!doctype html><title>Not found</title><h1>Not found</h1>\n";
 const REFRESH_SECONDS = 3;
 // what a browser with the cookie sees while the app isn't listening yet: a page that reloads itself
 const BUILDING = `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="${REFRESH_SECONDS}"><title>Building preview…</title><h1>Building preview…</h1><p>This page refreshes by itself.</p>\n`;
+// what it sees once the app was up and stopped listening: it crashed or is restarting, not building
+const notAnswering = (port: number) =>
+  `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="${REFRESH_SECONDS}"><title>The app isn't answering</title><h1>The app isn't answering</h1><p>It was up, and nothing listens on port ${port} now: it crashed or is restarting. This page refreshes by itself.</p>\n`;
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest();
 
@@ -116,6 +119,17 @@ export function createPreviewProxy({
     res.end(NOT_FOUND);
   };
 
+  const page = (res: ServerResponse, status: number, html: string) => {
+    res.writeHead(status, {
+      "content-type": "text/html; charset=utf-8",
+      "content-length": Buffer.byteLength(html),
+      "retry-after": String(REFRESH_SECONDS),
+      "cache-control": "no-store",
+    });
+    res.end(html);
+  };
+
+  let appHasAnswered = false;
   const server = createServer((req, res) => {
     const url = originForm(req.url);
     if (url === null) return notFound(res);
@@ -145,6 +159,7 @@ export function createPreviewProxy({
         agent: false,
       },
       (answer) => {
+        appHasAnswered = true;
         res.writeHead(
           answer.statusCode ?? 502,
           answer.statusMessage,
@@ -156,17 +171,12 @@ export function createPreviewProxy({
     );
     upstream.on("error", (error: NodeJS.ErrnoException) => {
       if (res.headersSent) return res.destroy();
-      // nothing listens yet: the preview is still being built or started, which only a browser holding
-      // the cookie gets to hear
+      // nothing listens: before the app's first answer it is still being built or started; after, it died.
+      // Only a browser holding the cookie gets to hear either
       if (error.code === "ECONNREFUSED") {
-        res.writeHead(503, {
-          "content-type": "text/html; charset=utf-8",
-          "content-length": Buffer.byteLength(BUILDING),
-          "retry-after": String(REFRESH_SECONDS),
-          "cache-control": "no-store",
-        });
-        res.end(BUILDING);
-        return;
+        return appHasAnswered
+          ? page(res, 502, notAnswering(upstreamPort))
+          : page(res, 503, BUILDING);
       }
       res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
       res.end("Bad gateway\n");

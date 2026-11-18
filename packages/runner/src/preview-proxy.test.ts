@@ -269,6 +269,30 @@ test("the building page gives way to the app the moment it listens", async () =>
   expect(res.body).toBe("the app");
 });
 
+test("once the app has answered, a refused connection says the app isn't answering, not that it is building", async () => {
+  const app = createServer((_req, res) => res.end("the app"));
+  const appPort = await listen(app);
+  const { port } = await proxyTo(appPort);
+  expect((await get(port, "/", { cookie })).body).toBe("the app");
+  // the app crashes
+  app.closeAllConnections();
+  await new Promise((r) => app.close(r));
+  const res = await get(port, "/some/page", { cookie });
+  expect(res.status).toBe(502);
+  expect(res.headers["content-type"]).toContain("text/html");
+  expect(res.body).toContain("The app isn't answering");
+  expect(res.body).toContain(`port ${appPort}`);
+  expect(res.body).not.toContain("Building");
+  // still only for the cookie's holder
+  const stranger = await get(port, "/");
+  expect(stranger.status).toBe(404);
+  expect(stranger.body).not.toContain("answering");
+  // and the app is back the moment it listens again
+  await new Promise<void>((resolve) => app.listen(appPort, resolve));
+  expect((await get(port, "/", { cookie })).body).toBe("the app");
+});
+
+/** Fails with what arrived after 2 s rather than hanging the test until the runner's own timeout. */
 function upgrade(
   port: number,
   headers: string,
@@ -282,6 +306,14 @@ function upgrade(
     });
     let received = "";
     let sent = false;
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(
+        new Error(
+          `upgrade to ${target} got neither a 404 nor the echo in 2s; received ${JSON.stringify(received)}`,
+        ),
+      );
+    }, 2_000);
     socket.on("data", (chunk) => {
       received += chunk.toString();
       if (received.startsWith("HTTP/1.1 101") && !sent) {
@@ -292,6 +324,7 @@ function upgrade(
         received.includes("echo:ping") ||
         received.startsWith("HTTP/1.1 404")
       ) {
+        clearTimeout(timer);
         socket.destroy();
         resolve({
           head: received.split("\r\n")[0] ?? "",
@@ -299,7 +332,10 @@ function upgrade(
         });
       }
     });
-    socket.on("error", reject);
+    socket.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
   });
 }
 
@@ -327,15 +363,12 @@ test("a websocket upgrade without the cookie gets a 404 and never reaches the ap
 test("a websocket upgrade to an odd target gets a 404, even with the cookie, and the proxy keeps serving", async () => {
   const app = await devServer();
   const { port } = await proxyTo(app.port);
-  // `//a:99999/` is a path to the app, as the HTTP route treats it; absolute-form is never forwarded
-  for (const target of ["http://a/"]) {
-    expect((await upgrade(port, "", target)).head).toBe(
-      "HTTP/1.1 404 Not Found",
-    );
-    expect((await upgrade(port, `Cookie: ${cookie}\r\n`, target)).head).toBe(
-      "HTTP/1.1 404 Not Found",
-    );
-  }
+  // absolute-form is never forwarded
+  const target = "http://a/";
+  expect((await upgrade(port, "", target)).head).toBe("HTTP/1.1 404 Not Found");
+  expect((await upgrade(port, `Cookie: ${cookie}\r\n`, target)).head).toBe(
+    "HTTP/1.1 404 Not Found",
+  );
   expect(app.seen).toEqual([]);
   expect((await upgrade(port, `Cookie: ${cookie}\r\n`)).echoed).toBe(
     "echo:ping",
