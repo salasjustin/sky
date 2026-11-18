@@ -147,10 +147,7 @@ describe("a variable the command set", () => {
   test.each([
     // bash resets `$_` to the previous command's last argument
     ["_=src; echo /proc/self/environ; cat $_", "syntax"],
-    [
-      "_=src/a.ts; echo /home/u/.bashrc; cat >> $_ <<'EOF'\nx\nEOF",
-      "syntax",
-    ],
+    ["_=src/a.ts; echo /home/u/.bashrc; cat >> $_ <<'EOF'\nx\nEOF", "syntax"],
     // bash ignores an assignment to FUNCNAME, so `$FUNCNAME` stays empty
     ["FUNCNAME=src; cat $FUNCNAME/etc/passwd", "syntax"],
     ["RANDOM=src; cat $RANDOM", "syntax"],
