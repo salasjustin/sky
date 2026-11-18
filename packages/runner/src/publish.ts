@@ -215,7 +215,8 @@ const MAX_RETRY_AFTER_S = 60;
 // GitHub's minimum wait for a secondary limit that sends neither `retry-after` nor a spent quota
 const SECONDARY_WAIT_S = 60;
 const RETRIES = 3;
-// the gateway's own 5xx answers and dropped connections pass within seconds; the pause before each retry
+// the gateway's own 5xx answers and dropped connections pass within seconds, so each retry waits
+// the matching TRANSIENT_BACKOFF_MS pause
 const TRANSIENT_STATUSES = new Set([500, 502, 503, 504]);
 const TRANSIENT_BACKOFF_MS = [1000, 3000, 9000];
 // the primary rate limit resets on the hour at the latest; a reset this near is waited out, a farther one fails naming its time
@@ -1282,8 +1283,8 @@ export async function publish(options: {
       base,
     },
   ).catch(async (error: unknown) => {
-    // a pull request GitHub made but answered 5xx for is refused as a duplicate on the retry:
-    // the one now open for this head is the one this publish made
+    // a pull request GitHub made but answered 5xx for is refused as a duplicate on the retry, so
+    // on any 422 a pull request already open for this head is taken as this publish's
     if (!(error instanceof GatewayError) || error.status !== 422) throw error;
     const [made] = await call<{ number: number; html_url: string }[]>(
       "GET",
