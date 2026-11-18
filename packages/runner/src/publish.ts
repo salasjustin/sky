@@ -781,7 +781,7 @@ export async function publish(options: {
   identity?: { author: PersonName; committer: PersonName };
   /** Told of each retry of a gateway call. */
   progress?: (line: string) => void;
-  /** The gateway's rate-limit and retry clock; a test sets its own sleeper. */
+  /** The gateway's rate-limit policy, whose `sleep` also paces retries; a test sets its own. */
   rateLimit?: Partial<RateLimitPolicy>;
 }): Promise<PublishResult> {
   // `ls-files` takes its implicit pathspec relative to the directory it runs in, while
@@ -1167,8 +1167,8 @@ export async function publish(options: {
       );
     });
 
-  // a ref create or fast-forward that GitHub made but answered 5xx comes back, on its retry, as a
-  // 422 (the ref exists, or isn't a fast-forward of itself); the ref already at `parent` is success
+  // a ref create or fast-forward that GitHub made but answered 5xx for can fail its retry with a
+  // 422; the ref already at `parent` is success
   const refIsAtParent = async (error: unknown) =>
     error instanceof GatewayError &&
     error.status === 422 &&
