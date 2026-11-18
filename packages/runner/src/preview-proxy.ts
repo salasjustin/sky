@@ -40,7 +40,7 @@ const sha256 = (value: string) => createHash("sha256").update(value).digest();
 const originForm = (target: string | undefined): URL | null =>
   target?.startsWith("/") ? URL.parse(`http://preview.invalid${target}`) : null;
 
-/** The headers of `req` as a browser sent them, less the preview cookie, which is the proxy's and not the app's. */
+/** The `Cookie` header as the browser sent it, less the preview cookie, which is the proxy's and not the app's; `undefined` when nothing else is left. */
 function withoutPreviewCookie(
   headers: IncomingHttpHeaders,
 ): string | undefined {
@@ -202,7 +202,7 @@ const Env = z.object({
     .default(PREVIEW_PROXY_PORT),
 });
 
-/** `runner.mjs preview-proxy`, run as a sprite service; resolves only if the server stops. */
+/** `runner.mjs preview-proxy`, run as a sprite service: 2 at once on a bad argv or env, else serves until the server closes (0) or errors (1). */
 export async function previewProxyMain(
   argv: string[],
   env: NodeJS.ProcessEnv,

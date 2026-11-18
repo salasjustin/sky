@@ -190,7 +190,7 @@ export const agents = sqliteTable(
 );
 
 // the one running preview of an environment: its sprite has a single HTTP port, so env_id is the key and
-// starting another agent's preview replaces the row. Only the token's hash is kept
+// starting another agent's preview replaces the row
 export const previews = sqliteTable(
   "previews",
   {

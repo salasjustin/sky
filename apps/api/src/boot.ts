@@ -131,7 +131,7 @@ export function boot(
     // after the timeout sweep, so a run it just failed isn't probed; not awaited, so a sprite
     // that is slow to wake never holds up the sweep (the prober logs, never throws)
     void prober.sweep();
-    // not awaited, like the probe: a sprite slow to answer never holds up the sweep; a failure is logged and retried next time
+    // not awaited, like the probe: a sprite slow to answer never holds up the sweep; a failure is logged and retried on the next sweep
     void sweepExpiredPreviews(db, spriteOps, log).catch((err: unknown) => {
       log(`sweeping expired previews failed: ${err}`);
     });

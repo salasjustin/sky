@@ -472,7 +472,7 @@ export function createPreviews({
       };
     },
 
-    /** Ends the preview of an agent (archive) or an environment (delete), whichever agent's. Throws when it can't. */
+    /** Ends the agent's preview (archive), or the environment's, whichever agent's it is (delete). Throws when it can't. */
     stopForAgent(agentId: AgentId, envId: EnvironmentId): Promise<void> {
       return serialized(envId, async () => {
         const row = runningOf(db).where(eq(previews.agentId, agentId)).get();

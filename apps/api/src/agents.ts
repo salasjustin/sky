@@ -768,7 +768,7 @@ export function agentRoutes(
               c,
               409,
               "no_worktree",
-              "the agent has no worktree on its sprite yet (it has not run, or was archived); start a run first",
+              "the agent has no worktree on its sprite yet; start a run first",
             );
           case "port_busy":
             return apiError(
@@ -777,7 +777,7 @@ export function agentRoutes(
               "port_busy",
               result.port === PREVIEW_PROXY_PORT
                 ? `something on the environment's sprite already holds port ${PREVIEW_PROXY_PORT}, which a sprite's URL is routed to; the preview would break it, so nothing was started`
-                : `port ${result.port} is already in use on the environment's sprite; pick another with --port`,
+                : `port ${result.port} is already in use on the environment's sprite; start the preview on another port`,
             );
           case "failed":
             return apiError(c, 502, "preview_failed", result.detail);

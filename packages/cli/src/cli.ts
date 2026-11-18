@@ -138,8 +138,8 @@ const help = (io: Io) => `Usage:
   sky agent preview <agent> --stop [options]
   sky agent preview <agent> [options]
       Start the app's dev server from the agent's worktree on its
-      environment's sandbox (--cmd, listening on --port, which gets $PORT
-      too and the environment's secrets) and print a link. Anyone who opens
+      environment's sandbox (--cmd, listening on --port; it gets $PORT and
+      the environment's secrets) and print a link. Anyone who opens
       the link in a browser sees the app at its root path, hot reload
       included; no Sky or Fly login is needed. The link works until --ttl
       (a duration such as 90m, 24h or 7d; 24h by default, 7d at most) or

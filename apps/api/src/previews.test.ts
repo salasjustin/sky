@@ -738,7 +738,7 @@ test("the port check runs after the replaced preview's services are gone, so it 
   expect(check).toBeGreaterThan(firstDelete);
 });
 
-/** Starts `agentId`'s preview; the check returned asserts that a start refused since left it as it was. */
+/** Starts `agentId`'s preview and returns a check, for after a refused start, that the preview still runs untouched. */
 async function runningPreviewOf(envId: EnvironmentId, agentId: AgentId) {
   await started(agentId);
   const row = db.select().from(previews).get();
