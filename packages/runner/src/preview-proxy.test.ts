@@ -171,7 +171,58 @@ test("with the cookie, HTTP reaches the dev server at the root path, as if from 
   expect(seen?.headers.host).toBe(`localhost:${app.port}`);
   expect(seen?.headers["x-forwarded-host"]).toBe("spr-org.sprites.app");
   expect(seen?.headers["x-forwarded-proto"]).toBe("https");
-  expect(seen?.headers["x-forwarded-for"]).not.toBe("6.6.6.6");
+  // the proxy's own peer, the test's loopback client, never the client's claim
+  expect(seen?.headers["x-forwarded-for"]).toMatch(/^(::ffff:)?127\.0\.0\.1$/);
+});
+
+test("a request target the WHATWG parser rejects gets the 404, and the proxy keeps serving", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  // http.request sends the path verbatim: `//a:99999` reads as an authority with an out-of-range port
+  const res = await get(port, "//a:99999/");
+  expect(res.status).toBe(404);
+  expect(res.body).toBe(
+    "<!doctype html><title>Not found</title><h1>Not found</h1>\n",
+  );
+  expect((await get(port, "/after", { cookie })).body).toBe("app /after");
+  expect(app.seen.map((s) => s.url)).toEqual(["/after"]);
+});
+
+test("an absolute-form target gets the 404 even with the cookie, and never reaches the dev server", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  expect((await get(port, "http://a:99999/", { cookie })).status).toBe(404);
+  expect((await get(port, "/after", { cookie })).status).toBe(200);
+  expect(app.seen.map((s) => s.url)).toEqual(["/after"]);
+});
+
+test("a dev server that dies mid-response ends the browser's response instead of leaving it open", async () => {
+  const dying = createServer((_req, res) => {
+    res.setHeader("content-type", "text/plain");
+    res.write("part", () => res.socket?.destroy());
+  });
+  const { port } = await proxyTo(await listen(dying));
+  const outcome = await new Promise<string>((resolve) => {
+    const timer = setTimeout(() => resolve("still open"), 2_000);
+    const req = request(
+      { host: "127.0.0.1", port, path: "/", headers: { cookie } },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => {
+          body += c;
+        });
+        res.on("error", () => {});
+        res.on("close", () => {
+          clearTimeout(timer);
+          resolve(`closed complete=${res.complete} body=${body}`);
+        });
+      },
+    );
+    req.on("error", () => {});
+    req.end();
+  });
+  expect(outcome).toBe("closed complete=false body=part");
 });
 
 test("a dev server that is down answers a signed-in browser 502", async () => {
@@ -185,11 +236,12 @@ test("a dev server that is down answers a signed-in browser 502", async () => {
 function upgrade(
   port: number,
   headers: string,
+  target = "/hmr?token=abc",
 ): Promise<{ head: string; echoed: string }> {
   return new Promise((resolve, reject) => {
     const socket = connect({ host: "127.0.0.1", port }, () => {
       socket.write(
-        `GET /hmr?token=abc HTTP/1.1\r\nHost: spr-org.sprites.app\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n${headers}\r\n`,
+        `GET ${target} HTTP/1.1\r\nHost: spr-org.sprites.app\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n${headers}\r\n`,
       );
     });
     let received = "";
@@ -234,6 +286,23 @@ test("a websocket upgrade without the cookie gets a 404 and never reaches the de
     (await upgrade(port, `Cookie: ${PREVIEW_COOKIE}=wrong\r\n`)).head,
   ).toBe("HTTP/1.1 404 Not Found");
   expect(app.seen).toEqual([]);
+});
+
+test("a websocket upgrade to an odd target gets a 404, even with the cookie, and the proxy keeps serving", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  for (const target of ["//a:99999/", "http://a:99999/"]) {
+    expect((await upgrade(port, "", target)).head).toBe(
+      "HTTP/1.1 404 Not Found",
+    );
+    expect(
+      (await upgrade(port, `Cookie: ${cookie}\r\n`, target)).head,
+    ).toBe("HTTP/1.1 404 Not Found");
+  }
+  expect(app.seen).toEqual([]);
+  expect((await upgrade(port, `Cookie: ${cookie}\r\n`)).echoed).toBe(
+    "echo:ping",
+  );
 });
 
 test("preview-proxy refuses to start without its env, naming the variables and no value", async () => {

@@ -8,6 +8,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { connect, type Socket } from "node:net";
+import { pipeline } from "node:stream";
 import {
   PREVIEW_COOKIE,
   PREVIEW_LINK_PATH,
@@ -30,6 +31,14 @@ export type PreviewProxyOptions = {
 const NOT_FOUND = "<!doctype html><title>Not found</title><h1>Not found</h1>\n";
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest();
+
+/**
+ * The request target as a path, or `null` for one the proxy never forwards: absolute-form, `*`, or
+ * anything the parser rejects. The base is prefixed rather than passed as `new URL`'s second argument,
+ * which would read `//host:port/` as an authority and throw on a bad port.
+ */
+const originForm = (target: string | undefined): URL | null =>
+  target?.startsWith("/") ? URL.parse(`http://preview.invalid${target}`) : null;
 
 /** The headers of `req` as a browser sent them, less the preview cookie, which is the proxy's and not the app's. */
 function withoutPreviewCookie(
@@ -104,7 +113,8 @@ export function createPreviewProxy({
   };
 
   const server = createServer((req, res) => {
-    const url = new URL(req.url ?? "/", "http://preview.invalid");
+    const url = originForm(req.url);
+    if (url === null) return notFound(res);
     if (url.pathname === PREVIEW_LINK_PATH) {
       const token = url.searchParams.get("t") ?? undefined;
       if (req.method !== "GET" || !valid(token)) return notFound(res);
@@ -136,7 +146,8 @@ export function createPreviewProxy({
           answer.statusMessage,
           answer.rawHeaders,
         );
-        answer.pipe(res);
+        // not pipe(): an upstream cut off mid-body must end the browser's response, not leave it open
+        pipeline(answer, res, () => {});
       },
     );
     upstream.on("error", () => {
@@ -151,7 +162,7 @@ export function createPreviewProxy({
   // a websocket upgrade (the dev server's hot reload): the same check, then the bytes go through untouched
   server.on("upgrade", (req: IncomingMessage, client: Socket, head: Buffer) => {
     client.on("error", () => client.destroy());
-    if (!valid(cookieOf(req.headers))) {
+    if (originForm(req.url) === null || !valid(cookieOf(req.headers))) {
       client.end(
         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
       );
