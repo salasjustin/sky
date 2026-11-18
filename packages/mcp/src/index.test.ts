@@ -851,3 +851,135 @@ test("wait_for_events tells the model events are data and to check status first"
   expect(description).toMatch(/only from a run\.waiting request/);
   expect(description).toMatch(/first call or after a restart, call status/);
 });
+
+test("list_agents forwards its filters as the query and returns the page as the API sent it", async () => {
+  const page = {
+    data: [{ id: "agt_1", envName: "trail", run: null }],
+    nextCursor: "abc",
+  };
+  const seen: { auth: string | null; search: string }[] = [];
+  server.use(
+    http.get(`${API}/v1/agents`, ({ request }) => {
+      seen.push({
+        auth: request.headers.get("authorization"),
+        search: new URL(request.url).search,
+      });
+      return HttpResponse.json(page);
+    }),
+  );
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "list_agents",
+    arguments: {
+      env: ["trail", "env_2"],
+      status: ["waiting_answer", "running"],
+      archived: "all",
+      limit: 25,
+      cursor: "prev",
+    },
+  });
+
+  expect(result.isError).toBeFalsy();
+  expect(textOf(result)).toEqual(page);
+  expect(seen).toEqual([
+    {
+      auth: `Bearer ${KEY}`,
+      search:
+        "?env=trail%2Cenv_2&status=waiting_answer%2Crunning&archived=all&limit=25&cursor=prev",
+    },
+  ]);
+});
+
+test("list_agents with no arguments sends no query", async () => {
+  const queries: string[] = [];
+  server.use(
+    http.get(`${API}/v1/agents`, ({ request }) => {
+      queries.push(new URL(request.url).search);
+      return HttpResponse.json({ data: [] });
+    }),
+  );
+  const client = await connect();
+
+  const result = await client.callTool({ name: "list_agents", arguments: {} });
+
+  expect(textOf(result)).toEqual({ data: [] });
+  expect(queries).toEqual([""]);
+});
+
+test("list_agents rejects an unknown state or an oversized limit before any API call", async () => {
+  const queries: string[] = [];
+  server.use(
+    http.get(`${API}/v1/agents`, ({ request }) => {
+      queries.push(request.url);
+      return HttpResponse.json({ data: [] });
+    }),
+  );
+  const client = await connect();
+
+  for (const args of [{ status: ["waiting"] }, { limit: 201 }, { env: [] }]) {
+    const result = await client.callTool({
+      name: "list_agents",
+      arguments: args,
+    });
+    expect(result.isError, JSON.stringify(args)).toBe(true);
+  }
+  expect(queries).toEqual([]);
+});
+
+test("list_agents is listed read-only with its filters and the states", async () => {
+  const client = await connect();
+
+  const { tools } = await client.listTools();
+  const tool = tools.find((t) => t.name === "list_agents");
+
+  expect(tool?.annotations?.readOnlyHint).toBe(true);
+  expect(tool?.description).toMatch(/waiting_approval/);
+  expect(tool?.description).toMatch(/nextCursor/);
+  expect(tool?.description).toMatch(/the admin key sees every agent/);
+  expect(tool?.inputSchema.properties).toMatchObject({
+    env: { type: "array" },
+    status: {
+      type: "array",
+      items: {
+        enum: [
+          "starting",
+          "running",
+          "waiting_approval",
+          "waiting_answer",
+          "finished",
+          "failed",
+          "stopped",
+        ],
+      },
+    },
+    archived: { enum: ["false", "true", "all"] },
+    limit: { type: "integer", minimum: 1, maximum: 200 },
+    cursor: { type: "string" },
+  });
+  expect(tool?.inputSchema.required ?? []).toEqual([]);
+});
+
+test("list_agents passes the API's refusal through, such as a bad cursor", async () => {
+  route("get", "/v1/agents", 400, {
+    error: {
+      code: "invalid_cursor",
+      message: "the cursor is not one this API returned",
+    },
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "list_agents",
+    arguments: { cursor: "junk" },
+  });
+
+  expect(result.isError).toBe(true);
+  expect(textOf(result)).toEqual({
+    status: 400,
+    error: {
+      code: "invalid_cursor",
+      message: "the cursor is not one this API returned",
+    },
+  });
+});

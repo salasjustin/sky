@@ -2,7 +2,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
+  AGENT_LIST_DEFAULT_LIMIT,
+  AGENT_LIST_MAX_LIMIT,
   AgentId,
+  AgentState,
+  ArchivedFilter,
   BranchName,
   Environment,
   EnvironmentId,
@@ -170,6 +174,34 @@ const clip = ({ diff, diffTruncated, diffSize, compareUrl }: RunDetail) => {
       : `[diff truncated: ${shown.length} of ${diff.length} chars shown; full diff at ${where}]`;
   return `${shown}${shown.endsWith("\n") ? "" : "\n"}${note}`;
 };
+
+const ListAgentsInput = z.strictObject({
+  env: z
+    .array(nonEmpty)
+    .min(1)
+    .optional()
+    .describe("Only agents in these environments, each an id or a name."),
+  status: z
+    .array(AgentState)
+    .min(1)
+    .optional()
+    .describe("Only agents whose latest run is in one of these states."),
+  archived: ArchivedFilter.optional().describe(
+    "false (the default): live agents; true: only archived ones; all: both.",
+  ),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(AGENT_LIST_MAX_LIMIT)
+    .optional()
+    .describe(
+      `Rows per page, at most ${AGENT_LIST_MAX_LIMIT}; ${AGENT_LIST_DEFAULT_LIMIT} when omitted.`,
+    ),
+  cursor: nonEmpty
+    .optional()
+    .describe("The nextCursor a previous page returned."),
+});
 
 const WaitForEventsInput = z.strictObject({
   after: EventCursor.optional().describe(
@@ -343,6 +375,25 @@ function buildServer(call: Call) {
       agentId
         ? runOf(agentId, runId, includeDiff)
         : api("GET", `/v1/environments/${envId}`),
+  );
+  server.registerTool(
+    "list_agents",
+    {
+      description:
+        "List your agents with their latest run, newest activity first: for finding an agent whose id you lost, or seeing what is running or stuck waiting on a person. Each row has id, envId, envName, branch (its own claude/<id> branch), remoteBranch (the GitHub branch it works on, null when it publishes its own), createdAt, archivedAt, and run: null before its first run, else { id, status, state, createdAt, lastEventAt, endedAt, openRequests }. state is running, starting, finished, failed or stopped like the run's status, except that a waiting run is waiting_approval (a tool call to approve or deny) or waiting_answer (a question to answer); openRequests counts the requests a waiting run has open, and is 0 otherwise. A runs key sees only the agents it started, and an env name it may not use matches nothing; the admin key sees every agent. When more rows match, the result has nextCursor: pass it back as cursor, with the same filters, for the next page.",
+      inputSchema: ListAgentsInput,
+      annotations: { readOnlyHint: true },
+    },
+    ({ env, status, archived, limit, cursor }) => {
+      const query = new URLSearchParams({
+        ...(env && { env: env.join(",") }),
+        ...(status && { status: status.join(",") }),
+        ...(archived && { archived }),
+        ...(limit !== undefined && { limit: String(limit) }),
+        ...(cursor && { cursor }),
+      });
+      return api("GET", `/v1/agents${query.size > 0 ? `?${query}` : ""}`);
+    },
   );
   server.registerTool(
     "wait_for_events",

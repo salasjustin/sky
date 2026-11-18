@@ -4,6 +4,29 @@ import { AgentId, EnvironmentId } from "./ids.js";
 export const AgentStatus = z.enum(["idle", "running", "waiting"]);
 export type AgentStatus = z.infer<typeof AgentStatus>;
 
+/**
+ * What an agent is doing, read off its latest run: the run's status, except that a `waiting` run
+ * splits by the kind of its open request (an approval request is `waiting_approval`, a question
+ * `waiting_answer`).
+ */
+export const AgentState = z.enum([
+  "starting",
+  "running",
+  "waiting_approval",
+  "waiting_answer",
+  "finished",
+  "failed",
+  "stopped",
+]);
+export type AgentState = z.infer<typeof AgentState>;
+
+export const AGENT_LIST_DEFAULT_LIMIT = 50;
+export const AGENT_LIST_MAX_LIMIT = 200;
+
+/** Which of its archived and live agents a list returns. */
+export const ArchivedFilter = z.enum(["false", "true", "all"]);
+export type ArchivedFilter = z.infer<typeof ArchivedFilter>;
+
 export const agentBranch = <Id extends AgentId>(agentId: Id) =>
   `claude/${agentId}` as const;
 

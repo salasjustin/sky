@@ -1,4 +1,5 @@
 import {
+  AgentState,
   ApiKey,
   ClaudeCredentialSummary,
   CreatedApiKey,
@@ -43,6 +44,31 @@ export const ApiRun = z
   })
   .loose();
 export type ApiRun = z.infer<typeof ApiRun>;
+
+/** An agent row of `GET /v1/agents`; loose so `--json` passes through fields this CLI doesn't read. */
+const ApiListedAgent = z
+  .object({
+    id: z.string(),
+    envName: z.string(),
+    branch: z.string(),
+    remoteBranch: z.string().nullable().optional(),
+    run: z
+      .object({
+        id: z.string(),
+        state: AgentState,
+        lastEventAt: z.string(),
+        openRequests: z.number().int(),
+      })
+      .loose()
+      .nullable(),
+  })
+  .loose();
+export type ApiListedAgent = z.infer<typeof ApiListedAgent>;
+
+const AgentList = z.object({
+  data: z.array(ApiListedAgent),
+  nextCursor: z.string().optional(),
+});
 
 /** Not loose, unlike the others: parsing strips every field but name and kind, so no value can reach output. */
 const SecretList = z.object({
@@ -212,6 +238,22 @@ export function createApi(config: Config) {
     async archiveAgent(agentId: string) {
       const { json } = await request("POST", agentPath(agentId, "archive"));
       return json;
+    },
+    /** One page, newest activity first; `cursor` is the previous page's `nextCursor`. */
+    async listAgents(query: URLSearchParams) {
+      const { status, json } = await request(
+        "GET",
+        `/v1/agents${query.size > 0 ? `?${query}` : ""}`,
+      );
+      const parsed = AgentList.safeParse(json);
+      if (!parsed.success) {
+        throw new ApiError(
+          status,
+          "bad_response",
+          "the API returned an agent list this CLI can't read",
+        );
+      }
+      return { raw: json, ...parsed.data };
     },
     /** Newest first. */
     async listRuns(agentId: string): Promise<{ raw: unknown; run: ApiRun }[]> {

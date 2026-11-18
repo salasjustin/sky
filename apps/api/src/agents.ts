@@ -13,6 +13,7 @@ import {
 import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
+import { AgentListQuery, decodeCursor, listAgents } from "./agent-list.js";
 import { mintAgentToken } from "./agent-token.js";
 import { canUseEnv, ownAgents, ownerKeyOf, type Principal } from "./auth.js";
 import type { BranchCheck, BranchChecker } from "./branch-check.js";
@@ -383,6 +384,12 @@ const agentParam = zValidator(
   },
 );
 
+const listQuery = zValidator("query", AgentListQuery, (result, c) => {
+  if (!result.success) {
+    return apiError(c, 400, "invalid_query", z.prettifyError(result.error));
+  }
+});
+
 const runParam = zValidator(
   "param",
   z.object({ id: AgentId, runId: RunId }),
@@ -722,6 +729,22 @@ export function agentRoutes(
     .post("/:id/approvals", agentParam, jsonBody, body(ApprovalInput), (c) =>
       decide(c, sprites, log, c.req.valid("param").id, c.req.valid("json")),
     )
+    .get("/", listQuery, (c) => {
+      const query = c.req.valid("query");
+      let after: [string, string] | undefined;
+      if (query.cursor !== undefined) {
+        after = decodeCursor(query.cursor);
+        if (!after) {
+          return apiError(
+            c,
+            400,
+            "invalid_cursor",
+            "the cursor is not one this API returned",
+          );
+        }
+      }
+      return c.json(listAgents(c.var.db, c.var.principal, query, after), 200);
+    })
     .get("/:id", agentParam, (c) => {
       const { id } = c.req.valid("param");
       const db = c.var.db;

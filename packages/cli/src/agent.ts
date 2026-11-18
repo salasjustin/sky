@@ -1,6 +1,11 @@
 import { readFileSync } from "node:fs";
-import { BranchName, type RunStatus } from "@sky/shared";
-import { type Api, ApiError, type ApiRun } from "./api.js";
+import {
+  AGENT_LIST_MAX_LIMIT,
+  AgentState,
+  BranchName,
+  type RunStatus,
+} from "@sky/shared";
+import { type Api, ApiError, type ApiListedAgent, type ApiRun } from "./api.js";
 import type { Io } from "./cli.js";
 import { type Output, UsageError } from "./output.js";
 import { resolveEnvId } from "./secret.js";
@@ -18,6 +23,10 @@ type Values = {
   role?: string;
   fallback?: string;
   pool?: string;
+  status?: string;
+  archived?: boolean;
+  limit?: string;
+  cursor?: string;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;
@@ -87,10 +96,114 @@ function parseBranch(raw: string | undefined): string | undefined {
   return parsed.data;
 }
 
+/** The agent list's query, with what argv can get wrong rejected here so it exits 2 rather than 1. */
+function listQuery(values: Values): URLSearchParams {
+  const query = new URLSearchParams();
+  const names = (raw: string | undefined, flag: string) => {
+    if (raw === undefined) return [];
+    const parts = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s !== "");
+    if (parts.length === 0) throw new UsageError(`${flag} names nothing`, true);
+    return parts;
+  };
+  const env = names(values.env, "--env");
+  if (env.length > 0) query.set("env", env.join(","));
+  const states = names(values.status, "--status");
+  const bad = states.find((s) => !AgentState.safeParse(s).success);
+  if (bad !== undefined) {
+    throw new UsageError(
+      `--status '${bad}' is not a state: ${AgentState.options.join(", ")}`,
+      true,
+    );
+  }
+  if (states.length > 0) query.set("status", states.join(","));
+  // every agent, archived ones too: the agent someone lost may be among them
+  if (values.archived) query.set("archived", "all");
+  if (values.limit !== undefined) {
+    const n = Number(values.limit);
+    if (!/^\d+$/.test(values.limit) || n < 1 || n > AGENT_LIST_MAX_LIMIT) {
+      throw new UsageError(
+        `--limit takes a whole number from 1 to ${AGENT_LIST_MAX_LIMIT}, not '${values.limit}'`,
+        true,
+      );
+    }
+    query.set("limit", String(n));
+  }
+  if (values.cursor !== undefined) {
+    // empty would read as no cursor, so a script's `--cursor=$next` would loop on the first page
+    if (values.cursor === "") throw new UsageError("--cursor is empty", true);
+    query.set("cursor", values.cursor);
+  }
+  return query;
+}
+
+/**
+ * `-` stands for a field the agent has no value for yet. The env name goes last because it may
+ * contain spaces, so the first six fields always split cleanly and the rest of the line is the name.
+ */
+function agentLine(a: ApiListedAgent): string {
+  const { run } = a;
+  return [
+    a.id,
+    run?.state ?? "-",
+    run?.id ?? "-",
+    run?.lastEventAt ?? "-",
+    run?.openRequests ?? 0,
+    a.remoteBranch ?? a.branch,
+    a.envName,
+  ].join(" ");
+}
+
+const listOnly = ["env", "status", "archived", "limit", "cursor"] as const;
+
 const agentSub: AgentCommand = {
-  options: { prompt: { type: "string" }, branch: { type: "string" } },
+  options: {
+    prompt: { type: "string" },
+    branch: { type: "string" },
+    env: { type: "string", multiple: true },
+    status: { type: "string", multiple: true },
+    archived: { type: "boolean" },
+    limit: { type: "string" },
+    cursor: { type: "string" },
+  },
   prepare(positionals, values) {
     const [sub, ref, ...extra] = positionals;
+    if (sub === "list") {
+      if (ref !== undefined) {
+        throw new UsageError("agent list takes no arguments", true);
+      }
+      for (const flag of ["prompt", "branch"] as const) {
+        if (values[flag] !== undefined) {
+          throw new UsageError(`agent list takes no --${flag}`, true);
+        }
+      }
+      const query = listQuery(values);
+      return async (api, _io, out) => {
+        const page = await api.listAgents(query);
+        if (out.json || page.data.length > 0) {
+          out.result(page.raw, page.data.map(agentLine).join("\n"));
+        } else {
+          // the API answers an env it can't resolve, or one the key may not use, with an empty page
+          out.progress(
+            values.env === undefined
+              ? "no agents match"
+              : "no agents match (an env that doesn't exist or this key can't use matches nothing)",
+          );
+        }
+        if (page.nextCursor !== undefined) {
+          out.progress(
+            `more agents match; for the next page pass --cursor=${page.nextCursor} with the same filters`,
+          );
+        }
+        return 0;
+      };
+    }
+    const stray = listOnly.find((flag) => values[flag] !== undefined);
+    if (stray !== undefined && values[stray] !== false) {
+      throw new UsageError(`--${stray} only goes with agent list`, true);
+    }
     if (sub === "start" || sub === "follow-up") {
       const what = sub === "start" ? "<env> [--branch=<name>]" : "<agent>";
       if (ref === undefined || extra.length > 0) {
@@ -136,7 +249,7 @@ const agentSub: AgentCommand = {
     }
     throw new UsageError(
       sub === undefined
-        ? "agent needs a subcommand: start, follow-up or archive"
+        ? "agent needs a subcommand: start, follow-up, list or archive"
         : `unknown agent subcommand '${sub}'`,
       true,
     );
