@@ -144,6 +144,22 @@ describe("a variable the command set", () => {
   ])("%j asks: the shell sets that name itself (%s)", (command, reason) => {
     expect(verdict(command)).toBe(reason);
   });
+
+  test.each([
+    // zsh's `:h` takes the dirname, so this reads beside the worktree
+    `S=${ROOT}/src; cat $S:h:h/other/x`,
+    `S=${ROOT}/src; cat "$S:h:h/other/x"`,
+    // zsh's `[1,0]` subscript is empty, so this reads /etc/passwd
+    `S=src; cat "$S[1,0]/etc/passwd"`,
+    `S=src; cat $S[1]`,
+  ])("%s asks: zsh modifies or subscripts an unbraced variable", (command) => {
+    expect(verdict(command)).toBe("syntax");
+  });
+
+  test("a braced variable followed by : or [ is plain text after it", () => {
+    expect(verdict(`S=src; cat \${S}:x`)).toBe("approved");
+    expect(verdict(`S=src; cat "\${S}[1]"`)).toBe("approved");
+  });
 });
 
 describe("date, true and sleep", () => {

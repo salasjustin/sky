@@ -205,6 +205,10 @@ function lex(command: string): Token[] | undefined {
       } else {
         if (ref !== undefined || text !== "" || parts.length > 0 || group)
           return undefined;
+        // zsh reads `$S:h` as a modifier and `$S[1,0]` as a subscript, quoted or not
+        const after = command[i + m[0].length];
+        if (m[1] !== undefined && (after === ":" || after === "["))
+          return undefined;
         ref = m[1] ?? m[2];
         open = true;
       }
