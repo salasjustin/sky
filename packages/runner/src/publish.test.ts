@@ -2733,6 +2733,65 @@ test("a 502 on the fast-forward of an existing ref is retried and succeeds", asy
   ]);
 });
 
+/** A branch GitHub holds on a base that has since moved, so publishing it is a forced update. */
+const rewrittenBranch = () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  const firstTree = git(work, "rev-parse", `${first}^{tree}`);
+  return fakeGitHub({
+    ref: "gh_stale",
+    commitTrees: { gh_stale: firstTree, gh_old_base: firstTree },
+    commitParents: { gh_stale: ["gh_old_base"], gh_old_base: [] },
+  });
+};
+
+test("a forced update answered 502 is not sent again once the branch has moved on GitHub", async () => {
+  const gh = rewrittenBranch();
+  let patches = 0;
+  server.use(
+    http.patch(`${REPO}/git/refs/heads/claude/agt_1`, async ({ request }) => {
+      patches++;
+      if (patches === 1) {
+        // not made, and someone pushes during the pause
+        gh.ref = "theirs";
+        return badGateway();
+      }
+      gh.ref = ((await request.json()) as { sha: string }).sha;
+      return HttpResponse.json({ object: { sha: gh.ref } });
+    }),
+  );
+
+  const { result, sleeps, lines } = retryRun();
+
+  await expect(result).rejects.toThrow(
+    "claude/agt_1 moved on GitHub to theirs while this publish ran; nothing was overwritten, publish again",
+  );
+  expect(patches).toBe(1);
+  expect(gh.ref).toBe("theirs");
+  expect(sleeps).toEqual([1000]);
+  expect(lines).toEqual([
+    "GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 answered 502; retrying in 1 s (retry 1/3)",
+  ]);
+});
+
+test("a forced update made but answered 502 is found made on the read after the pause, not sent again", async () => {
+  const gh = rewrittenBranch();
+  let patches = 0;
+  server.use(
+    http.patch(`${REPO}/git/refs/heads/claude/agt_1`, async ({ request }) => {
+      patches++;
+      gh.ref = ((await request.json()) as { sha: string }).sha;
+      return badGateway();
+    }),
+  );
+
+  const { result, sleeps } = retryRun();
+
+  expect((await result).sha).toBe("commit1");
+  expect(patches).toBe(1);
+  expect(sleeps).toEqual([1000]);
+});
+
 test("a 502 on a GET is retried", async () => {
   fakeGitHub();
   writeFileSync(join(work, "a.txt"), "first\n");

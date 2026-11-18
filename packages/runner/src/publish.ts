@@ -557,13 +557,7 @@ export function gateway(options: {
     retrying(whereOf(method, path), async () =>
       settle(await open(method, path, body)),
     );
-  const call = async function call<T>(
-    method: string,
-    path: string,
-    body?: unknown,
-  ): Promise<T> {
-    const where = whereOf(method, path);
-    const answer = await request(method, path, body);
+  const parsed = <T>(where: string, answer: Buffer): T => {
     try {
       return JSON.parse(answer.toString("utf8")) as T;
     } catch (error) {
@@ -572,6 +566,25 @@ export function gateway(options: {
       );
     }
   };
+  const call = async function call<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<T> {
+    return parsed<T>(whereOf(method, path), await request(method, path, body));
+  };
+  /** One attempt of a call, never sent again on a 5xx or a lost connection. */
+  call.once = async <T>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<T> =>
+    parsed<T>(
+      whereOf(method, path),
+      await settle(await open(method, path, body)),
+    );
+  /** The retries `call` makes, around attempts its caller makes itself. */
+  call.retrying = retrying;
   /** The bytes a GET answers with, such as a repo's tarball; only silence times it out. */
   call.bytes = (path: string): Promise<Buffer> => request("GET", path);
   /**
@@ -1146,8 +1159,13 @@ export async function publish(options: {
   // GitHub refuses a ref update that changes .github/workflows/ when the token lacks the `workflow`
   // scope, with a 404 or 403 that reads, bare, as lost repo access; this publish's object writes
   // have succeeded by now, so the workflow files the sent commits change are named as the likely cause
-  const writeRef = (method: string, path: string, body: unknown) =>
-    call(method, path, body).catch(async (error: unknown) => {
+  const writeRef = (
+    method: string,
+    path: string,
+    body: unknown,
+    send: typeof call.once = call,
+  ) =>
+    send(method, path, body).catch(async (error: unknown) => {
       if (
         !(error instanceof GatewayError) ||
         error.rateLimited ||
@@ -1188,18 +1206,37 @@ export async function publish(options: {
   } else if (rewritten) {
     // GitHub's ref update takes no expected old value: it is read again just before the forced
     // update, so a write since the lookup above isn't overwritten
-    const now = await call<{ object: { sha: string } }>(
-      "GET",
-      `/git/ref/${refPath}`,
-    );
-    if (now.object.sha !== remote) {
-      throw new PublishError(
-        `${remoteBranch} moved on GitHub to ${now.object.sha} while this publish ran; nothing was overwritten, publish again`,
+    const refAt = async () => {
+      const ref = await call<{ object: { sha: string } }>(
+        "GET",
+        `/git/ref/${refPath}`,
       );
-    }
-    await writeRef("PATCH", `/git/refs/${refPath}`, {
-      sha: parent,
-      force: true,
+      return ref.object.sha;
+    };
+    const moved = (sha: string) =>
+      new PublishError(
+        `${remoteBranch} moved on GitHub to ${sha} while this publish ran; nothing was overwritten, publish again`,
+      );
+    const now = await refAt();
+    if (now !== remote) throw moved(now);
+    // a forced update answered 5xx or cut off may have been made or not, and the branch may have
+    // moved since, so it is never sent again blind: the ref is read after each pause, and the
+    // update goes again only while the ref still holds `remote`
+    const patch = `/git/refs/${refPath}`;
+    let sent = false;
+    await call.retrying(call.where("PATCH", patch), async () => {
+      if (sent) {
+        const at = await refAt().catch((error: unknown) => {
+          // the read has spent its own retries; the forced update's aren't for it
+          throw error instanceof GatewayError && error.transient
+            ? new GatewayError(error.message, error.status, error.rateLimited)
+            : error;
+        });
+        if (at === parent) return;
+        if (at !== remote) throw moved(at);
+      }
+      sent = true;
+      await writeRef("PATCH", patch, { sha: parent, force: true }, call.once);
     });
   } else if (remote !== parent) {
     await writeRef("PATCH", `/git/refs/${refPath}`, {
