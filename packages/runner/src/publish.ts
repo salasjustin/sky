@@ -1227,7 +1227,7 @@ export async function publish(options: {
     await call.retrying(call.where("PATCH", patch), async () => {
       if (sent) {
         const at = await refAt().catch((error: unknown) => {
-          // the read has spent its own retries; the forced update's aren't for it
+          // the read already spent its own retries, so its failure ends the forced update's too
           throw error instanceof GatewayError && error.transient
             ? new GatewayError(error.message, error.status, error.rateLimited)
             : error;
