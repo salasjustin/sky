@@ -994,14 +994,9 @@ const GIT_STASH_FLAGS = new Set([
   "-q",
   "--quiet",
 ]);
-const GIT_STASH_SUBCOMMANDS = new Set([
-  "push",
-  "pop",
-  "apply",
-  "list",
-  "show",
-  "drop",
-]);
+// refs/stash is shared by every worktree of the repository, so another agent's entries sit on
+// the same list: `pop`, `apply`, `show` and `drop` would read, take or destroy their work
+const GIT_STASH_SUBCOMMANDS = new Set(["push", "list"]);
 
 /** Whether `git`'s write commands (`add`, `commit`, `restore`, `checkout`, `stash`) have only arguments this accepts; `complete` false is the start of a command. */
 function gitWriteOk(

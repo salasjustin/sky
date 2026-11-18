@@ -325,9 +325,8 @@ describe("git writes in the worktree", () => {
     "git stash",
     "git stash push -m 'wip' -- src",
     "git stash -u",
-    "git stash pop",
+    "git stash push -k -q -m 'wip' src/a.ts",
     "git stash list",
-    "git stash apply 'stash@{1}'",
   ])("%s runs", (command) => {
     expect(verdict(command)).toBe("approved");
   });
@@ -370,6 +369,13 @@ describe("git writes in the worktree", () => {
     ["git stash branch x", "unsafe-option"],
     ["git stash -p", "unsafe-option"],
     ["git stash -a", "unsafe-option"],
+    // every worktree of the repository shares one stash list, other agents' entries included
+    ["git stash pop", "unsafe-option"],
+    ["git stash apply", "unsafe-option"],
+    ["git stash apply 'stash@{3}'", "unsafe-option"],
+    ["git stash drop", "unsafe-option"],
+    ["git stash show -p", "unsafe-option"],
+    ["git stash show", "unsafe-option"],
     ["git -c core.hooksPath=x commit -m y", "not-allowed"],
     ["git commit -c core.editor=x -m y", "unsafe-option"],
     // outside the worktree and scratch, or a secret or a hook
