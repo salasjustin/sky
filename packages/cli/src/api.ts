@@ -90,6 +90,14 @@ const ApiWebhook = z
   .loose();
 export type ApiWebhook = z.infer<typeof ApiWebhook>;
 
+/** A preview as the API describes it; the link only comes with a start. */
+const ApiPreview = z.looseObject({
+  agentId: z.string(),
+  port: z.number().int(),
+  expiresAt: z.string(),
+  replaced: z.string().nullish(),
+});
+
 /** Keys are parsed, not loose: output is built from the parse, so a field the API adds (a hash) never reaches stdout. */
 const KeyList = z.object({ data: z.array(ApiKey) });
 
@@ -238,6 +246,46 @@ export function createApi(config: Config) {
     async archiveAgent(agentId: string) {
       const { json } = await request("POST", agentPath(agentId, "archive"));
       return json;
+    },
+    async startPreview(
+      agentId: string,
+      body: { cmd: string; port: number; ttlSeconds?: number },
+    ) {
+      const { status, json } = await request(
+        "POST",
+        agentPath(agentId, "preview"),
+        body,
+      );
+      const { preview } = parseKey(
+        z.object({ preview: ApiPreview.extend({ link: z.string() }) }),
+        status,
+        json,
+        "a preview",
+      );
+      return { raw: json, preview };
+    },
+    async stopPreview(agentId: string) {
+      const { json } = await request("DELETE", agentPath(agentId, "preview"));
+      return json;
+    },
+    async getPreview(agentId: string) {
+      const { status, json } = await request(
+        "GET",
+        agentPath(agentId, "preview"),
+      );
+      const { preview } = parseKey(
+        z.object({
+          preview: ApiPreview.extend({
+            services: z
+              .object({ app: z.string(), proxy: z.string() })
+              .nullish(),
+          }).nullable(),
+        }),
+        status,
+        json,
+        "a preview",
+      );
+      return { raw: json, preview };
     },
     /** One page, newest activity first; `cursor` is the previous page's `nextCursor`. */
     async listAgents(query: URLSearchParams) {

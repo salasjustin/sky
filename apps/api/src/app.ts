@@ -17,6 +17,7 @@ import { factory } from "./factory.js";
 import { internalRoutes } from "./internal.js";
 import { keyRoutes } from "./keys.js";
 import { createLauncher } from "./launch.js";
+import { createPreviews } from "./previews.js";
 import { wakeLaunch } from "./probe.js";
 import { createProvisioner } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
@@ -112,6 +113,13 @@ export function createApp({
     ensureBundle,
     log,
   });
+  const previews = createPreviews({
+    db,
+    config,
+    sprites: spriteOps,
+    ensureBundle,
+    log,
+  });
   const guard = apiKeyGuard(db, config.apiKey);
   // the MCP tools call /v1 in-process through the whole app with the caller's own header, so its
   // guard checks them too and an issued key keeps its limits
@@ -121,7 +129,10 @@ export function createApp({
   });
   const v1 = factory
     .createApp()
-    .route("/environments", environmentRoutes(provisioner, spriteOps, log))
+    .route(
+      "/environments",
+      environmentRoutes(provisioner, spriteOps, log, previews),
+    )
     .route("/environments", secretRoutes())
     .route(
       "/agents",
@@ -132,6 +143,7 @@ export function createApp({
         log,
         heartbeatMs,
         preLaunchDeadlineMs,
+        previews,
       ),
     )
     .route("/webhooks", webhookRoutes())

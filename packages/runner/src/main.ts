@@ -11,6 +11,7 @@ import { removeSkyLogin } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
 import { holdSprite, spriteApiFrom } from "./keepalive.js";
 import { refreshPlugins } from "./plugins.js";
+import { previewProxyMain } from "./preview-proxy.js";
 import { publishMain } from "./publish.js";
 import { endSessionProcesses } from "./reap.js";
 import { repoPullMain } from "./repo.js";
@@ -210,6 +211,8 @@ const commands: Record<
   "store-sync": (argv, env) => storeSyncMain(argv, env, io),
   "repo-pull": (argv, env) => repoPullMain(argv, env, io),
   "branch-check": (argv, env) => branchCheckMain(argv, env, io),
+  // a sprite service the API starts for an agent's preview; it runs until the API removes it
+  "preview-proxy": (argv, env) => previewProxyMain(argv, env, io),
 };
 const command = Object.hasOwn(commands, process.argv[2] ?? "")
   ? commands[process.argv[2] as string]

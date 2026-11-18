@@ -115,7 +115,7 @@ setup: |
 
 Provisioning fails at the setup step, naming the plugin and its marketplace, if a plugin's marketplace is neither declared nor added.
 
-**Memory and `concurrency`.** Every agent of an environment runs on its one sprite, and a sprite has a fixed amount of memory and no swap. A large monorepo (thousands of files, with a typecheck or test run per agent) can use several GB at a time, so set `concurrency` to 1-2 there; the default of 3 suits small repos. When a sprite runs out of memory the kernel kills processes, often the runner, and the run is lost with the work since its last commit. Sky guards against this two ways. Before it starts a run, it reads the sprite's available memory (`free -m`) and, below `SPRITE_MIN_FREE_MB` (an environment variable of the API; default `1024`, `0` turns the check off), refuses the launch with `sprite_low_memory`. And when a run ends, the runner ends every process the run's session started (dev servers, watchers, test workers, a nested `claude -p`), so they don't hold memory for the next run; other runs' processes on the sprite are left alone.
+**Memory and `concurrency`.** Every agent of an environment runs on its one sprite, and a sprite has a fixed amount of memory and no swap. A large monorepo (thousands of files, with a typecheck or test run per agent) can use several GB at a time, so set `concurrency` to 1-2 there; the default of 3 suits small repos. When a sprite runs out of memory the kernel kills processes, often the runner, and the run is lost with the work since its last commit. Sky guards against this two ways. Before it starts a run, it reads the sprite's available memory (`free -m`) and, below `SPRITE_MIN_FREE_MB` (an environment variable of the API; default `1024`, `0` turns the check off), refuses the launch with `sprite_low_memory`. And when a run ends, the runner ends every process the run's session started (dev servers, watchers, test workers, a nested `claude -p`), so they don't hold memory for the next run; other runs' processes on the sprite are left alone. A [preview](#previews) is the exception to that cleanup, and it counts against the same memory: its dev server and proxy stay up past the run, so budget for them in `concurrency` and in `SPRITE_MIN_FREE_MB` like another agent's run, and stop a preview you no longer need.
 
 ```
 sky secret set web NPM_TOKEN < token.txt
@@ -365,6 +365,24 @@ Sandboxes hold no GitHub credential, so `git push` and any fetch of a private re
 - **Shared branch.** Two agents may target the same branch, and `publish` refuses to overwrite commits the branch never had.
 - **Commits pushed from outside.** Follow-up runs fetch the agent's GitHub branch first. A clean worktree takes the commits pushed there by someone else (fast-forward, or a cherry-pick when `publish` gave its commits new shas). Diverged histories change nothing; the agent's prompt says what is on GitHub and `publish` refuses to overwrite it. Mid-run, `runner.mjs sync` (above) brings such commits in, rebasing the agent's unpublished commits onto them.
 
+## Previews
+
+Check an agent's work by using it:
+
+```
+sky agent preview <agent> --cmd="pnpm dev --host" --port=5173 [--ttl=24h]
+sky agent preview <agent> --stop
+sky agent preview <agent>
+```
+
+The first starts the app's dev server (`--cmd`, run from the agent's worktree and listening on `--port`) on the environment's sprite and prints a link. It runs with the environment's secrets and its base profile's `sessionEnv`, plus `PORT`, and never with a Claude credential or a Sky token. Opening the link in any browser, with no Sky or Fly login, shows the app at its root path, so root-relative assets, client-side routing and the dev server's hot-reload websocket work. The dev server should listen on all interfaces (`--host` for Vite). The proxy in front of it rewrites `Host` to `localhost:<port>`, so a dev server's allowed-hosts check doesn't turn the sprite's address away.
+
+- **One per environment.** A sprite has one HTTP port, so an environment has one preview. Starting one on another agent replaces the running one; the answer (`replaced`, and a note on stderr) names the agent it replaced. Starting again on the same agent restarts it with a new link.
+- **Private to whoever holds the link.** The sprite's URL is public only while a preview runs, and everything it serves goes through a small proxy (from the runner bundle) on the sprite's HTTP port, 8080. The proxy answers 404, with a page that names nothing, to any browser without the preview's cookie. The link is the sprite's URL plus `/__sky/preview?t=<token>`: the token is 32 random bytes, Sky and the proxy keep only its hash, and a valid token sets an HttpOnly, Secure, SameSite=Lax cookie that lasts as long as the preview, then redirects to `/`. The link is shown once, when the preview starts; `sky agent preview <agent>` without flags reports its port, expiry and how the dev server and proxy are doing. Anyone who has the link can use the app until the preview ends, so share it like a password. If something already listens on 8080 or on `--port` on the sprite, the start is refused (`port_busy`) and nothing on the sprite is touched.
+- **How it ends.** At `--ttl` (24 hours by default, 7 days at most), on `--stop`, when the agent is archived and when the environment is deleted. Each removes both sprite services, sets the sprite's URL back to private and invalidates the token. Anything else leaves it running: the agent's runs ending, or a follow-up starting, do not touch it, and the follow-up's edits reach the running dev server through the shared worktree. The proxy and dev server are sprite services, so they restart when a sleeping sprite wakes.
+
+Over REST it is `POST`, `GET` and `DELETE /v1/agents/:id/preview` (`{ "cmd", "port", "ttlSeconds"? }` to start), and over MCP the `preview` tool. A `runs` key can preview only the agents it started.
+
 ## REST API
 
 All routes live under `/v1`. Ids are prefixed: `env_…`, `agent_…`, `run_…`.
@@ -389,6 +407,7 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | `GET /v1/agents/:id/runs/:runId` · `…/stream`                           | a run's result, or its events as SSE                   |
 | `POST /v1/agents/:id/answers` · `…/approvals`                           | answer a waiting question; approve or deny a tool call |
 | `POST /v1/agents/:id/stop` · `…/archive`                                | stop the current run; archive the agent                |
+| `POST`, `GET`, `DELETE /v1/agents/:id/preview`                          | start, read and stop the agent's [preview](#previews)  |
 | `POST`, `GET /v1/webhooks` · `GET`, `DELETE /v1/webhooks/:id`           | subscribe an https URL to events; list, read, remove   |
 | `POST`, `GET /v1/keys` · `DELETE /v1/keys/:id`                          | admin only: mint, list and revoke `runs` keys          |
 | `GET /v1/claude-credentials`                                            | admin only: the Claude credentials, by name            |
@@ -493,7 +512,7 @@ Runs on one sprite share its repo, so a run's worktree setup takes the repo lock
 
 ## MCP
 
-`POST /mcp` (streamable HTTP, same bearer keys) exposes `create_env`, `launch`, `followup`, `status`, `list_agents`, `answer`, `approve`, `stop`, `archive` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents. Every tool call runs with the caller's own key, so a `runs` key gets the same limits as over REST.
+`POST /mcp` (streamable HTTP, same bearer keys) exposes `create_env`, `launch`, `followup`, `status`, `list_agents`, `answer`, `approve`, `stop`, `archive`, `preview` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents. Every tool call runs with the caller's own key, so a `runs` key gets the same limits as over REST.
 
 `list_agents` is `GET /v1/agents` ([Listing agents](#listing-agents)): it takes `env` (ids or names) and `status` (states) as arrays, `archived` (`false`, `true` or `all`), `limit` and `cursor`, and returns the page the API sends, with `nextCursor` when more agents match. Use it to find an agent whose id you lost, or to see which are running or waiting on you.
 

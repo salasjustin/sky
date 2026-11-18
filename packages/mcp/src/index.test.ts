@@ -109,7 +109,7 @@ test("an upstream error echoing the caller's key comes back without it", async (
 
 /** Answers one route, recording the bearer and JSON body it received. */
 function route(
-  method: "get" | "post",
+  method: "get" | "post" | "delete",
   path: string,
   status: number,
   body: JsonBodyType,
@@ -982,4 +982,145 @@ test("list_agents passes the API's refusal through, such as a bad cursor", async
       message: "the cursor is not one this API returned",
     },
   });
+});
+
+const previewLink =
+  "https://sky-abc-org.sprites.app/__sky/preview?t=tokentokentoken";
+
+test("preview with cmd and port starts it and returns the API's answer, link included", async () => {
+  const answer = {
+    preview: { agentId: "agt_1", link: previewLink, replaced: "agt_0" },
+  };
+  const seen = route("post", "/v1/agents/agt_1/preview", 200, answer);
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_1", cmd: "pnpm dev --host", port: 5173 },
+  });
+
+  expect(result.isError).toBeUndefined();
+  expect(textOf(result)).toEqual(answer);
+  expect(seen).toEqual([
+    { auth: `Bearer ${KEY}`, body: { cmd: "pnpm dev --host", port: 5173 } },
+  ]);
+});
+
+test("preview passes ttlSeconds along", async () => {
+  const seen = route("post", "/v1/agents/agt_1/preview", 200, { preview: {} });
+  const client = await connect();
+
+  await client.callTool({
+    name: "preview",
+    arguments: {
+      agentId: "agt_1",
+      cmd: "npm start",
+      port: 3000,
+      ttlSeconds: 7200,
+    },
+  });
+
+  expect(seen.map((s) => s.body)).toEqual([
+    { cmd: "npm start", port: 3000, ttlSeconds: 7200 },
+  ]);
+});
+
+test("preview with stop ends it", async () => {
+  const seen = route("delete", "/v1/agents/agt_1/preview", 200, {
+    preview: null,
+    stopped: { agentId: "agt_1" },
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_1", stop: true },
+  });
+
+  expect(textOf(result)).toEqual({
+    preview: null,
+    stopped: { agentId: "agt_1" },
+  });
+  expect(seen.map((s) => s.auth)).toEqual([`Bearer ${KEY}`]);
+});
+
+test("preview with only an agent reads its state", async () => {
+  const seen = route("get", "/v1/agents/agt_1/preview", 200, { preview: null });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_1" },
+  });
+
+  expect(textOf(result)).toEqual({ preview: null });
+  expect(seen).toHaveLength(1);
+});
+
+test.each([
+  ["a command with no port", { agentId: "agt_1", cmd: "pnpm dev" }],
+  ["a port with no command", { agentId: "agt_1", port: 5173 }],
+  ["the proxy's own port", { agentId: "agt_1", cmd: "x", port: 8080 }],
+  ["a port under 1024", { agentId: "agt_1", cmd: "x", port: 80 }],
+  [
+    "a TTL past 7 days",
+    { agentId: "agt_1", cmd: "x", port: 5173, ttlSeconds: 604801 },
+  ],
+  ["a TTL with no command", { agentId: "agt_1", ttlSeconds: 3600 }],
+  [
+    "stop with a command",
+    { agentId: "agt_1", stop: true, cmd: "x", port: 5173 },
+  ],
+  ["an unknown field", { agentId: "agt_1", public: true }],
+])("preview rejects %s before any API call", async (_, args) => {
+  const seen = [
+    route("post", "/v1/agents/agt_1/preview", 200, {}),
+    route("delete", "/v1/agents/agt_1/preview", 200, {}),
+    route("get", "/v1/agents/agt_1/preview", 200, {}),
+  ];
+  const client = await connect();
+
+  const result = await client.callTool({ name: "preview", arguments: args });
+
+  expect(result.isError).toBe(true);
+  expect(seen.flat()).toEqual([]);
+});
+
+test("preview passes the API's refusal through, such as a runs key outside its agents", async () => {
+  route("post", "/v1/agents/agt_9/preview", 404, {
+    error: { code: "not_found", message: "no such agent" },
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "preview",
+    arguments: { agentId: "agt_9", cmd: "pnpm dev", port: 5173 },
+  });
+
+  expect(result.isError).toBe(true);
+  expect(textOf(result)).toEqual({
+    status: 404,
+    error: { code: "not_found", message: "no such agent" },
+  });
+});
+
+test("preview is listed with what the link gives and the one-per-environment rule", async () => {
+  const client = await connect();
+
+  const { tools } = await client.listTools();
+  const tool = tools.find((t) => t.name === "preview");
+
+  expect(tool?.description).toMatch(/only in this answer/);
+  expect(tool?.description).toMatch(/one preview/);
+  expect(tool?.description).toMatch(
+    /runs key can preview only the agents it started/,
+  );
+  expect(tool?.inputSchema.properties).toMatchObject({
+    agentId: { type: "string" },
+    cmd: { type: "string" },
+    port: { type: "integer", minimum: 1024, maximum: 65535 },
+    ttlSeconds: { type: "integer", minimum: 60, maximum: 604800 },
+    stop: { type: "boolean" },
+  });
+  expect(tool?.inputSchema.required).toEqual(["agentId"]);
 });

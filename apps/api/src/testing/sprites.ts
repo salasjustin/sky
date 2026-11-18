@@ -82,6 +82,19 @@ const invalidName = () =>
     { status: 400 },
   );
 
+/** A service as the Sprites API holds it: the request body of the PUT that made it. */
+export type ServiceRecord = {
+  cmd: string;
+  args?: string[];
+  env?: Record<string, string>;
+  dir?: string;
+  needs?: string[];
+  http_port?: number;
+};
+
+/** The sprite's URL as the API reports it: `<sprite>-<org>.sprites.app`. */
+export const spriteUrlOf = (name: string) => `https://${name}-test.sprites.app`;
+
 /** In-memory Sprites API speaking the wire format @fly/sprites reads. */
 export function stubSprites() {
   const wire = {
@@ -177,6 +190,17 @@ export function stubSprites() {
     readStatus: 200,
     checkpointLines: undefined as object[] | undefined,
     deleteStatus: 204,
+    /** Each sprite's services by name, as `PUT …/services/:name` left them; a delete removes one. */
+    services: new Map<string, Map<string, ServiceRecord>>(),
+    /**
+     * The events a created service streams back before its stream ends; `started` then `complete`
+     * unless set. A test makes a dev server die at start with an `exit` event.
+     */
+    serviceEvents: undefined as
+      | ((sprite: string, service: string) => object[])
+      | undefined,
+    serviceStatus: 200,
+    serviceDeleteStatus: 204,
   };
   let checkpoints = 0;
   const madeDirs = new Map<
@@ -477,9 +501,78 @@ export function stubSprites() {
         id: `spr_${name}`,
         name,
         status: "warm",
+        url: spriteUrlOf(name),
         labels,
         url_settings,
       });
+    }),
+    http.get(`${SPRITES}/:name/services`, ({ request, params }) => {
+      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
+      const name = String(params.name);
+      wire.calls.push(`services-list ${name}`);
+      if (!wire.sprites.has(name)) {
+        return HttpResponse.json({ error: "not found" }, { status: 404 });
+      }
+      return HttpResponse.json(
+        [...(wire.services.get(name) ?? [])].map(([service, record]) => ({
+          name: service,
+          ...record,
+          state: { name: service, status: "running", pid: 100 },
+        })),
+      );
+    }),
+    http.put(
+      `${SPRITES}/:name/services/:service`,
+      async ({ request, params }) => {
+        if (!authorized(request))
+          return new HttpResponse(null, { status: 401 });
+        const name = String(params.name);
+        const service = String(params.service);
+        wire.calls.push(`service-create ${name} ${service}`);
+        if (wire.hangs(`service-create ${name} ${service}`)) {
+          return hang(request);
+        }
+        if (!wire.sprites.has(name)) {
+          return HttpResponse.json({ error: "not found" }, { status: 404 });
+        }
+        if (wire.serviceStatus !== 200) {
+          return HttpResponse.json(
+            { error: "service refused" },
+            { status: wire.serviceStatus },
+          );
+        }
+        const record = (await request.json()) as ServiceRecord;
+        const services = wire.services.get(name) ?? new Map();
+        services.set(service, record);
+        wire.services.set(name, services);
+        const events = wire.serviceEvents?.(name, service) ?? [
+          { type: "started", timestamp: 1 },
+          { type: "complete", timestamp: 2 },
+        ];
+        return new HttpResponse(
+          `${events.map((e) => JSON.stringify(e)).join("\n")}\n`,
+          { headers: { "content-type": "application/x-ndjson" } },
+        );
+      },
+    ),
+    http.delete(`${SPRITES}/:name/services/:service`, ({ request, params }) => {
+      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
+      const name = String(params.name);
+      const service = String(params.service);
+      wire.calls.push(`service-delete ${name} ${service}`);
+      if (wire.serviceDeleteStatus !== 204) {
+        return HttpResponse.json(
+          { error: "upstream unavailable" },
+          { status: wire.serviceDeleteStatus },
+        );
+      }
+      if (!wire.services.get(name)?.delete(service)) {
+        return HttpResponse.json(
+          { error: "service not found" },
+          { status: 404 },
+        );
+      }
+      return new HttpResponse(null, { status: 204 });
     }),
     http.put(`${SPRITES}/:name`, async ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });

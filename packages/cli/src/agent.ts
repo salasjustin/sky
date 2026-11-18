@@ -3,6 +3,10 @@ import {
   AGENT_LIST_MAX_LIMIT,
   AgentState,
   BranchName,
+  PREVIEW_MAX_TTL_SECONDS,
+  PREVIEW_MIN_TTL_SECONDS,
+  PREVIEW_PROXY_PORT,
+  PreviewPort,
   type RunStatus,
 } from "@sky/shared";
 import { type Api, ApiError, type ApiListedAgent, type ApiRun } from "./api.js";
@@ -27,6 +31,10 @@ type Values = {
   archived?: boolean;
   limit?: string;
   cursor?: string;
+  cmd?: string;
+  port?: string;
+  ttl?: string;
+  stop?: boolean;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;
@@ -157,6 +165,100 @@ function agentLine(a: ApiListedAgent): string {
 }
 
 const listOnly = ["env", "status", "archived", "limit", "cursor"] as const;
+const previewOnly = ["cmd", "port", "ttl", "stop"] as const;
+
+/** `90s`, `30m`, `2h`, `7d`; a bare number is seconds. Rejected here what the API's range would reject, so it exits 2. */
+function parseTtl(raw: string): number {
+  const match = /^(\d+)([smhd]?)$/.exec(raw);
+  const unit = { "": 1, s: 1, m: 60, h: 3600, d: 86_400 } as const;
+  const seconds = match
+    ? Number(match[1]) * unit[match[2] as keyof typeof unit]
+    : Number.NaN;
+  if (
+    !Number.isSafeInteger(seconds) ||
+    seconds < PREVIEW_MIN_TTL_SECONDS ||
+    seconds > PREVIEW_MAX_TTL_SECONDS
+  ) {
+    throw new UsageError(
+      `--ttl takes a duration like 90m, 24h or 7d, from 1m to 7d, not '${raw}'`,
+      true,
+    );
+  }
+  return seconds;
+}
+
+/** What `agent preview` was asked to do, checked before any request. */
+function previewAction(ref: string | undefined, values: Values): Action {
+  if (ref === undefined) {
+    throw new UsageError(
+      "agent preview takes <agent> --cmd=<command> --port=<n> [--ttl=<duration>], or <agent> --stop",
+      true,
+    );
+  }
+  for (const flag of ["prompt", "branch"] as const) {
+    if (values[flag] !== undefined) {
+      throw new UsageError(`agent preview takes no --${flag}`, true);
+    }
+  }
+  const { cmd, port, ttl } = values;
+  if (values.stop) {
+    if (cmd !== undefined || port !== undefined || ttl !== undefined) {
+      throw new UsageError(
+        "agent preview --stop takes no --cmd, --port or --ttl",
+        true,
+      );
+    }
+    return async (api, _io, out) => {
+      out.result(await api.stopPreview(ref), `stopped the preview of ${ref}`);
+      return 0;
+    };
+  }
+  if (cmd === undefined && port === undefined && ttl === undefined) {
+    return async (api, _io, out) => {
+      const { raw, preview } = await api.getPreview(ref);
+      if (preview === null) {
+        out.result(raw, "");
+        out.progress(`${ref} has no running preview`);
+        return 0;
+      }
+      const services = preview.services
+        ? `${preview.services.app} ${preview.services.proxy}`
+        : "- -";
+      out.result(raw, `${preview.port} ${preview.expiresAt} ${services}`);
+      return 0;
+    };
+  }
+  if (cmd === undefined || port === undefined) {
+    throw new UsageError(
+      "agent preview needs --cmd=<command> and --port=<n>",
+      true,
+    );
+  }
+  if (cmd.trim() === "") throw new UsageError("--cmd is empty", true);
+  const parsedPort = /^\d+$/.test(port)
+    ? PreviewPort.safeParse(Number(port))
+    : undefined;
+  if (!parsedPort?.success) {
+    throw new UsageError(
+      `--port takes a whole number from 1024 to 65535, other than ${PREVIEW_PROXY_PORT} (the preview's own), not '${port}'`,
+      true,
+    );
+  }
+  const ttlSeconds = ttl === undefined ? undefined : parseTtl(ttl);
+  return async (api, _io, out) => {
+    const { raw, preview } = await api.startPreview(ref, {
+      cmd,
+      port: parsedPort.data,
+      ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
+    });
+    out.result(raw, preview.link);
+    if (preview.replaced) {
+      out.progress(`replaced the running preview of ${preview.replaced}`);
+    }
+    out.progress(`the link works until ${preview.expiresAt}`);
+    return 0;
+  };
+}
 
 const agentSub: AgentCommand = {
   options: {
@@ -167,6 +269,10 @@ const agentSub: AgentCommand = {
     archived: { type: "boolean" },
     limit: { type: "string" },
     cursor: { type: "string" },
+    cmd: { type: "string" },
+    port: { type: "string" },
+    ttl: { type: "string" },
+    stop: { type: "boolean" },
   },
   prepare(positionals, values) {
     const [sub, ref, ...extra] = positionals;
@@ -178,6 +284,15 @@ const agentSub: AgentCommand = {
         if (values[flag] !== undefined) {
           throw new UsageError(`agent list takes no --${flag}`, true);
         }
+      }
+      const previewFlag = previewOnly.find(
+        (flag) => values[flag] !== undefined && values[flag] !== false,
+      );
+      if (previewFlag !== undefined) {
+        throw new UsageError(
+          `--${previewFlag} only goes with agent preview`,
+          true,
+        );
       }
       const query = listQuery(values);
       return async (api, _io, out) => {
@@ -203,6 +318,21 @@ const agentSub: AgentCommand = {
     const stray = listOnly.find((flag) => values[flag] !== undefined);
     if (stray !== undefined && values[stray] !== false) {
       throw new UsageError(`--${stray} only goes with agent list`, true);
+    }
+    if (sub === "preview") {
+      if (extra.length > 0) {
+        throw new UsageError("agent preview takes one agent", true);
+      }
+      return previewAction(ref, values);
+    }
+    const previewStray = previewOnly.find(
+      (flag) => values[flag] !== undefined && values[flag] !== false,
+    );
+    if (previewStray !== undefined) {
+      throw new UsageError(
+        `--${previewStray} only goes with agent preview`,
+        true,
+      );
     }
     if (sub === "start" || sub === "follow-up") {
       const what = sub === "start" ? "<env> [--branch=<name>]" : "<agent>";
@@ -249,7 +379,7 @@ const agentSub: AgentCommand = {
     }
     throw new UsageError(
       sub === undefined
-        ? "agent needs a subcommand: start, follow-up, list or archive"
+        ? "agent needs a subcommand: start, follow-up, list, preview or archive"
         : `unknown agent subcommand '${sub}'`,
       true,
     );

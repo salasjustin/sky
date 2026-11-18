@@ -189,6 +189,35 @@ export const agents = sqliteTable(
   ],
 );
 
+// the one running preview of an environment: its sprite has a single HTTP port, so env_id is the key and
+// starting another agent's preview replaces the row. Only the token's hash is kept
+export const previews = sqliteTable(
+  "previews",
+  {
+    envId: text("env_id")
+      .$type<EnvironmentId>()
+      .primaryKey()
+      .references(() => environments.id),
+    agentId: text("agent_id")
+      .$type<AgentId>()
+      .notNull()
+      .references(() => agents.id),
+    port: integer().notNull(),
+    cmd: text().notNull(),
+    // lowercase-hex sha-256 of the link's token; the token itself is never stored
+    tokenHash: text("token_hash").notNull(),
+    expiresAt: text("expires_at").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    // the archive's lookup by agent, and the FK lookup on every agents delete
+    index("previews_agent_id").on(t.agentId),
+    check("previews_port", sql`${c(t.port)} between 1 and 65535`),
+    check("previews_expires_at", isoUtc(t.expiresAt)),
+    check("previews_created_at", isoUtc(t.createdAt)),
+  ],
+);
+
 export const runs = sqliteTable(
   "runs",
   {

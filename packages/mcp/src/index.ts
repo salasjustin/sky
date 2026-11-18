@@ -12,6 +12,10 @@ import {
   EnvironmentId,
   EventCursor,
   EventType,
+  PREVIEW_DEFAULT_TTL_SECONDS,
+  PREVIEW_MAX_TTL_SECONDS,
+  PREVIEW_MIN_TTL_SECONDS,
+  PreviewPort,
   RequestId,
   RunId,
 } from "@sky/shared";
@@ -35,7 +39,7 @@ type Outcome =
   | { ok: false; result: CallToolResult; error?: ApiError };
 
 type Call = (
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "DELETE",
   path: string,
   body?: unknown,
 ) => Promise<Outcome>;
@@ -202,6 +206,41 @@ const ListAgentsInput = z.strictObject({
     .optional()
     .describe("The nextCursor a previous page returned."),
 });
+
+const PreviewInput = z
+  .strictObject({
+    agentId: AgentId,
+    cmd: nonEmpty
+      .optional()
+      .describe(
+        "The shell command that starts the app's dev server, run from the agent's worktree, for example `pnpm dev --host`. It must listen on port (it is also given $PORT) and on all interfaces; `--host` for Vite. Needs port.",
+      ),
+    port: PreviewPort.optional().describe(
+      "The port the dev server listens on: 1024 to 65535, and not 8080, which the preview's own proxy holds. Needs cmd.",
+    ),
+    ttlSeconds: z
+      .number()
+      .int()
+      .min(PREVIEW_MIN_TTL_SECONDS)
+      .max(PREVIEW_MAX_TTL_SECONDS)
+      .optional()
+      .describe(
+        `How long the link works, ${PREVIEW_MIN_TTL_SECONDS} to ${PREVIEW_MAX_TTL_SECONDS} seconds; ${PREVIEW_DEFAULT_TTL_SECONDS} (24 hours) when omitted. Goes with cmd and port.`,
+      ),
+    stop: z.boolean().optional().describe("true: end the agent's preview."),
+  })
+  .refine((i) => (i.cmd === undefined) === (i.port === undefined), {
+    message: "cmd and port go together",
+    path: ["cmd"],
+  })
+  .refine((i) => i.ttlSeconds === undefined || i.cmd !== undefined, {
+    message: "ttlSeconds goes with cmd and port",
+    path: ["ttlSeconds"],
+  })
+  .refine((i) => !i.stop || i.cmd === undefined, {
+    message: "stop takes no cmd, port or ttlSeconds",
+    path: ["stop"],
+  });
 
 const WaitForEventsInput = z.strictObject({
   after: EventCursor.optional().describe(
@@ -393,6 +432,24 @@ function buildServer(call: Call) {
         ...(cursor && { cursor }),
       });
       return api("GET", `/v1/agents${query.size > 0 ? `?${query}` : ""}`);
+    },
+  );
+  server.registerTool(
+    "preview",
+    {
+      description:
+        "Preview an agent's branch in a browser. With cmd and port: starts the app's dev server from the agent's worktree on its environment's sprite (with the environment's secrets) and returns { preview: { link, expiresAt, replaced, … } }. Give the link to a person; opening it in any browser, with no login, shows the app at its root path with hot reload, and the link is shown only in this answer. An environment has one preview: starting one replaces the environment's running preview, and replaced names the agent whose it was (null when none). The preview outlives the agent's runs, so a followup's edits reach it; it ends at the TTL, with stop: true, when the agent is archived or the environment is deleted. With stop: true: ends it. With neither: returns the agent's preview state (port, expiresAt, and the status of its app and proxy services; preview is null when none runs), never the link. The preview uses the sprite's memory like anything else running there. A runs key can preview only the agents it started.",
+      inputSchema: PreviewInput,
+    },
+    ({ agentId, cmd, port, ttlSeconds, stop }) => {
+      const path = `/v1/agents/${agentId}/preview`;
+      if (stop) return api("DELETE", path);
+      if (cmd === undefined) return api("GET", path);
+      return api("POST", path, {
+        cmd,
+        port,
+        ...(ttlSeconds !== undefined && { ttlSeconds }),
+      });
     },
   );
   server.registerTool(
