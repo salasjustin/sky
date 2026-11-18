@@ -8,32 +8,18 @@
     #open-lockup {
       position: absolute;
       left: 560px;
-      top: 340px;
+      top: 353px;
       width: 800px;
       height: 374px;
-    }
-    #open-tag {
-      position: absolute;
-      left: 0;
-      right: 0;
-      top: 800px;
-      text-align: center;
-      font-family: "Inter", sans-serif;
-      font-weight: 400;
-      font-size: 40px;
-      letter-spacing: 0.01em;
-      color: #9a9a9a;
     }
   </style>
   <div id="root" data-composition-id="open" data-width="1920" data-height="1080">
     <img id="open-lockup" src="assets/sky-header-dark.svg" alt="sky" />
-    <div id="open-tag">Your crew, in the cloud.</div>
   </div>
   <script>
     const tl = gsap.timeline({ paused: true });
     tl.fromTo("#open-lockup", { scale: 0.94 }, { scale: 1, duration: 1.6, ease: "power3.out" }, 0);
-    tl.fromTo("#open-tag", { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.6, ease: "power2.out" }, 1.3);
-    tl.to("#root", { opacity: 0, duration: 0.3, ease: "power1.in" }, 3.1);
+    tl.to("#root", { opacity: 0, duration: 0.3, ease: "power1.in" }, 2.2);
     window.__timelines["open"] = tl;
   </script>
 </template>

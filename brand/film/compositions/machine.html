@@ -1,0 +1,138 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      background: #16181d;
+    }
+    #mach-art {
+      position: absolute;
+      inset: 0;
+    }
+    .lab {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 920px;
+      text-align: center;
+      font-family: "Inter", sans-serif;
+      font-weight: 400;
+      font-size: 44px;
+    }
+    #mach-lab-p {
+      color: #9a9a9a;
+    }
+    #mach-lab-a {
+      color: #f7f6f2;
+    }
+    .lap {
+      fill: none;
+      stroke: #9a9a9a;
+      stroke-width: 6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .chip {
+      fill: #2a2a2a;
+      stroke: #9a9a9a;
+      stroke-width: 4;
+    }
+    .box {
+      fill: none;
+      stroke: #f7f6f2;
+      stroke-width: 3;
+      stroke-dasharray: 14 12;
+    }
+    .glyph {
+      fill: none;
+      stroke: #f7f6f2;
+      stroke-width: 4;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+  </style>
+  <div id="root" data-composition-id="machine" data-width="1920" data-height="1080">
+    <svg id="mach-art" viewBox="0 0 1920 1080" width="1920" height="1080">
+      <title>A laptop pinned by builds hands its work to cloud sandboxes and goes idle</title>
+
+      <g id="mach-laptop">
+        <rect class="lap" x="300" y="340" width="360" height="200" rx="16" />
+        <rect class="lap" x="260" y="548" width="440" height="24" rx="12" />
+      </g>
+
+      <g id="mach-bars">
+        <g class="lap" stroke-width="5">
+          <rect x="226" y="640" width="30" height="30" rx="4" />
+          <path d="M234 634V640M248 634V640M234 670V676M248 670V676M220 648H226M220 662H226M256 648H262M256 662H262" />
+          <rect x="222" y="710" width="38" height="22" rx="4" />
+          <path d="M230 732V740M242 732V740M254 732V740" />
+        </g>
+        <rect x="300" y="643" width="400" height="24" rx="12" fill="#2a2a2a" />
+        <rect id="mach-cpu" x="300" y="643" width="40" height="24" rx="12" fill="#9a9a9a" />
+        <rect x="300" y="709" width="400" height="24" rx="12" fill="#2a2a2a" />
+        <rect id="mach-mem" x="300" y="709" width="40" height="24" rx="12" fill="#9a9a9a" />
+      </g>
+
+      <g id="mach-c0"><rect class="chip" x="-70" y="-24" width="140" height="48" rx="12" /><path class="lap" stroke-width="4" d="M-40 0H20" /></g>
+      <g id="mach-c1"><rect class="chip" x="-70" y="-24" width="140" height="48" rx="12" /><path class="lap" stroke-width="4" d="M-40 0H10" /></g>
+      <g id="mach-c2"><rect class="chip" x="-70" y="-24" width="140" height="48" rx="12" /><path class="lap" stroke-width="4" d="M-40 0H28" /></g>
+
+      <g id="mach-sandboxes">
+        <g id="mach-s0">
+          <rect class="box" x="1000" y="300" width="700" height="140" rx="30" />
+          <g class="glyph"><circle cx="1058" cy="352" r="8" /><circle cx="1058" cy="388" r="8" /><circle cx="1090" cy="364" r="8" /><path d="M1058 360V380M1090 372Q1090 384 1058 384" /></g>
+          <rect x="1140" y="362" width="500" height="16" rx="8" fill="#2a2a2a" />
+          <rect id="mach-p0" x="1140" y="362" width="0" height="16" rx="8" fill="#f7f6f2" />
+        </g>
+        <g id="mach-s1">
+          <rect class="box" x="1000" y="480" width="700" height="140" rx="30" />
+          <g class="glyph"><circle cx="1058" cy="532" r="8" /><circle cx="1058" cy="568" r="8" /><circle cx="1090" cy="544" r="8" /><path d="M1058 540V560M1090 552Q1090 564 1058 564" /></g>
+          <rect x="1140" y="542" width="500" height="16" rx="8" fill="#2a2a2a" />
+          <rect id="mach-p1" x="1140" y="542" width="0" height="16" rx="8" fill="#f7f6f2" />
+        </g>
+        <g id="mach-s2">
+          <rect class="box" x="1000" y="660" width="700" height="140" rx="30" />
+          <g class="glyph"><circle cx="1058" cy="712" r="8" /><circle cx="1058" cy="748" r="8" /><circle cx="1090" cy="724" r="8" /><path d="M1058 720V740M1090 732Q1090 744 1058 744" /></g>
+          <rect x="1140" y="722" width="500" height="16" rx="8" fill="#2a2a2a" />
+          <rect id="mach-p2" x="1140" y="722" width="0" height="16" rx="8" fill="#f7f6f2" />
+        </g>
+      </g>
+    </svg>
+    <div id="mach-lab-p" class="lab">Builds pin your machine</div>
+    <div id="mach-lab-a" class="lab">Your machine stays free</div>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.set("#mach-c0", { x: 480, y: 300 }, 0);
+    tl.set("#mach-c1", { x: 480, y: 246 }, 0);
+    tl.set("#mach-c2", { x: 480, y: 192 }, 0);
+
+    // problem: chips of work pile onto the laptop, its bars pin and it shakes
+    tl.fromTo(["#mach-laptop", "#mach-bars"], { opacity: 0 }, { opacity: 1, duration: 0.3 }, 0.1);
+    tl.fromTo("#mach-c0", { opacity: 0 }, { opacity: 1, duration: 0.2 }, 0.4);
+    tl.fromTo("#mach-c1", { opacity: 0 }, { opacity: 1, duration: 0.2 }, 0.7);
+    tl.fromTo("#mach-c2", { opacity: 0 }, { opacity: 1, duration: 0.2 }, 1.0);
+    tl.fromTo("#mach-cpu", { attr: { width: 40 } }, { attr: { width: 400 }, duration: 0.8, ease: "power2.in" }, 0.5);
+    tl.fromTo("#mach-mem", { attr: { width: 40 } }, { attr: { width: 400 }, duration: 0.9, ease: "power2.in" }, 0.6);
+    tl.fromTo(["#mach-laptop", "#mach-bars"], { x: 0 }, { x: 4, duration: 0.08, ease: "none", repeat: 19, yoyo: true, immediateRender: false }, 0.8);
+    tl.fromTo("#mach-lab-p", { opacity: 0 }, { opacity: 1, duration: 0.4 }, 0.7);
+
+    // answer: the work lifts into one sandbox per repo and the machine idles
+    tl.to("#mach-lab-p", { opacity: 0, duration: 0.3 }, 2.4);
+    tl.fromTo("#mach-lab-a", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 2.7);
+    tl.fromTo("#mach-sandboxes", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 2.4);
+    [["#mach-c0", 370, 2.6], ["#mach-c1", 550, 2.75], ["#mach-c2", 730, 2.9]].forEach(([id, y, at]) => {
+      tl.to(id, { x: 1090, y, duration: 0.8, ease: "power2.inOut" }, at);
+      tl.to(id, { opacity: 0, duration: 0.2 }, at + 0.8);
+    });
+    tl.to("#mach-cpu", { attr: { width: 40 }, duration: 0.9, ease: "power2.out" }, 3.4);
+    tl.to("#mach-mem", { attr: { width: 70 }, duration: 0.9, ease: "power2.out" }, 3.4);
+    tl.to([".lap"], { stroke: "#f7f6f2", duration: 0.6 }, 3.4);
+    tl.to(["#mach-cpu", "#mach-mem"], { fill: "#f7f6f2", duration: 0.6 }, 3.4);
+    tl.fromTo("#mach-p0", { attr: { width: 0 } }, { attr: { width: 500 }, duration: 2.2, ease: "none" }, 3.5);
+    tl.fromTo("#mach-p1", { attr: { width: 0 } }, { attr: { width: 500 }, duration: 2.5, ease: "none" }, 3.6);
+    tl.fromTo("#mach-p2", { attr: { width: 0 } }, { attr: { width: 500 }, duration: 2.8, ease: "none" }, 3.7);
+    tl.to("#root", { opacity: 0, duration: 0.35, ease: "power1.in" }, 6.65);
+    window.__timelines["machine"] = tl;
+  </script>
+</template>

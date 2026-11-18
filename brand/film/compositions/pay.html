@@ -1,0 +1,136 @@
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      background: #16181d;
+    }
+    #pay-art {
+      position: absolute;
+      inset: 0;
+    }
+    .lab {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 920px;
+      text-align: center;
+      font-family: "Inter", sans-serif;
+      font-weight: 400;
+      font-size: 44px;
+    }
+    #pay-lab-p {
+      color: #9a9a9a;
+    }
+    #pay-lab-a {
+      color: #f7f6f2;
+    }
+    .dim {
+      fill: none;
+      stroke: #9a9a9a;
+      stroke-width: 6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .note {
+      fill: #2a2a2a;
+      stroke: #9a9a9a;
+      stroke-width: 4;
+    }
+    .lt {
+      fill: none;
+      stroke: #f7f6f2;
+      stroke-width: 6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .card {
+      fill: #2a2a2a;
+      stroke: #f7f6f2;
+      stroke-width: 3;
+    }
+  </style>
+  <div id="root" data-composition-id="pay" data-width="1920" data-height="1080">
+    <svg id="pay-art" viewBox="0 0 1920 1080" width="1920" height="1080">
+      <title>Per-token bills give way to work running on two Claude subscriptions that take turns</title>
+
+      <g id="pay-problem">
+        <path class="dim" d="M260 640A220 220 0 0 1 700 640" />
+        <line id="pay-needle" class="dim" x1="480" y1="640" x2="300" y2="640" stroke="#f7f6f2" />
+        <circle cx="480" cy="640" r="14" fill="#9a9a9a" />
+        <g id="pay-b0"><rect class="note" x="1060" y="760" width="320" height="110" rx="14" /><circle class="dim" cx="1220" cy="815" r="28" /><circle cx="1090" cy="790" r="7" fill="#9a9a9a" /><circle cx="1350" cy="840" r="7" fill="#9a9a9a" /></g>
+        <g id="pay-b1"><rect class="note" x="1080" y="672" width="320" height="110" rx="14" /><circle class="dim" cx="1240" cy="727" r="28" /><circle cx="1110" cy="702" r="7" fill="#9a9a9a" /><circle cx="1370" cy="752" r="7" fill="#9a9a9a" /></g>
+        <g id="pay-b2"><rect class="note" x="1050" y="584" width="320" height="110" rx="14" /><circle class="dim" cx="1210" cy="639" r="28" /><circle cx="1080" cy="614" r="7" fill="#9a9a9a" /><circle cx="1340" cy="664" r="7" fill="#9a9a9a" /></g>
+        <g id="pay-b3"><rect class="note" x="1075" y="496" width="320" height="110" rx="14" /><circle class="dim" cx="1235" cy="551" r="28" /><circle cx="1105" cy="526" r="7" fill="#9a9a9a" /><circle cx="1365" cy="576" r="7" fill="#9a9a9a" /></g>
+        <g id="pay-b4"><rect class="note" x="1055" y="408" width="320" height="110" rx="14" /><circle class="dim" cx="1215" cy="463" r="28" /><circle cx="1085" cy="438" r="7" fill="#9a9a9a" /><circle cx="1345" cy="488" r="7" fill="#9a9a9a" /></g>
+      </g>
+
+      <g id="pay-answer">
+        <g id="pay-chips" fill="none" stroke="#f7f6f2" stroke-width="4">
+          <rect x="190" y="440" width="140" height="56" rx="14" />
+          <rect x="190" y="512" width="140" height="56" rx="14" />
+          <rect x="190" y="584" width="140" height="56" rx="14" />
+        </g>
+        <line class="lt" x1="340" y1="540" x2="560" y2="540" />
+        <circle id="pay-hub" cx="560" cy="540" r="16" fill="#f7f6f2" />
+        <line id="pay-la" class="lt" x1="560" y1="540" x2="760" y2="430" />
+        <line id="pay-lb" class="lt" x1="560" y1="540" x2="760" y2="690" />
+
+        <g id="pay-ca">
+          <rect class="card" x="760" y="330" width="360" height="200" rx="28" />
+          <rect x="792" y="366" width="64" height="46" rx="9" fill="none" stroke="#f7f6f2" stroke-width="4" />
+          <rect x="792" y="476" width="296" height="14" rx="7" fill="#16181d" />
+          <rect id="pay-fa" x="792" y="476" width="40" height="14" rx="7" fill="#f7f6f2" />
+          <g id="pay-lock"><rect x="1040" y="364" width="48" height="38" rx="7" fill="#f7f6f2" /><path d="M1050 364V354A14 14 0 0 1 1078 354V364" fill="none" stroke="#f7f6f2" stroke-width="5" /></g>
+        </g>
+        <g id="pay-cb">
+          <rect class="card" x="760" y="590" width="360" height="200" rx="28" />
+          <rect x="792" y="626" width="64" height="46" rx="9" fill="none" stroke="#f7f6f2" stroke-width="4" />
+          <rect x="792" y="736" width="296" height="14" rx="7" fill="#16181d" />
+          <rect id="pay-fb" x="792" y="736" width="40" height="14" rx="7" fill="#f7f6f2" />
+        </g>
+        <line id="pay-oa" class="lt" x1="1120" y1="430" x2="1500" y2="560" />
+        <line id="pay-ob" class="lt" x1="1120" y1="690" x2="1500" y2="560" />
+        <g id="pay-done">
+          <circle cx="1560" cy="560" r="70" fill="#2a2a2a" stroke="#f7f6f2" stroke-width="4" />
+          <path class="lt" d="M1528 560l22 24l44 -50" />
+        </g>
+      </g>
+    </svg>
+    <div id="pay-lab-p" class="lab">Per-token bills</div>
+    <div id="pay-lab-a" class="lab">Your Claude subscriptions</div>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    // problem: the meter ticks up and the bills pile up
+    tl.fromTo("#pay-problem", { opacity: 0 }, { opacity: 1, duration: 0.3 }, 0.1);
+    tl.fromTo("#pay-needle", { rotation: 0, svgOrigin: "480 640" }, { rotation: 168, svgOrigin: "480 640", duration: 2.1, ease: "steps(14)" }, 0.4);
+    ["#pay-b0", "#pay-b1", "#pay-b2", "#pay-b3", "#pay-b4"].forEach((id, i) => {
+      tl.fromTo(id, { opacity: 0, y: -30 }, { opacity: 1, y: 0, duration: 0.25, ease: "power2.out" }, 0.6 + i * 0.4);
+    });
+    tl.fromTo("#pay-lab-p", { opacity: 0 }, { opacity: 1, duration: 0.4 }, 0.8);
+
+    // answer: the pain steps aside, work runs on one subscription, then the next
+    tl.to("#pay-problem", { opacity: 0, x: -40, duration: 0.5, ease: "power1.in" }, 2.8);
+    tl.to("#pay-lab-p", { opacity: 0, duration: 0.3 }, 2.8);
+    tl.fromTo("#pay-answer", { opacity: 0 }, { opacity: 1, duration: 0.01 }, 3.0);
+    tl.fromTo("#pay-chips", { opacity: 0, x: -30 }, { opacity: 1, x: 0, duration: 0.5, ease: "power2.out" }, 3.0);
+    tl.fromTo(["#pay-hub", "#pay-la", "#pay-lb"], { opacity: 0 }, { opacity: 1, duration: 0.4 }, 3.4);
+    tl.fromTo("#pay-ca", { opacity: 0, scale: 0.92, svgOrigin: "940 430" }, { opacity: 1, scale: 1, svgOrigin: "940 430", duration: 0.5, ease: "back.out(1.6)" }, 3.6);
+    tl.fromTo("#pay-cb", { opacity: 0, scale: 0.92, svgOrigin: "940 690" }, { opacity: 0.5, scale: 1, svgOrigin: "940 690", duration: 0.5, ease: "back.out(1.6)" }, 3.8);
+    tl.fromTo("#pay-lb", { opacity: 1 }, { opacity: 0.25, duration: 0.3, immediateRender: false }, 3.9);
+    tl.fromTo("#pay-lab-a", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 3.4);
+    tl.fromTo("#pay-fa", { attr: { width: 40 } }, { attr: { width: 296 }, duration: 1.6, ease: "none" }, 4.2);
+    tl.fromTo("#pay-lock", { opacity: 0, scale: 0.6, svgOrigin: "1064 380" }, { opacity: 1, scale: 1, svgOrigin: "1064 380", duration: 0.35, ease: "back.out(2)" }, 5.8);
+    tl.to("#pay-ca", { opacity: 0.4, duration: 0.4 }, 6.0);
+    tl.to("#pay-la", { opacity: 0.25, duration: 0.3 }, 6.0);
+    tl.to("#pay-lb", { opacity: 1, duration: 0.3 }, 6.0);
+    tl.to("#pay-cb", { opacity: 1, duration: 0.4 }, 6.0);
+    tl.fromTo("#pay-fb", { attr: { width: 40 } }, { attr: { width: 120 }, duration: 0.8, ease: "none", immediateRender: false }, 6.2);
+    tl.fromTo("#pay-ob", { opacity: 0 }, { opacity: 1, duration: 0.4 }, 6.3);
+    tl.fromTo("#pay-oa", { opacity: 0 }, { opacity: 0.25, duration: 0.4 }, 6.3);
+    tl.fromTo("#pay-done", { opacity: 0, scale: 0.7, svgOrigin: "1560 560" }, { opacity: 1, scale: 1, svgOrigin: "1560 560", duration: 0.45, ease: "back.out(2)" }, 6.7);
+    tl.to("#root", { opacity: 0, duration: 0.35, ease: "power1.in" }, 7.65);
+    window.__timelines["pay"] = tl;
+  </script>
+</template>
