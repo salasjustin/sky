@@ -12,11 +12,11 @@ const MIN_KNOWN_LENGTH = 8;
 const tokenStart = String.raw`(?:(?<![0-9A-Za-z_])|(?<=\\[nrt]))`;
 const token = (body: string) => new RegExp(tokenStart + body, "g");
 const tokenPatterns = [
-  token(String.raw`sk-ant-oat[0-9A-Za-z_-]+`),
-  token(String.raw`sk-[0-9A-Za-z_-]{16,}`),
-  token(String.raw`gh[pousr]_[0-9A-Za-z]{20,}`),
-  token(String.raw`github_pat_[0-9A-Za-z_]{20,}`),
-  token(String.raw`sky_[0-9A-Za-z_-]{20,}`),
+  token("sk-ant-oat[0-9A-Za-z_-]+"),
+  token("sk-[0-9A-Za-z_-]{16,}"),
+  token("gh[pousr]_[0-9A-Za-z]{20,}"),
+  token("github_pat_[0-9A-Za-z_]{20,}"),
+  token("sky_[0-9A-Za-z_-]{20,}"),
   token(String.raw`eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+`),
 ];
 
