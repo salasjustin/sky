@@ -129,10 +129,10 @@ const help = (io: Io) => `Usage:
       spaces. An agent with no run yet shows - in their place.
       --env and --status repeat or take a comma list. States: starting,
       running, waiting_approval, waiting_answer, finished, failed, stopped.
-      Archived agents are left out unless --archived. --limit is at most
-      200 (50 without it); when more agents match, a note on stderr gives
-      the --cursor for the next page, to pass with the same filters.
-      A key sees only the agents it started.
+      --archived lists archived agents too, not only live ones. --limit is
+      at most 200 (50 without it); when more agents match, a note on stderr
+      gives the --cursor for the next page, to pass with the same filters.
+      A runs key sees only the agents it started; the admin key sees all.
   sky agent archive <agent> [options]
       Stop any active run and delete the agent's worktree; uncommitted work
       in it is lost.

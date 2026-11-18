@@ -135,7 +135,7 @@ test("no agent matching an --env says a name the key can't use matches nothing",
   expect(r.code).toBe(0);
   expect(r.stdout).toBe("");
   expect(r.stderr).toBe(
-    "no agents match (an env name this key can't use matches nothing)\n",
+    "no agents match (an env that doesn't exist or this key can't use matches nothing)\n",
   );
 });
 

@@ -189,7 +189,7 @@ const agentSub: AgentCommand = {
           out.progress(
             values.env === undefined
               ? "no agents match"
-              : "no agents match (an env name this key can't use matches nothing)",
+              : "no agents match (an env that doesn't exist or this key can't use matches nothing)",
           );
         }
         if (page.nextCursor !== undefined) {
