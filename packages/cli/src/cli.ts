@@ -119,6 +119,18 @@ const help = (io: Io) => `Usage:
       agent can't fetch or push itself: Sky fetches the branch through the
       connector when each run starts, and the agent runs runner.mjs only
       for publish.
+  sky agent list [--env=<id|name>,...] [--status=<state>,...] [--archived]
+      [--limit=N] [options]
+      Print "<agent> <env> <state> <run> <last event> <open requests>
+      <branch>" per agent, newest activity first: the state, run and last
+      event (UTC) of its latest run, the requests that run still has open,
+      and the GitHub branch it works on (its own claude/ branch when it was
+      started without one). An agent with no run yet shows - in their place.
+      --env and --status repeat or take a comma list. States: starting,
+      running, waiting_approval, waiting_answer, finished, failed, stopped.
+      Archived agents are left out unless --archived. --limit is at most
+      200 (50 without it); when more agents match, a note on stderr says so.
+      A key sees only the agents it started.
   sky agent archive <agent> [options]
       Stop any active run and delete the agent's worktree; uncommitted work
       in it is lost.
@@ -153,7 +165,8 @@ Options:
                          name and kind; env delete, secret delete and
                          webhook delete: {"id"|"name": …, "deleted": true};
                          key create: the key with its secret; key list:
-                         {"data": [keys]}, never a secret;
+                         {"data": [keys]}, never a secret; agent list: the
+                         page {"data": [agents], "nextCursor"?: …};
                          key revoke: {"id": …, "revoked": true})
   -h, --help             show this help
   -v, --version          print the version (on its own: sky --version)
@@ -367,6 +380,9 @@ async function runCommand(
     role: text(values.role),
     fallback: text(values.fallback),
     pool: text(values.pool),
+    status: list(values.status),
+    archived: values.archived === true,
+    limit: text(values.limit),
   });
   return await withApi(values, io, (api, out) => action(api, io, out));
 }

@@ -150,7 +150,17 @@ sky wait <agent>      # until it needs an answer or approval, or ends
 sky inbox <agent>     # the pending question or approval
 sky approve <agent> <requestId>   # or deny --reason=…, or answer -- <text>
 sky status <agent>    # status, summary, error and compare link
+sky agent list        # every live agent with its latest run's state
+sky agent list --env=web --status=waiting_answer,waiting_approval
 ```
+
+`sky agent list [--env=<id|name>,...] [--status=<state>,...] [--archived] [--limit=N] [--json]` finds an agent whose id you lost and shows what is running or stuck. It prints one line per agent, newest activity first:
+
+```
+<agent id> <env name> <state> <run id> <last event, UTC ISO> <open requests> <branch>
+```
+
+`<state>` is that of the agent's latest run (see [Listing agents](#listing-agents)), and `<branch>` is the GitHub branch the agent works on, or its own `claude/<agent id>` branch when it was started without one. An agent with no run yet shows `-` for the state, run and last event. `--env` and `--status` repeat or take a comma list. Archived agents are left out unless you pass `--archived`, which lists every agent, archived ones too. `--limit` is at most 200 (50 without it); when more agents match, a note on stderr says so. `--json` prints the API's page, `{ "data": [...], "nextCursor"?: ... }`.
 
 A deny's `--reason` is what the agent is told. `approve` takes one too: it is recorded with the decision and passed to the agent as a note.
 
@@ -374,6 +384,7 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | ----------------------------------------------------------------------- | ------------------------------------------------------ |
 | `POST /v1/environments` · `GET`, `PATCH`, `DELETE /v1/environments/:id` | environments; create returns `202` while provisioning  |
 | `PUT`, `GET`, `DELETE /v1/environments/:id/secrets[/:name]`             | environment secrets                                    |
+| `GET /v1/agents`                                                        | list your agents with their latest run                 |
 | `POST /v1/agents/:id/runs`                                              | follow-up run, resuming the agent's session            |
 | `GET /v1/agents/:id/runs/:runId` · `…/stream`                           | a run's result, or its events as SSE                   |
 | `POST /v1/agents/:id/answers` · `…/approvals`                           | answer a waiting question; approve or deny a tool call |
@@ -381,6 +392,54 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | `POST`, `GET /v1/webhooks` · `GET`, `DELETE /v1/webhooks/:id`           | subscribe an https URL to events; list, read, remove   |
 | `POST`, `GET /v1/keys` · `DELETE /v1/keys/:id`                          | admin only: mint, list and revoke `runs` keys          |
 | `GET /v1/claude-credentials`                                            | admin only: the Claude credentials, by name            |
+
+### Listing agents
+
+```
+GET /v1/agents?env=web&status=running,waiting_answer&archived=false&limit=50&cursor=…
+```
+
+Newest activity first, where an agent's activity is the last event of its latest run (its creation, before a first run). Every query parameter is optional:
+
+| parameter  | meaning                                                                                                         |
+| ---------- | --------------------------------------------------------------------------------------------------------------- |
+| `env`      | environment ids or names; repeat the parameter or use a comma list                                              |
+| `status`   | the latest run's state (below); repeat or comma list. An agent with no run matches none                         |
+| `archived` | `false` (default) live agents, `true` only archived ones, `all` both                                            |
+| `limit`    | rows per page, 1 to 200 (default 50)                                                                            |
+| `cursor`   | the `nextCursor` of the previous page, with the same filters; a cursor Sky didn't issue is `400 invalid_cursor` |
+
+```json
+{
+  "data": [
+    {
+      "id": "agt_…",
+      "envId": "env_…",
+      "envName": "web",
+      "branch": "claude/agt_…",
+      "remoteBranch": "feature/login",
+      "createdAt": "2026-11-17T09:00:00.000Z",
+      "archivedAt": null,
+      "run": {
+        "id": "run_…",
+        "status": "waiting",
+        "state": "waiting_answer",
+        "createdAt": "2026-11-17T09:00:01.000Z",
+        "lastEventAt": "2026-11-17T09:12:30.000Z",
+        "endedAt": null,
+        "openRequests": 1
+      }
+    }
+  ],
+  "nextCursor": "…"
+}
+```
+
+`run` is `null` for an agent that hasn't started one, and `nextCursor` is present only when more agents match. `lastEventAt` is the run's latest event, or the run's creation before its first; `endedAt` is when a finished, failed or stopped run ended, else `null`. `openRequests` counts the run's unresolved questions and tool-call requests. `remoteBranch` is the GitHub branch the agent was started on, `null` otherwise.
+
+`state` is the run's `status`, except that a `waiting` run is split by what it waits on: `waiting_approval` for a tool call to approve or deny, `waiting_answer` for a question. A waiting run whose request was already decided (the runner hasn't resumed yet) is `running`. So the states are `starting`, `running`, `waiting_approval`, `waiting_answer`, `finished`, `failed` and `stopped`.
+
+A `runs` key lists only the agents it started, and `env` names it may not use match nothing; the admin key lists every agent.
 
 Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you'll meet:
 
@@ -434,7 +493,9 @@ Runs on one sprite share its repo, so a run's worktree setup takes the repo lock
 
 ## MCP
 
-`POST /mcp` (streamable HTTP, same bearer keys) exposes `create_env`, `launch`, `followup`, `status`, `answer`, `approve`, `stop`, `archive` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents. Every tool call runs with the caller's own key, so a `runs` key gets the same limits as over REST.
+`POST /mcp` (streamable HTTP, same bearer keys) exposes `create_env`, `launch`, `followup`, `status`, `list_agents`, `answer`, `approve`, `stop`, `archive` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents. Every tool call runs with the caller's own key, so a `runs` key gets the same limits as over REST.
+
+`list_agents` is `GET /v1/agents` ([Listing agents](#listing-agents)): it takes `env` (ids or names) and `status` (states) as arrays, `archived` (`false`, `true` or `all`), `limit` and `cursor`, and returns the page the API sends, with `nextCursor` when more agents match. Use it to find an agent whose id you lost, or to see which are running or waiting on you.
 
 `wait_for_events` waits up to 30 seconds and returns as soon as something happens, with a `cursor` to pass back as `after` on the next call. Call it in a loop to follow every agent live without a public URL. On your first call, use `status` to find agents already waiting.
 

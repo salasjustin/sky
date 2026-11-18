@@ -216,7 +216,8 @@ export const runs = sqliteTable(
     createdAt: createdAt(),
   },
   (t) => [
-    index("runs_agent_id").on(t.agentId),
+    // an agent's runs newest first: the latest run is the first entry; also serves the agent_id foreign key
+    index("runs_agent_id_created_at").on(t.agentId, t.createdAt),
     check(
       "runs_status",
       sql`${c(t.status)} in ('starting', 'running', 'waiting', 'finished', 'failed', 'stopped')`,
