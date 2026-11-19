@@ -81,6 +81,9 @@ beforeEach(() => {
   // workers share: keep them in this test's own
   mkdirSync(join(root, "os-tmp"));
   vi.stubEnv("TMPDIR", join(root, "os-tmp"));
+  // a run with checks marks its repo trusted in `~/.claude.json`: keep that off the developer's own
+  mkdirSync(join(root, "default-home"));
+  vi.stubEnv("HOME", join(root, "default-home"));
   const origin = join(root, "origin");
   execFileSync("git", ["init", "-q", "-b", "main", origin]);
   writeFileSync(join(origin, "README"), "hi\n");
@@ -2367,7 +2370,82 @@ describe("the Claude credential of a run", () => {
         { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
       );
       expect(append).toMatch(
-        /Run each command that calls `claude` .*, as `CLAUDE_CODE_OAUTH_TOKEN="\$\(<'[^']+'\)" env -u ANTHROPIC_API_KEY -u .* CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 KRU_NO_LEAD_GATE=1 claude --settings '\{"env":\{"KRU_NO_LEAD_GATE":"1"\}\}' -p …`, even where the check leaves that prefix out\./,
+        /Run each command that calls `claude` .*, as `CLAUDE_CODE_OAUTH_TOKEN="\$\(<'[^']+'\)" env -u ANTHROPIC_API_KEY -u .* CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1 KRU_NO_LEAD_GATE=1 claude --settings '\{"env":\{"KRU_NO_LEAD_GATE":"1"\}\}' --output-format json -p …`, even where the check leaves that prefix out\./,
+      );
+    });
+
+    test("the prompt has the agent read `.result` and report permission_denials, is_error or a missing result as a gap", async () => {
+      const append = await promptOf(
+        { claudeAuth: "oauth" },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      );
+      expect(append).toContain("`.result`");
+      expect(append).toContain("`permission_denials`");
+      expect(append).toContain("`is_error: true`");
+      expect(append).toContain("never as a clean pass");
+    });
+
+    test("a run with checks marks the repo and the worktree trusted in the sandbox user's ~/.claude.json, keeping its other keys", async () => {
+      const home = join(root, "home");
+      mkdirSync(home);
+      writeFileSync(
+        join(home, ".claude.json"),
+        JSON.stringify({
+          oauthAccount: { a: 1 },
+          projects: { "/x": { n: 2 } },
+        }),
+        { mode: 0o640 },
+      );
+      chmodSync(join(home, ".claude.json"), 0o640);
+      await promptOf(
+        { claudeAuth: "oauth", sessionEnv: { HOME: home } },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      );
+      const saved = JSON.parse(
+        readFileSync(join(home, ".claude.json"), "utf8"),
+      );
+      expect(saved.oauthAccount).toEqual({ a: 1 });
+      expect(saved.projects["/x"]).toEqual({ n: 2 });
+      expect(saved.projects[config.repoDir]).toEqual({
+        hasTrustDialogAccepted: true,
+      });
+      expect(
+        Object.keys(saved.projects).filter((p) =>
+          p.startsWith(config.worktreesDir),
+        ),
+      ).toHaveLength(1);
+      expect(statSync(join(home, ".claude.json")).mode & 0o777).toBe(0o640);
+      expect(JSON.stringify(saved)).not.toContain(TOKEN);
+    });
+
+    test("a trust write that fails posts a runner.warning and the run goes on", async () => {
+      const home = join(root, "home");
+      mkdirSync(home);
+      writeFileSync(join(home, ".claude.json"), "{ half a wri");
+      const query = scripted([init, success]);
+      const { posted, post } = recorder();
+      const code = await runSession(
+        {
+          ...config,
+          checks: ["claude -p /review"],
+          sessionEnv: { HOME: home },
+        },
+        {
+          query,
+          post,
+          signal: new AbortController().signal,
+          awaitDecision: noDecision,
+          credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+        },
+      );
+      expect(code).toBe(0);
+      expect(posted).toContainEqual(
+        expect.objectContaining({
+          type: "runner.warning",
+          payload: {
+            message: expect.stringContaining("could not mark the repo trusted"),
+          },
+        }),
       );
     });
 

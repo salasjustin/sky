@@ -82,6 +82,7 @@ import {
   prepareWorktree,
   type Refreshed,
 } from "./sync.js";
+import { trustProjects } from "./trust.js";
 import { commitAll, diffRollup, headSha } from "./worktree.js";
 
 /** The Agent SDK's `query`, narrowed to what the runner calls; tests feed it scripted streams. */
@@ -390,7 +391,7 @@ export function removeScratchNow(): void {
 export const nestedClaude = (login: NestedPrefix | undefined) => {
   const prefix = login ? `${login.assignment} ` : "";
   // single-quoted for the shell: the JSON holds no single quote
-  return `${prefix}env ${PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ")} ${HOST_MANAGED}=1 ${NO_LEAD_GATE}=1 claude --settings '${JSON.stringify(LEAD_GATE_OFF)}' -p …`;
+  return `${prefix}env ${PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ")} ${HOST_MANAGED}=1 ${NO_LEAD_GATE}=1 claude --settings '${JSON.stringify(LEAD_GATE_OFF)}' --output-format json -p …`;
 };
 
 /**
@@ -410,6 +411,7 @@ const checkInstructions = (
     ...(login
       ? [
           `Run each command that calls \`claude\` with the project's Anthropic key, auth token, base URL and provider switches unset, as \`${nestedClaude(login)}\`, even where the check leaves that prefix out.`,
+          `The nested session prints one JSON object: read its \`.result\` for the report. A non-empty \`permission_denials\`, \`is_error: true\` or a missing \`.result\` means the check did not fully run: report it as a gap, never as a clean pass.`,
           `Use that form on this run in place of any nested \`claude\` command or credential file path from an earlier run of this session.`,
           ...(scratchDir
             ? [
@@ -1323,6 +1325,18 @@ export async function runSession(
       sessionEnvOf(config),
     );
     scratch = scratchDirOf(runId);
+    // a check's nested `claude` ignores the repo's permissions in a workspace it doesn't trust
+    if (config.checks.length > 0) {
+      try {
+        trustProjects(claudeHome, [...new Set([config.repoDir, cwd])]);
+      } catch (error) {
+        const message = `could not mark the repo trusted for nested claude sessions: ${messageOf(error)}`;
+        warn(`runner: ${message}`);
+        void post({ type: "runner.warning", payload: { message } }).catch(
+          () => {},
+        );
+      }
+    }
     // a check's nested `claude` is the file's only reader, so a run without checks gets none
     if (config.checks.length > 0)
       nestedLogin = await prepareNestedLogin(
