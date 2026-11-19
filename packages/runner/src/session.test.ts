@@ -2441,6 +2441,25 @@ describe("the Claude credential of a run", () => {
       expect(existsSync(join(home, ".claude.json"))).toBe(false);
     });
 
+    test.each([
+      ["a run without checks", { claudeAuth: "oauth", checks: [] }],
+      ["an API-key run with checks", { claudeAuth: "api-key" }],
+    ] as const)(
+      "%s leaves the config file untouched",
+      async (_name, overrides) => {
+        const home = join(root, "home");
+        mkdirSync(home);
+        const text = '{"oauthAccount":{"a":1}}';
+        writeFileSync(join(home, ".claude.json"), text);
+        await promptOf(
+          { ...overrides, sessionEnv: { HOME: home } },
+          { CLAUDE_CODE_OAUTH_TOKEN: TOKEN, SKY_CLAUDE_API_KEY: SKY_KEY },
+        );
+        expect(readFileSync(join(home, ".claude.json"), "utf8")).toBe(text);
+        expect(readdirSync(home)).toEqual([".claude.json"]);
+      },
+    );
+
     test("a trust write that fails posts a runner.warning and the run goes on", async () => {
       const home = join(root, "home");
       mkdirSync(home);

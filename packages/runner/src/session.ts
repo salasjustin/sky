@@ -1331,7 +1331,8 @@ export async function runSession(
     // `extraKnownMarketplaces` and the `.mcp.json` `headersHelper`. Deny and ask rules, settings hooks,
     // `env`, `apiKeyHelper` and `.mcp.json` servers apply without it, so a nested session without it
     // runs with only Claude Code's built-in read-only allowances, and tests and builds are denied.
-    if (config.checks.length > 0) {
+    // Only a run with checks on a login starts a nested `claude`; an API-key run has none.
+    if (config.checks.length > 0 && config.claudeAuth !== "api-key") {
       try {
         // the file Claude reads: the one the rest of the runner reads, under the session's env
         trustProjects(
