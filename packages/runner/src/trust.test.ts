@@ -31,7 +31,7 @@ test("merges into the file, keeping every other key and the file's mode, and is 
     }),
   );
   chmodSync(file(), 0o640);
-  expect(trustProjects(home, ["/workspace/repo", "/workspace/wt/a"])).toBe(
+  expect(trustProjects(file(), ["/workspace/repo", "/workspace/wt/a"])).toBe(
     true,
   );
   expect(read()).toEqual({
@@ -46,7 +46,7 @@ test("merges into the file, keeping every other key and the file's mode, and is 
   const once = readFileSync(file(), "utf8");
   // a rewrite renames a new file over it, so the inode changes even within one mtime tick
   const inode = statSync(file()).ino;
-  expect(trustProjects(home, ["/workspace/repo", "/workspace/wt/a"])).toBe(
+  expect(trustProjects(file(), ["/workspace/repo", "/workspace/wt/a"])).toBe(
     false,
   );
   expect(readFileSync(file(), "utf8")).toBe(once);
@@ -56,7 +56,9 @@ test("merges into the file, keeping every other key and the file's mode, and is 
 
 test("creates the file, and the home, when missing", () => {
   const nested = join(home, "new-home");
-  expect(trustProjects(nested, ["/workspace/repo"])).toBe(true);
+  expect(trustProjects(join(nested, ".claude.json"), ["/workspace/repo"])).toBe(
+    true,
+  );
   expect(
     JSON.parse(readFileSync(join(nested, ".claude.json"), "utf8")),
   ).toEqual({
@@ -67,6 +69,6 @@ test("creates the file, and the home, when missing", () => {
 
 test("throws on a file that isn't JSON, leaving it as it was", () => {
   writeFileSync(file(), "{ half");
-  expect(() => trustProjects(home, ["/r"])).toThrow();
+  expect(() => trustProjects(file(), ["/r"])).toThrow();
   expect(readFileSync(file(), "utf8")).toBe("{ half");
 });

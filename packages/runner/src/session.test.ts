@@ -2420,6 +2420,27 @@ describe("the Claude credential of a run", () => {
       expect(JSON.stringify(saved)).not.toContain(TOKEN);
     });
 
+    test("with CLAUDE_CONFIG_DIR set, trust goes to that directory's .claude.json and not the home's", async () => {
+      const home = join(root, "home");
+      const configDir = join(root, "claude-config");
+      mkdirSync(home);
+      mkdirSync(configDir);
+      await promptOf(
+        {
+          claudeAuth: "oauth",
+          sessionEnv: { HOME: home, CLAUDE_CONFIG_DIR: configDir },
+        },
+        { CLAUDE_CODE_OAUTH_TOKEN: TOKEN },
+      );
+      const saved = JSON.parse(
+        readFileSync(join(configDir, ".claude.json"), "utf8"),
+      );
+      expect(saved.projects[config.repoDir]).toEqual({
+        hasTrustDialogAccepted: true,
+      });
+      expect(existsSync(join(home, ".claude.json"))).toBe(false);
+    });
+
     test("a trust write that fails posts a runner.warning and the run goes on", async () => {
       const home = join(root, "home");
       mkdirSync(home);

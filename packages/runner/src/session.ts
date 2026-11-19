@@ -1333,7 +1333,14 @@ export async function runSession(
     // runs with only Claude Code's built-in read-only allowances, and tests and builds are denied.
     if (config.checks.length > 0) {
       try {
-        trustProjects(claudeHome, [...new Set([config.repoDir, cwd])]);
+        // the file Claude reads: the one the rest of the runner reads, under the session's env
+        trustProjects(
+          userConfigFile({
+            ...(deps.env ?? process.env),
+            ...config.sessionEnv,
+          }),
+          [...new Set([config.repoDir, cwd])],
+        );
       } catch (error) {
         const message = `could not mark the repo trusted for nested claude sessions: ${messageOf(error)}`;
         warn(`runner: ${message}`);
