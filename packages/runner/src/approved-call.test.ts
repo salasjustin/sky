@@ -188,6 +188,8 @@ beforeEach(() => {
   // the machine's own `~/.claude` (its plugins and hooks) stays out of the session
   home = join(root, "home");
   mkdirSync(join(home, ".claude"), { recursive: true });
+  // a run with checks marks its repo trusted in `~/.claude.json`: keep that off the developer's own
+  vi.stubEnv("HOME", home);
 });
 afterEach(() => {
   vi.unstubAllEnvs();

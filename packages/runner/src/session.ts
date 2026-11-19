@@ -82,6 +82,7 @@ import {
   prepareWorktree,
   type Refreshed,
 } from "./sync.js";
+import { trustProjects, untrustedPaths } from "./trust.js";
 import { commitAll, diffRollup, headSha } from "./worktree.js";
 
 /** The Agent SDK's `query`, narrowed to what the runner calls; tests feed it scripted streams. */
@@ -390,7 +391,7 @@ export function removeScratchNow(): void {
 export const nestedClaude = (login: NestedPrefix | undefined) => {
   const prefix = login ? `${login.assignment} ` : "";
   // single-quoted for the shell: the JSON holds no single quote
-  return `${prefix}env ${PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ")} ${HOST_MANAGED}=1 ${NO_LEAD_GATE}=1 claude --settings '${JSON.stringify(LEAD_GATE_OFF)}' -p …`;
+  return `${prefix}env ${PROJECT_VARIABLES.map((name) => `-u ${name}`).join(" ")} ${HOST_MANAGED}=1 ${NO_LEAD_GATE}=1 claude --settings '${JSON.stringify(LEAD_GATE_OFF)}' --output-format json -p …`;
 };
 
 /**
@@ -410,6 +411,7 @@ const checkInstructions = (
     ...(login
       ? [
           `Run each command that calls \`claude\` with the project's Anthropic key, auth token, base URL and provider switches unset, as \`${nestedClaude(login)}\`, even where the check leaves that prefix out.`,
+          `The log also holds the nested session's stderr, so find the JSON object in the log and read its \`.result\` for the report. A non-empty \`permission_denials\`, \`is_error: true\` or a missing \`.result\` means the check did not fully run: report it as a gap, never as a clean pass. With no \`.result\`, quote the object's \`subtype\` and \`errors\` in the report.`,
           `Use that form on this run in place of any nested \`claude\` command or credential file path from an earlier run of this session.`,
           ...(scratchDir
             ? [
@@ -1323,6 +1325,39 @@ export async function runSession(
       sessionEnvOf(config),
     );
     scratch = scratchDirOf(runId);
+    // Claude Code applies the repo's `permissions.allow` only once the repo is trusted: an untrusted
+    // nested session runs with just the built-in read-only allowances, so tests and builds are denied.
+    // Trust is permanent and covers every Claude session in the repo on the sprite, this one included.
+    // Beyond `permissions.allow` it adds only `additionalDirectories`, allow rules in a tracked
+    // `settings.local.json`, subagent frontmatter hooks and `mcpServers`, project skills-dir plugins,
+    // `extraKnownMarketplaces` and the `.mcp.json` `headersHelper`; deny and ask rules, settings hooks,
+    // `env`, `apiKeyHelper` and `.mcp.json` servers apply without it.
+    // Only a run with checks on a login starts a nested `claude`; an API-key run has none.
+    if (config.checks.length > 0 && config.claudeAuth !== "api-key") {
+      try {
+        // the file the nested claude reads: resolved under the session's env, so a profile's
+        // CLAUDE_CONFIG_DIR counts here though the runner's own config reads use its env alone
+        const file = userConfigFile({
+          ...(deps.env ?? process.env),
+          ...config.sessionEnv,
+        });
+        // Claude keys trust on the main checkout's root, from inside a worktree too
+        const paths = [config.repoDir];
+        trustProjects(file, paths);
+        // another process rewriting the file in between would drop the entry
+        const missing = untrustedPaths(file, paths);
+        if (missing.length > 0)
+          throw new Error(
+            `${file} no longer holds the trust entry for ${missing.join(", ")}`,
+          );
+      } catch (error) {
+        const message = `could not mark the repo trusted for nested claude sessions: ${messageOf(error)}`;
+        warn(`runner: ${message}`);
+        void post({ type: "runner.warning", payload: { message } }).catch(
+          () => {},
+        );
+      }
+    }
     // a check's nested `claude` is the file's only reader, so a run without checks gets none
     if (config.checks.length > 0)
       nestedLogin = await prepareNestedLogin(
