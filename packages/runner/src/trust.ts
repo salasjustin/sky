@@ -16,7 +16,11 @@ import { dirname } from "node:path";
  * other key stays, and so does its mode. A path already trusted leaves the file untouched. The write
  * goes to a temp file renamed into place. Returns whether it wrote.
  */
-export function trustProjects(file: string, paths: string[]): boolean {
+export function trustProjects(
+  file: string,
+  paths: string[],
+  rename: typeof renameSync = renameSync,
+): boolean {
   let text: string | undefined;
   let mode = 0o600;
   try {
@@ -58,10 +62,24 @@ export function trustProjects(file: string, paths: string[]): boolean {
         mode,
       },
     );
-    renameSync(temp, file);
+    rename(temp, file);
   } catch (error) {
     rmSync(temp, { force: true });
     throw error;
   }
   return true;
+}
+
+/**
+ * The paths `file` doesn't hold as trusted now, read back from disk: another process rewriting the
+ * config between our write and Claude's read can drop the entry. A file that can't be read holds none.
+ */
+export function untrustedPaths(file: string, paths: string[]): string[] {
+  let projects: Record<string, { hasTrustDialogAccepted?: unknown }> = {};
+  try {
+    projects = JSON.parse(readFileSync(file, "utf8")).projects ?? {};
+  } catch {}
+  return paths.filter(
+    (path) => projects[path]?.hasTrustDialogAccepted !== true,
+  );
 }

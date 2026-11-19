@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { trustProjects } from "./trust.js";
+import { trustProjects, untrustedPaths } from "./trust.js";
 
 let home: string;
 beforeEach(() => {
@@ -71,4 +71,25 @@ test("throws on a file that isn't JSON, leaving it as it was", () => {
   writeFileSync(file(), "{ half");
   expect(() => trustProjects(file(), ["/r"])).toThrow();
   expect(readFileSync(file(), "utf8")).toBe("{ half");
+});
+
+test("removes its temp file and rethrows when the rename fails, leaving the config as it was", () => {
+  writeFileSync(file(), '{"a":1}');
+  expect(() =>
+    trustProjects(file(), ["/r"], () => {
+      throw new Error("rename refused");
+    }),
+  ).toThrow("rename refused");
+  expect(readdirSync(home)).toEqual([".claude.json"]);
+  expect(readFileSync(file(), "utf8")).toBe('{"a":1}');
+});
+
+test("untrustedPaths reads the file back and names the paths it doesn't hold as trusted", () => {
+  trustProjects(file(), ["/a", "/b"]);
+  expect(untrustedPaths(file(), ["/a", "/b"])).toEqual([]);
+  // another process rewrites the config without the entry
+  writeFileSync(file(), JSON.stringify({ projects: { "/a": {} } }));
+  expect(untrustedPaths(file(), ["/a", "/b"])).toEqual(["/a", "/b"]);
+  rmSync(file());
+  expect(untrustedPaths(file(), ["/a"])).toEqual(["/a"]);
 });

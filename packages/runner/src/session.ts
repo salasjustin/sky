@@ -82,7 +82,7 @@ import {
   prepareWorktree,
   type Refreshed,
 } from "./sync.js";
-import { trustProjects } from "./trust.js";
+import { trustProjects, untrustedPaths } from "./trust.js";
 import { commitAll, diffRollup, headSha } from "./worktree.js";
 
 /** The Agent SDK's `query`, narrowed to what the runner calls; tests feed it scripted streams. */
@@ -1335,13 +1335,18 @@ export async function runSession(
     if (config.checks.length > 0 && config.claudeAuth !== "api-key") {
       try {
         // the file Claude reads: the one the rest of the runner reads, under the session's env
-        trustProjects(
-          userConfigFile({
-            ...(deps.env ?? process.env),
-            ...config.sessionEnv,
-          }),
-          [...new Set([config.repoDir, cwd])],
-        );
+        const file = userConfigFile({
+          ...(deps.env ?? process.env),
+          ...config.sessionEnv,
+        });
+        const paths = [...new Set([config.repoDir, cwd])];
+        trustProjects(file, paths);
+        // another process rewriting the file in between would drop the entry
+        const missing = untrustedPaths(file, paths);
+        if (missing.length > 0)
+          throw new Error(
+            `${file} no longer holds the trust entry for ${missing.join(", ")}`,
+          );
       } catch (error) {
         const message = `could not mark the repo trusted for nested claude sessions: ${messageOf(error)}`;
         warn(`runner: ${message}`);
