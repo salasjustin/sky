@@ -13,7 +13,7 @@ import { dirname } from "node:path";
  * Marks each path as a trusted project in Claude Code's user config `file`, so a nested `claude -p`
  * honours the repo's `permissions.allow` entries, which wait on trust. The mark is permanent and
  * applies to every Claude session in that repo, not only nested ones. Merges into the file: every
- * other key stays, and so does its mode. A path already trusted leaves the file untouched. The write
+ * other key stays, and so does its mode. When every path is already trusted the file is untouched. The write
  * goes to a temp file renamed into place. Returns whether it wrote.
  */
 export function trustProjects(
