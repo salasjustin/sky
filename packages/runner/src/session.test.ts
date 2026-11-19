@@ -2409,11 +2409,13 @@ describe("the Claude credential of a run", () => {
       expect(saved.projects[config.repoDir]).toEqual({
         hasTrustDialogAccepted: true,
       });
-      expect(
-        Object.keys(saved.projects).filter((p) =>
-          p.startsWith(config.worktreesDir),
-        ),
-      ).toHaveLength(1);
+      const worktree = join(config.worktreesDir, config.agentId);
+      expect(saved.projects[worktree]).toEqual({
+        hasTrustDialogAccepted: true,
+      });
+      expect(Object.keys(saved.projects).sort()).toEqual(
+        ["/x", config.repoDir, worktree].sort(),
+      );
       expect(statSync(join(home, ".claude.json")).mode & 0o777).toBe(0o640);
       expect(JSON.stringify(saved)).not.toContain(TOKEN);
     });

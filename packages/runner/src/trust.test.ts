@@ -44,12 +44,13 @@ test("merges into the file, keeping every other key and the file's mode, and is 
   });
   expect(statSync(file()).mode & 0o777).toBe(0o640);
   const once = readFileSync(file(), "utf8");
-  const mtime = statSync(file()).mtimeMs;
+  // a rewrite renames a new file over it, so the inode changes even within one mtime tick
+  const inode = statSync(file()).ino;
   expect(trustProjects(home, ["/workspace/repo", "/workspace/wt/a"])).toBe(
     false,
   );
   expect(readFileSync(file(), "utf8")).toBe(once);
-  expect(statSync(file()).mtimeMs).toBe(mtime);
+  expect(statSync(file()).ino).toBe(inode);
   expect(readdirSync(home)).toEqual([".claude.json"]);
 });
 
