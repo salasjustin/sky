@@ -299,9 +299,11 @@ function draw_cloud(t) {
     [700, -1820, 240],
     [900, -1720, 180],
   ].forEach(([x, y, r]) => circle(x, y, r, C.ink));
-  fill_rr(-170, -1888, 340, 100, 50, C.bg);
-  draw_mark(-102, -1838, 58, C.ink);
-  txt("Sky", -62, -1812, { size: 70, w: 800, ls: -1 });
+  // the "Sky" badge sits in the cloud's right margin, clear of the top edge and the sprites
+  // (x >= 790 keeps it out of the rise shot, whose view ends at x = 768)
+  fill_rr(790, -1540, 210, 80, 40, C.bg);
+  draw_mark(822, -1500, 40, C.ink);
+  txt("Sky", 850, -1482, { size: 50, w: 800, ls: -1 });
   ctx.restore();
 }
 
@@ -515,9 +517,9 @@ function draw_list(t) {
           size: 24,
           color: col === C.g1 ? C.g1 : C.ink,
         });
-        txt(env, -240, y, { mono: true, size: 24, color: C.g1 });
+        txt(env, -330, y, { mono: true, size: 24, color: C.g1 });
         if (st === "waiting_approval")
-          txt("1 open request", -130, y, {
+          txt("1 open request", -250, y, {
             mono: true,
             size: 20,
             color: C.amber,
@@ -702,10 +704,10 @@ function camera(t) {
   if (t < T.cam_brand[0])
     return track(t, [
       [T.cam_result[0], 0, -1195, 0.7],
-      [T.cam_result[1], 0, -760, 0.6],
+      [T.cam_result[1], 0, -920, 0.46],
     ]);
   return track(t, [
-    [T.cam_brand[0], 0, -760, 0.6],
+    [T.cam_brand[0], 0, -920, 0.46],
     [T.cam_brand[1], 0, -2800, 1.0],
   ]);
 }

@@ -1,4 +1,4 @@
-"""Render chosen timestamps into a 2-column contact sheet: preview.py name t1,t2,... (fails on page or console errors)."""
+"""Render chosen timestamps into a 2-column contact sheet: preview.py name t1,t2,... [columns] (fails on page or console errors)."""
 import base64
 import glob
 import io
@@ -41,10 +41,12 @@ def main():
             ImageDraw.Draw(im).text((12, 10), f"t={t:.2f}", fill=(255, 255, 0))
             tiles.append(im)
         browser.close()
-    rows = (len(tiles) + 1) // 2
-    sheet = Image.new("RGB", (1920, 540 * rows), (0, 0, 0))
+    cols = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+    tw, th = 1920 // cols, 1080 // cols
+    rows = -(-len(tiles) // cols)
+    sheet = Image.new("RGB", (tw * cols, th * rows), (0, 0, 0))
     for i, im in enumerate(tiles):
-        sheet.paste(im, ((i % 2) * 960, (i // 2) * 540))
+        sheet.paste(im.resize((tw, th)), ((i % cols) * tw, (i // cols) * th))
     out = ROOT / "sheets"
     out.mkdir(exist_ok=True)
     path = out / f"{name}.png"

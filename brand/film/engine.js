@@ -1,6 +1,7 @@
 // Deterministic canvas engine: draw(t) redraws the whole frame from scratch for any t.
 const W = 1920;
 const H = 1080;
+const HEAD_H = 150; // height of the solid headline band
 const canvas = document.getElementById("c");
 const ctx = canvas.getContext("2d");
 
@@ -146,11 +147,15 @@ function headline(str, t, t0, t1) {
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   const x = 80;
-  const y = 58;
+  const y = 27;
   const bw = w + 76;
-  with_alpha(a, () => fill_rr(x, y, bw, 96, 48, C.bg));
+  // a solid header band: content scrolls under it, so nothing is ever drawn over the headline
+  with_alpha(a, () => {
+    ctx.fillStyle = C.bg;
+    ctx.fillRect(0, 0, W, HEAD_H);
+  });
   ctx.beginPath();
-  rr(x, y, bw, 96, 48);
+  ctx.rect(x, y, bw, 96);
   ctx.clip();
   kinetic(str, x + 38, y + 69, t, t0, t1, o);
   ctx.restore();
