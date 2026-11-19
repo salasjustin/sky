@@ -880,7 +880,7 @@ export async function runSession(
       if (apiEnded || reason !== "hook_cancelled") return undefined;
       // the session goes on, so the model must not read this as a refusal; the PM sees it apart
       // from a deny
-      const message = `The wait for request ${requestId} ended without an answer (${reason}); the call was told no one answered in time, not that it was refused.`;
+      const message = `The wait for request ${requestId} ended without an answer (${reason}); Claude was told no one answered in time, not that it was refused.`;
       warn(`runner: ${message}`);
       void post({ type: "runner.warning", payload: { message } }).catch(
         () => {},
