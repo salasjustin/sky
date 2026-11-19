@@ -11,8 +11,8 @@ import { dirname, join } from "node:path";
 
 /**
  * Marks each path as a trusted project in Claude Code's user config (`~/.claude.json`), so a nested
- * `claude -p` applies the repo's `.claude/settings.json` permissions instead of ignoring them as
- * coming from an untrusted workspace. Merges into the file: every other key stays, and so does its
+ * `claude -p` honours the repo's `permissions.allow` entries, which wait on trust. The mark is
+ * permanent and applies to every Claude session in that repo, not only nested ones. Merges into the file: every other key stays, and so does its
  * mode. A path already trusted leaves the file untouched. The write goes to a temp file renamed into
  * place. Returns whether it wrote.
  */

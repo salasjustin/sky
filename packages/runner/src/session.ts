@@ -1325,7 +1325,12 @@ export async function runSession(
       sessionEnvOf(config),
     );
     scratch = scratchDirOf(runId);
-    // a check's nested `claude` ignores the repo's permissions in a workspace it doesn't trust
+    // Trust is permanent and covers every Claude session in the repo on the sprite, this one included.
+    // It adds only the repo's `permissions.allow` and `additionalDirectories`, allow rules in a tracked
+    // `settings.local.json`, subagent frontmatter hooks and `mcpServers`, project skills-dir plugins,
+    // `extraKnownMarketplaces` and the `.mcp.json` `headersHelper`. Deny and ask rules, settings hooks,
+    // `env`, `apiKeyHelper` and `.mcp.json` servers apply without it, so a nested session without it
+    // runs with only Claude Code's built-in read-only allowances, and tests and builds are denied.
     if (config.checks.length > 0) {
       try {
         trustProjects(claudeHome, [...new Set([config.repoDir, cwd])]);
