@@ -81,9 +81,11 @@ beforeEach(() => {
   // workers share: keep them in this test's own
   mkdirSync(join(root, "os-tmp"));
   vi.stubEnv("TMPDIR", join(root, "os-tmp"));
-  // a run with checks marks its repo trusted in `~/.claude.json`: keep that off the developer's own
+  // a run with checks marks its repo trusted in `~/.claude.json`: keep that off the developer's own,
+  // which a host's CLAUDE_CONFIG_DIR would point the write at in place of HOME
   mkdirSync(join(root, "default-home"));
   vi.stubEnv("HOME", join(root, "default-home"));
+  vi.stubEnv("CLAUDE_CONFIG_DIR", undefined);
   const origin = join(root, "origin");
   execFileSync("git", ["init", "-q", "-b", "main", origin]);
   writeFileSync(join(origin, "README"), "hi\n");
