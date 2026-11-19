@@ -2383,6 +2383,8 @@ describe("the Claude credential of a run", () => {
       expect(append).toContain("`permission_denials`");
       expect(append).toContain("`is_error: true`");
       expect(append).toContain("never as a clean pass");
+      expect(append).toContain("find the JSON object in the log");
+      expect(append).toContain("quote the object's `subtype` and `errors`");
     });
 
     test("a run with checks marks the repo trusted in the sandbox user's ~/.claude.json, keeping its other keys", async () => {

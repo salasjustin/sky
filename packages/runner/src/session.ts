@@ -411,7 +411,7 @@ const checkInstructions = (
     ...(login
       ? [
           `Run each command that calls \`claude\` with the project's Anthropic key, auth token, base URL and provider switches unset, as \`${nestedClaude(login)}\`, even where the check leaves that prefix out.`,
-          `The nested session prints one JSON object: read its \`.result\` for the report. A non-empty \`permission_denials\`, \`is_error: true\` or a missing \`.result\` means the check did not fully run: report it as a gap, never as a clean pass.`,
+          `The log also holds the nested session's stderr, so find the JSON object in the log and read its \`.result\` for the report. A non-empty \`permission_denials\`, \`is_error: true\` or a missing \`.result\` means the check did not fully run: report it as a gap, never as a clean pass. With no \`.result\`, quote the object's \`subtype\` and \`errors\` in the report.`,
           `Use that form on this run in place of any nested \`claude\` command or credential file path from an earlier run of this session.`,
           ...(scratchDir
             ? [
