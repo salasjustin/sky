@@ -1,0 +1,6 @@
+numpy
+scipy
+playwright
+fonttools
+brotli
+pillow

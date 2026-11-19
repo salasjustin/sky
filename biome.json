@@ -7,9 +7,22 @@
       "!**/dist",
       "!.claude",
       "!**/*.tsbuildinfo",
-      "!lint/fixtures"
+      "!lint/fixtures",
+      "!brand/film/out"
     ]
   },
+  "overrides": [
+    {
+      "includes": ["brand/film/*.js"],
+      "linter": {
+        "rules": {
+          "correctness": { "noUnusedVariables": "off" },
+          "suspicious": { "useIterableCallbackReturn": "off" },
+          "nursery": { "noFloatingPromises": "off" }
+        }
+      }
+    }
+  ],
   "formatter": { "indentStyle": "space", "indentWidth": 2 },
   "linter": {
     "enabled": true,

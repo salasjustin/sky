@@ -1,1 +1,8 @@
-.hyperframes/
+.venv/
+frames/
+sheets/
+work/
+out/score.wav
+out/score.mp3
+out/*.log
+__pycache__/
