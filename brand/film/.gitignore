@@ -2,7 +2,5 @@
 frames/
 sheets/
 work/
-out/score.wav
-out/score.mp3
-out/*.log
+out/
 __pycache__/
