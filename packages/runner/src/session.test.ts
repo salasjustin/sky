@@ -2385,7 +2385,7 @@ describe("the Claude credential of a run", () => {
       expect(append).toContain("never as a clean pass");
     });
 
-    test("a run with checks marks the repo and the worktree trusted in the sandbox user's ~/.claude.json, keeping its other keys", async () => {
+    test("a run with checks marks the repo trusted in the sandbox user's ~/.claude.json, keeping its other keys", async () => {
       const home = join(root, "home");
       mkdirSync(home);
       writeFileSync(
@@ -2409,12 +2409,9 @@ describe("the Claude credential of a run", () => {
       expect(saved.projects[config.repoDir]).toEqual({
         hasTrustDialogAccepted: true,
       });
-      const worktree = join(config.worktreesDir, config.agentId);
-      expect(saved.projects[worktree]).toEqual({
-        hasTrustDialogAccepted: true,
-      });
+      // Claude keys trust on the main checkout's root, so the worktree gets no entry
       expect(Object.keys(saved.projects).sort()).toEqual(
-        ["/x", config.repoDir, worktree].sort(),
+        ["/x", config.repoDir].sort(),
       );
       expect(statSync(join(home, ".claude.json")).mode & 0o777).toBe(0o640);
       expect(JSON.stringify(saved)).not.toContain(TOKEN);

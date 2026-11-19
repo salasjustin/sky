@@ -1339,7 +1339,8 @@ export async function runSession(
           ...(deps.env ?? process.env),
           ...config.sessionEnv,
         });
-        const paths = [...new Set([config.repoDir, cwd])];
+        // Claude keys trust on the main checkout's root, from inside a worktree too
+        const paths = [config.repoDir];
         trustProjects(file, paths);
         // another process rewriting the file in between would drop the entry
         const missing = untrustedPaths(file, paths);
