@@ -282,7 +282,7 @@ Here `DOCS_API_KEY` on the left is the variable the server sees, and on the righ
 
 ### Approvals
 
-`approvalPolicy` holds the listed tool calls until you approve or deny them. A Bash command on the auto-approve list skips a bare `Bash` entry and runs at once, so `git status` or `grep` doesn't cost an approval. A `Bash(git diff:*)` entry still holds what it names, and `Read`, `Glob` and `Grep` are unaffected.
+`approvalPolicy` holds the listed tool calls until you approve or deny them; a wait that ends with no answer while the run goes on tells the agent that no one answered in time, that it was not a refusal and the step may be retried, and records a `runner.warning` naming the request. A Bash command on the auto-approve list skips a bare `Bash` entry and runs at once, so `git status` or `grep` doesn't cost an approval. A `Bash(git diff:*)` entry still holds what it names, and `Read`, `Glob` and `Grep` are unaffected.
 
 A command skips approval only when every simple command in it would skip approval on its own: each is plain words starting with a list entry, and none of the checks below asks. Simple commands may be joined by `;`, `&&`, `||` and `|`, so `git status -sb | head -3`, `ls a; cat b` and `cd packages/x && grep -n foo bar.ts` run at once, while `git status && git push` asks. Anything else waits for you, and so does a command the runner can't evaluate.
 
