@@ -158,12 +158,25 @@ def buzz(t0, d=0.45, f=140, gain=0.5):
     place(sfx, t0, sig + thump * 0.8, rev=0.1, gain=gain)
 
 
+def arrive(i):
+    """When bot i's "+" reaches the CPU meter: the picture's own formula."""
+    return T["spawn"][i] + 0.1 + T["token"]
+
+
+def load_curve(t):
+    """The meters' load, a staircase with one eased step per bot (same weights and timing as scenes.js)."""
+    out = np.zeros_like(t)
+    for i, w in enumerate(T["bot_w"]):
+        p = np.clip((t - arrive(i)) / 0.4, 0, 1)
+        out += w * (1 - (1 - p) ** 3)
+    return out
+
+
 def strain_hum(t0, t1, fade_to, gain=0.28):
     """A strained mains hum plus fan noise that tightens as the meters climb and dies when the work leaves."""
     n = int((fade_to - t0) * SR)
     t = np.arange(n) / SR + t0
-    heat = np.clip((t - T["meters_up"]) / (T["meters_pin"] - T["meters_up"]), 0, 1)
-    heat = (1 - np.cos(np.pi * heat)) / 2
+    heat = load_curve(t)
     stop = np.clip((t - T["lift"][0]) / (fade_to - T["lift"][0]), 0, 1)
     amp = (0.15 + 0.85 * heat) * (1 - stop) ** 2
     f0 = 52 + 14 * heat
@@ -213,13 +226,16 @@ def typing(a, b, s, k0):
 for h in T["head"].values():
     whoosh(h[0] - 0.05, 0.5, 2500, 6000, gain=0.12, peak=0.3)
 
-# outset: agent windows working
-for i in range(4):
-    pop(0.9 + i * 1.0, 640 + 90 * i, gain=0.3, pan=-0.6 + 0.4 * i)
-    tick(1.3 + i * 1.0, i, gain=0.25)
+# outset: each new bot pops in, starts its step, and its "+" lands on the meters a beat later
+for i, s in enumerate(T["spawn"]):
+    pan = -0.7 + 1.4 * i / (len(T["spawn"]) - 1)
+    pop(s, 560 + 45 * i, gain=0.32, pan=pan)
+    tick(s + 0.1, i, gain=0.3)
+    whoosh(s + 0.1, T["token"], 1800, 5200, gain=0.1, pan=pan, peak=0.5)
+    pop(arrive(i), 760 + 70 * i, gain=0.22, pan=0.5, rev=0.2)
 
-# problem: the strained hum from the first climb until the work leaves, then the freeze
-strain_hum(T["meters_up"], T["freeze"], T["lift"][0] + 1.0)
+# problem: the strained hum steps up with each bot until the meters pin, then the freeze
+strain_hum(T["spawn"][0], T["freeze"], T["lift"][0] + 1.0)
 for t in np.arange(T["shake"][0], T["freeze"], 0.5):
     tick(t, int(t * 4), gain=0.18)
 buzz(T["dialog"], 0.55, 135, 0.55)
@@ -228,8 +244,9 @@ buzz(T["dialog"], 0.55, 135, 0.55)
 click(T["grab"], 0.8)
 whoosh(T["cam_up"][0] + 0.2, 2.6, 250, 3800, gain=0.55, peak=0.6)
 for i, l in enumerate(T["lift"]):
-    whoosh(l, 0.5, 900, 3000, gain=0.22, pan=-0.6 + 0.4 * i)
-    pop(l + T["flight"], 520 + 70 * i, gain=0.5, pan=-0.5 + 0.33 * i)
+    pan = -0.8 + 1.6 * i / (len(T["lift"]) - 1)
+    whoosh(l, 0.5, 900, 3000, gain=0.16, pan=pan)
+    pop(l + T["flight"], 520 + 40 * i, gain=0.34, pan=pan)
 notes = [mf(m) for m in (72, 76, 79)]
 for a in range(4):
     for k in range(3):

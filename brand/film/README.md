@@ -28,9 +28,9 @@ Every fact on screen traces to the root `README.md`.
 | A private preview link                                                                                           | Previews section         |
 | `github.com/salasjustin/sky`                                                                                     | repo URL                 |
 
-Illustrative, not from the README: agent ids (`agt_7f3k`), the env names `web`, `api`, `docs`, the toast wording, and the four laptop windows (`claude code`, `build`, `lint`, `test`). No counts or timings are stated.
+Illustrative, not from the README: agent ids (`agt_7f3k`), the env names `web`, `api`, `docs`, the toast wording, and the eight laptop windows ("bot · docs", "bot · api" and so on) with their `pnpm` steps. The number of windows, and the CPU and memory meters, show the cause of the load and are not product claims. No counts or timings about Sky are stated.
 
-The README says one sprite per environment; the film gives each window its own sprite, labelled with an example env name.
+The README says one sprite per environment; the film lands the eight windows in four sprites, two to a sprite, and labels the demo sprites with example env names.
 
 Product names are plain text only. No Anthropic, Claude or Fly logos, and no Claude Code mascot.
 

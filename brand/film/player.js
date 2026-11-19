@@ -3,8 +3,8 @@ const query = new URLSearchParams(location.search);
 const POSTER_T = T.poster;
 const CHAPTERS = [
   [0, "Outset"],
-  [T.meters_up, "Problem"],
-  [T.head.c[0], "Solution"],
+  [T.head.b[0], "Problem"],
+  [T.grab, "Solution"],
   [T.head.d[0], "Demo"],
   [T.head.e[0], "Result"],
   [T.cam_brand[0], "Brand"],

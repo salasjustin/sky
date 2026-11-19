@@ -1,44 +1,105 @@
 // One continuous world drawn through a moving camera. Every scene function reads only t.
 
 const WIN = { w: 660, h: 335 };
+const WIN_S = 0.72; // size of a bot window on the laptop screen
+// Eight bots, each with its own heavy step. `at` is the window centre on the laptop screen.
 const AGENTS = [
   {
-    title: "claude code",
+    title: "bot · docs",
+    job: "install",
     col: C.blue,
-    slot: [-680, -330],
+    at: [-440, -170],
     log: [
-      "reading the repo",
-      "planning the change",
-      "editing files",
-      "running the checks",
-      "writing the summary",
+      "pnpm install",
+      "resolving packages",
+      "fetching tarballs",
+      "linking deps",
     ],
   },
   {
-    title: "build",
+    title: "bot · api",
+    job: "build",
     col: C.amber,
-    slot: [20, -330],
-    log: ["resolving packages", "compiling", "bundling", "writing output"],
+    at: [-85, -225],
+    log: ["pnpm build", "compiling", "bundling", "writing output"],
   },
   {
-    title: "lint",
+    title: "bot · web",
+    job: "build",
     col: C.violet,
-    slot: [-680, 25],
-    log: ["checking files", "checking types", "formatting"],
+    at: [270, -175],
+    log: ["pnpm build", "compiling", "bundling", "optimizing assets"],
   },
   {
-    title: "test",
+    title: "bot · tests",
+    job: "test",
     col: C.green,
-    slot: [20, 25],
-    log: ["starting tests", "running suites", "collecting results"],
+    at: [-330, 45],
+    log: [
+      "pnpm test",
+      "starting tests",
+      "running suites",
+      "collecting results",
+    ],
+  },
+  {
+    title: "bot · lint",
+    job: "lint",
+    col: C.blue,
+    at: [55, -20],
+    log: ["pnpm lint", "checking files", "checking types", "formatting"],
+  },
+  {
+    title: "bot · design",
+    job: "install",
+    col: C.amber,
+    at: [440, 45],
+    log: [
+      "pnpm install",
+      "fetching tarballs",
+      "linking deps",
+      "building tokens",
+    ],
+  },
+  {
+    title: "bot · deps",
+    job: "install",
+    col: C.violet,
+    at: [-150, 235],
+    log: [
+      "pnpm install",
+      "resolving packages",
+      "fetching tarballs",
+      "linking deps",
+    ],
+  },
+  {
+    title: "bot · e2e",
+    job: "test",
+    col: C.green,
+    at: [255, 255],
+    log: [
+      "pnpm test:e2e",
+      "starting browser",
+      "running suites",
+      "collecting results",
+    ],
   },
 ];
+const N_BOTS = AGENTS.length;
 const ROW_NAMES = ["Claude Code", "CI", "tests"];
 const SPR_W = 320;
 const SPR_H = 250;
 
 // ---- phases of the overload --------------------------------------------------
-const heat_raw = (t) => ease.in_out_sine(prog(t, T.meters_up, T.meters_pin));
+const arrive = (i) => T.spawn[i] + 0.1 + T.token; // when bot i's token reaches CPU (MEM is 0.12 s later)
+const load_at = (t, lag = 0) =>
+  T.bot_w.reduce(
+    (s, w, i) =>
+      s + w * ease.out_cubic(prog(t, arrive(i) + lag, arrive(i) + lag + 0.4)),
+    0,
+  );
+const heat_raw = (t) => ease.in_out_sine(clamp01((load_at(t) - 0.2) / 0.8));
 const calm_p = (t) => ease.in_out_cubic(prog(t, T.calm[0], T.calm[1]));
 const heat = (t) => heat_raw(t) * (1 - calm_p(t));
 const lerp_col = (a, b, p) => {
@@ -51,28 +112,20 @@ const meter_col = (v) =>
     ? lerp_col(C.green, C.amber, v / 0.6)
     : lerp_col(C.amber, C.red, (v - 0.6) / 0.4);
 const cpu_val = (t) => {
-  const idle = 0.2 + 0.05 * Math.sin(t * 1.3);
-  const up = lerp(
-    idle,
-    0.99,
-    ease.in_out_sine(prog(t, T.meters_up, T.meters_pin)),
-  );
+  const idle = 0.2 + 0.03 * Math.sin(t * 1.3);
+  const up = lerp(idle, 0.99, load_at(t));
   return lerp(up, 0.1 + 0.02 * Math.sin(t * 1.1), calm_p(t));
 };
 const mem_val = (t) => {
-  const idle = 0.3 + 0.04 * Math.sin(t * 0.9 + 1);
-  const up = lerp(
-    idle,
-    0.97,
-    ease.in_out_sine(prog(t, T.meters_up + 0.3, T.meters_pin + 0.3)),
-  );
+  const idle = 0.28 + 0.03 * Math.sin(t * 0.9 + 1);
+  const up = lerp(idle, 0.97, load_at(t, 0.12));
   return lerp(up, 0.16 + 0.02 * Math.sin(t * 0.8), calm_p(t));
 };
 
 // seconds of work an agent window has done; it slows with the heat, stops at the freeze and resumes once lifted
 function alive(i, t) {
   let a = 0;
-  for (let u = 0.05; u < t; u += 0.1) {
+  for (let u = T.spawn[i] + 0.05; u < t; u += 0.1) {
     const r = u < T.freeze ? 1 - 0.85 * heat_raw(u) : u >= T.lift[i] ? 1 : 0;
     a += r * 0.1;
   }
@@ -96,7 +149,16 @@ function agent_window(i, x, y, s, rot, t, a_alive, grey) {
   ctx.fillStyle = C.panel2;
   ctx.fillRect(0, 0, WIN.w, 48);
   [26, 48, 70].forEach((dx) => circle(dx, 24, 6, C.g2));
-  txt(g.title, 100, 33, { size: 24, w: 600 });
+  txt(g.title, 100, 33, { size: 26, w: 700 });
+  // the heavy step this bot just started
+  const flash = 1 - ease.out_cubic(prog(t, T.spawn[i] + 0.1, T.spawn[i] + 1.0));
+  fill_rr(WIN.w - 232, 10, 150, 30, 15, lerp_col(C.track, C.amber, flash));
+  txt(g.job, WIN.w - 157, 32, {
+    size: 20,
+    w: 700,
+    align: "center",
+    color: lerp_col(C.g1, C.bg, flash),
+  });
   const col = lerp_col(g.col, C.orange, h_ * 0.85);
   spinner(WIN.w - 36, 24, 9, 4 * a_alive, col);
   const p = clamp01(0.1 + 0.052 * a_alive);
@@ -142,8 +204,10 @@ function agent_window(i, x, y, s, rot, t, a_alive, grey) {
 }
 
 function slot_center(i) {
-  return [AGENTS[i].slot[0] + WIN.w / 2, AGENTS[i].slot[1] + WIN.h / 2];
+  return AGENTS[i].at;
 }
+// the sprite a bot lands in: bots 0-3 take the four sprites, bots 4-7 share them
+const spr_of = (i) => i % 4;
 function sprite_pos(sp, t) {
   return [sp.x, sp.y + drift(t)];
 }
@@ -152,30 +216,33 @@ function window_pose(i, t) {
   const t0 = T.lift[i];
   const t1 = t0 + T.flight;
   const [cx, cy] = slot_center(i);
+  if (t < T.spawn[i]) return null;
   if (t < t0) {
     const A =
-      6 *
+      5 *
       ease.in_out_sine(prog(t, T.shake[0], T.shake[0] + 1.0)) *
       (1 - ease.in_out_sine(prog(t, T.freeze - 0.3, T.freeze + 0.2)));
+    const pop = Math.max(spring_t(t - T.spawn[i], 11, 2.4), 0.01);
     return {
       x: cx + A * Math.sin(t * 38 + i * 1.7),
       y: cy + A * 0.6 * Math.sin(t * 31 + i),
-      s: 1,
+      s: WIN_S * Math.min(pop, 1.06),
       rot: 0,
       flying: false,
     };
   }
   if (t >= t1) return null;
   const p = ease.in_out_cubic(prog(t, t0, t1));
-  const sp = SPR[i];
-  const [sx, sy0] = sprite_pos(sp, t);
+  const sp = SPR[spr_of(i)];
+  const [sx0, sy0] = sprite_pos(sp, t);
+  const sx = sx0 + (i < 4 ? -72 : 72);
   const sy = sy0 + 80;
   const mx = (cx + sx) / 2 + (cx < 0 ? -380 : 380) * (i % 2 === 0 ? 1 : 0.7);
   const my = Math.min(cy, sy) - 320 - i * 40;
   const u = 1 - p;
   const x = u * u * cx + 2 * u * p * mx + p * p * sx;
   const y = u * u * cy + 2 * u * p * my + p * p * sy;
-  const s = lerp(1, 280 / WIN.w, ease.in_out_cubic(prog(p, 0.25, 1)));
+  const s = lerp(WIN_S, 132 / WIN.w, ease.in_out_cubic(prog(p, 0.25, 1)));
   return {
     x,
     y,
@@ -186,6 +253,11 @@ function window_pose(i, t) {
 }
 
 // ---- the laptop ----------------------------------------------------------------------
+const METER = {
+  y: -385,
+  cpu: { x: 130, w: 240 },
+  mem: { x: 470, w: 230 },
+};
 function draw_laptop(t) {
   const h_ = heat(t);
   fill_rr(-740, -430, 1480, 860, 40, C.g3);
@@ -203,10 +275,10 @@ function draw_laptop(t) {
   ctx.restore();
   const c = cpu_val(t);
   const m = mem_val(t);
-  txt("CPU", 170, -370, { size: 20, w: 700, color: C.g1 });
-  progress_bar(232, -383, 150, 12, c, meter_col(c));
-  txt("MEM", 410, -370, { size: 20, w: 700, color: C.g1 });
-  progress_bar(472, -383, 150, 12, m, meter_col(m));
+  txt("CPU", METER.cpu.x - 62, -368, { size: 22, w: 700, color: C.g1 });
+  progress_bar(METER.cpu.x, METER.y, METER.cpu.w, 16, c, meter_col(c));
+  txt("MEM", METER.mem.x - 62, -368, { size: 22, w: 700, color: C.g1 });
+  progress_bar(METER.mem.x, METER.y, METER.mem.w, 16, m, meter_col(m));
   // heat: a warm tint and a hot edge
   if (h_ > 0.003) {
     ctx.fillStyle = `rgba(255,120,40,${0.09 * h_})`;
@@ -254,6 +326,74 @@ function draw_windows(t) {
       (1 - prog(t, T.lift[i], T.lift[i] + 1.0));
     agent_window(i, w.x, w.y, w.s, w.rot, t, a_, grey);
   });
+}
+
+// each new bot sends a "+" to the CPU meter and another to the memory meter: the cause, drawn
+function token_pos(i, t, lag, dest) {
+  const u = (t - T.spawn[i] - 0.1 - lag) / T.token;
+  if (u < 0 || u > 1) return null;
+  const e = ease.in_out_cubic(u);
+  const [sx, sy] = AGENTS[i].at;
+  return [
+    lerp(sx, dest[0], e),
+    lerp(sy - 40, dest[1], e) - 70 * Math.sin(Math.PI * e),
+    u,
+  ];
+}
+function draw_tokens(t) {
+  const kinds = [
+    ["cpu", 0, C.amber, cpu_val],
+    ["mem", 0.12, C.blue, mem_val],
+  ];
+  for (let i = 0; i < N_BOTS; i++) {
+    // a ring where the bot appears
+    const ra = prog(t, T.spawn[i], T.spawn[i] + 0.5);
+    if (ra > 0 && ra < 1) {
+      ctx.save();
+      ctx.globalAlpha = 1 - ra;
+      ctx.beginPath();
+      ctx.arc(
+        AGENTS[i].at[0],
+        AGENTS[i].at[1],
+        50 + 130 * ease.out_cubic(ra),
+        0,
+        Math.PI * 2,
+      );
+      ctx.strokeStyle = AGENTS[i].col;
+      ctx.lineWidth = 6;
+      ctx.stroke();
+      ctx.restore();
+    }
+    for (const [k, lag, col, val] of kinds) {
+      const m = METER[k];
+      const dest = [m.x + m.w * val(arrive(i) + lag + 0.4), METER.y + 8];
+      for (let tr = 5; tr >= 0; tr--) {
+        const p = token_pos(i, t - tr * 0.035, lag, dest);
+        if (!p) continue;
+        const a = tr === 0 ? 1 : 0.32 * (1 - tr / 6);
+        with_alpha(a, () => circle(p[0], p[1], tr === 0 ? 17 : 11 - tr, col));
+        if (tr === 0) {
+          with_alpha(1, () => {
+            ctx.fillStyle = C.bg;
+            ctx.fillRect(p[0] - 9, p[1] - 2, 18, 4);
+            ctx.fillRect(p[0] - 2, p[1] - 9, 4, 18);
+          });
+        }
+      }
+      // a ring on the meter when the "+" lands
+      const la = prog(t, arrive(i) + lag, arrive(i) + lag + 0.45);
+      if (la > 0 && la < 1) {
+        ctx.save();
+        ctx.globalAlpha = 1 - la;
+        ctx.beginPath();
+        ctx.arc(dest[0], dest[1], 10 + 34 * ease.out_cubic(la), 0, Math.PI * 2);
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 4;
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
 }
 
 function draw_dialog(t) {
@@ -389,36 +529,48 @@ function draw_sprite(sp, t) {
     if (done) check_badge(SPR_W / 2 - 46, y0 + 21, 17, t, spec.done);
   }
   // the agent window that landed here, shrunk to a status strip
-  const lt = sp.agent >= 0 ? landed : sp.appear + 0.15;
-  const tp = sp.agent >= 0 ? clamp01((t - landed) / 0.01) : 1;
-  if (tp > 0 || sp.agent < 0) {
-    const title = sp.agent >= 0 ? AGENTS[sp.agent].title : "claude code";
-    const col = sp.agent >= 0 ? AGENTS[sp.agent].col : C.blue;
+  // sprites in the top row hold two bots each; the extra sprites hold one
+  const strips =
+    sp.agent >= 0
+      ? [sp.agent, sp.agent + 4]
+      : [{ title: "claude code", col: C.blue }];
+  strips.forEach((b, n) => {
+    const bot = typeof b === "number" ? AGENTS[b] : b;
+    const lt = typeof b === "number" ? T.lift[b] + T.flight : sp.appear + 0.15;
+    if (typeof b === "number" && t < lt) return;
     const sc =
-      sp.agent >= 0
+      typeof b === "number"
         ? 1 +
           0.06 *
-            Math.exp(-8 * Math.max(0, t - landed)) *
-            Math.abs(Math.cos(20 * (t - landed)))
+            Math.exp(-8 * Math.max(0, t - lt)) *
+            Math.abs(Math.cos(20 * (t - lt)))
         : 1;
+    const solo = strips.length === 1;
+    const w = solo ? 280 : 136;
+    const x0 = solo ? 0 : n === 0 ? -72 : 72;
     ctx.save();
-    ctx.translate(0, 80);
+    ctx.translate(x0, 80);
     ctx.scale(sc, sc);
-    fill_rr(-140, -28, 280, 56, 12, C.panel2);
-    fill_rr(-140, -28, 280, 56, 12, C.bg, 0.0);
-    circle(-118, -8, 5, C.g2);
-    txt(title, -104, -2, { size: 20, w: 600 });
-    const total = t - T.run;
+    fill_rr(-w / 2, -28, w, 56, 12, C.panel2);
+    circle(-w / 2 + 14, -8, 4, C.g2);
+    txt(bot.title, -w / 2 + 26, -2, { size: solo ? 20 : 15, w: 600 });
     const pall =
-      sp.agent >= 0
+      typeof b === "number"
         ? clamp01((t - row_spec(sp, 0).start) / (3 * T.step))
         : clamp01(
             (t - row_spec(sp, 0).start) /
               (row_spec(sp, 2).done - row_spec(sp, 0).start),
           );
-    progress_bar(-118, 12, 236, 8, t >= lt ? lerp(0.25, 1, pall) : 0.25, col);
+    progress_bar(
+      -w / 2 + 14,
+      12,
+      w - 28,
+      8,
+      t >= lt ? lerp(0.25, 1, pall) : 0.25,
+      bot.col,
+    );
     ctx.restore();
-  }
+  });
   ctx.restore();
 }
 
@@ -637,7 +789,10 @@ function draw_toast(t, t0, label, kind) {
 
 // ---- cursor ---------------------------------------------------------------------------
 function cursor_at(t) {
-  const [gx, gy] = [AGENTS[0].slot[0] + 200, AGENTS[0].slot[1] + 24];
+  const [gx, gy] = [
+    AGENTS[0].at[0] - 200 * WIN_S,
+    AGENTS[0].at[1] - 143 * WIN_S,
+  ];
   if (t >= T.cursor_in && t < T.grab + 0.9) {
     const p = track(t, [
       [T.cursor_in, 420, 520],
@@ -678,19 +833,14 @@ function cursor_at(t) {
 // ---- camera -----------------------------------------------------------------------------
 function camera(t) {
   if (t < T.cam_up[0]) {
-    if (t < 5.0) return [0, -40, 1 + 0.012 * t];
-    return track(t, [
-      [5.0, 0, -40, 1.06],
-      [7.6, 100, -130, 1.2],
-      [10.2, 100, -130, 1.2],
-      [T.cam_up[0], 0, -40, 1.0],
-    ]);
+    // one steady wide shot: all the bots and both meters stay in frame, clear of the headline band
+    return [0, -50, 1.0];
   }
   if (t < T.cam_demo[0]) {
     return track(
       t,
       [
-        [T.cam_up[0], 0, -40, 1.0],
+        [T.cam_up[0], 0, -50, 1.0],
         [T.cam_up[1], 0, -1500, 1.25],
       ],
       ease.in_out_cubic,
@@ -729,13 +879,19 @@ function world(t) {
   draw_laptop(t);
   draw_idle(t);
   draw_windows(t);
+  draw_tokens(t);
   draw_dialog(t);
   const cu = cursor_at(t);
   if (cu) {
     if (cu.press > 0 || t > T.click) ripple(cu.x + 4, cu.y + 4, t, T.click);
     with_alpha(cu.a, () => draw_cursor(cu.x, cu.y, cu.press));
   }
-  ripple(AGENTS[0].slot[0] + 204, AGENTS[0].slot[1] + 28, t, T.grab);
+  ripple(
+    AGENTS[0].at[0] - 200 * WIN_S + 4,
+    AGENTS[0].at[1] - 143 * WIN_S + 4,
+    t,
+    T.grab,
+  );
 }
 
 function brand(t) {
@@ -748,7 +904,7 @@ function brand(t) {
 
 function hud(t) {
   const H_ = T.head;
-  headline("Agents run on your laptop.", t, H_.a[0], H_.a[1]);
+  headline("Your bots all build on your laptop.", t, H_.a[0], H_.a[1]);
   headline("Your laptop can't keep up.", t, H_.b[0], H_.b[1]);
   headline("Hand it to Sky.", t, H_.c[0], H_.c[1]);
   headline("Sky keeps you in the loop.", t, H_.d[0], H_.d[1]);
