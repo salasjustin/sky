@@ -201,6 +201,16 @@ function sessionHomeOf(config: Config): string {
 }
 
 type RunnerEvent = Omit<RunnerEventPost, "runId">;
+/** What a call is told when its wait was cancelled and the session goes on: not a refusal. */
+export const NO_ANSWER =
+  "No one answered in time. This was not a refusal: retry this step as it is.";
+
+export const UNANSWERED_NOTE =
+  'A step that ended with "No one answered in time" was not refused: retry it as it is, and do not route around it.';
+
+/** A wait that ended with no decision while the session goes on; `requestId` is absent when none was opened. */
+type Unanswered = { decision: "unanswered"; requestId?: string };
+
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
   : never;
@@ -260,6 +270,7 @@ export function sessionOptions(
       type: "preset",
       preset: "claude_code",
       append: [
+        UNANSWERED_NOTE,
         ...(process.env[CONNECTOR_ENV] ? [publishInstructions(refreshed)] : []),
         ...(config.checks.length > 0
           ? [checkInstructions(config.checks, nestedLogin, scratchDir)]
@@ -782,16 +793,18 @@ export async function runSession(
     return decided;
   };
   /**
-   * The person's decision, or undefined when there is none: the SDK cancelled the wait, the session
-   * is being torn down, or the API gave something short of a decision (a request it never stored,
-   * an API unreachable until the deadline, a wait that expired), which stops the session and fails
-   * the run.
+   * The person's decision, or undefined when there is none and the session is ending: it is being
+   * torn down, or the API gave something short of a decision (a request it never stored, an API
+   * unreachable until the deadline, a wait that expired), which stops the session and fails the
+   * run. A wait the SDK cancelled while the session goes on is `unanswered`: nobody decided, and
+   * the call may be tried again.
    */
   const waitForDecision = async (
     request: DistributiveOmit<PendingRequest, "requestId">,
     signal: AbortSignal,
-  ): Promise<Decision | undefined> => {
-    if (abortController.signal.aborted || signal.aborted) return undefined;
+  ): Promise<Decision | Unanswered | undefined> => {
+    if (abortController.signal.aborted) return undefined;
+    if (signal.aborted) return { decision: "unanswered" };
     const requestId: RequestId = `req_${randomUUID().replaceAll("-", "")}`;
     // also ended by a withdrawal the ending makes, so a poll left running doesn't outlive it
     const withdrawn = new AbortController();
@@ -858,22 +871,27 @@ export async function runSession(
         // cut off mid-post, so the API may hold the request
         openRequest = requestId;
       }
-      await withdrawOpen(
-        deps.signal.aborted
-          ? "run_stopping"
-          : abortController.signal.aborted
-            ? "session_ending"
-            : "hook_cancelled",
+      const reason = deps.signal.aborted
+        ? "run_stopping"
+        : abortController.signal.aborted
+          ? "session_ending"
+          : "hook_cancelled";
+      const apiEnded = await withdrawOpen(reason);
+      if (apiEnded || reason !== "hook_cancelled") return undefined;
+      // the session goes on, so the model must not read this as a refusal; the PM sees it apart
+      // from a deny
+      const message = `The wait for request ${requestId} ended without an answer (${reason}); Claude was told no one answered in time, not that it was refused.`;
+      warn(`runner: ${message}`);
+      void post({ type: "runner.warning", payload: { message } }).catch(
+        () => {},
       );
-      return undefined;
+      return { decision: "unanswered", requestId };
     }
   };
 
   /** Why a held call can't go ahead: the run is ending, which is not the person's answer. */
   const endingReason = () =>
     `The run is ending: ${stopReason ?? "it was stopped"}.`;
-  /** The SDK cancelled this one hook or permission prompt; the session goes on. */
-  const WAIT_CANCELLED = "The approval wait was cancelled.";
   const denyCall = (reason: string) => ({
     hookEventName: "PreToolUse" as const,
     permissionDecision: "deny" as const,
@@ -1034,14 +1052,15 @@ export async function runSession(
         return declined(`it could not be copied: ${messageOf(error)}.`);
       }
     }
-    if (decision === undefined) return waitEnded();
+    if (decision === undefined || decision.decision === "unanswered")
+      return waitEnded();
     return declined(visibleReason(decision));
   };
 
   /** What the gate answers when a wait ended without a decision. */
   const waitEnded = (): SyncHookJSONOutput => {
     if (!abortController.signal.aborted)
-      return { continue: true, hookSpecificOutput: denyCall(WAIT_CANCELLED) };
+      return { continue: true, hookSpecificOutput: denyCall(NO_ANSWER) };
     // a stop, not a denial; the deny is still needed: Claude Code runs the tool on `continue: false` alone, then stops
     const reason = endingReason();
     return {
@@ -1115,7 +1134,8 @@ export async function runSession(
         },
       };
     }
-    if (decision === undefined) return waitEnded();
+    if (decision === undefined || decision.decision === "unanswered")
+      return waitEnded();
     return {
       continue: true,
       hookSpecificOutput: denyCall(visibleReason(decision)),
@@ -1135,10 +1155,10 @@ export async function runSession(
       { kind: "question", prompt: questionPrompt(input) },
       signal,
     );
-    if (decision === undefined)
+    if (decision === undefined || decision.decision === "unanswered")
       return abortController.signal.aborted
         ? { behavior: "deny", interrupt: true, message: endingReason() }
-        : { behavior: "deny", message: WAIT_CANCELLED };
+        : { behavior: "deny", message: NO_ANSWER };
     if (decision.decision !== "answer")
       return {
         behavior: "deny",

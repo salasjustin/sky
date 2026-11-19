@@ -50,6 +50,7 @@ import { repoLockPath } from "./repo-lock.js";
 import { createDecisionWaiter } from "./requests.js";
 import type { Seal } from "./seal.js";
 import {
+  NO_ANSWER,
   nestedClaude,
   type QueryFn,
   quietCommands,
@@ -57,6 +58,7 @@ import {
   repoLockWaitS,
   scratchDirOf,
   sessionGitIdentity,
+  UNANSWERED_NOTE,
 } from "./session.js";
 import {
   defaultSettingsDirs,
@@ -1057,7 +1059,9 @@ test("with a connector and checks, the publish instructions come first, then the
     const paragraphs = append
       .split("\n\n")
       .filter(
-        (paragraph) => !paragraph.startsWith("What the runner's refresh"),
+        (paragraph) =>
+          !paragraph.startsWith("What the runner's refresh") &&
+          paragraph !== UNANSWERED_NOTE,
       );
     expect(paragraphs).toHaveLength(2);
     expect(paragraphs[0]).toContain(" publish --title <title>");
@@ -1932,7 +1936,7 @@ test("the runner's own denials after the input closed over a running subagent ar
     await closedOverSubagent(async () => [
       erroredResult(
         "The user denied this tool call.",
-        "The approval wait was cancelled.",
+        NO_ANSWER,
         "The run is ending: run ended while waiting.",
         "The user declined to answer.",
       ),
@@ -1978,7 +1982,7 @@ test("without checks, the session is told nothing about them", async () => {
   vi.stubEnv("GITHUB_CONNECTOR", undefined);
   try {
     const append = await appendOf([]);
-    expect(append).toBe("");
+    expect(append).toBe(UNANSWERED_NOTE);
   } finally {
     vi.unstubAllEnvs();
   }
@@ -4584,7 +4588,7 @@ test("the SDK cancelling a held call's hook denies that call without claiming th
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
-      permissionDecisionReason: "The approval wait was cancelled.",
+      permissionDecisionReason: NO_ANSWER,
     },
   });
   expect(code).toBe(0);
@@ -4612,7 +4616,7 @@ test("the SDK cancelling Claude's question declines it without interrupting the 
   expect(await runSession(config, { ...deps, query })).toBe(0);
   expect(permission).toEqual({
     behavior: "deny",
-    message: "The approval wait was cancelled.",
+    message: NO_ANSWER,
   });
 });
 
@@ -7820,6 +7824,85 @@ test("a hook the SDK cancels mid-session withdraws its request, and the next hel
       payload: { requestId: waitingId(first), reason: "hook_cancelled" },
     },
   ]);
+});
+
+test("a wait the SDK cancels while the session goes on tells the call no one answered, records a warning naming the request, and the retry opens a new request a person approves", async () => {
+  const cancel = new AbortController();
+  const { sent, deps } = api(
+    onFirstPoll(firstRequestHeld(), () =>
+      cancel.abort(new Error("hook timed out")),
+    ),
+  );
+  let first: unknown;
+  let retried: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      const [gate] = options.hooks?.PreToolUse?.[0]?.hooks ?? [];
+      first = await gate?.(
+        {
+          session_id: "sess-new",
+          transcript_path: "/t.jsonl",
+          cwd: options.cwd ?? "",
+          hook_event_name: "PreToolUse",
+          ...gitPush,
+        } as HookInput,
+        "toolu_1",
+        { signal: cancel.signal },
+      );
+      retried = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query },
+  );
+  expect(code).toBe(0);
+  expect(first).toEqual({
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: NO_ANSWER,
+    },
+  });
+  expect(NO_ANSWER).toMatch(/No one answered in time.*not a refusal.*retry/);
+  expect(retried).toEqual([approved]);
+  const [firstWait, secondWait] = sent.filter((e) => e.type === "run.waiting");
+  expect(waitingId(firstWait)).not.toBe(waitingId(secondWait));
+  const warnings = sent.filter((e) => e.type === "runner.warning");
+  expect(warnings).toHaveLength(1);
+  const message =
+    warnings[0]?.type === "runner.warning" ? warnings[0].payload.message : "";
+  expect(message).toContain(waitingId(firstWait));
+  expect(message).toContain("hook_cancelled");
+});
+
+test("a person's deny reaches the call with their reason and records no warning", async () => {
+  const { sent, deps } = api(
+    decided({ decision: "deny", reason: "open a PR" }),
+  );
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  await runSession({ ...config, approvalPolicy: ["Bash"] }, { ...deps, query });
+  expect(answers).toEqual([
+    {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: "open a PR",
+      },
+    },
+  ]);
+  expect(sent.map((e) => e.type)).not.toContain("runner.warning");
 });
 
 test("Claude's question the SDK cancels is withdrawn the same way", async () => {
