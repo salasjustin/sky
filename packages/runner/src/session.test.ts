@@ -7879,7 +7879,7 @@ test("a wait the SDK cancels while the session goes on tells the call no one ans
   expect(message).toContain("hook_cancelled");
 });
 
-test("a wait cancelled while the session goes on leaves a person's real deny unchanged", async () => {
+test("a person's deny reaches the call with their reason and records no warning", async () => {
   const { sent, deps } = api(
     decided({ decision: "deny", reason: "open a PR" }),
   );
