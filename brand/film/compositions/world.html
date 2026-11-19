@@ -1,0 +1,646 @@
+<!-- biome-ignore-all lint/a11y/noSvgWithoutTitle: decorative UI icons inside a video scene -->
+<template>
+  <style>
+    #root {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      background: #16181d;
+    }
+    .a {
+      position: absolute;
+    }
+    .lay {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 1920px;
+      height: 1080px;
+      transform-origin: 960px 540px;
+    }
+    .glass {
+      background: linear-gradient(160deg, rgba(247, 246, 242, 0.13), rgba(247, 246, 242, 0.03));
+      border: 2px solid rgba(247, 246, 242, 0.3);
+      box-shadow: 0 40px 90px rgba(0, 0, 0, 0.5), inset 0 0 70px rgba(247, 246, 242, 0.07);
+    }
+    .pill {
+      border-radius: 999px;
+    }
+    .skel {
+      height: 14px;
+      border-radius: 7px;
+      background: #9a9a9a;
+    }
+    .dimskel {
+      height: 14px;
+      border-radius: 7px;
+      background: #3a3d44;
+    }
+    .ico {
+      fill: none;
+      stroke: #f7f6f2;
+      stroke-width: 4;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    #label {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 900px;
+      text-align: center;
+      font-family: "Inter", sans-serif;
+      font-weight: 400;
+      font-size: 52px;
+      color: #f7f6f2;
+      opacity: 0;
+    }
+    #url {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 780px;
+      text-align: center;
+      font-family: "Inter", sans-serif;
+      font-size: 46px;
+      color: #f7f6f2;
+      opacity: 0;
+    }
+    #note {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 900px;
+      text-align: center;
+      font-family: "Inter", sans-serif;
+      font-size: 28px;
+      color: #9a9a9a;
+      opacity: 0;
+    }
+  </style>
+  <div id="root" data-composition-id="world" data-width="1920" data-height="1080">
+    <div id="bg-lo" class="a" style="inset: 0; background: radial-gradient(ellipse at 50% 38%, #272a31 0%, #16181d 62%, #0f1013 100%)"></div>
+    <div id="bg-hi" class="a" style="inset: 0; opacity: 0; background: linear-gradient(180deg, #4b4e57 0%, #2f3239 46%, #1b1d22 100%)"></div>
+
+    <div id="cam" class="a" style="inset: 0">
+      <div id="L-far" class="lay">
+        <div id="sun" class="a" style="width: 1400px; height: 1400px; border-radius: 50%; background: radial-gradient(circle, rgba(247, 246, 242, 0.34) 0%, rgba(247, 246, 242, 0.1) 38%, rgba(247, 246, 242, 0) 68%)"></div>
+        <div id="haze0" class="a" style="width: 2600px; height: 220px; border-radius: 50%; background: radial-gradient(ellipse, rgba(247, 246, 242, 0.1), rgba(247, 246, 242, 0) 70%)"></div>
+        <div id="haze1" class="a" style="width: 2600px; height: 260px; border-radius: 50%; background: radial-gradient(ellipse, rgba(247, 246, 242, 0.09), rgba(247, 246, 242, 0) 70%)"></div>
+        <div id="haze2" class="a" style="width: 2600px; height: 240px; border-radius: 50%; background: radial-gradient(ellipse, rgba(247, 246, 242, 0.08), rgba(247, 246, 242, 0) 70%)"></div>
+      </div>
+      <div id="L-mid" class="lay">
+        <div id="rack0" class="a glass" style="width: 300px; height: 420px; border-radius: 28px; opacity: 0.35"></div>
+        <div id="rack1" class="a glass" style="width: 360px; height: 520px; border-radius: 28px; opacity: 0.3"></div>
+        <div id="rack2" class="a glass" style="width: 280px; height: 380px; border-radius: 28px; opacity: 0.35"></div>
+        <div id="rack3" class="a glass" style="width: 340px; height: 480px; border-radius: 28px; opacity: 0.28"></div>
+      </div>
+
+      <div id="L-main" class="lay">
+        <!-- DESK -->
+        <div id="desk" class="a" style="left: 0; top: 0; width: 1920px; height: 1080px">
+          <div class="a" style="left: -800px; top: 790px; width: 3520px; height: 700px; background: linear-gradient(180deg, #2c2f36 0%, #1a1c21 40%, #121317 100%); box-shadow: 0 -2px 0 rgba(247, 246, 242, 0.12)"></div>
+          <div class="a" style="left: 360px; top: 190px; width: 1200px; height: 640px; border-radius: 50%; background: radial-gradient(ellipse, rgba(247, 246, 242, 0.1), rgba(247, 246, 242, 0) 70%)"></div>
+
+          <div id="fan" class="a" style="left: 130px; top: 450px; width: 320px; height: 320px">
+            <div class="a" style="inset: 0; border-radius: 50%; background: radial-gradient(circle, #1a1d22 55%, #2a2d34 100%); border: 6px solid #3a3d44; box-shadow: 0 30px 60px rgba(0, 0, 0, 0.55)"></div>
+            <div id="fan-rot" class="a" style="left: 160px; top: 160px; width: 0; height: 0"></div>
+            <div class="a" style="left: 140px; top: 140px; width: 40px; height: 40px; border-radius: 50%; background: #5e5e5e; border: 3px solid #9a9a9a"></div>
+          </div>
+
+          <div id="lid" class="a" style="left: 560px; top: 250px; width: 800px; height: 500px; border-radius: 26px; background: #0e1014; border: 2px solid #34373e; box-shadow: 0 40px 90px rgba(0, 0, 0, 0.6)">
+            <div id="scr" class="a" style="left: 20px; top: 20px; width: 760px; height: 460px; border-radius: 12px; background: linear-gradient(180deg, #23262d, #16181d); overflow: hidden">
+              <div id="scr-flick" class="a" style="inset: 0; background: #f7f6f2; opacity: 0"></div>
+            </div>
+          </div>
+          <div class="a" style="left: 470px; top: 750px; width: 980px; height: 36px; border-radius: 0 0 28px 28px; background: linear-gradient(180deg, #4a4d55, #1d2026); box-shadow: 0 30px 50px rgba(0, 0, 0, 0.55)"></div>
+          <div id="heat" class="a" style="left: 500px; top: 560px; width: 920px; height: 360px; border-radius: 50%; background: radial-gradient(ellipse, rgba(247, 246, 242, 0.32), rgba(247, 246, 242, 0) 70%); opacity: 0"></div>
+
+          <div id="mp" class="a glass" style="left: 1500px; top: 290px; width: 300px; height: 330px; border-radius: 26px">
+            <div id="bars" class="a" style="left: 30px; top: 30px; width: 240px; height: 270px"></div>
+          </div>
+          <div id="prn" class="a" style="left: 1520px; top: 700px; width: 260px; height: 84px; border-radius: 18px; background: linear-gradient(180deg, #3a3d44, #1d2026); box-shadow: 0 24px 40px rgba(0, 0, 0, 0.55)">
+            <div class="a" style="left: 40px; top: 14px; width: 180px; height: 10px; border-radius: 5px; background: #0e1014"></div>
+          </div>
+          <div id="rc" class="a" style="left: 1560px; top: 784px; width: 180px; height: 520px; background: linear-gradient(90deg, #e9e8e3, #f7f6f2 50%, #e9e8e3); clip-path: inset(0 0 100% 0); box-shadow: 0 0 40px rgba(247, 246, 242, 0.25)"></div>
+
+          <div id="pw" class="a" style="left: 670px; top: 330px; width: 580px; height: 320px; border-radius: 20px; background: linear-gradient(180deg, #2b2e36, #23262d); border: 1px solid #454851; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55)">
+            <div class="a" style="left: 20px; top: 16px; width: 12px; height: 12px; border-radius: 50%; background: #5e5e5e"></div>
+            <div class="a" style="left: 40px; top: 16px; width: 12px; height: 12px; border-radius: 50%; background: #5e5e5e"></div>
+            <div class="a" style="left: 60px; top: 16px; width: 12px; height: 12px; border-radius: 50%; background: #5e5e5e"></div>
+            <div class="a pill" style="left: 24px; top: 52px; width: 150px; height: 38px; background: #16181d; border: 1px solid #454851">
+              <svg class="a" style="left: 14px; top: 7px" width="24" height="24" viewBox="0 0 36 36"><g class="ico" stroke-width="3.2"><circle cx="9" cy="8" r="4" /><circle cx="9" cy="28" r="4" /><circle cx="27" cy="14" r="4" /><path d="M9 12V24M27 18Q27 24 9 24" /></g></svg>
+              <div class="a skel" style="left: 50px; top: 12px; width: 80px; height: 12px"></div>
+            </div>
+            <div class="a dimskel" style="left: 24px; top: 120px; width: 532px"></div>
+            <div class="a dimskel" style="left: 24px; top: 160px; width: 532px"></div>
+            <div class="a dimskel" style="left: 24px; top: 200px; width: 532px"></div>
+            <div id="ln0" class="a skel" style="left: 24px; top: 120px; width: 180px"></div>
+            <div id="ln1" class="a skel" style="left: 24px; top: 160px; width: 0px"></div>
+            <div id="ln2" class="a skel" style="left: 24px; top: 200px; width: 0px"></div>
+            <div id="send" class="a" style="left: 500px; top: 248px; width: 56px; height: 56px; border-radius: 28px; background: #f7f6f2; box-shadow: 0 0 0 rgba(247, 246, 242, 0)">
+              <svg class="a" style="left: 14px; top: 14px" width="28" height="28" viewBox="0 0 28 28"><path d="M14 22V6M6 14L14 6L22 14" fill="none" stroke="#16181d" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </div>
+            <div id="spin" class="a" style="left: 250px; top: 120px; width: 80px; height: 80px; opacity: 0">
+              <div class="a" style="left: 0; top: 0; width: 80px; height: 80px; border-radius: 50%; border: 6px solid rgba(247, 246, 242, 0.18); border-top-color: #f7f6f2"></div>
+            </div>
+          </div>
+          <svg id="cursor" class="a" style="left: 0; top: 0; opacity: 0" width="44" height="52" viewBox="0 0 44 52"><path d="M6 4L6 40L16 31L23 46L30 43L23 28L36 28Z" fill="#f7f6f2" stroke="#16181d" stroke-width="3" stroke-linejoin="round" /></svg>
+        </div>
+
+        <!-- SKY -->
+        <div id="thr" class="a" style="left: -600px; top: -840px; width: 3120px; height: 6px; background: linear-gradient(90deg, rgba(247, 246, 242, 0), rgba(247, 246, 242, 0.95) 30%, rgba(247, 246, 242, 0.95) 70%, rgba(247, 246, 242, 0)); box-shadow: 0 0 80px 30px rgba(247, 246, 242, 0.35); opacity: 0.45"></div>
+        <div id="tiles"></div>
+        <div id="dots"></div>
+        <div id="queue"></div>
+
+        <!-- CHAT -->
+        <div id="chat" class="a glass" style="left: 1500px; top: -2570px; width: 440px; height: 800px; border-radius: 44px; opacity: 0; background: linear-gradient(180deg, #2d3037, #1c1f25)">
+          <div class="a" style="left: 30px; top: 34px; width: 56px; height: 56px; border-radius: 50%; background: #9a9a9a"></div>
+          <div class="a skel" style="left: 104px; top: 46px; width: 160px; background: #f7f6f2"></div>
+          <div class="a dimskel" style="left: 104px; top: 72px; width: 90px; height: 10px"></div>
+          <div id="msg-in" class="a" style="left: 30px; top: 150px; width: 240px; height: 110px; border-radius: 26px 26px 26px 6px; background: #3a3d44; opacity: 0">
+            <div class="a" style="left: 24px; top: 24px; width: 60px; height: 60px; border-radius: 50%; border: 4px solid #f7f6f2"></div>
+            <svg class="a" style="left: 40px; top: 34px" width="28" height="40" viewBox="0 0 40 52"><path d="M8 14Q8 4 20 4Q32 4 32 14Q32 22 20 26V32" fill="none" stroke="#f7f6f2" stroke-width="7" stroke-linecap="round" /><circle cx="20" cy="44" r="4.5" fill="#f7f6f2" /></svg>
+            <div class="a skel" style="left: 100px; top: 36px; width: 110px"></div>
+            <div class="a dimskel" style="left: 100px; top: 62px; width: 70px; background: #5e5e5e"></div>
+          </div>
+          <div id="msg-out" class="a" style="left: 160px; top: 300px; width: 250px; height: 100px; border-radius: 26px 26px 6px 26px; background: #f7f6f2; opacity: 0">
+            <svg class="a" style="left: 30px; top: 26px" width="52" height="44" viewBox="0 0 52 44"><path d="M6 24L20 38L46 6" fill="none" stroke="#16181d" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            <div class="a" style="left: 100px; top: 36px; width: 110px; height: 14px; border-radius: 7px; background: #5e5e5e"></div>
+          </div>
+          <div class="a" style="left: 24px; top: 690px; width: 392px; height: 74px; border-radius: 37px; background: #16181d; border: 1px solid #454851">
+            <div id="cl0" class="a skel" style="left: 28px; top: 30px; width: 0px"></div>
+            <div id="csend" class="a" style="left: 328px; top: 12px; width: 50px; height: 50px; border-radius: 25px; background: #f7f6f2">
+              <svg class="a" style="left: 11px; top: 11px" width="28" height="28" viewBox="0 0 28 28"><path d="M14 22V6M6 14L14 6L22 14" fill="none" stroke="#16181d" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </div>
+          </div>
+        </div>
+
+        <div id="sbwrap" class="a" style="left: 580px; top: -2460px; width: 760px; height: 520px">
+          <div id="sb" class="a glass" style="inset: 0; border-radius: 40px"></div>
+          <div class="a" style="left: 40px; top: 470px; width: 680px; height: 6px; border-radius: 3px; background: rgba(247, 246, 242, 0.25)"></div>
+          <div id="sb-glow" class="a" style="left: -40px; top: 400px; width: 840px; height: 220px; border-radius: 50%; background: radial-gradient(ellipse, rgba(247, 246, 242, 0.5), rgba(247, 246, 242, 0) 70%); opacity: 0"></div>
+          <div id="sb-in" class="a" style="left: 0; top: 0; width: 760px; height: 520px">
+            <div id="track" class="a" style="left: 40px; top: 250px; width: 680px; height: 8px; border-radius: 4px; background: #3a3d44"></div>
+            <div id="track-lit" class="a" style="left: 40px; top: 250px; width: 0px; height: 8px; border-radius: 4px; background: #f7f6f2"></div>
+            <div id="nodes"></div>
+            <div id="orb" class="a" style="left: 0; top: 0; width: 0; height: 0">
+              <div id="orb-halo" class="a" style="left: -60px; top: -60px; width: 120px; height: 120px; border-radius: 50%; background: radial-gradient(circle, rgba(247, 246, 242, 0.55), rgba(247, 246, 242, 0) 70%)"></div>
+              <div id="orb-core" class="a" style="left: -20px; top: -20px; width: 40px; height: 40px; border-radius: 50%; background: #f7f6f2"></div>
+            </div>
+            <div id="stuck" class="a" style="left: 360px; top: 200px; width: 240px; height: 20px; opacity: 0"></div>
+            <div id="ask" class="a" style="left: 0; top: 0; width: 0; height: 0; opacity: 0">
+              <div class="a" style="left: -44px; top: -44px; width: 88px; height: 88px; border-radius: 50%; background: #16181d; border: 4px solid #f7f6f2; box-shadow: 0 0 40px rgba(247, 246, 242, 0.5)"></div>
+              <svg class="a" style="left: -20px; top: -26px" width="40" height="52" viewBox="0 0 40 52"><path d="M8 14Q8 4 20 4Q32 4 32 14Q32 22 20 26V32" fill="none" stroke="#f7f6f2" stroke-width="6" stroke-linecap="round" /><circle cx="20" cy="44" r="4" fill="#f7f6f2" /></svg>
+            </div>
+            <div id="ok" class="a" style="left: 0; top: 0; width: 0; height: 0; opacity: 0">
+              <div class="a" style="left: -44px; top: -44px; width: 88px; height: 88px; border-radius: 50%; background: #f7f6f2; box-shadow: 0 0 40px rgba(247, 246, 242, 0.6)"></div>
+              <svg class="a" style="left: -26px; top: -22px" width="52" height="44" viewBox="0 0 52 44"><path d="M6 24L20 38L46 6" fill="none" stroke="#16181d" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </div>
+          </div>
+        </div>
+
+        <div id="sub2" class="a" style="left: 110px; top: -2360px; width: 340px; height: 200px; border-radius: 26px; background: linear-gradient(135deg, #3a3d44, #23262d); border: 2px solid rgba(247, 246, 242, 0.2); opacity: 0"></div>
+        <div id="sub" class="a" style="left: 140px; top: -2400px; width: 340px; height: 200px; border-radius: 26px; background: linear-gradient(135deg, #5a5d66, #2b2e36); border: 2px solid rgba(247, 246, 242, 0.45); box-shadow: 0 30px 60px rgba(0, 0, 0, 0.5); opacity: 0">
+          <div class="a" style="left: 30px; top: 34px; width: 70px; height: 50px; border-radius: 10px; background: linear-gradient(135deg, #f7f6f2, #9a9a9a)"></div>
+          <div class="a" style="left: 30px; top: 120px; width: 280px; height: 16px; border-radius: 8px; background: rgba(0, 0, 0, 0.35)"></div>
+          <div class="a" style="left: 30px; top: 120px; width: 96px; height: 16px; border-radius: 8px; background: #f7f6f2"></div>
+          <div class="a" style="left: 30px; top: 152px; width: 120px; height: 10px; border-radius: 5px; background: rgba(247, 246, 242, 0.4)"></div>
+        </div>
+        <svg id="cable" class="a" style="left: 440px; top: -2330px; opacity: 0" width="180" height="200" viewBox="0 0 180 200"><path id="cable-p" d="M10 40C70 40 70 130 150 130" fill="none" stroke="rgba(247,246,242,0.55)" stroke-width="5" stroke-linecap="round" /><circle id="cable-d0" r="7" fill="#f7f6f2" /><circle id="cable-d1" r="7" fill="#f7f6f2" /><circle id="cable-d2" r="7" fill="#f7f6f2" /></svg>
+
+        <!-- PR PAGE -->
+        <div id="pr" class="a" style="left: 510px; top: -2810px; width: 900px; height: 620px; border-radius: 30px; background: linear-gradient(180deg, #262930, #1a1c21); border: 2px solid #454851; box-shadow: 0 60px 120px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(247, 246, 242, 0.06); opacity: 0">
+          <div class="a" style="left: 0; top: 0; width: 900px; height: 84px; border-bottom: 2px solid #34373e">
+            <svg class="a" style="left: 34px; top: 24px" width="36" height="36" viewBox="0 0 36 36"><g class="ico" stroke-width="3"><circle cx="9" cy="8" r="4" /><circle cx="9" cy="28" r="4" /><circle cx="27" cy="28" r="4" /><path d="M9 12V24M27 24V14Q27 10 23 10H17M20 6L16 10L20 14" /></g></svg>
+            <div class="a skel" style="left: 92px; top: 34px; width: 380px; height: 18px; background: #f7f6f2"></div>
+            <div class="a pill" style="left: 740px; top: 22px; width: 126px; height: 40px; background: #3a3d44"></div>
+          </div>
+          <div class="a" style="left: 34px; top: 118px; width: 540px; height: 330px; border-radius: 16px; background: #14161a; border: 1px solid #34373e">
+            <div class="a" style="left: 0; top: 18px; width: 540px; height: 38px; background: rgba(247, 246, 242, 0.1)"></div>
+            <div class="a" style="left: 18px; top: 29px; width: 16px; height: 4px; background: #f7f6f2"></div><div class="a" style="left: 24px; top: 23px; width: 4px; height: 16px; background: #f7f6f2"></div>
+            <div class="a skel" style="left: 56px; top: 30px; width: 280px; background: #f7f6f2; height: 12px"></div>
+            <div class="a skel" style="left: 56px; top: 82px; width: 360px; height: 12px"></div>
+            <div class="a" style="left: 0; top: 108px; width: 540px; height: 38px; background: rgba(247, 246, 242, 0.1)"></div>
+            <div class="a" style="left: 18px; top: 119px; width: 16px; height: 4px; background: #f7f6f2"></div><div class="a" style="left: 24px; top: 113px; width: 4px; height: 16px; background: #f7f6f2"></div>
+            <div class="a skel" style="left: 56px; top: 120px; width: 220px; background: #f7f6f2; height: 12px"></div>
+            <div class="a skel" style="left: 56px; top: 172px; width: 300px; height: 12px"></div>
+            <div class="a" style="left: 18px; top: 224px; width: 16px; height: 4px; background: #9a9a9a"></div>
+            <div class="a skel" style="left: 56px; top: 222px; width: 180px; height: 12px; background: #5e5e5e"></div>
+            <div class="a skel" style="left: 56px; top: 262px; width: 340px; height: 12px"></div>
+            <div class="a skel" style="left: 56px; top: 298px; width: 120px; height: 12px"></div>
+          </div>
+          <div class="a" style="left: 612px; top: 118px; width: 254px; height: 330px; border-radius: 16px; background: #1e2127; border: 1px solid #34373e">
+            <div class="a" style="left: 24px; top: 28px; width: 40px; height: 40px; border-radius: 50%; background: #9a9a9a"></div>
+            <div class="a skel" style="left: 80px; top: 42px; width: 120px"></div>
+            <div class="a" style="left: 24px; top: 110px; width: 28px; height: 28px; border-radius: 50%; background: #f7f6f2"></div><div class="a skel" style="left: 68px; top: 117px; width: 140px; background: #5e5e5e"></div>
+            <div class="a" style="left: 24px; top: 160px; width: 28px; height: 28px; border-radius: 50%; background: #f7f6f2"></div><div class="a skel" style="left: 68px; top: 167px; width: 110px; background: #5e5e5e"></div>
+            <div class="a" style="left: 24px; top: 210px; width: 28px; height: 28px; border-radius: 50%; background: #f7f6f2"></div><div class="a skel" style="left: 68px; top: 217px; width: 150px; background: #5e5e5e"></div>
+          </div>
+          <div id="chip" class="a pill" style="left: 130px; top: 500px; width: 330px; height: 72px; background: linear-gradient(180deg, #3a3d44, #2a2c33); border: 2px solid rgba(247, 246, 242, 0.5); box-shadow: 0 0 0 rgba(247, 246, 242, 0)">
+            <svg class="a" style="left: 30px; top: 18px" width="72" height="36" viewBox="0 0 72 36"><g class="ico" stroke-width="5"><rect x="4" y="8" width="36" height="22" rx="11" /><rect x="30" y="8" width="36" height="22" rx="11" /></g></svg>
+            <div class="a skel" style="left: 126px; top: 29px; width: 120px; background: #f7f6f2; height: 14px"></div>
+            <svg class="a" style="left: 268px; top: 18px" width="36" height="36" viewBox="0 0 36 36"><rect x="6" y="16" width="24" height="16" rx="4" fill="#f7f6f2" /><path d="M11 16V12A7 7 0 0 1 25 12V16" fill="none" stroke="#f7f6f2" stroke-width="4" /></svg>
+          </div>
+          <div id="prbadge" class="a" style="left: 836px; top: -34px; width: 72px; height: 72px; border-radius: 50%; background: #f7f6f2; box-shadow: 0 0 60px rgba(247, 246, 242, 0.6); opacity: 0">
+            <svg class="a" style="left: 14px; top: 16px" width="44" height="40" viewBox="0 0 52 44"><path d="M6 24L20 38L46 6" fill="none" stroke="#16181d" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </div>
+        </div>
+        <div id="ghost" class="a" style="left: 60px; top: -2700px; width: 340px; height: 300px; opacity: 0">
+          <div class="a" style="left: 40px; top: 20px; width: 260px; height: 170px; border-radius: 14px; border: 4px solid #5e5e5e"></div>
+          <div class="a" style="left: 14px; top: 196px; width: 312px; height: 18px; border-radius: 9px; border: 4px solid #5e5e5e"></div>
+          <div id="clock" class="a" style="left: 110px; top: 70px; width: 120px; height: 120px; border-radius: 50%; border: 4px solid #9a9a9a">
+            <div id="hand" class="a" style="left: 56px; top: 14px; width: 4px; height: 46px; border-radius: 2px; background: #9a9a9a; transform-origin: 2px 46px"></div>
+          </div>
+          <div class="a" style="left: 160px; top: 220px; width: 4px; height: 80px; background: repeating-linear-gradient(180deg, #5e5e5e 0 8px, transparent 8px 20px)"></div>
+        </div>
+        <div id="newpr" class="a" style="left: 940px; top: -2220px; width: 40px; height: 40px; border-radius: 50%; background: #f7f6f2; box-shadow: 0 0 60px 20px rgba(247, 246, 242, 0.5); opacity: 0"></div>
+
+        <!-- LOCKUP -->
+        <svg id="lockup" class="a" style="left: 560px; top: -5767px; color: #f7f6f2" width="800" height="333" viewBox="0 0 84 35">
+          <g id="lk-mark" transform="translate(-1.757142857142857 1.9428571428571448) scale(0.8785714285714284)"><path fill="currentColor" d="M2.584 20A14 14 0 1 1 29.416 20Z M3.876 23H28.124A14 14 0 0 1 3.876 23Z" /></g>
+          <g id="lk-word-w"><g id="lk-word" transform="translate(33.20778523489933 28) scale(0.016107382550335572)"><path fill="currentColor" d="M526.4 25.1Q397.6 25.1 295.7 -15.3Q193.8 -55.8 131.9 -134.3Q70 -212.9 61.6 -326.4H311Q319.2 -249.4 373.4 -206.7Q427.6 -164.1 521.7 -164.1Q613.3 -164.1 665.7 -200.2Q718 -236.3 718 -292.3Q718 -340 679.4 -369.2Q640.8 -398.4 573.8 -412.2L393.7 -449.3Q242.4 -481.1 164 -557.9Q85.6 -634.7 85.6 -754.4Q85.6 -851.2 138.1 -924.3Q190.5 -997.4 286.4 -1038.2Q382.2 -1078.9 511.4 -1078.9Q639.4 -1078.9 736.7 -1036Q833.9 -993 889.5 -914.5Q945.2 -836 948.2 -727.4H710.9Q709.9 -797.7 656.6 -844.1Q603.4 -890.4 517.2 -890.4Q434.2 -890.4 386 -853.3Q337.7 -816.2 337.7 -762.3Q337.7 -714.9 375 -685.2Q412.4 -655.6 477.9 -641.2L668.1 -601.9Q825.5 -568.8 899.5 -498Q973.6 -427.2 973.6 -311.4Q973.6 -208.4 916.3 -132.8Q859 -57.2 757.9 -16.1Q656.9 25.1 526.4 25.1ZM1335.3 -329.6V-628.2H1360.2L1770.9 -1056H2074.4L1584.2 -535.1H1533.6ZM1104.6 0V-1490H1357.4V0ZM1798.8 0 1432.9 -479.1 1602.6 -655.4 2100.5 0ZM2181.6 418V212.6H2305.7Q2340.2 212.6 2363.5 200.7Q2386.8 188.8 2404.2 163.1Q2421.6 137.5 2436.5 96L2475.4 -5.8L2067.8 -1056H2335.4L2529.2 -505.6Q2559.2 -418.4 2586.8 -330.7Q2614.3 -243 2640.4 -155.5H2570.2Q2595.6 -243 2623.2 -330.9Q2650.9 -418.8 2680.7 -505.6L2873.8 -1056H3137.9L2665.7 173.7Q2634.1 256.2 2588.9 310.4Q2543.8 364.6 2483.4 391.3Q2423.1 418 2346 418Q2305.6 418 2263.8 418Q2222 418 2181.6 418Z" /></g></g>
+        </svg>
+      </div>
+
+      <div id="L-fg" class="lay">
+        <div id="fg0" class="a" style="width: 520px; height: 520px; border-radius: 50%; background: radial-gradient(circle, rgba(247, 246, 242, 0.1), rgba(247, 246, 242, 0) 70%)"></div>
+        <div id="fg1" class="a" style="width: 640px; height: 640px; border-radius: 50%; background: radial-gradient(circle, rgba(247, 246, 242, 0.08), rgba(247, 246, 242, 0) 70%)"></div>
+        <div id="fg2" class="a" style="width: 460px; height: 460px; border-radius: 50%; background: radial-gradient(circle, rgba(247, 246, 242, 0.09), rgba(247, 246, 242, 0) 70%)"></div>
+      </div>
+    </div>
+
+    <div id="browser" class="a" style="inset: 0; background: radial-gradient(ellipse at 50% 40%, #2c2f36, #14161a); clip-path: circle(0px at 800px 700px)">
+      <div class="a" style="left: 160px; top: 90px; width: 1600px; height: 900px; border-radius: 28px; background: #1b1d22; border: 2px solid #454851; box-shadow: 0 60px 140px rgba(0, 0, 0, 0.7); overflow: hidden">
+        <div class="a" style="left: 0; top: 0; width: 1600px; height: 84px; background: #23262d; border-bottom: 2px solid #34373e">
+          <div class="a" style="left: 34px; top: 34px; width: 16px; height: 16px; border-radius: 50%; background: #5e5e5e"></div>
+          <div class="a" style="left: 64px; top: 34px; width: 16px; height: 16px; border-radius: 50%; background: #5e5e5e"></div>
+          <div class="a" style="left: 94px; top: 34px; width: 16px; height: 16px; border-radius: 50%; background: #5e5e5e"></div>
+          <div class="a pill" style="left: 330px; top: 18px; width: 940px; height: 48px; background: #14161a">
+            <svg class="a" style="left: 22px; top: 11px" width="26" height="26" viewBox="0 0 36 36"><rect x="6" y="16" width="24" height="16" rx="4" fill="#f7f6f2" /><path d="M11 16V12A7 7 0 0 1 25 12V16" fill="none" stroke="#f7f6f2" stroke-width="4" /></svg>
+            <div class="a skel" style="left: 70px; top: 17px; width: 380px; height: 14px; background: #9a9a9a"></div>
+          </div>
+        </div>
+        <div class="a" style="left: 0; top: 84px; width: 150px; height: 816px; background: #16181d; border-right: 2px solid #2a2d34">
+          <div class="a" style="left: 42px; top: 50px; width: 66px; height: 66px; border-radius: 18px; background: #f7f6f2"></div>
+          <div class="a" style="left: 42px; top: 150px; width: 66px; height: 66px; border-radius: 18px; background: #34373e"></div>
+          <div class="a" style="left: 42px; top: 250px; width: 66px; height: 66px; border-radius: 18px; background: #34373e"></div>
+          <div class="a" style="left: 42px; top: 350px; width: 66px; height: 66px; border-radius: 18px; background: #34373e"></div>
+        </div>
+        <div class="a" style="left: 190px; top: 124px; width: 1370px; height: 340px; border-radius: 28px; background: linear-gradient(120deg, #f7f6f2, #bdbcb6)">
+          <div class="a" style="left: 60px; top: 70px; width: 560px; height: 40px; border-radius: 20px; background: #16181d"></div>
+          <div class="a" style="left: 60px; top: 140px; width: 400px; height: 20px; border-radius: 10px; background: #5e5e5e"></div>
+          <div class="a pill" style="left: 60px; top: 220px; width: 200px; height: 64px; background: #16181d"></div>
+          <div class="a" style="left: 940px; top: 40px; width: 260px; height: 260px; border-radius: 50%; background: #16181d"></div>
+          <div class="a" style="left: 1060px; top: 160px; width: 220px; height: 150px; border-radius: 28px; background: #5e5e5e"></div>
+        </div>
+        <div class="a" style="left: 190px; top: 500px; width: 436px; height: 340px; border-radius: 24px; background: #23262d; border: 2px solid #34373e"><div class="a skel" style="left: 36px; top: 40px; width: 200px; background: #f7f6f2"></div><div class="a dimskel" style="left: 36px; top: 90px; width: 330px"></div><div class="a dimskel" style="left: 36px; top: 126px; width: 280px"></div></div>
+        <div class="a" style="left: 662px; top: 500px; width: 436px; height: 340px; border-radius: 24px; background: #23262d; border: 2px solid #34373e"><div class="a skel" style="left: 36px; top: 40px; width: 160px; background: #f7f6f2"></div><div class="a dimskel" style="left: 36px; top: 90px; width: 330px"></div><div class="a" style="left: 36px; top: 190px; width: 364px; height: 110px; border-radius: 16px; background: #34373e"></div></div>
+        <div class="a" style="left: 1134px; top: 500px; width: 426px; height: 340px; border-radius: 24px; background: #23262d; border: 2px solid #34373e"><div class="a skel" style="left: 36px; top: 40px; width: 220px; background: #f7f6f2"></div><div class="a dimskel" style="left: 36px; top: 90px; width: 300px"></div><div class="a pill" style="left: 36px; top: 250px; width: 120px; height: 52px; background: #f7f6f2"></div></div>
+      </div>
+    </div>
+
+    <div id="vig" class="a" style="inset: 0; background: radial-gradient(ellipse at 50% 50%, rgba(0, 0, 0, 0) 55%, rgba(0, 0, 0, 0.45) 100%); pointer-events: none"></div>
+    <div id="flash" class="a" style="inset: 0; background: #f7f6f2; opacity: 0; pointer-events: none"></div>
+    <div id="label">Sky builds Sky</div>
+    <div id="url">github.com/salasjustin/sky</div>
+    <div id="note">Not affiliated with Anthropic.</div>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    const $ = (s) => document.querySelector(s);
+    const NS = "http://www.w3.org/2000/svg";
+
+    // ---- builders -------------------------------------------------------
+    const place = (sel, left, top) => {
+      const el = $(sel);
+      el.style.left = `${left}px`;
+      el.style.top = `${top}px`;
+    };
+    // far and mid layers are positioned so each item shows at (sx, sy) when the camera is at (cx, cy)
+    const par = (sel, f, sx, sy, cx, cy, w, h) => place(sel, sx + f * (cx - 960) - w / 2, sy + f * (cy - 540) - h / 2);
+    par("#sun", 0.15, 960, 540, 960, -5600, 1400, 1400);
+    par("#haze0", 0.15, 960, 700, 960, -900, 2600, 220);
+    par("#haze1", 0.15, 960, 560, 960, -2800, 2600, 260);
+    par("#haze2", 0.15, 960, 540, 960, -4300, 2600, 240);
+    par("#rack0", 0.5, 300, 540, 960, -1800, 300, 420);
+    par("#rack1", 0.5, 1620, 600, 960, -2000, 360, 520);
+    par("#rack2", 0.5, 560, 300, 960, -3000, 280, 380);
+    par("#rack3", 0.5, 1500, 500, 960, -3300, 340, 480);
+    par("#fg0", 1.5, 200, 420, 960, -1400, 520, 520);
+    par("#fg1", 1.5, 1750, 640, 960, -1900, 640, 640);
+    par("#fg2", 1.5, 1300, 300, 960, -3000, 460, 460);
+
+    // fan blades
+    const fanRot = $("#fan-rot");
+    for (let b = 0; b < 6; b++) {
+      const blade = document.createElement("div");
+      blade.className = "a";
+      blade.style.cssText = `left:-22px;top:-130px;width:44px;height:110px;border-radius:22px 22px 8px 8px;background:linear-gradient(180deg,#9a9a9a,#5e5e5e);transform-origin:22px 130px;transform:rotate(${b * 60}deg)`;
+      fanRot.appendChild(blade);
+    }
+    // meter bars
+    const bars = $("#bars");
+    for (let i = 0; i < 6; i++) {
+      const track = document.createElement("div");
+      track.className = "a";
+      track.style.cssText = `left:${i * 42}px;top:0;width:30px;height:270px;border-radius:15px;background:#16181d`;
+      const fill = document.createElement("div");
+      fill.id = `bar${i}`;
+      fill.className = "a";
+      fill.style.cssText = `left:${i * 42}px;bottom:0;width:30px;height:20px;border-radius:15px;background:linear-gradient(180deg,#f7f6f2,#9a9a9a)`;
+      bars.appendChild(track);
+      bars.appendChild(fill);
+    }
+    // receipt rows
+    const rc = $("#rc");
+    for (let r = 0; r < 14; r++) {
+      const row = document.createElement("div");
+      row.className = "a";
+      row.style.cssText = `left:24px;top:${28 + r * 34}px;width:${70 + ((r * 37) % 70)}px;height:9px;border-radius:5px;background:#9a9a9a`;
+      const amt = document.createElement("div");
+      amt.className = "a";
+      amt.style.cssText = `right:24px;top:${28 + r * 34}px;width:30px;height:9px;border-radius:5px;background:#5e5e5e`;
+      rc.appendChild(row);
+      rc.appendChild(amt);
+    }
+    // branch nodes inside the hero sandbox
+    const nodesHost = $("#nodes");
+    const NODE_X = [140, 260, 380, 500, 620, 700];
+    NODE_X.forEach((x, i) => {
+      const n = document.createElement("div");
+      n.id = `node${i}`;
+      n.className = "a";
+      const last = i === NODE_X.length - 1;
+      n.style.cssText = `left:${x - (last ? 22 : 14)}px;top:${254 - (last ? 22 : 14)}px;width:${last ? 44 : 28}px;height:${last ? 44 : 28}px;border-radius:50%;background:#16181d;border:4px solid ${last ? "#f7f6f2" : "#5e5e5e"}`;
+      nodesHost.appendChild(n);
+    });
+    // grid of environments: 5 columns, 4 rows, hero is column 2 row 1
+    const tileHost = $("#tiles");
+    const TILE = [];
+    const AGENTS = [3, 2, 1, 4, 2, 3, 1, 2, 3, 2, 0, 4, 3, 1, 2, 2, 4, 1, 3, 2];
+    for (let r = 0; r < 4; r++) {
+      for (let c = 0; c < 5; c++) {
+        // 20 slots less the hero (drawn separately) and one empty corner: 19 environments in all
+        if ((c === 2 && r === 1) || (c === 4 && r === 3)) continue;
+        const idx = TILE.length;
+        const cx = 960 + (c - 2) * 1000;
+        const cy = -2200 + (r - 1) * 800;
+        const t = document.createElement("div");
+        t.id = `tile${idx}`;
+        t.className = "a glass";
+        t.style.cssText = `left:${cx - 380}px;top:${cy - 260}px;width:760px;height:520px;border-radius:40px;opacity:0`;
+        let inner = `<div class="a" style="left:40px;top:250px;width:680px;height:8px;border-radius:4px;background:#3a3d44"></div>`;
+        for (let k = 0; k < 4; k++) inner += `<div class="a" style="left:${126 + k * 130}px;top:240px;width:28px;height:28px;border-radius:50%;background:#16181d;border:4px solid #9a9a9a"></div>`;
+        const n = AGENTS[idx] || 1;
+        for (let k = 0; k < n; k++) inner += `<div id="to${idx}-${k}" class="a" style="left:${150 + k * 150}px;top:${222 + (k % 2) * 8}px;width:44px;height:44px;border-radius:50%;background:#f7f6f2;box-shadow:0 0 50px rgba(247,246,242,0.6)"></div>`;
+        t.innerHTML = inner;
+        tileHost.appendChild(t);
+        const card = document.createElement("div");
+        card.id = `tcard${idx}`;
+        card.className = "a";
+        card.style.cssText = `left:${cx - 180}px;top:${cy - 520}px;width:360px;height:200px;border-radius:24px;background:linear-gradient(180deg,#2b2e36,#23262d);border:1px solid #454851;box-shadow:0 24px 60px rgba(0,0,0,0.55);opacity:0`;
+        card.innerHTML = `<div class="a dimskel" style="left:24px;top:60px;width:300px"></div><div class="a skel" style="left:24px;top:60px;width:200px"></div><div class="a skel" style="left:24px;top:100px;width:120px"></div>`;
+        tileHost.appendChild(card);
+        TILE.push({ idx, cx, cy, c, r });
+      }
+    }
+    // queue of waiting cards above the hero sandbox
+    const qHost = $("#queue");
+    for (let q = 0; q < 3; q++) {
+      const card = document.createElement("div");
+      card.id = `q${q}`;
+      card.className = "a";
+      card.style.cssText = `left:780px;top:${-3000 - q * 220}px;width:360px;height:200px;border-radius:24px;background:linear-gradient(180deg,#2b2e36,#23262d);border:1px solid #454851;opacity:0`;
+      card.innerHTML = `<div class="a dimskel" style="left:24px;top:60px;width:300px"></div><div class="a skel" style="left:24px;top:60px;width:200px;background:#5e5e5e"></div><div class="a skel" style="left:24px;top:100px;width:120px;background:#5e5e5e"></div>`;
+      qHost.appendChild(card);
+    }
+    // 82 merged pull requests: 10 columns, 8 full rows then 2
+    const dotHost = $("#dots");
+    for (let d = 0; d < 82; d++) {
+      const dot = document.createElement("div");
+      dot.id = `d${d}`;
+      dot.className = "a";
+      dot.style.cssText = `left:${375 + (d % 10) * 130 - 36}px;top:${-4900 + Math.floor(d / 10) * 130 - 36}px;width:72px;height:72px;border-radius:50%;background:#f7f6f2;box-shadow:0 0 40px rgba(247,246,242,0.45);opacity:0.14`;
+      dotHost.appendChild(dot);
+    }
+
+    // ---- camera ---------------------------------------------------------
+    const LAYERS = [
+      { sel: "#L-far", f: 0.15, fs: 0.3 },
+      { sel: "#L-mid", f: 0.5, fs: 0.65 },
+      { sel: "#L-main", f: 1, fs: 1 },
+      { sel: "#L-fg", f: 1.5, fs: 1.3 },
+    ];
+    const camState = (cx, cy, s) =>
+      LAYERS.map((l) => {
+        const sl = 1 + (s - 1) * l.fs;
+        return { sel: l.sel, x: -sl * l.f * (cx - 960), y: -sl * l.f * (cy - 540), scale: sl };
+      });
+    const camSet = (cx, cy, s) => camState(cx, cy, s).forEach((c) => {
+        tl.set(c.sel, { x: c.x, y: c.y, scale: c.scale }, 0);
+      });
+    const camTo = (at, dur, cx, cy, s, ease, from) => {
+      const a = camState(from[0], from[1], from[2]);
+      camState(cx, cy, s).forEach((c, i) => {
+        tl.fromTo(c.sel, { x: a[i].x, y: a[i].y, scale: a[i].scale }, { x: c.x, y: c.y, scale: c.scale, duration: dur, ease, immediateRender: false }, at);
+      });
+    };
+    let cur = [960, 480, 1.35];
+    camSet(...cur);
+    const move = (at, dur, cx, cy, s, ease = "power2.inOut") => {
+      camTo(at, dur, cx, cy, s, ease, cur);
+      cur = [cx, cy, s];
+    };
+
+    // ---- 0 – 2.4  typing ------------------------------------------------
+    const tick = (el, w, at) => tl.set(el, { width: w }, at);
+    for (let i = 0; i < 5; i++) tick("#ln0", 240 + i * 60, 0.2 + i * 0.12);
+    for (let i = 0; i < 6; i++) tick("#ln1", 55 * (i + 1), 0.95 + i * 0.12);
+    for (let i = 0; i < 3; i++) tick("#ln2", 60 * (i + 1), 1.7 + i * 0.12);
+    tl.fromTo("#send", { scale: 1 }, { scale: 0.88, duration: 0.07, ease: "power2.in", immediateRender: false }, 2.35);
+    tl.to("#send", { scale: 1, boxShadow: "0 0 60px rgba(247,246,242,0.9)", duration: 0.25, ease: "power2.out" }, 2.42);
+    move(2.3, 0.8, 960, 540, 1.0);
+    // the prompt becomes a card
+    tl.fromTo("#pw", { scale: 1 }, { scale: 0.62, y: 30, duration: 0.5, ease: "back.out(1.4)", immediateRender: false }, 2.5);
+    tl.fromTo("#spin", { opacity: 0 }, { opacity: 1, duration: 0.2, immediateRender: false }, 3.0);
+    tl.fromTo("#spin", { rotation: 0 }, { rotation: 3000, duration: 4.4, ease: "none", immediateRender: false }, 3.0);
+    tl.to("#spin", { opacity: 0, duration: 0.2 }, 7.3);
+
+    // ---- 3 – 7.3  the laptop strains ------------------------------------
+    tl.fromTo("#fan-rot", { rotation: 0 }, { rotation: 1500, duration: 4.3, ease: "power2.in", immediateRender: false }, 3.0);
+    tl.fromTo("#fan-rot", { rotation: 1500 }, { rotation: 1920, duration: 1.3, ease: "power1.out", immediateRender: false }, 7.3);
+    for (let i = 0; i < 6; i++) {
+      tl.fromTo(`#bar${i}`, { height: 20 }, { height: 215 + (i % 3) * 20, duration: 0.8 + i * 0.1, ease: "power2.in", immediateRender: false }, 3.0);
+      tl.fromTo(`#bar${i}`, { height: 215 + (i % 3) * 20 }, { height: 262, duration: 0.09, repeat: 9, yoyo: true, ease: "none", immediateRender: false }, 4.1 + i * 0.05);
+      tl.to(`#bar${i}`, { height: 20, duration: 0.8, ease: "power2.out" }, 7.45 + i * 0.05);
+    }
+    tl.fromTo("#rc", { clipPath: "inset(0 0 100% 0)" }, { clipPath: "inset(0 0 0% 0)", duration: 4.2, ease: "steps(18)", immediateRender: false }, 3.1);
+    tl.fromTo("#heat", { opacity: 0 }, { opacity: 1, duration: 3.5, ease: "power2.in", immediateRender: false }, 3.2);
+    tl.fromTo("#scr-flick", { opacity: 0 }, { opacity: 0.16, duration: 0.06, repeat: 13, yoyo: true, ease: "none", immediateRender: false }, 4.6);
+    tl.fromTo("#desk", { x: 0 }, { x: 5, duration: 0.05, repeat: 79, yoyo: true, ease: "none", immediateRender: false }, 3.4);
+    tl.fromTo("#pw", { rotation: -1.2 }, { rotation: 1.2, duration: 0.06, repeat: 59, yoyo: true, ease: "none", immediateRender: false }, 3.4);
+    move(3.3, 0.7, 420, 600, 1.4);
+    move(4.4, 0.6, 1650, 440, 1.35);
+    move(5.5, 0.6, 1650, 800, 1.4);
+    move(6.5, 0.6, 960, 540, 1.0);
+
+    // ---- 7.2 – 10.8  the card is handed up into Sky --------------------
+    tl.fromTo("#cursor", { opacity: 0, x: 1180, y: 700 }, { opacity: 1, x: 1020, y: 470, duration: 0.35, ease: "power2.out", immediateRender: false }, 6.85);
+    tl.fromTo("#cursor", { scale: 1 }, { scale: 0.85, duration: 0.07, immediateRender: false }, 7.22);
+    tl.to("#cursor", { scale: 1, duration: 0.1 }, 7.3);
+    // the card rises with the cursor, then the cursor lets go
+    tl.fromTo("#pw", { y: 30, rotation: 0 }, { y: -3100, rotation: 0, duration: 2.7, ease: "power3.inOut", immediateRender: false }, 7.35);
+    tl.fromTo("#cursor", { y: 470 }, { y: -2660, duration: 2.7, ease: "power3.inOut", immediateRender: false }, 7.35);
+    tl.to("#cursor", { opacity: 0, duration: 0.3 }, 8.3);
+    tl.to("#heat", { opacity: 0, duration: 0.3 }, 7.3);
+    move(7.6, 2.4, 960, -2350, 1.0, "power3.inOut");
+    tl.fromTo("#bg-hi", { opacity: 0 }, { opacity: 1, duration: 2.4, ease: "power1.inOut", immediateRender: false }, 7.6);
+    tl.to("#bg-lo", { opacity: 0.2, duration: 2.4, ease: "power1.inOut" }, 7.6);
+    tl.fromTo("#flash", { opacity: 0 }, { opacity: 0.34, duration: 0.1, ease: "power1.in", immediateRender: false }, 8.62);
+    tl.to("#flash", { opacity: 0, duration: 0.4, ease: "power2.out" }, 8.72);
+    tl.fromTo("#thr", { opacity: 0.45 }, { opacity: 1, duration: 0.15, immediateRender: false }, 8.55);
+    tl.to("#thr", { opacity: 0.4, duration: 0.6 }, 8.7);
+
+    // the card descends into its sandbox; waiting cards queue above it
+    tl.fromTo("#pw", { y: -3100 }, { y: -2640, duration: 0.7, ease: "power2.in", immediateRender: false }, 10.1);
+    tl.fromTo("#pw", { scale: 0.62 }, { scale: 0.46, duration: 0.7, ease: "power2.in", immediateRender: false }, 10.1);
+    tl.fromTo("#sb-glow", { opacity: 0 }, { opacity: 1, duration: 0.12, immediateRender: false }, 10.8);
+    tl.to("#sb-glow", { opacity: 0.25, duration: 0.8 }, 10.92);
+    tl.fromTo("#pw", { opacity: 1 }, { opacity: 0, duration: 0.25, immediateRender: false }, 10.85);
+    tl.set("#orb", { x: 40, y: 254 }, 0);
+    tl.fromTo("#orb", { opacity: 0 }, { opacity: 1, duration: 0.3 }, 10.9);
+    tl.fromTo("#sb-in", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 10.85);
+    for (let q = 0; q < 3; q++) tl.fromTo(`#q${q}`, { opacity: 0 }, { opacity: 0.55, duration: 0.5, immediateRender: false }, 9.6 + q * 0.2);
+    tl.fromTo(["#sub2", "#sub"], { opacity: 0, x: -60 }, { opacity: 1, x: 0, duration: 0.5, stagger: 0.06, ease: "power3.out", immediateRender: false }, 11.0);
+    tl.to("#sub2", { opacity: 0.5, duration: 0.01 }, 11.7);
+    tl.fromTo("#cable", { opacity: 0 }, { opacity: 1, duration: 0.3, immediateRender: false }, 11.5);
+    // work-in-flight dots flow along the cable on the subscription
+    for (let d = 0; d < 3; d++) {
+      for (let k = 0; k < 6; k++) {
+        const at = 11.7 + k * 0.9 + d * 0.3;
+        tl.fromTo(`#cable-d${d}`, { x: 10, y: 40, opacity: 1 }, { x: 150, y: 130, duration: 0.7, ease: "power1.inOut", immediateRender: false }, at);
+        tl.set(`#cable-d${d}`, { opacity: 0 }, at + 0.7);
+      }
+      tl.set(`#cable-d${d}`, { opacity: 0 }, 0);
+    }
+
+    // ---- 12.4 – 21  inside the sandbox: branch, stall, chat, reply ----
+    move(12.4, 0.9, 960, -2200, 2.4, "power3.in");
+    tl.to("#sb", { opacity: 0.25, duration: 0.5 }, 12.7);
+    tl.to("#sub", { opacity: 0.0, duration: 0.3 }, 12.7);
+    tl.to(["#sub2", "#cable"], { opacity: 0, duration: 0.3 }, 12.7);
+    tl.fromTo("#orb", { x: 40 }, { x: 140, duration: 0.6, ease: "power2.out", immediateRender: false }, 13.4);
+    const orbTo = (at, dur, x, ease = "power1.inOut") => tl.to("#orb", { x, duration: dur, ease }, at);
+    const lightNode = (i, at) => {
+      tl.fromTo(`#node${i}`, { backgroundColor: "#16181d", borderColor: "#5e5e5e" }, { backgroundColor: "#f7f6f2", borderColor: "#f7f6f2", duration: 0.12, immediateRender: false }, at);
+    };
+    orbTo(13.9, 0.8, 260);
+    lightNode(0, 13.45);
+    lightNode(1, 14.65);
+    tl.fromTo("#track-lit", { width: 0 }, { width: 100, duration: 0.5, ease: "power1.out", immediateRender: false }, 13.4);
+    tl.to("#track-lit", { width: 220, duration: 0.8, ease: "power1.inOut" }, 13.9);
+    orbTo(14.8, 0.9, 380);
+    tl.to("#track-lit", { width: 340, duration: 0.9, ease: "power1.inOut" }, 14.8);
+    lightNode(2, 15.65);
+    // the agent stalls: silent and stuck
+    tl.to("#orb-halo", { opacity: 0.2, duration: 0.3 }, 15.7);
+    tl.to("#orb-core", { backgroundColor: "#5e5e5e", duration: 0.3 }, 15.7);
+    // the question rises out of the stalled agent
+    tl.set("#ask", { x: 380, y: 180 }, 0);
+    tl.set("#ok", { x: 1030, y: 100 }, 0);
+    tl.fromTo("#ask", { opacity: 0, scale: 0.4 }, { opacity: 1, scale: 1, duration: 0.3, ease: "back.out(2)" }, 16.0);
+    move(16.2, 0.8, 1400, -2170, 1.25);
+    tl.fromTo("#chat", { opacity: 0, x: 100 }, { opacity: 1, x: 0, duration: 0.5, ease: "power3.out", immediateRender: false }, 16.3);
+    // ask bubble flies to the chat: sandbox-local coordinates -> chat
+    tl.fromTo("#ask", { x: 380, y: 180 }, { x: 1030, y: 100, duration: 0.7, ease: "power2.inOut", immediateRender: false }, 16.45);
+    tl.to("#ask", { opacity: 0, duration: 0.15 }, 17.1);
+    tl.fromTo("#msg-in", { opacity: 0, scale: 0.7 }, { opacity: 1, scale: 1, duration: 0.3, ease: "back.out(2)", transformOrigin: "0% 100%", immediateRender: false }, 17.1);
+    // the reply is typed and sent
+    for (let i = 0; i < 3; i++) tick("#cl0", 70 * (i + 1), 17.35 + i * 0.2);
+    tl.fromTo("#csend", { scale: 1 }, { scale: 0.85, duration: 0.07, immediateRender: false }, 18.0);
+    tl.to("#csend", { scale: 1, duration: 0.15 }, 18.07);
+    tl.fromTo("#msg-out", { opacity: 0, scale: 0.7 }, { opacity: 1, scale: 1, duration: 0.3, ease: "back.out(2)", transformOrigin: "100% 100%", immediateRender: false }, 18.1);
+    tl.fromTo("#ok", { opacity: 0 }, { opacity: 1, duration: 0.01 }, 18.4);
+    tl.fromTo("#ok", { x: 1030, y: 100 }, { x: 380, y: 180, duration: 0.6, ease: "power2.inOut", immediateRender: false }, 18.4);
+    move(18.7, 0.8, 960, -2200, 2.0);
+    tl.to("#ok", { opacity: 0, duration: 0.15 }, 19.0);
+    tl.to("#chat", { opacity: 0, x: 100, duration: 0.4 }, 19.0);
+    tl.to("#orb-halo", { opacity: 1, duration: 0.2 }, 19.0);
+    tl.to("#orb-core", { backgroundColor: "#f7f6f2", duration: 0.2 }, 19.0);
+    orbTo(19.2, 0.6, 500);
+    tl.to("#track-lit", { width: 460, duration: 0.6 }, 19.2);
+    lightNode(3, 19.75);
+    orbTo(19.9, 0.5, 620);
+    tl.to("#track-lit", { width: 580, duration: 0.5 }, 19.9);
+    lightNode(4, 20.35);
+    orbTo(20.5, 0.4, 700);
+    tl.to("#track-lit", { width: 680, duration: 0.4 }, 20.5);
+    lightNode(5, 20.85);
+
+    // ---- 21 – 27  the pull request and its preview link -------------------
+    move(20.9, 1.0, 960, -2450, 0.9, "power2.inOut");
+    tl.to("#sb", { opacity: 1, duration: 0.5 }, 20.9);
+    tl.fromTo("#pr", { opacity: 0, y: 520, scale: 0.4 }, { opacity: 1, y: 0, scale: 1, duration: 0.9, ease: "power3.out", immediateRender: false }, 20.95);
+    tl.fromTo("#prbadge", { opacity: 0, scale: 0.3 }, { opacity: 1, scale: 1, duration: 0.35, ease: "back.out(2.5)", immediateRender: false }, 22.0);
+    // the old way: pulling a branch to a laptop to see it
+    tl.fromTo("#ghost", { opacity: 0 }, { opacity: 0.8, duration: 0.5, immediateRender: false }, 22.2);
+    tl.fromTo("#hand", { rotation: 0 }, { rotation: 1080, duration: 1.4, ease: "none", immediateRender: false }, 22.2);
+    tl.fromTo("#chip", { boxShadow: "0 0 0 rgba(247,246,242,0)" }, { boxShadow: "0 0 70px rgba(247,246,242,0.85)", duration: 0.5, immediateRender: false }, 23.0);
+    tl.to("#ghost", { opacity: 0, x: 575, y: 276, scale: 0.2, duration: 0.5, ease: "power3.in" }, 23.1);
+    tl.fromTo("#cursor", { opacity: 0 }, { opacity: 1, duration: 0.01, immediateRender: false }, 22.6);
+    tl.fromTo("#cursor", { x: 1250, y: -1900 }, { x: 800, y: -2278, duration: 0.8, ease: "power2.out", immediateRender: false }, 22.6);
+    tl.fromTo("#cursor", { scale: 1 }, { scale: 0.85, duration: 0.07, immediateRender: false }, 23.5);
+    tl.to("#cursor", { scale: 1, duration: 0.1 }, 23.57);
+    tl.to("#cursor", { opacity: 0, duration: 0.2 }, 23.7);
+    // iris from the click opens onto the running app
+    tl.fromTo("#browser", { clipPath: "circle(0px at 820px 698px)" }, { clipPath: "circle(1800px at 820px 698px)", duration: 0.7, ease: "power3.in", immediateRender: false }, 23.55);
+    tl.fromTo("#browser", { clipPath: "circle(1800px at 820px 698px)" }, { clipPath: "circle(0px at 820px 698px)", duration: 0.55, ease: "power3.in", immediateRender: false }, 26.2);
+
+    // ---- 27 – 33  many sandboxes at once --------------------------------
+    tl.to("#pr", { scale: 0.08, y: 330, opacity: 0, duration: 0.7, ease: "power3.in" }, 26.4);
+    tl.fromTo("#newpr", { opacity: 0, scale: 0.3 }, { opacity: 1, scale: 1, duration: 0.4, ease: "back.out(2)", immediateRender: false }, 26.8);
+    move(27.0, 2.2, 960, -1700, 0.3, "power2.inOut");
+    const dropAt = [28.0, 28.3, 28.7];
+    TILE.forEach((t, i) => {
+      const at = 27.4 + i * 0.07;
+      tl.fromTo(`#tile${t.idx}`, { opacity: 0, scale: 0.85 }, { opacity: 1, scale: 1, duration: 0.5, ease: "power3.out", immediateRender: false }, at);
+      const orbs = AGENTS[t.idx] || 1;
+      for (let k = 0; k < orbs; k++) {
+        tl.fromTo(`#to${t.idx}-${k}`, { opacity: 0.3, scale: 0.7 }, { opacity: 1, scale: 1, duration: 0.3, repeat: 7, yoyo: true, ease: "sine.inOut", immediateRender: false }, 28.6 + ((t.idx * 3 + k * 5) % 7) * 0.08);
+      }
+    });
+    // waiting cards leave the queue and drop into their own sandboxes
+    const qTarget = [[960, -3000], [-40, -3000], [1960, -3000]];
+    for (let q = 0; q < 3; q++) {
+      tl.to(`#q${q}`, { opacity: 0.9, duration: 0.3 }, 27.2);
+      tl.to(`#q${q}`, { x: qTarget[q][0] - 960, y: qTarget[q][1] + 40 - (-2900 - q * 220), duration: 0.5, ease: "power3.in" }, dropAt[q] - 0.5);
+      tl.to(`#q${q}`, { opacity: 0, duration: 0.15 }, dropAt[q]);
+    }
+    TILE.forEach((t) => {
+      const at = 27.9 + (t.idx % 9) * 0.1;
+      tl.fromTo(`#tcard${t.idx}`, { opacity: 0, y: 0 }, { opacity: 1, duration: 0.2, immediateRender: false }, at);
+      tl.fromTo(`#tcard${t.idx}`, { y: 0 }, { y: 360, duration: 0.45, ease: "power2.in", immediateRender: false }, at + 0.1);
+      tl.to(`#tcard${t.idx}`, { opacity: 0, duration: 0.12 }, at + 0.55);
+    });
+    tl.to("#sb", { opacity: 1, duration: 0.1 }, 27.0);
+    tl.to("#orb", { x: 700, duration: 0.01 }, 27.0);
+
+    // ---- 33 – 37  eighty-two merged pull requests, then the mark --------
+    move(31.2, 2.0, 960, -4300, 0.5, "power2.inOut");
+    tl.fromTo("#dots div:not(#d81)", { opacity: 0.14 }, { opacity: 1, duration: 0.12, stagger: 0.011, ease: "none", immediateRender: false }, 31.7);
+    // the new pull request flies up from its sandbox and becomes the 82nd dot
+    tl.fromTo("#newpr", { x: 0, y: 0 }, { x: 505 - 960, y: -3860 - -2200, duration: 1.3, ease: "power2.inOut", immediateRender: false }, 31.7);
+    tl.to("#d81", { opacity: 1, duration: 0.15 }, 33.0);
+    tl.to("#newpr", { opacity: 0, duration: 0.2 }, 33.0);
+    tl.fromTo("#label", { opacity: 0, filter: "blur(8px)" }, { opacity: 1, filter: "blur(0px)", duration: 0.25 }, 32.9);
+    tl.to("#label", { opacity: 0, filter: "blur(8px)", duration: 0.25 }, 35.2);
+    move(34.0, 3.0, 960, -5600, 1.0, "power2.inOut");
+    tl.fromTo("#lk-word-w", { opacity: 0, x: -10 }, { opacity: 1, x: 0, duration: 0.6, ease: "power3.out" }, 37.0);
+    tl.fromTo("#url", { opacity: 0, filter: "blur(8px)" }, { opacity: 1, filter: "blur(0px)", duration: 0.3 }, 37.8);
+    tl.fromTo("#note", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 38.6);
+
+    window.__timelines["world"] = tl;
+  </script>
+</template>
