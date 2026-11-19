@@ -1334,7 +1334,8 @@ export async function runSession(
     // Only a run with checks on a login starts a nested `claude`; an API-key run has none.
     if (config.checks.length > 0 && config.claudeAuth !== "api-key") {
       try {
-        // the file Claude reads: the one the rest of the runner reads, under the session's env
+        // the file the nested claude reads: resolved under the session's env, so a profile's
+        // CLAUDE_CONFIG_DIR counts here though the runner's own config reads use its env alone
         const file = userConfigFile({
           ...(deps.env ?? process.env),
           ...config.sessionEnv,
