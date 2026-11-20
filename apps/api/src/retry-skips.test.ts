@@ -17,6 +17,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { open, runLaunchAad, seal } from "./crypto.js";
+import { failUnlaunchedRuns } from "./runs.js";
 import { spriteNameFor } from "./sprites.js";
 import { fiveHourLimit } from "./testing/limits.js";
 import {
@@ -250,7 +251,16 @@ function keptLaunch(id: string) {
   };
   return JSON.parse(
     open(config.secretEncryptionKey, sealed, runLaunchAad(id)),
-  ) as { launch: { prompt: string }; at: number };
+  ) as {
+    launch: {
+      prompt: string;
+      sessionId: string | null;
+      remoteBranch: string | null;
+      forceCredential?: string;
+      keepCredential?: boolean;
+    };
+    at: number;
+  };
 }
 
 /** Keeps `value` as the run's launch, sealed as the API does. */
@@ -331,8 +341,28 @@ test("a limit failure after an API restart is retried once on the next credentia
   expect(wire.sessions).toHaveLength(2);
 });
 
-test("the stored launch is sealed: the prompt is nowhere in the raw row, and it opens only for its own run", async () => {
+test("the stored launch is sealed: the prompt is in no column of the raw row, each run has its own nonce, and it opens only for its own run", async () => {
   const r = await launchedRun(readyEnv());
+  const other = await launchedRun(readyEnv());
+  // every column of the row, a blob read as bytes, so a plaintext copy anywhere shows up
+  const wholeRow = (id: string) =>
+    Object.values(
+      db.$client.prepare("select * from runs where id = ?").get(id) as Record<
+        string,
+        unknown
+      >,
+    )
+      .map((value) =>
+        Buffer.isBuffer(value) ? value.toString("latin1") : String(value),
+      )
+      .join("\n");
+  expect(wholeRow(r.run.id)).toContain(r.run.id);
+  expect(wholeRow(r.run.id)).not.toContain("fix the flaky test");
+  // the same prompt twice, and different nonces
+  const nonceOf = (id: string) => runRow(id)?.launchNonce?.toString("hex");
+  expect(nonceOf(r.run.id)).toHaveLength(24);
+  expect(nonceOf(other.run.id)).toHaveLength(24);
+  expect(nonceOf(r.run.id)).not.toBe(nonceOf(other.run.id));
   const raw = db.$client
     .prepare(
       "select launch_ciphertext, launch_nonce, launch_key_version from runs where id = ?",
@@ -671,6 +701,52 @@ test("a stopped run keeps no launch", async () => {
   expect(launchKept(r.run.id)).toBe(false);
 });
 
+test("a run whose launcher fails keeps no launch", async () => {
+  wire.sessionExit = { output: "node: bad option\r\n", code: 1 };
+  const r = await launchedRun(readyEnv());
+  await vi.waitFor(() => expect(runRow(r.run.id)?.status).toBe("failed"));
+  expect(runRow(r.run.id)).toMatchObject({
+    launchCiphertext: null,
+    launchNonce: null,
+    launchKeyVersion: null,
+  });
+});
+
+test("a run failed by the launch deadline keeps no launch", async () => {
+  const r = await launchedRun(readyEnv());
+  expect(launchKept(r.run.id)).toBe(true);
+  const deadline = config.launchDeadlineMs;
+  expect(
+    failUnlaunchedRuns(db, deadline, Date.now() + deadline + 1000),
+  ).toHaveLength(1);
+  expect(runRow(r.run.id)?.status).toBe("failed");
+  expect(runRow(r.run.id)).toMatchObject({
+    launchCiphertext: null,
+    launchNonce: null,
+    launchKeyVersion: null,
+  });
+});
+
+test.each([
+  ["no credential recorded", null],
+  ["the API key", "api-key"],
+])(
+  "a limit failure of a run with %s keeps no launch",
+  async (_name, credential) => {
+    const r = await launchedRun(readyEnv());
+    db.update(runs)
+      .set({ claudeCredential: credential })
+      .where(eq(runs.id, r.run.id as RunId))
+      .run();
+    expect(launchKept(r.run.id)).toBe(true);
+    await failWith(r, FIVE_HOUR);
+    await vi.waitFor(() => expect(runRow(r.run.id)?.status).toBe("failed"));
+    expect(launchKept(r.run.id)).toBe(false);
+    expect(retryOf(r.run.id)).toBeUndefined();
+    expect(wire.sessions).toHaveLength(1);
+  },
+);
+
 test.each([
   ["an unrelated error", UNRELATED],
   ["a challenge on a run with no credential recorded", CHALLENGE],
@@ -718,6 +794,71 @@ test.each([
   },
 );
 
+test.each([2, 0])(
+  "a stored launch under key version %i counts as no record",
+  async (keyVersion) => {
+    const r = await launchedRun(readyEnv());
+    expect(launchKept(r.run.id)).toBe(true);
+    db.update(runs)
+      .set({ launchKeyVersion: keyVersion })
+      .where(eq(runs.id, r.run.id as RunId))
+      .run();
+    restartApi();
+    await failWith(r, FIVE_HOUR);
+    await vi.waitFor(() => expect(warningsOf(r.run.id)).toHaveLength(1));
+    expect(warningsOf(r.run.id)).toEqual([NO_RECORD]);
+    expect(wire.sessions).toHaveLength(1);
+  },
+);
+
+test("a stored launch with every optional field set opens after a restart and is retried from", async () => {
+  const r = await launchedRun(readyEnv());
+  const kept = keptLaunch(r.run.id);
+  keepLaunch(r.run.id, {
+    ...kept,
+    launch: {
+      ...kept.launch,
+      sessionId: "sess-0",
+      remoteBranch: "feature/retry-me",
+      forceCredential: "work",
+      keepCredential: true,
+    },
+  });
+  restartApi();
+  await failWith(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(2));
+  expect(warningsOf(r.run.id)).toEqual([]);
+  // the branch rides on to the retry's own launch, which the agent's resumed session now leads
+  const retry = retryOf(r.run.id);
+  expect(keptLaunch(String(retry?.id)).launch).toMatchObject({
+    remoteBranch: "feature/retry-me",
+    sessionId: "sess-1",
+    forceCredential: "api-key",
+    keepCredential: false,
+  });
+});
+
+test("a launch kept for a retry that launched more than 12 hours before the next launch is dropped, a younger one is kept", async () => {
+  const old = await launchedRun(readyEnv());
+  const young = await launchedRun(readyEnv());
+  const hoursAgo = (h: number) =>
+    new Date(Date.now() - h * 3_600_000).toISOString();
+  db.update(runs)
+    .set({ createdAt: hoursAgo(13) })
+    .where(eq(runs.id, old.run.id as RunId))
+    .run();
+  db.update(runs)
+    .set({ createdAt: hoursAgo(11) })
+    .where(eq(runs.id, young.run.id as RunId))
+    .run();
+  expect(launchKept(old.run.id)).toBe(true);
+  expect(launchKept(young.run.id)).toBe(true);
+  const next = await launchedRun(readyEnv());
+  expect(launchKept(old.run.id)).toBe(false);
+  expect(launchKept(young.run.id)).toBe(true);
+  expect(launchKept(next.run.id)).toBe(true);
+});
+
 test("a launch whose write fails still starts its run, and only loses the retry after a restart", async () => {
   db.$client.exec(
     "create trigger refuse_launch before update of launch_ciphertext on runs when new.launch_ciphertext is not null begin select raise(abort, 'disk full'); end",
@@ -728,6 +869,8 @@ test("a launch whose write fails still starts its run, and only loses the retry 
   expect(
     logs.some((line) => line.includes(`keeping the launch of ${r.run.id}`)),
   ).toBe(true);
+  // the log line above is the one that carries the failure: it must not carry the task
+  expect(logs.join("\n")).not.toContain("fix the flaky test");
   // the map still holds it: a failure without a restart is retried
   await failWith(r, FIVE_HOUR);
   await vi.waitFor(() => expect(wire.sessions).toHaveLength(2));
