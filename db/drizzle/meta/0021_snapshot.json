@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "4416e85e-dbb7-4a4c-a3e0-b7e5c6006ba8",
+  "id": "b6bd6383-621e-4f8e-bd69-bdc6bc3b49eb",
   "prevId": "d5c1c107-2d40-4ec8-8b43-58321847c512",
   "tables": {
     "agents": {
@@ -997,9 +997,23 @@
           "notNull": false,
           "autoincrement": false
         },
-        "launch": {
-          "name": "launch",
-          "type": "text",
+        "launch_ciphertext": {
+          "name": "launch_ciphertext",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "launch_nonce": {
+          "name": "launch_nonce",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "launch_key_version": {
+          "name": "launch_key_version",
+          "type": "integer",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false

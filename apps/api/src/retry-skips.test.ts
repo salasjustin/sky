@@ -16,6 +16,7 @@ import { and, eq } from "drizzle-orm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
+import { open, runLaunchAad, seal } from "./crypto.js";
 import { spriteNameFor } from "./sprites.js";
 import { fiveHourLimit } from "./testing/limits.js";
 import {
@@ -233,10 +234,50 @@ async function failAgain(r: Launched, error: string) {
 
 // --- a limit failure that is not retried says why ---------------------------------------------------
 
+/** Whether a launch is kept on the run's row. */
+const launchKept = (id: string) => runRow(id)?.launchCiphertext != null;
+
+/** The launch kept on the run's row, opened. */
+function keptLaunch(id: string) {
+  const row = runRow(id);
+  if (!row?.launchCiphertext || !row.launchNonce || !row.launchKeyVersion) {
+    throw new Error(`no launch kept for ${id}`);
+  }
+  const sealed = {
+    ciphertext: row.launchCiphertext,
+    nonce: row.launchNonce,
+    keyVersion: row.launchKeyVersion,
+  };
+  return JSON.parse(
+    open(config.secretEncryptionKey, sealed, runLaunchAad(id)),
+  ) as { launch: { prompt: string }; at: number };
+}
+
+/** Keeps `value` as the run's launch, sealed as the API does. */
+function keepLaunch(id: string, value: unknown) {
+  const sealed = seal(
+    config.secretEncryptionKey,
+    JSON.stringify(value),
+    runLaunchAad(id),
+  );
+  db.update(runs)
+    .set({
+      launchCiphertext: sealed.ciphertext,
+      launchNonce: sealed.nonce,
+      launchKeyVersion: sealed.keyVersion,
+    })
+    .where(eq(runs.id, id as RunId))
+    .run();
+}
+
 test("a limit failure whose launch is held nowhere is not retried and says so", async () => {
   const r = await launchedRun(readyEnv());
   db.update(runs)
-    .set({ launch: null })
+    .set({
+      launchCiphertext: null,
+      launchNonce: null,
+      launchKeyVersion: null,
+    })
     .where(eq(runs.id, r.run.id as RunId))
     .run();
   restartApi();
@@ -248,17 +289,10 @@ test("a limit failure whose launch is held nowhere is not retried and says so", 
 
 test("a limit failure of a run launched past the remembered window is not retried and says so", async () => {
   const r = await launchedRun(readyEnv());
-  const row = runRow(r.run.id);
-  const stored = JSON.parse(String(row?.launch)) as {
-    launch: unknown;
-    at: number;
-  };
-  db.update(runs)
-    .set({
-      launch: JSON.stringify({ ...stored, at: Date.now() - 13 * 3_600_000 }),
-    })
-    .where(eq(runs.id, r.run.id as RunId))
-    .run();
+  keepLaunch(r.run.id, {
+    ...keptLaunch(r.run.id),
+    at: Date.now() - 13 * 3_600_000,
+  });
   restartApi();
   await failWith(r, FIVE_HOUR);
   await vi.waitFor(() => expect(warningsOf(r.run.id)).toHaveLength(1));
@@ -270,15 +304,16 @@ test("a limit failure of a run launched past the remembered window is not retrie
 
 test("a limit failure after an API restart is retried once on the next credential", async () => {
   const r = await launchedRun(readyEnv());
-  expect(runRow(r.run.id)?.launch).toEqual(expect.any(String));
-  // no secret is stored with the launch
+  expect(launchKept(r.run.id)).toBe(true);
+  // no secret is stored with the launch, even opened
+  const opened = JSON.stringify(keptLaunch(r.run.id));
   for (const secret of [
     PERSONAL_TOKEN,
     WORK_TOKEN,
     API_KEY,
     testConfig().apiKey,
   ]) {
-    expect(runRow(r.run.id)?.launch).not.toContain(secret);
+    expect(opened).not.toContain(secret);
   }
   restartApi();
   await failWith(r, FIVE_HOUR);
@@ -292,7 +327,57 @@ test("a limit failure after an API restart is retried once on the next credentia
   });
   expect(warningsOf(r.run.id)).toEqual([]);
   // once: the stored launch is spent
-  expect(runRow(r.run.id)?.launch).toBeNull();
+  expect(launchKept(r.run.id)).toBe(false);
+  expect(wire.sessions).toHaveLength(2);
+});
+
+test("the stored launch is sealed: the prompt is nowhere in the raw row, and it opens only for its own run", async () => {
+  const r = await launchedRun(readyEnv());
+  const raw = db.$client
+    .prepare(
+      "select launch_ciphertext, launch_nonce, launch_key_version from runs where id = ?",
+    )
+    .get(r.run.id) as {
+    launch_ciphertext: Buffer;
+    launch_nonce: Buffer;
+    launch_key_version: number;
+  };
+  expect(raw.launch_ciphertext.toString("latin1")).not.toContain(
+    "fix the flaky test",
+  );
+  expect(raw.launch_nonce).toHaveLength(12);
+  expect(raw.launch_key_version).toBe(1);
+  expect(keptLaunch(r.run.id).launch.prompt).toBe("fix the flaky test");
+  // its own AAD only
+  expect(() =>
+    open(
+      config.secretEncryptionKey,
+      {
+        ciphertext: raw.launch_ciphertext,
+        nonce: raw.launch_nonce,
+        keyVersion: raw.launch_key_version,
+      },
+      runLaunchAad("run_other"),
+    ),
+  ).toThrow();
+});
+
+test("a launch copied from another run's row won't open and counts as no record", async () => {
+  const a = await launchedRun(readyEnv());
+  const b = await launchedRun(readyEnv());
+  const rowA = runRow(a.run.id);
+  db.update(runs)
+    .set({
+      launchCiphertext: rowA?.launchCiphertext,
+      launchNonce: rowA?.launchNonce,
+      launchKeyVersion: rowA?.launchKeyVersion,
+    })
+    .where(eq(runs.id, b.run.id as RunId))
+    .run();
+  restartApi();
+  await failWith(b, FIVE_HOUR);
+  await vi.waitFor(() => expect(warningsOf(b.run.id)).toHaveLength(1));
+  expect(warningsOf(b.run.id)).toEqual([NO_RECORD]);
   expect(wire.sessions).toHaveLength(2);
 });
 
@@ -470,8 +555,15 @@ test("stopping another agent while a limit retry waits on its runner still lets 
   fakeDelay();
   await failWith(r, FIVE_HOUR);
   await vi.waitFor(() => expect(backoffLogged()).toBe(true));
-  const stop = await call("POST", `/v1/agents/${other.agent.id}/stop`);
-  expect(stop.status).toBe(200);
+  // the stop execs on the sprite and its stub streams frames on faked timers: waiting on the state
+  // steps them, where awaiting the response would not
+  let stopStatus: number | undefined;
+  void Promise.resolve(call("POST", `/v1/agents/${other.agent.id}/stop`)).then(
+    (res) => {
+      stopStatus = res.status;
+    },
+  );
+  await vi.waitFor(() => expect(stopStatus).toBe(200));
   await vi.advanceTimersByTimeAsync(2 * PAUSE_MS);
   await vi.waitFor(() => expect(retryOf(r.run.id)).toBeDefined());
   expect(warningsOf(r.run.id)).toEqual([]);
@@ -486,11 +578,11 @@ test("stopping the agent while a challenge retry waits leaves a warning on the f
   fakeDelay();
   await failWith(r, CHALLENGE);
   // held for the retry until the stop drops it
-  expect(runRow(r.run.id)?.launch).toEqual(expect.any(String));
+  expect(launchKept(r.run.id)).toBe(true);
   const stop = await call("POST", `/v1/agents/${r.agent.id}/stop`);
   expect(stop.status).toBe(200);
   // read before the delay passes: the stop itself clears it, not the timer firing
-  expect(runRow(r.run.id)?.launch).toBeNull();
+  expect(launchKept(r.run.id)).toBe(false);
   await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
   expect(warningsOf(r.run.id)).toEqual([STOPPED]);
   expect(wire.sessions).toHaveLength(1);

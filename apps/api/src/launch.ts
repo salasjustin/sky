@@ -36,6 +36,7 @@ import {
 } from "./claude-pool.js";
 import type { UsageProbe } from "./claude-usage.js";
 import type { Config } from "./config.js";
+import { open, runLaunchAad, seal } from "./crypto.js";
 import { mintId } from "./ids.js";
 import { readMemory } from "./memory.js";
 import {
@@ -388,6 +389,68 @@ const RETRY_ENV_VARS_TTL_S = 3_600;
 /** The prompt of a retry that resumes the agent's session: the original task, which that session may not hold whole. */
 const resumedPrompt = (prompt: string) =>
   `Your previous attempt at this task was cut off before it finished. Continue it in this session: check the worktree for what is already done, then finish what remains. The task was:\n\n${prompt}`;
+
+/** A launch as kept for a retry: when it started rides with it, for the `REMEMBER_LAUNCH_MS` bound. */
+type StoredLaunch = { launch: Launch; at: number };
+
+const NO_LAUNCH = {
+  launchCiphertext: null,
+  launchNonce: null,
+  launchKeyVersion: null,
+} as const;
+
+/** Keeps a run's launch on its row, sealed like its env vars with the AAD bound to the run id. */
+function storeLaunch(
+  db: Db,
+  key: Buffer,
+  runId: RunId,
+  stored: StoredLaunch,
+): void {
+  const sealed = seal(key, JSON.stringify(stored), runLaunchAad(runId));
+  db.update(runs)
+    .set({
+      launchCiphertext: sealed.ciphertext,
+      launchNonce: sealed.nonce,
+      launchKeyVersion: sealed.keyVersion,
+    })
+    .where(eq(runs.id, runId))
+    .run();
+}
+
+/** Drops the launch kept on a run's row. */
+function clearLaunch(db: Db, runId: RunId): void {
+  db.update(runs).set(NO_LAUNCH).where(eq(runs.id, runId)).run();
+}
+
+/** The launch kept on a run's row; undefined when none is, or one doesn't open under this key and run id. */
+function readLaunch(
+  db: Db,
+  key: Buffer,
+  runId: RunId,
+): StoredLaunch | undefined {
+  const row = db
+    .select({
+      ciphertext: runs.launchCiphertext,
+      nonce: runs.launchNonce,
+      keyVersion: runs.launchKeyVersion,
+    })
+    .from(runs)
+    .where(eq(runs.id, runId))
+    .get();
+  if (!row?.ciphertext || !row.nonce || row.keyVersion === null) {
+    return undefined;
+  }
+  try {
+    const sealed = {
+      ciphertext: row.ciphertext,
+      nonce: row.nonce,
+      keyVersion: row.keyVersion,
+    };
+    return JSON.parse(open(key, sealed, runLaunchAad(runId))) as StoredLaunch;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Where a failed run is retried, or why it is not (the warning left on it). */
 type RetryTarget = { target: string } | { skip: string };
@@ -810,35 +873,21 @@ export function createLauncher({
   }
 
   // launches by run, so a run that fails on its subscription's usage limit or Cloudflare's challenge
-  // can be retried once. Also stored on the run's row (`runs.launch`), which a retry reads when the
+  // can be retried once. Also stored sealed on the run's row (`storeLaunch`), which a retry reads when the
   // map has no entry after a restart; a restart during a challenge retry's wait still loses the retry,
   // and the run stays failed with the challenge's error
   const launches = new Map<RunId, { launch: Launch; at: number }>();
 
   /** Takes the held launch of `runId` for its one retry, from memory else from its row; `missing` says why there is none to take. */
   function takeLaunch(runId: RunId): { launch: Launch } | { missing: string } {
-    let entry = launches.get(runId);
+    const entry =
+      launches.get(runId) ?? readLaunch(db, config.secretEncryptionKey, runId);
     launches.delete(runId);
-    if (!entry) {
-      const stored = db
-        .select({ launch: runs.launch })
-        .from(runs)
-        .where(eq(runs.id, runId))
-        .get()?.launch;
-      if (stored) {
-        try {
-          entry = JSON.parse(stored) as { launch: Launch; at: number };
-        } catch {
-          entry = undefined;
-        }
-      }
-    }
     // once: a second failure of the same run finds nothing, in memory or in the row
-    db.update(runs).set({ launch: null }).where(eq(runs.id, runId)).run();
+    clearLaunch(db, runId);
     if (!entry?.launch) {
       return {
-        missing:
-          `not retried: no record of this run's launch is held (the API restarted since this run launched and it was not recorded, it launched more than ${REMEMBER_LAUNCH_MS / 3_600_000} hours ago, or it was already retried)`,
+        missing: `not retried: no record of this run's launch is held (the API restarted since this run launched and it was not recorded, it launched more than ${REMEMBER_LAUNCH_MS / 3_600_000} hours ago, or it was already retried)`,
       };
     }
     if (Date.now() - entry.at > REMEMBER_LAUNCH_MS) {
@@ -1095,10 +1144,7 @@ export function createLauncher({
         }
         if (stopped()) return { kind: "cancelled" } as const;
         // the assignment can change while the failed runner exits too
-        if (
-          keepCredential &&
-          "skip" in challengeTarget(launch.envId, target)
-        ) {
+        if (keepCredential && "skip" in challengeTarget(launch.envId, target)) {
           return { kind: "unassigned" } as const;
         }
         tx.insert(runs)
@@ -1176,10 +1222,7 @@ export function createLauncher({
         clearTimeout(pending.timer);
         challengeRetries.delete(failedId);
         launches.delete(failedId);
-        db.update(runs)
-          .set({ launch: null })
-          .where(eq(runs.id, failedId))
-          .run();
+        clearLaunch(db, failedId);
         skipRetry(failedId, "not retried: its agent was stopped");
       }
     },
@@ -1190,15 +1233,15 @@ export function createLauncher({
       }
       launches.set(launch.runId, { launch, at: now });
       // what a retry needs survives a restart; rows past the bound drop theirs
+      storeLaunch(db, config.secretEncryptionKey, launch.runId, {
+        launch,
+        at: now,
+      });
       db.update(runs)
-        .set({ launch: JSON.stringify({ launch, at: now }) })
-        .where(eq(runs.id, launch.runId))
-        .run();
-      db.update(runs)
-        .set({ launch: null })
+        .set(NO_LAUNCH)
         .where(
           and(
-            isNotNull(runs.launch),
+            isNotNull(runs.launchCiphertext),
             lt(
               runs.createdAt,
               new Date(now - REMEMBER_LAUNCH_MS).toISOString(),
