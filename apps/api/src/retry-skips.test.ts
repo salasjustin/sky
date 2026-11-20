@@ -633,3 +633,70 @@ test.each([
   expect(warningsOf(r.run.id)).toEqual([]);
   expect(retryOf(r.run.id)).toBeUndefined();
 });
+
+// --- the stored launch is kept only while a retry is still possible ---------------------------------
+
+test("a run that finishes keeps no launch", async () => {
+  const r = await launchedRun(readyEnv());
+  expect(launchKept(r.run.id)).toBe(true);
+  await postEvent(r.file.AGENT_TOKEN, {
+    runId: r.run.id,
+    type: "run.started",
+    payload: { sessionId: "sess-1" },
+  });
+  const res = await postEvent(r.file.AGENT_TOKEN, {
+    runId: r.run.id,
+    type: "run.finished",
+    payload: {
+      summary: "done",
+      usage: {
+        inputTokens: 1,
+        outputTokens: 1,
+        costUsd: 0,
+        turns: 1,
+        durationMs: 1,
+      },
+    },
+  });
+  expect(res.status).toBe(201);
+  expect(launchKept(r.run.id)).toBe(false);
+});
+
+test("a stopped run keeps no launch", async () => {
+  const r = await launchedRun(readyEnv());
+  expect(launchKept(r.run.id)).toBe(true);
+  const stop = await call("POST", `/v1/agents/${r.agent.id}/stop`);
+  expect(stop.status).toBe(200);
+  expect(runRow(r.run.id)?.status).toBe("stopped");
+  expect(launchKept(r.run.id)).toBe(false);
+});
+
+test.each([
+  ["an unrelated error", UNRELATED],
+  ["a challenge on a run with no credential recorded", CHALLENGE],
+])(
+  "a failure that is not a retry candidate (%s) keeps no launch",
+  async (name, error) => {
+    const r = await launchedRun(readyEnv());
+    if (name !== "an unrelated error") {
+      db.update(runs)
+        .set({ claudeCredential: null })
+        .where(eq(runs.id, r.run.id as RunId))
+        .run();
+    }
+    expect(launchKept(r.run.id)).toBe(true);
+    await failWith(r, error);
+    await vi.waitFor(() => expect(runRow(r.run.id)?.status).toBe("failed"));
+    expect(launchKept(r.run.id)).toBe(false);
+  },
+);
+
+test("a limit failure keeps the launch only until its retry takes it", async () => {
+  const r = await launchedRun(readyEnv());
+  await failWith(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(2));
+  expect(launchKept(r.run.id)).toBe(false);
+  // the retry run holds its own, for a retry of its own
+  const retry = retryOf(r.run.id);
+  expect(launchKept(String(retry?.id))).toBe(true);
+});

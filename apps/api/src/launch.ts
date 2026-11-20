@@ -54,6 +54,7 @@ import {
   isActive,
   isSilentLaunch,
   liveAgentTokens,
+  NO_LAUNCH,
   recordEvent,
   type Tx,
 } from "./runs.js";
@@ -392,12 +393,6 @@ const resumedPrompt = (prompt: string) =>
 
 /** A launch as kept for a retry: when it started rides with it, for the `REMEMBER_LAUNCH_MS` bound. */
 type StoredLaunch = { launch: Launch; at: number };
-
-const NO_LAUNCH = {
-  launchCiphertext: null,
-  launchNonce: null,
-  launchKeyVersion: null,
-} as const;
 
 /** Keeps a run's launch on its row, sealed like its env vars with the AAD bound to the run id. */
 function storeLaunch(
@@ -898,6 +893,12 @@ export function createLauncher({
     return { launch: entry.launch };
   }
 
+  /** Drops the launch of a run no retry can use, from memory and from its row. */
+  function forgetLaunch(runId: RunId): void {
+    launches.delete(runId);
+    clearLaunch(db, runId);
+  }
+
   /** Leaves `message`, which says why the failed run is not retried, as a warning on it. */
   function skipRetry(failedId: RunId, message: string): void {
     db.transaction(
@@ -947,7 +948,10 @@ export function createLauncher({
     const credential = failed?.credential;
     if (isCloudflareChallenge(error)) {
       // transient: the credential is untouched and the retry stays on it
-      if (!failed || !credential) return;
+      if (!failed || !credential) {
+        forgetLaunch(runId);
+        return;
+      }
       const timer = setTimeout(() => {
         // a stop already cancelled and explained it
         if (!challengeRetries.has(runId)) return;
@@ -968,9 +972,16 @@ export function createLauncher({
       return;
     }
     const limit = parseUsageLimit(error);
-    if (!limit) return;
+    // not a retry candidate: nothing will use the launch kept for it
+    if (!limit) {
+      forgetLaunch(runId);
+      return;
+    }
     // a run on the API key hit something other than a subscription's limit
-    if (!credential || credential === API_KEY_CREDENTIAL) return;
+    if (!credential || credential === API_KEY_CREDENTIAL) {
+      forgetLaunch(runId);
+      return;
+    }
     const until = limit.resetsAt ?? new Date(Date.now() + UNKNOWN_RESET_MS);
     markLimited(db, credential, until);
     log(

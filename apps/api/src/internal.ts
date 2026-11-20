@@ -34,6 +34,7 @@ import {
   agentStatusFor,
   isActive,
   liveAgentTokens,
+  NO_LAUNCH,
   recordEvent,
   runError,
   type Tx,
@@ -306,8 +307,9 @@ export function internalRoutes(
             tx.update(runs)
               .set({
                 status: next,
+                // a finished run is never retried; a failed one keeps its launch until `onRunFailed` decides
                 ...(redacted.type === "run.finished"
-                  ? { summary: redacted.payload.summary }
+                  ? { summary: redacted.payload.summary, ...NO_LAUNCH }
                   : {}),
                 ...(ended?.usage ?? {}),
                 ...(ended?.rollup ? { rollup: ended.rollup } : {}),
