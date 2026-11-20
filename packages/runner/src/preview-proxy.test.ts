@@ -548,7 +548,7 @@ test("a redirect to the app's own localhost origin is pointed back at the previe
   expect(await via("/dashboard")).toBe("/dashboard");
   expect(await via("https://other.example/a")).toBe("https://other.example/a");
   expect(await via("http://localhost:1/a")).toBe("http://localhost:1/a");
-  // only Location is pointed at the preview, and the cookies beside it reach the browser both
+  // only Location is pointed at the preview; Content-Location stays, and both cookies reach the browser
   const res = await answer("http://localhost:APP/dashboard");
   expect(res.headers.location).toBe(`${PREVIEW_ORIGIN}/dashboard`);
   expect(res.headers["content-location"]).toBe(

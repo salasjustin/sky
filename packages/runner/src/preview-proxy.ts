@@ -130,7 +130,6 @@ export function createPreviewProxy({
     const cookie = withoutPreviewCookie(req.headers);
     if (cookie !== undefined) headers.cookie = cookie;
     headers.host = `localhost:${upstreamPort}`;
-    // the preview's own origin is what the browser sent as Host; the app gets that Host as X-Forwarded-Host
     const own = previewOrigin(req.headers.host);
     if (req.headers.host) headers["x-forwarded-host"] = req.headers.host;
     if (own !== undefined) {
