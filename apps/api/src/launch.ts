@@ -336,8 +336,8 @@ type Deps = {
   /** How long after the runner starts a run that hasn't reported in gets its sprite woken. */
   wakeAfterMs: number;
   /**
-   * Pauses between the waits on a failed run's runner to exit before its retry; each wait is up to
-   * 30 s, so the default gives up after about four minutes.
+   * Pauses between the waits on a failed run's runner to exit before its retry, one per extra wait;
+   * `DEFAULT_RUNNER_EXIT_BACKOFF_MS` unless a test shortens them.
    */
   runnerExitBackoffMs?: number[];
   /**
