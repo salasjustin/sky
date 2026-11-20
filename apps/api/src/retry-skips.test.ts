@@ -700,3 +700,20 @@ test("a limit failure keeps the launch only until its retry takes it", async () 
   const retry = retryOf(r.run.id);
   expect(launchKept(String(retry?.id))).toBe(true);
 });
+
+test.each([
+  ["JSON that is not a launch", { launch: { prompt: 5 }, at: "now" }],
+  ["a launch missing its environment", { launch: { prompt: "x" }, at: 1 }],
+  ["a bare string", "fix the flaky test"],
+])(
+  "a stored launch that opens as %s counts as no record",
+  async (_name, value) => {
+    const r = await launchedRun(readyEnv());
+    keepLaunch(r.run.id, value);
+    restartApi();
+    await failWith(r, FIVE_HOUR);
+    await vi.waitFor(() => expect(warningsOf(r.run.id)).toHaveLength(1));
+    expect(warningsOf(r.run.id)).toEqual([NO_RECORD]);
+    expect(wire.sessions).toHaveLength(1);
+  },
+);

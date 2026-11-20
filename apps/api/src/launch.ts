@@ -1,17 +1,18 @@
 import { agents, type Db, environments, runs } from "@sky/db";
 import {
-  type AgentId,
+  AgentId,
   API_KEY_CREDENTIAL,
   type AutoApprove,
   type BaseProfile,
-  type EnvironmentId,
+  EnvironmentId,
   POOL_CREDENTIAL,
   REPO_LOCK_FILE,
   REPO_LOCK_TIMED_OUT,
-  type RunId,
+  RunId,
   spriteTaskNameFor,
 } from "@sky/shared";
 import { and, eq, gte, isNotNull, lt, ne } from "drizzle-orm";
+import { z } from "zod";
 import { mintAgentToken } from "./agent-token.js";
 import { runEnv } from "./base-profile.js";
 import {
@@ -391,8 +392,27 @@ const RETRY_ENV_VARS_TTL_S = 3_600;
 const resumedPrompt = (prompt: string) =>
   `Your previous attempt at this task was cut off before it finished. Continue it in this session: check the worktree for what is already done, then finish what remains. The task was:\n\n${prompt}`;
 
+/** `Launch` as a schema: what a stored launch must be once opened. */
+const LaunchSchema = z.object({
+  envId: EnvironmentId,
+  spriteName: z.string(),
+  agentId: AgentId,
+  runId: RunId,
+  prompt: z.string(),
+  sessionId: z.string().nullable(),
+  approvalPolicy: z.array(z.string()),
+  autoApprove: z.object({
+    defaults: z.boolean(),
+    commands: z.array(z.string()),
+  }),
+  remoteBranch: z.string().nullable(),
+  forceCredential: z.string().optional(),
+  keepCredential: z.boolean().optional(),
+}) satisfies z.ZodType<Launch>;
+
 /** A launch as kept for a retry: when it started rides with it, for the `REMEMBER_LAUNCH_MS` bound. */
-type StoredLaunch = { launch: Launch; at: number };
+const StoredLaunchSchema = z.object({ launch: LaunchSchema, at: z.number() });
+type StoredLaunch = z.infer<typeof StoredLaunchSchema>;
 
 /** Keeps a run's launch on its row, sealed like its env vars with the AAD bound to the run id. */
 function storeLaunch(
@@ -417,7 +437,7 @@ function clearLaunch(db: Db, runId: RunId): void {
   db.update(runs).set(NO_LAUNCH).where(eq(runs.id, runId)).run();
 }
 
-/** The launch kept on a run's row; undefined when none is, or one doesn't open under this key and run id. */
+/** The launch kept on a run's row; undefined when none is, or one doesn't open under this key and run id or isn't the shape of a launch. */
 function readLaunch(
   db: Db,
   key: Buffer,
@@ -441,7 +461,10 @@ function readLaunch(
       nonce: row.nonce,
       keyVersion: row.keyVersion,
     };
-    return JSON.parse(open(key, sealed, runLaunchAad(runId))) as StoredLaunch;
+    const parsed = StoredLaunchSchema.safeParse(
+      JSON.parse(open(key, sealed, runLaunchAad(runId))),
+    );
+    return parsed.success ? parsed.data : undefined;
   } catch {
     return undefined;
   }
