@@ -147,6 +147,13 @@ export function recordEvent(
   return { id, enqueued: enqueueDeliveries(tx, id, type, ts) };
 }
 
+/** The columns of a run's row that hold its sealed launch, emptied: no retry can use it. */
+export const NO_LAUNCH = {
+  launchCiphertext: null,
+  launchNonce: null,
+  launchKeyVersion: null,
+} as const;
+
 /** Ends a still-active run as `status`, recording `payload` as its event; the ended row, or undefined on an ended run. */
 function endRun(
   tx: Tx,
@@ -156,9 +163,11 @@ function endRun(
 ): RunRow | undefined {
   const run = tx.select().from(runs).where(eq(runs.id, runId)).get();
   if (!run || !isActive(run.status)) return undefined;
+  // never retried from here: a stop ends the task, and a failure that doesn't come from the runner's
+  // own report (a launch, a sweep) isn't a retry candidate
   const ended = tx
     .update(runs)
-    .set({ status })
+    .set({ status, ...NO_LAUNCH })
     .where(eq(runs.id, runId))
     .returning()
     .get();

@@ -1,17 +1,18 @@
 import { agents, type Db, environments, runs } from "@sky/db";
 import {
-  type AgentId,
+  AgentId,
   API_KEY_CREDENTIAL,
   type AutoApprove,
   type BaseProfile,
-  type EnvironmentId,
+  EnvironmentId,
   POOL_CREDENTIAL,
   REPO_LOCK_FILE,
   REPO_LOCK_TIMED_OUT,
-  type RunId,
+  RunId,
   spriteTaskNameFor,
 } from "@sky/shared";
-import { and, eq, gte, ne } from "drizzle-orm";
+import { and, eq, gte, isNotNull, lt, ne } from "drizzle-orm";
+import { z } from "zod";
 import { mintAgentToken } from "./agent-token.js";
 import { runEnv } from "./base-profile.js";
 import {
@@ -36,6 +37,7 @@ import {
 } from "./claude-pool.js";
 import type { UsageProbe } from "./claude-usage.js";
 import type { Config } from "./config.js";
+import { open, runLaunchAad, seal } from "./crypto.js";
 import { mintId } from "./ids.js";
 import { readMemory } from "./memory.js";
 import {
@@ -53,6 +55,7 @@ import {
   isActive,
   isSilentLaunch,
   liveAgentTokens,
+  NO_LAUNCH,
   recordEvent,
   type Tx,
 } from "./runs.js";
@@ -333,6 +336,11 @@ type Deps = {
   /** How long after the runner starts a run that hasn't reported in gets its sprite woken. */
   wakeAfterMs: number;
   /**
+   * Pauses between the waits on a failed run's runner to exit before its retry, one per extra wait;
+   * `DEFAULT_RUNNER_EXIT_BACKOFF_MS` unless a test shortens them.
+   */
+  runnerExitBackoffMs?: number[];
+  /**
    * Wakes the run's sprite and looks for its runner (see `wakeLaunch`): whether it is alive, or
    * `undefined` when the check failed; never throws.
    */
@@ -373,14 +381,97 @@ const LAUNCH_LEFT_FLOOR_MS = 1_000;
 // how long a run that met Cloudflare's challenge waits before its one retry
 const CHALLENGE_RETRY_MS = 60_000;
 
-// how long a launch is kept in memory for a retry after a usage limit; a run that long has ended
+// how long a launch is held for a retry, in memory and on its run's row; a run that long has ended
 const REMEMBER_LAUNCH_MS = 12 * 3_600_000;
+// the pauses between a failed runner's exit waits: with each wait's 30 s, about four minutes in all
+const DEFAULT_RUNNER_EXIT_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000];
 // the retry's copy of the failed run's envVars lives this long, as a follow-up's default does
 const RETRY_ENV_VARS_TTL_S = 3_600;
 
 /** The prompt of a retry that resumes the agent's session: the original task, which that session may not hold whole. */
 const resumedPrompt = (prompt: string) =>
   `Your previous attempt at this task was cut off before it finished. Continue it in this session: check the worktree for what is already done, then finish what remains. The task was:\n\n${prompt}`;
+
+/** `Launch` as a schema: what a stored launch must be once opened. */
+const LaunchSchema = z.object({
+  envId: EnvironmentId,
+  spriteName: z.string(),
+  agentId: AgentId,
+  runId: RunId,
+  prompt: z.string(),
+  sessionId: z.string().nullable(),
+  approvalPolicy: z.array(z.string()),
+  autoApprove: z.object({
+    defaults: z.boolean(),
+    commands: z.array(z.string()),
+  }),
+  remoteBranch: z.string().nullable(),
+  forceCredential: z.string().optional(),
+  keepCredential: z.boolean().optional(),
+}) satisfies z.ZodType<Launch>;
+
+/** A launch as kept for a retry: when it started rides with it, for the `REMEMBER_LAUNCH_MS` bound. */
+const StoredLaunchSchema = z.object({ launch: LaunchSchema, at: z.number() });
+type StoredLaunch = z.infer<typeof StoredLaunchSchema>;
+
+/** Keeps a run's launch on its row, sealed like its env vars with the AAD bound to the run id. */
+function storeLaunch(
+  db: Db,
+  key: Buffer,
+  runId: RunId,
+  stored: StoredLaunch,
+): void {
+  const sealed = seal(key, JSON.stringify(stored), runLaunchAad(runId));
+  db.update(runs)
+    .set({
+      launchCiphertext: sealed.ciphertext,
+      launchNonce: sealed.nonce,
+      launchKeyVersion: sealed.keyVersion,
+    })
+    .where(eq(runs.id, runId))
+    .run();
+}
+
+/** Drops the launch kept on a run's row. */
+function clearLaunch(db: Db, runId: RunId): void {
+  db.update(runs).set(NO_LAUNCH).where(eq(runs.id, runId)).run();
+}
+
+/** The launch kept on a run's row; undefined when none is, or one doesn't open under this key and run id or isn't the shape of a launch. */
+function readLaunch(
+  db: Db,
+  key: Buffer,
+  runId: RunId,
+): StoredLaunch | undefined {
+  const row = db
+    .select({
+      ciphertext: runs.launchCiphertext,
+      nonce: runs.launchNonce,
+      keyVersion: runs.launchKeyVersion,
+    })
+    .from(runs)
+    .where(eq(runs.id, runId))
+    .get();
+  if (!row?.ciphertext || !row.nonce || row.keyVersion === null) {
+    return undefined;
+  }
+  try {
+    const sealed = {
+      ciphertext: row.ciphertext,
+      nonce: row.nonce,
+      keyVersion: row.keyVersion,
+    };
+    const parsed = StoredLaunchSchema.safeParse(
+      JSON.parse(open(key, sealed, runLaunchAad(runId))),
+    );
+    return parsed.success ? parsed.data : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Where a failed run is retried, or why it is not (the warning left on it). */
+type RetryTarget = { target: string } | { skip: string };
 
 /**
  * Starts runners in the background; a launch that fails fails its run with a redacted
@@ -397,6 +488,7 @@ export function createLauncher({
   nudgeDeliveries,
   watchMs,
   wakeAfterMs,
+  runnerExitBackoffMs = DEFAULT_RUNNER_EXIT_BACKOFF_MS,
   wake,
 }: Deps) {
   /** The env's base profile, without its store when there is no connector to reach GitHub with. */
@@ -799,16 +891,58 @@ export function createLauncher({
   }
 
   // launches by run, so a run that fails on its subscription's usage limit or Cloudflare's challenge
-  // can be retried once. In memory: a restart between the launch and a limit failure loses the retry,
-  // never the limit; a restart during a challenge retry's wait loses the retry, and the run stays
-  // failed with the challenge's error
+  // can be retried once. Also stored sealed on the run's row (`storeLaunch`), which a retry reads when the
+  // map has no entry after a restart; a restart during a challenge retry's wait still loses the retry,
+  // and the run stays failed with the challenge's error
   const launches = new Map<RunId, { launch: Launch; at: number }>();
+
+  /** Takes the held launch of `runId` for its one retry, from memory else from its row; `missing` says why there is none to take. */
+  function takeLaunch(runId: RunId): { launch: Launch } | { missing: string } {
+    const entry =
+      launches.get(runId) ?? readLaunch(db, config.secretEncryptionKey, runId);
+    launches.delete(runId);
+    // once: a second failure of the same run finds nothing, in memory or in the row
+    clearLaunch(db, runId);
+    if (!entry?.launch) {
+      return {
+        missing: `not retried: no record of this run's launch is held (the API restarted since this run launched and it was not recorded, it launched more than ${REMEMBER_LAUNCH_MS / 3_600_000} hours ago, or it was already retried)`,
+      };
+    }
+    if (Date.now() - entry.at > REMEMBER_LAUNCH_MS) {
+      return {
+        missing: `not retried: this run launched more than ${REMEMBER_LAUNCH_MS / 3_600_000} hours ago`,
+      };
+    }
+    return { launch: entry.launch };
+  }
+
+  /** Drops the launch of a run no retry can use, from memory and from its row. */
+  function forgetLaunch(runId: RunId): void {
+    launches.delete(runId);
+    clearLaunch(db, runId);
+  }
+
+  /** Leaves `message`, which says why the failed run is not retried, as a warning on it. */
+  function skipRetry(failedId: RunId, message: string): void {
+    db.transaction(
+      (tx) => recordEvent(tx, failedId, "runner.warning", { message }),
+      { behavior: "immediate" },
+    );
+    log(
+      message.startsWith("not retried")
+        ? `${failedId} is ${message}`
+        : `${failedId}: ${message}`,
+    );
+  }
   // challenge retries waiting out their delay or still launching, by failed run; a stop on the agent
   // cancels its own
   const challengeRetries = new Map<
     RunId,
     { agentId: AgentId; timer: ReturnType<typeof setTimeout> }
   >();
+  // usage-limit retries from taking their launch until their transaction, by failed run to its agent;
+  // a stop on the agent cancels its own, as it does a challenge retry
+  const limitRetries = new Map<RunId, AgentId>();
   // runs whose launch is at or past the runner's start: one that fails there (a start that timed out
   // may still have spawned it) has its runner signalled, as a run failed `runner_timeout` does
   const maybeStarted = new Set<RunId>();
@@ -837,11 +971,16 @@ export function createLauncher({
     const credential = failed?.credential;
     if (isCloudflareChallenge(error)) {
       // transient: the credential is untouched and the retry stays on it
-      if (!failed || !credential) return;
+      if (!failed || !credential) {
+        forgetLaunch(runId);
+        return;
+      }
       const timer = setTimeout(() => {
+        // a stop already cancelled and explained it
+        if (!challengeRetries.has(runId)) return;
         void retryFailedRun(
           runId,
-          (_, launch) => challengeTarget(runId, launch.envId, credential),
+          (_, launch) => challengeTarget(launch.envId, credential),
           true,
         )
           .catch((err: unknown) => {
@@ -856,9 +995,16 @@ export function createLauncher({
       return;
     }
     const limit = parseUsageLimit(error);
-    if (!limit) return;
+    // not a retry candidate: nothing will use the launch kept for it
+    if (!limit) {
+      forgetLaunch(runId);
+      return;
+    }
     // a run on the API key hit something other than a subscription's limit
-    if (!credential || credential === API_KEY_CREDENTIAL) return;
+    if (!credential || credential === API_KEY_CREDENTIAL) {
+      forgetLaunch(runId);
+      return;
+    }
     const until = limit.resetsAt ?? new Date(Date.now() + UNKNOWN_RESET_MS);
     markLimited(db, credential, until);
     log(
@@ -870,48 +1016,61 @@ export function createLauncher({
   }
 
   /** Where a run that hit its subscription's limit goes next, if anywhere. */
-  function retryTarget(failedId: RunId, launch: Launch): string | undefined {
+  function retryTarget(failedId: RunId, launch: Launch): RetryTarget {
     const env = assignmentOf(launch.envId);
-    if (env?.status !== "ready") return undefined;
+    if (env?.status !== "ready") {
+      return { skip: "not retried: its environment is not ready" };
+    }
     const fallback =
       env.claudeFallback !== "none" && config.anthropicApiKey
         ? API_KEY_CREDENTIAL
         : undefined;
-    if (env.claudeCredential !== POOL_CREDENTIAL) return fallback;
+    const noFallback = {
+      skip: "not retried: its environment has no other credential to use (the API-key fallback is off or the server has no key)",
+    };
+    if (env.claudeCredential !== POOL_CREDENTIAL) {
+      return fallback ? { target: fallback } : noFallback;
+    }
     const next = nextInPool(
       { db, config },
       env,
       credentialsTried(db, failedId),
     );
-    if (next) return next;
-    if (fallback) return fallback;
+    if (next) return { target: next };
+    if (fallback) return { target: fallback };
     // nothing is left to try: say when the pool is next available
     const members = poolMembers(config, env.claudePool);
-    const warning = poolExhausted(
-      db,
-      members,
-      new Date(),
-      "this run is not retried",
-    ).message;
-    db.transaction(
-      (tx) => recordEvent(tx, failedId, "runner.warning", { message: warning }),
-      { behavior: "immediate" },
-    );
-    log(`${failedId}: ${warning}`);
-    return undefined;
+    return {
+      skip: poolExhausted(db, members, new Date(), "this run is not retried")
+        .message,
+    };
   }
 
   /** Where a run that met Cloudflare's challenge on `credential` goes next: that one, while its environment still assigns it. */
   function challengeTarget(
-    failedId: RunId,
     envId: EnvironmentId,
     credential: string,
-  ): string | undefined {
-    if (stillAssigned(credential, envId)) return credential;
-    log(
-      `${failedId} is not retried after the Cloudflare challenge: its environment is not ready or no longer assigns Claude credential ${credential}`,
-    );
-    return undefined;
+  ): RetryTarget {
+    if (stillAssigned(credential, envId)) return { target: credential };
+    return {
+      skip: `not retried after the Cloudflare challenge: its environment is not ready or no longer assigns Claude credential ${credential}`,
+    };
+  }
+
+  /** Waits for the failed run's runner to exit, pausing between waits as `runnerExitBackoffMs` says; false if it never does. */
+  async function runnerExited(
+    spriteName: string,
+    failedId: RunId,
+  ): Promise<boolean> {
+    for (let attempt = 0; ; attempt++) {
+      if (await awaitRunnerExit(sprites, spriteName, failedId)) return true;
+      const pause = runnerExitBackoffMs[attempt];
+      if (pause === undefined) return false;
+      log(
+        `the runner of ${failedId} is still exiting; waiting again in ${Math.round(pause / 1000)}s`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, pause).unref());
+    }
   }
 
   /** Whether the agent has a run other than `runId` created since it. */
@@ -943,22 +1102,59 @@ export function createLauncher({
    */
   async function retryFailedRun(
     failedId: RunId,
-    targetOf: (failedId: RunId, launch: Launch) => string | undefined,
+    targetOf: (failedId: RunId, launch: Launch) => RetryTarget,
     keepCredential = false,
   ): Promise<void> {
-    const entry = launches.get(failedId);
-    if (!entry) {
-      log(`no launch of ${failedId} is held; it is not retried`);
+    const taken = takeLaunch(failedId);
+    if ("missing" in taken) {
+      skipRetry(failedId, taken.missing);
       return;
     }
-    // once: a second failure of the same run finds nothing
-    launches.delete(failedId);
-    const { launch } = entry;
-    const target = targetOf(failedId, launch);
-    if (!target) return;
+    if (keepCredential) {
+      await retryTaken(failedId, taken.launch, targetOf, true);
+      return;
+    }
+    limitRetries.set(failedId, taken.launch.agentId);
+    try {
+      await retryTaken(failedId, taken.launch, targetOf, false);
+    } finally {
+      limitRetries.delete(failedId);
+    }
+  }
+
+  /** The rest of `retryFailedRun`, once the launch is taken. */
+  async function retryTaken(
+    failedId: RunId,
+    launch: Launch,
+    targetOf: (failedId: RunId, launch: Launch) => RetryTarget,
+    keepCredential: boolean,
+  ): Promise<void> {
+    // a stop on the agent dropped the retry's entry, and recorded why it is not retried
+    const stopped = () =>
+      !(keepCredential ? challengeRetries : limitRetries).has(failedId);
+    const picked = targetOf(failedId, launch);
+    if ("skip" in picked) {
+      skipRetry(failedId, picked.skip);
+      return;
+    }
+    const { target } = picked;
     // the failed runner commits in the worktree the retry resumes in
-    if (!(await awaitRunnerExit(sprites, launch.spriteName, failedId))) {
-      log(`the runner of ${failedId} is still exiting; not retried`);
+    let exited: boolean;
+    try {
+      exited = await runnerExited(launch.spriteName, failedId);
+    } catch (err) {
+      if (!stopped()) {
+        skipRetry(
+          failedId,
+          "not retried: the sprite could not say whether the runner had exited",
+        );
+      }
+      throw err;
+    }
+    if (!exited) {
+      if (!stopped()) {
+        skipRetry(failedId, "not retried: the runner was still exiting");
+      }
       return;
     }
     const envVars = Object.fromEntries(
@@ -980,15 +1176,10 @@ export function createLauncher({
         if (hasRunAfter(tx, found.id, failedId)) {
           return { kind: "superseded" } as const;
         }
-        if (keepCredential) {
-          // a stop cancelled it while the failed runner exited
-          if (!challengeRetries.has(failedId)) {
-            return { kind: "cancelled" } as const;
-          }
-          // the assignment can change while the failed runner exits too
-          if (!challengeTarget(failedId, launch.envId, target)) {
-            return { kind: "unassigned" } as const;
-          }
+        if (stopped()) return { kind: "cancelled" } as const;
+        // the assignment can change while the failed runner exits too
+        if (keepCredential && "skip" in challengeTarget(launch.envId, target)) {
+          return { kind: "unassigned" } as const;
         }
         tx.insert(runs)
           .values({
@@ -1017,13 +1208,22 @@ export function createLauncher({
     );
     switch (outcome.kind) {
       case "superseded":
-        log(`${failedId} is not retried: its agent has a newer run`);
+        skipRetry(failedId, "not retried: its agent has a newer run");
         return;
       case "taken":
+        skipRetry(
+          failedId,
+          "not retried: its agent was archived or already has a run in progress",
+        );
         return;
-      // logged where they were decided
       case "cancelled":
+        // the stop already recorded why
+        return;
       case "unassigned":
+        skipRetry(
+          failedId,
+          `not retried after the Cloudflare challenge: its environment is not ready or no longer assigns Claude credential ${target}`,
+        );
         return;
     }
     const { agent } = outcome;
@@ -1041,14 +1241,23 @@ export function createLauncher({
 
   const api = {
     onRunFailed,
-    /** Cancels the agent's challenge retry, if one is pending: a stop ends the task, run or not. */
+    /**
+     * Cancels the agent's pending retries, of a Cloudflare challenge or of a usage limit (one waiting
+     * on its failed runner's exit): a stop ends the task, run or not.
+     */
     cancelChallengeRetry(agentId: AgentId): void {
+      for (const [failedId, retryAgentId] of limitRetries) {
+        if (retryAgentId !== agentId) continue;
+        limitRetries.delete(failedId);
+        skipRetry(failedId, "not retried: its agent was stopped");
+      }
       for (const [failedId, pending] of challengeRetries) {
         if (pending.agentId !== agentId) continue;
         clearTimeout(pending.timer);
         challengeRetries.delete(failedId);
         launches.delete(failedId);
-        log(`${failedId} is not retried: its agent was stopped`);
+        clearLaunch(db, failedId);
+        skipRetry(failedId, "not retried: its agent was stopped");
       }
     },
     start(launch: Launch): void {
@@ -1057,6 +1266,31 @@ export function createLauncher({
         if (now - held.at > REMEMBER_LAUNCH_MS) launches.delete(id);
       }
       launches.set(launch.runId, { launch, at: now });
+      // what a retry needs survives a restart; rows past the bound drop theirs. A write that fails
+      // only loses that: the run's row is already committed, and a throw here would leave it in
+      // `starting` with no runner
+      try {
+        storeLaunch(db, config.secretEncryptionKey, launch.runId, {
+          launch,
+          at: now,
+        });
+        db.update(runs)
+          .set(NO_LAUNCH)
+          .where(
+            and(
+              isNotNull(runs.launchCiphertext),
+              lt(
+                runs.createdAt,
+                new Date(now - REMEMBER_LAUNCH_MS).toISOString(),
+              ),
+            ),
+          )
+          .run();
+      } catch (err) {
+        log(
+          `keeping the launch of ${launch.runId} for a retry failed; a restart before it ends loses the retry: ${err}`,
+        );
+      }
       const agentToken = mintAgentToken(config.apiKey, launch.runId);
       run(launch, agentToken)
         .catch(async (err: unknown) => {

@@ -14,6 +14,7 @@ export const envSecretAad = (envId: string, name: string) =>
 export const webhookSecretAad = (webhookId: string) => `webhook:${webhookId}`;
 export const runEnvVarAad = (runId: string, name: string) =>
   `run:${runId}:${name}`;
+export const runLaunchAad = (runId: string) => `run-launch:${runId}`;
 
 /** AES-256-GCM under `key` with a fresh nonce. */
 export function seal(key: Buffer, plaintext: string, aad: string): Sealed {
