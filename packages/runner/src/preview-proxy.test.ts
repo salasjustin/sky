@@ -74,18 +74,22 @@ function get(
   port: number,
   path: string,
   headers: Record<string, string> = {},
+  method = "GET",
 ): Promise<{ status: number; headers: IncomingHttpHeaders; body: string }> {
   return new Promise((resolve, reject) => {
-    const req = request({ host: "127.0.0.1", port, path, headers }, (res) => {
-      let body = "";
-      res.setEncoding("utf8");
-      res.on("data", (c) => {
-        body += c;
-      });
-      res.on("end", () =>
-        resolve({ status: res.statusCode ?? 0, headers: res.headers, body }),
-      );
-    });
+    const req = request(
+      { host: "127.0.0.1", port, path, headers, method },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => {
+          body += c;
+        });
+        res.on("end", () =>
+          resolve({ status: res.statusCode ?? 0, headers: res.headers, body }),
+        );
+      },
+    );
     req.on("error", reject);
     req.end();
   });
@@ -373,6 +377,187 @@ test("a websocket upgrade to an odd target gets a 404, even with the cookie, and
   expect((await upgrade(port, `Cookie: ${cookie}\r\n`)).echoed).toBe(
     "echo:ping",
   );
+});
+
+const PREVIEW_HOST = "spr-org.sprites.app";
+const PREVIEW_ORIGIN = `https://${PREVIEW_HOST}`;
+
+test("a POST with the preview's own Origin reaches the app as http://localhost:<port>", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  const res = await get(
+    port,
+    "/login.data",
+    { cookie, host: PREVIEW_HOST, origin: PREVIEW_ORIGIN },
+    "POST",
+  );
+  expect(res.status).toBe(200);
+  expect(app.seen[0]?.headers.origin).toBe(`http://localhost:${app.port}`);
+});
+
+test("X-Forwarded-Host agrees with a rewritten Origin, and stays the preview host otherwise", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  const post = (headers: Record<string, string>) =>
+    get(port, "/", { cookie, host: PREVIEW_HOST, ...headers }, "POST");
+  await post({ origin: PREVIEW_ORIGIN });
+  await post({ origin: "https://evil.example" });
+  await post({});
+  // Next.js Server Actions compare Origin's host with X-Forwarded-Host when it is set
+  expect(app.seen[0]?.headers.origin).toBe(`http://localhost:${app.port}`);
+  expect(app.seen[0]?.headers["x-forwarded-host"]).toBe(
+    `localhost:${app.port}`,
+  );
+  expect(app.seen[0]?.headers["x-forwarded-proto"]).toBe("https");
+  expect(app.seen[1]?.headers["x-forwarded-host"]).toBe(PREVIEW_HOST);
+  expect(app.seen[2]?.headers["x-forwarded-host"]).toBe(PREVIEW_HOST);
+});
+
+test("a same-origin Referer keeps its path, query and fragment and gets the app's origin", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  await get(port, "/", {
+    cookie,
+    host: PREVIEW_HOST,
+    referer: `${PREVIEW_ORIGIN}/login?next=%2Fhome&a=1#top`,
+  });
+  expect(app.seen[0]?.headers.referer).toBe(
+    `http://localhost:${app.port}/login?next=%2Fhome&a=1#top`,
+  );
+});
+
+test("another site's Origin and Referer pass through byte for byte", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  const origin = "https://evil.example";
+  const referer = "https://evil.example/a?b=c#d";
+  // control: the rewrite is on, so a pass-through below is a decision and not a proxy that touches nothing
+  await get(
+    port,
+    "/",
+    { cookie, host: PREVIEW_HOST, origin: PREVIEW_ORIGIN },
+    "POST",
+  );
+  expect(app.seen.shift()?.headers.origin).toBe(`http://localhost:${app.port}`);
+  await get(port, "/", { cookie, host: PREVIEW_HOST, origin, referer }, "POST");
+  // a lookalike that only starts with the preview's origin is another site too
+  const lookalike = `${PREVIEW_ORIGIN}.evil.example`;
+  await get(
+    port,
+    "/",
+    {
+      cookie,
+      host: PREVIEW_HOST,
+      origin: lookalike,
+      referer: `${lookalike}/x`,
+    },
+    "POST",
+  );
+  // the preview's host over plain http is not its origin: the preview is https only
+  const plain = `http://${PREVIEW_HOST}`;
+  await get(
+    port,
+    "/",
+    { cookie, host: PREVIEW_HOST, origin: plain, referer: `${plain}/a` },
+    "POST",
+  );
+  expect(app.seen[0]?.headers.origin).toBe(origin);
+  expect(app.seen[0]?.headers.referer).toBe(referer);
+  expect(app.seen[1]?.headers.origin).toBe(lookalike);
+  expect(app.seen[1]?.headers.referer).toBe(`${lookalike}/x`);
+  expect(app.seen[2]?.headers.origin).toBe(plain);
+  expect(app.seen[2]?.headers.referer).toBe(`${plain}/a`);
+});
+
+test("a preview served on a port rewrites only an Origin that carries that port", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  const host = `${PREVIEW_HOST}:8443`;
+  const post = (origin: string) =>
+    get(port, "/", { cookie, host, origin }, "POST");
+  await post(`https://${host}`);
+  await post(PREVIEW_ORIGIN);
+  expect(app.seen[0]?.headers.origin).toBe(`http://localhost:${app.port}`);
+  expect(app.seen[1]?.headers.origin).toBe(PREVIEW_ORIGIN);
+});
+
+test("Origin: null, an unparsable value and no Origin are left as they are", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  // control: the rewrite is on
+  await get(
+    port,
+    "/",
+    { cookie, host: PREVIEW_HOST, origin: PREVIEW_ORIGIN },
+    "POST",
+  );
+  expect(app.seen.shift()?.headers.origin).toBe(`http://localhost:${app.port}`);
+  await get(port, "/", { cookie, host: PREVIEW_HOST, origin: "null" }, "POST");
+  await get(
+    port,
+    "/",
+    { cookie, host: PREVIEW_HOST, origin: "not a url", referer: "::nope::" },
+    "POST",
+  );
+  await get(port, "/", { cookie, host: PREVIEW_HOST }, "POST");
+  expect(app.seen[0]?.headers.origin).toBe("null");
+  expect(app.seen[1]?.headers.origin).toBe("not a url");
+  expect(app.seen[1]?.headers.referer).toBe("::nope::");
+  expect(app.seen[2]?.headers.origin).toBeUndefined();
+  expect(app.seen[2]?.headers.referer).toBeUndefined();
+});
+
+test("a websocket upgrade gets the same Origin and Referer rewrite", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  const out = await upgrade(
+    port,
+    `Cookie: ${cookie}\r\nOrigin: ${PREVIEW_ORIGIN}\r\nReferer: ${PREVIEW_ORIGIN}/page?x=1\r\n`,
+  );
+  expect(out.head).toBe("HTTP/1.1 101 Switching Protocols");
+  expect(app.seen[0]?.headers.origin).toBe(`http://localhost:${app.port}`);
+  expect(app.seen[0]?.headers.referer).toBe(
+    `http://localhost:${app.port}/page?x=1`,
+  );
+  await upgrade(port, `Cookie: ${cookie}\r\nOrigin: https://evil.example\r\n`);
+  expect(app.seen[1]?.headers.origin).toBe("https://evil.example");
+});
+
+test("a redirect to the app's own localhost origin is pointed back at the preview", async () => {
+  const redirecting = createServer((req, res) => {
+    const to = String(req.headers["x-redirect-to"]);
+    // capitalized as Express and Koa send it; Set-Cookie twice, Content-Location beside the Location
+    res.writeHead(302, {
+      Location: to.replace("APP", `${appPort}`),
+      "Content-Location": `http://localhost:${appPort}/x`,
+      "Set-Cookie": ["sid=abc; Path=/; HttpOnly", "theme=dark; Path=/"],
+    });
+    res.end();
+  });
+  const appPort = await listen(redirecting);
+  const { port } = await proxyTo(appPort);
+  const answer = (to: string) =>
+    get(port, "/", { cookie, host: PREVIEW_HOST, "x-redirect-to": to });
+  const via = async (to: string) => (await answer(to)).headers.location;
+  expect(await via("http://localhost:APP/dashboard?tab=1#x")).toBe(
+    `${PREVIEW_ORIGIN}/dashboard?tab=1#x`,
+  );
+  // an app that assumes https (SvelteKit adapter-node, or X-Forwarded-Proto honoured) redirects there
+  expect(await via("https://localhost:APP/dashboard?tab=1#x")).toBe(
+    `${PREVIEW_ORIGIN}/dashboard?tab=1#x`,
+  );
+  // relative and other-host values are not touched
+  expect(await via("/dashboard")).toBe("/dashboard");
+  expect(await via("https://other.example/a")).toBe("https://other.example/a");
+  expect(await via("http://localhost:1/a")).toBe("http://localhost:1/a");
+  // only Location is pointed at the preview; Content-Location stays, and both cookies reach the browser
+  const res = await answer("http://localhost:APP/dashboard");
+  expect(res.headers.location).toBe(`${PREVIEW_ORIGIN}/dashboard`);
+  expect(res.headers["content-location"]).toBe(`http://localhost:${appPort}/x`);
+  expect(res.headers["set-cookie"]).toEqual([
+    "sid=abc; Path=/; HttpOnly",
+    "theme=dark; Path=/",
+  ]);
 });
 
 test("preview-proxy refuses to start without its env, naming the variables and no value", async () => {

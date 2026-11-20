@@ -68,12 +68,38 @@ function cookieOf(headers: IncomingHttpHeaders): string | undefined {
   return undefined;
 }
 
+/** `https://<host>` as a URL origin for the `Host` the proxy received, or `undefined` when there is none or it doesn't parse. */
+const previewOrigin = (host: string | undefined): string | undefined => {
+  const url = host ? URL.parse(`https://${host}`) : null;
+  return url && url.origin !== "null" ? url.origin : undefined;
+};
+
+/** `value`, an absolute URL, with its origin `from` replaced by `to`; path, query and fragment kept. Any other value comes back as it was. */
+function swapOrigin(value: string, from: string, to: string): string {
+  const url = URL.parse(value);
+  if (url === null || url.origin !== from) return value;
+  const target = new URL(to);
+  url.protocol = target.protocol;
+  url.hostname = target.hostname;
+  url.port = target.port;
+  return url.href;
+}
+
 /**
  * The sprite's HTTP port, with the app behind it. It answers a browser only once that browser
  * holds the preview's token as a cookie, which the link's one path hands out; everything else gets a
  * plain 404 that names nothing. The app sees the request as if it came from localhost: the
  * `Host` is rewritten, since app servers refuse a host they weren't told of, and the preview cookie is
- * stripped.
+ * stripped. The received `Host` goes on as `X-Forwarded-Host`, with `X-Forwarded-Proto: https`. An
+ * `Origin` or `Referer` that is the preview's own (`https://` plus the `Host` received) is rewritten
+ * to `http://localhost:<port>`, and on a request whose `Origin` was rewritten `X-Forwarded-Host`
+ * becomes `localhost:<port>` too: frameworks refuse a form post whose `Origin` differs from the
+ * origin they build for the request. That passes React Router under `@react-router/serve`, Next.js
+ * Server Actions and SvelteKit under `vite preview`; an app that builds its origin from
+ * `X-Forwarded-Proto` still sees `https` and refuses the rewritten `http` origin. Any other `Origin`
+ * or `Referer` goes through untouched, so the app's cross-site checks still turn other sites away. A
+ * response `Location` back to `http://` or `https://localhost:<port>` is pointed at the preview's own
+ * origin, so a redirect stays on the preview.
  */
 export function createPreviewProxy({
   tokenHash,
@@ -92,6 +118,8 @@ export function createPreviewProxy({
     );
   };
 
+  const upstreamOrigin = `http://localhost:${upstreamPort}`;
+
   const forwardedHeaders = (req: IncomingMessage): Record<string, string> => {
     const headers: Record<string, string> = {};
     for (const [name, value] of Object.entries(req.headers)) {
@@ -102,7 +130,18 @@ export function createPreviewProxy({
     const cookie = withoutPreviewCookie(req.headers);
     if (cookie !== undefined) headers.cookie = cookie;
     headers.host = `localhost:${upstreamPort}`;
+    const own = previewOrigin(req.headers.host);
     if (req.headers.host) headers["x-forwarded-host"] = req.headers.host;
+    if (own !== undefined) {
+      if (headers.origin === own) {
+        headers.origin = upstreamOrigin;
+        // Next.js Server Actions compare Origin's host with X-Forwarded-Host when it is set
+        headers["x-forwarded-host"] = `localhost:${upstreamPort}`;
+      }
+      if (headers.referer !== undefined) {
+        headers.referer = swapOrigin(headers.referer, own, upstreamOrigin);
+      }
+    }
     headers["x-forwarded-proto"] = "https";
     if (req.socket.remoteAddress) {
       headers["x-forwarded-for"] = req.socket.remoteAddress;
@@ -160,10 +199,23 @@ export function createPreviewProxy({
       },
       (answer) => {
         appHasAnswered = true;
+        const own = previewOrigin(req.headers.host);
+        const rawHeaders = [...answer.rawHeaders];
+        if (own !== undefined) {
+          for (let i = 0; i < rawHeaders.length; i += 2) {
+            if (rawHeaders[i]?.toLowerCase() === "location") {
+              rawHeaders[i + 1] = swapOrigin(
+                swapOrigin(rawHeaders[i + 1] ?? "", upstreamOrigin, own),
+                `https://localhost:${upstreamPort}`,
+                own,
+              );
+            }
+          }
+        }
         res.writeHead(
           answer.statusCode ?? 502,
           answer.statusMessage,
-          answer.rawHeaders,
+          rawHeaders,
         );
         // not pipe(): an upstream cut off mid-body must end the browser's response, not leave it open
         pipeline(answer, res, () => {});
