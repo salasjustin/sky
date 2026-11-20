@@ -405,7 +405,9 @@ test("X-Forwarded-Host agrees with a rewritten Origin, and stays the preview hos
   await post({});
   // Next.js Server Actions compare Origin's host with X-Forwarded-Host when it is set
   expect(app.seen[0]?.headers.origin).toBe(`http://localhost:${app.port}`);
-  expect(app.seen[0]?.headers["x-forwarded-host"]).toBe(`localhost:${app.port}`);
+  expect(app.seen[0]?.headers["x-forwarded-host"]).toBe(
+    `localhost:${app.port}`,
+  );
   expect(app.seen[0]?.headers["x-forwarded-proto"]).toBe("https");
   expect(app.seen[1]?.headers["x-forwarded-host"]).toBe(PREVIEW_HOST);
   expect(app.seen[2]?.headers["x-forwarded-host"]).toBe(PREVIEW_HOST);
@@ -551,9 +553,7 @@ test("a redirect to the app's own localhost origin is pointed back at the previe
   // only Location is pointed at the preview; Content-Location stays, and both cookies reach the browser
   const res = await answer("http://localhost:APP/dashboard");
   expect(res.headers.location).toBe(`${PREVIEW_ORIGIN}/dashboard`);
-  expect(res.headers["content-location"]).toBe(
-    `http://localhost:${appPort}/x`,
-  );
+  expect(res.headers["content-location"]).toBe(`http://localhost:${appPort}/x`);
   expect(res.headers["set-cookie"]).toEqual([
     "sid=abc; Path=/; HttpOnly",
     "theme=dark; Path=/",
