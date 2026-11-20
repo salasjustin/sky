@@ -68,12 +68,34 @@ function cookieOf(headers: IncomingHttpHeaders): string | undefined {
   return undefined;
 }
 
+/** `https://<host>` as a URL origin for the `Host` the proxy received, or `undefined` when there is none or it doesn't parse. */
+const previewOrigin = (host: string | undefined): string | undefined => {
+  const url = host ? URL.parse(`https://${host}`) : null;
+  return url && url.origin !== "null" ? url.origin : undefined;
+};
+
+/** `value`, an absolute URL, with its origin `from` replaced by `to`; path, query and fragment kept. Any other value comes back as it was. */
+function swapOrigin(value: string, from: string, to: string): string {
+  const url = URL.parse(value);
+  if (url === null || url.origin !== from) return value;
+  const target = new URL(to);
+  url.protocol = target.protocol;
+  url.hostname = target.hostname;
+  url.port = target.port;
+  return url.href;
+}
+
 /**
  * The sprite's HTTP port, with the app behind it. It answers a browser only once that browser
  * holds the preview's token as a cookie, which the link's one path hands out; everything else gets a
  * plain 404 that names nothing. The app sees the request as if it came from localhost: the
  * `Host` is rewritten, since app servers refuse a host they weren't told of, and the preview cookie is
- * stripped.
+ * stripped. An `Origin` or `Referer` that is the preview's own (`https://` plus the `Host` received) is
+ * rewritten to `http://localhost:<port>` as well: frameworks compare `Origin` with the host of the
+ * request URL built from `Host` (React Router, SvelteKit, Next.js, Astro) and refuse a form post when
+ * they differ. Any other `Origin` or `Referer` goes through untouched, so the app's cross-site checks
+ * still turn other sites away. A response `Location` back to `http://localhost:<port>` is pointed at
+ * the preview's own origin, so a redirect stays on the preview.
  */
 export function createPreviewProxy({
   tokenHash,
@@ -92,6 +114,8 @@ export function createPreviewProxy({
     );
   };
 
+  const upstreamOrigin = `http://localhost:${upstreamPort}`;
+
   const forwardedHeaders = (req: IncomingMessage): Record<string, string> => {
     const headers: Record<string, string> = {};
     for (const [name, value] of Object.entries(req.headers)) {
@@ -102,6 +126,14 @@ export function createPreviewProxy({
     const cookie = withoutPreviewCookie(req.headers);
     if (cookie !== undefined) headers.cookie = cookie;
     headers.host = `localhost:${upstreamPort}`;
+    // the preview's own origin is what the browser sent as Host, which the app never sees
+    const own = previewOrigin(req.headers.host);
+    if (own !== undefined) {
+      if (headers.origin === own) headers.origin = upstreamOrigin;
+      if (headers.referer !== undefined) {
+        headers.referer = swapOrigin(headers.referer, own, upstreamOrigin);
+      }
+    }
     if (req.headers.host) headers["x-forwarded-host"] = req.headers.host;
     headers["x-forwarded-proto"] = "https";
     if (req.socket.remoteAddress) {
@@ -160,10 +192,23 @@ export function createPreviewProxy({
       },
       (answer) => {
         appHasAnswered = true;
+        const own = previewOrigin(req.headers.host);
+        const rawHeaders = [...answer.rawHeaders];
+        if (own !== undefined) {
+          for (let i = 0; i < rawHeaders.length; i += 2) {
+            if (rawHeaders[i]?.toLowerCase() === "location") {
+              rawHeaders[i + 1] = swapOrigin(
+                rawHeaders[i + 1] ?? "",
+                upstreamOrigin,
+                own,
+              );
+            }
+          }
+        }
         res.writeHead(
           answer.statusCode ?? 502,
           answer.statusMessage,
-          answer.rawHeaders,
+          rawHeaders,
         );
         // not pipe(): an upstream cut off mid-body must end the browser's response, not leave it open
         pipeline(answer, res, () => {});
