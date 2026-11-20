@@ -378,7 +378,7 @@ const LAUNCH_LEFT_FLOOR_MS = 1_000;
 // how long a run that met Cloudflare's challenge waits before its one retry
 const CHALLENGE_RETRY_MS = 60_000;
 
-// how long a launch is kept in memory for a retry after a usage limit; a run that long has ended
+// how long a launch is held for a retry, in memory and on its run's row; a run that long has ended
 const REMEMBER_LAUNCH_MS = 12 * 3_600_000;
 // the pauses between a failed runner's exit waits: with each wait's 30 s, about four minutes in all
 const DEFAULT_RUNNER_EXIT_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000];
@@ -838,7 +838,7 @@ export function createLauncher({
     if (!entry?.launch) {
       return {
         missing:
-          "not retried: no record of this run's launch is held (the API restarted since this run launched and it was not recorded, or the run was already retried)",
+          `not retried: no record of this run's launch is held (the API restarted since this run launched and it was not recorded, it launched more than ${REMEMBER_LAUNCH_MS / 3_600_000} hours ago, or it was already retried)`,
       };
     }
     if (Date.now() - entry.at > REMEMBER_LAUNCH_MS) {
@@ -867,6 +867,9 @@ export function createLauncher({
     RunId,
     { agentId: AgentId; timer: ReturnType<typeof setTimeout> }
   >();
+  // usage-limit retries from taking their launch until their transaction, by failed run to its agent;
+  // a stop on the agent cancels its own, as it does a challenge retry
+  const limitRetries = new Map<RunId, AgentId>();
   // runs whose launch is at or past the runner's start: one that fails there (a start that timed out
   // may still have spawned it) has its runner signalled, as a run failed `runner_timeout` does
   const maybeStarted = new Set<RunId>();
@@ -1024,7 +1027,28 @@ export function createLauncher({
       skipRetry(failedId, taken.missing);
       return;
     }
-    const { launch } = taken;
+    if (keepCredential) {
+      await retryTaken(failedId, taken.launch, targetOf, true);
+      return;
+    }
+    limitRetries.set(failedId, taken.launch.agentId);
+    try {
+      await retryTaken(failedId, taken.launch, targetOf, false);
+    } finally {
+      limitRetries.delete(failedId);
+    }
+  }
+
+  /** The rest of `retryFailedRun`, once the launch is taken. */
+  async function retryTaken(
+    failedId: RunId,
+    launch: Launch,
+    targetOf: (failedId: RunId, launch: Launch) => RetryTarget,
+    keepCredential: boolean,
+  ): Promise<void> {
+    // a stop on the agent dropped the retry's entry, and recorded why it is not retried
+    const stopped = () =>
+      !(keepCredential ? challengeRetries : limitRetries).has(failedId);
     const picked = targetOf(failedId, launch);
     if ("skip" in picked) {
       skipRetry(failedId, picked.skip);
@@ -1036,14 +1060,18 @@ export function createLauncher({
     try {
       exited = await runnerExited(launch.spriteName, failedId);
     } catch (err) {
-      skipRetry(
-        failedId,
-        "not retried: the sprite could not say whether the runner had exited",
-      );
+      if (!stopped()) {
+        skipRetry(
+          failedId,
+          "not retried: the sprite could not say whether the runner had exited",
+        );
+      }
       throw err;
     }
     if (!exited) {
-      skipRetry(failedId, "not retried: the runner was still exiting");
+      if (!stopped()) {
+        skipRetry(failedId, "not retried: the runner was still exiting");
+      }
       return;
     }
     const envVars = Object.fromEntries(
@@ -1065,15 +1093,13 @@ export function createLauncher({
         if (hasRunAfter(tx, found.id, failedId)) {
           return { kind: "superseded" } as const;
         }
-        if (keepCredential) {
-          // a stop cancelled it while the failed runner exited
-          if (!challengeRetries.has(failedId)) {
-            return { kind: "cancelled" } as const;
-          }
-          // the assignment can change while the failed runner exits too
-          if ("skip" in challengeTarget(launch.envId, target)) {
-            return { kind: "unassigned" } as const;
-          }
+        if (stopped()) return { kind: "cancelled" } as const;
+        // the assignment can change while the failed runner exits too
+        if (
+          keepCredential &&
+          "skip" in challengeTarget(launch.envId, target)
+        ) {
+          return { kind: "unassigned" } as const;
         }
         tx.insert(runs)
           .values({
@@ -1111,7 +1137,7 @@ export function createLauncher({
         );
         return;
       case "cancelled":
-        skipRetry(failedId, "not retried: its agent was stopped");
+        // the stop already recorded why
         return;
       case "unassigned":
         skipRetry(
@@ -1135,8 +1161,16 @@ export function createLauncher({
 
   const api = {
     onRunFailed,
-    /** Cancels the agent's challenge retry, if one is pending: a stop ends the task, run or not. */
+    /**
+     * Cancels the agent's pending retries, of a Cloudflare challenge or of a usage limit (one waiting
+     * on its failed runner's exit): a stop ends the task, run or not.
+     */
     cancelChallengeRetry(agentId: AgentId): void {
+      for (const [failedId, retryAgentId] of limitRetries) {
+        if (retryAgentId !== agentId) continue;
+        limitRetries.delete(failedId);
+        skipRetry(failedId, "not retried: its agent was stopped");
+      }
       for (const [failedId, pending] of challengeRetries) {
         if (pending.agentId !== agentId) continue;
         clearTimeout(pending.timer);
