@@ -717,3 +717,30 @@ test.each([
     expect(wire.sessions).toHaveLength(1);
   },
 );
+
+test("a launch whose write fails still starts its run, and only loses the retry after a restart", async () => {
+  db.$client.exec(
+    "create trigger refuse_launch before update of launch_ciphertext on runs when new.launch_ciphertext is not null begin select raise(abort, 'disk full'); end",
+  );
+  const r = await launchedRun(readyEnv());
+  expect(runRow(r.run.id)?.status).not.toBe("failed");
+  expect(launchKept(r.run.id)).toBe(false);
+  expect(
+    logs.some((line) => line.includes(`keeping the launch of ${r.run.id}`)),
+  ).toBe(true);
+  // the map still holds it: a failure without a restart is retried
+  await failWith(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(2));
+  expect(warningsOf(r.run.id)).toEqual([]);
+});
+
+test("a launch whose write fails leaves a restarted API with no record to retry from", async () => {
+  db.$client.exec(
+    "create trigger refuse_launch before update of launch_ciphertext on runs when new.launch_ciphertext is not null begin select raise(abort, 'disk full'); end",
+  );
+  const r = await launchedRun(readyEnv());
+  restartApi();
+  await failWith(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(warningsOf(r.run.id)).toEqual([NO_RECORD]));
+  expect(wire.sessions).toHaveLength(1);
+});

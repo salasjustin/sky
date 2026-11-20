@@ -1266,23 +1266,31 @@ export function createLauncher({
         if (now - held.at > REMEMBER_LAUNCH_MS) launches.delete(id);
       }
       launches.set(launch.runId, { launch, at: now });
-      // what a retry needs survives a restart; rows past the bound drop theirs
-      storeLaunch(db, config.secretEncryptionKey, launch.runId, {
-        launch,
-        at: now,
-      });
-      db.update(runs)
-        .set(NO_LAUNCH)
-        .where(
-          and(
-            isNotNull(runs.launchCiphertext),
-            lt(
-              runs.createdAt,
-              new Date(now - REMEMBER_LAUNCH_MS).toISOString(),
+      // what a retry needs survives a restart; rows past the bound drop theirs. A write that fails
+      // only loses that: the run's row is already committed, and a throw here would leave it in
+      // `starting` with no runner
+      try {
+        storeLaunch(db, config.secretEncryptionKey, launch.runId, {
+          launch,
+          at: now,
+        });
+        db.update(runs)
+          .set(NO_LAUNCH)
+          .where(
+            and(
+              isNotNull(runs.launchCiphertext),
+              lt(
+                runs.createdAt,
+                new Date(now - REMEMBER_LAUNCH_MS).toISOString(),
+              ),
             ),
-          ),
-        )
-        .run();
+          )
+          .run();
+      } catch (err) {
+        log(
+          `keeping the launch of ${launch.runId} for a retry failed; a restart before it ends loses the retry: ${err}`,
+        );
+      }
       const agentToken = mintAgentToken(config.apiKey, launch.runId);
       run(launch, agentToken)
         .catch(async (err: unknown) => {
