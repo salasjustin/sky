@@ -36,6 +36,11 @@ const CHALLENGE =
   "Claude Code returned an error result: Failed to authenticate. API Error: 403 Attention Required! | Cloudflare";
 const UNRELATED = "Failed to authenticate. API Error: 401 invalid x-api-key";
 const CHALLENGE_DELAY_MS = 60_000;
+// long enough that the clock's small steps in `vi.waitFor` never reach it
+const PAUSE_MS = 10 * 60_000;
+const NO_RECORD =
+  "not retried: no record of this run's launch is held (the API restarted since this run launched and it was not recorded, it launched more than 12 hours ago, or it was already retried)";
+const STOPPED = "not retried: its agent was stopped";
 
 let dir: string;
 let db: Db;
@@ -182,6 +187,21 @@ const warningsOf = (runId: string) =>
 const exitWaits = () =>
   logs.filter((line) => line.includes("await-exit: start")).length;
 
+const retriesOf = (failedId: string) =>
+  db
+    .select()
+    .from(runs)
+    .where(eq(runs.retryOf, failedId as RunId))
+    .all();
+
+const backoffLogged = () =>
+  logs.some((line) => line.includes("is still exiting; waiting again in"));
+
+/** Lets the I/O and continuations already under way run out; only `setTimeout` may be faked. */
+async function settle() {
+  for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r));
+}
+
 /** Runs `change` each time the retry of `failedId` asks whether that run's runner exited. */
 function onExitWait(failedId: string, change: () => ExitAnswer | undefined) {
   const exec = wire.exec;
@@ -197,6 +217,20 @@ type ExitAnswer = ReturnType<SpritesWire["exec"]>;
 /** Restarts the API on the same database: nothing is held in memory. */
 const restartApi = () => buildApp();
 
+/** Fails a run that already failed once, as a second failure of it would arrive. */
+async function failAgain(r: Launched, error: string) {
+  db.update(runs)
+    .set({ status: "running" })
+    .where(eq(runs.id, r.run.id as RunId))
+    .run();
+  const res = await postEvent(r.file.AGENT_TOKEN, {
+    runId: r.run.id,
+    type: "run.failed",
+    payload: { error },
+  });
+  expect(res.status).toBe(201);
+}
+
 // --- a limit failure that is not retried says why ---------------------------------------------------
 
 test("a limit failure whose launch is held nowhere is not retried and says so", async () => {
@@ -208,9 +242,7 @@ test("a limit failure whose launch is held nowhere is not retried and says so", 
   restartApi();
   await failWith(r, FIVE_HOUR);
   await vi.waitFor(() => expect(warningsOf(r.run.id)).toHaveLength(1));
-  expect(warningsOf(r.run.id)[0]).toMatch(
-    /^not retried: no record of this run's launch/,
-  );
+  expect(warningsOf(r.run.id)).toEqual([NO_RECORD]);
   expect(wire.sessions).toHaveLength(1);
 });
 
@@ -296,6 +328,8 @@ test("a runner that exits on the second wait gets its retry", async () => {
   await failWith(r, FIVE_HOUR);
   await vi.waitFor(() => expect(wire.sessions).toHaveLength(2));
   expect(waits).toBe(2);
+  // the log line the "no wait was made" checks read is live: each wait logs one
+  expect(exitWaits()).toBe(waits);
   expect(warningsOf(r.run.id)).toEqual([]);
 });
 
@@ -354,6 +388,95 @@ test("an agent archived before its retry says so", async () => {
   expect(retryOf(r.run.id)).toBeUndefined();
 });
 
+test("a second failure of a retried run is not retried again and says no record is held", async () => {
+  const r = await launchedRun(readyEnv());
+  await failWith(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(2));
+  expect(retriesOf(r.run.id)).toHaveLength(1);
+  expect(warningsOf(r.run.id)).toEqual([]);
+  await failAgain(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(warningsOf(r.run.id)).toHaveLength(1));
+  expect(warningsOf(r.run.id)).toEqual([NO_RECORD]);
+  expect(retriesOf(r.run.id)).toHaveLength(1);
+  expect(wire.sessions).toHaveLength(2);
+});
+
+test("a second failure of a retried run after an API restart is not retried again and says no record is held", async () => {
+  const r = await launchedRun(readyEnv());
+  await failWith(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(2));
+  expect(warningsOf(r.run.id)).toEqual([]);
+  restartApi();
+  await failAgain(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(warningsOf(r.run.id)).toHaveLength(1));
+  expect(warningsOf(r.run.id)).toEqual([NO_RECORD]);
+  expect(retriesOf(r.run.id)).toHaveLength(1);
+  expect(wire.sessions).toHaveLength(2);
+});
+
+// --- a usage-limit retry waits out the failed runner's exit ------------------------------------------
+
+/** The first exit wait of `failedId` reports its runner still running; later ones report it gone. */
+function runnerExitsOnSecondWait(failedId: string) {
+  const seen = { waits: 0 };
+  onExitWait(failedId, () =>
+    ++seen.waits === 1 ? { exitCode: 1 } : undefined,
+  );
+  return seen;
+}
+
+test("a runner still exiting is waited on for the full pause before the next wait", async () => {
+  buildApp({}, [PAUSE_MS]);
+  const r = await launchedRun(readyEnv());
+  const seen = runnerExitsOnSecondWait(r.run.id);
+  fakeDelay();
+  await failWith(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(backoffLogged()).toBe(true));
+  expect(logs.join("\n")).toContain(
+    `the runner of ${r.run.id} is still exiting; waiting again in 600s`,
+  );
+  await vi.advanceTimersByTimeAsync(PAUSE_MS / 2);
+  expect(seen.waits).toBe(1);
+  expect(retryOf(r.run.id)).toBeUndefined();
+  await vi.advanceTimersByTimeAsync(PAUSE_MS);
+  await vi.waitFor(() => expect(retryOf(r.run.id)).toBeDefined());
+  expect(seen.waits).toBe(2);
+  expect(warningsOf(r.run.id)).toEqual([]);
+});
+
+test("stopping the agent while a limit retry waits on its runner cancels the retry and says so once", async () => {
+  buildApp({}, [PAUSE_MS]);
+  const r = await launchedRun(readyEnv());
+  const seen = runnerExitsOnSecondWait(r.run.id);
+  fakeDelay();
+  await failWith(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(backoffLogged()).toBe(true));
+  const stop = await call("POST", `/v1/agents/${r.agent.id}/stop`);
+  expect(stop.status).toBe(200);
+  // the runner exits after the stop: the retry the stop cancelled must not go ahead
+  await vi.advanceTimersByTimeAsync(2 * PAUSE_MS);
+  await vi.waitFor(() => expect(seen.waits).toBe(2));
+  await settle();
+  expect(retriesOf(r.run.id)).toEqual([]);
+  expect(wire.sessions).toHaveLength(1);
+  expect(warningsOf(r.run.id)).toEqual([STOPPED]);
+});
+
+test("stopping another agent while a limit retry waits on its runner still lets the retry happen", async () => {
+  buildApp({}, [PAUSE_MS]);
+  const r = await launchedRun(readyEnv());
+  const other = await launchedRun(readyEnv());
+  runnerExitsOnSecondWait(r.run.id);
+  fakeDelay();
+  await failWith(r, FIVE_HOUR);
+  await vi.waitFor(() => expect(backoffLogged()).toBe(true));
+  const stop = await call("POST", `/v1/agents/${other.agent.id}/stop`);
+  expect(stop.status).toBe(200);
+  await vi.advanceTimersByTimeAsync(2 * PAUSE_MS);
+  await vi.waitFor(() => expect(retryOf(r.run.id)).toBeDefined());
+  expect(warningsOf(r.run.id)).toEqual([]);
+});
+
 // --- a challenge failure that is not retried says why -------------------------------------------------
 
 const fakeDelay = () => vi.useFakeTimers({ toFake: ["setTimeout"] });
@@ -362,10 +485,14 @@ test("stopping the agent while a challenge retry waits leaves a warning on the f
   const r = await launchedRun(readyEnv());
   fakeDelay();
   await failWith(r, CHALLENGE);
+  // held for the retry until the stop drops it
+  expect(runRow(r.run.id)?.launch).toEqual(expect.any(String));
   const stop = await call("POST", `/v1/agents/${r.agent.id}/stop`);
   expect(stop.status).toBe(200);
+  // read before the delay passes: the stop itself clears it, not the timer firing
+  expect(runRow(r.run.id)?.launch).toBeNull();
   await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
-  expect(warningsOf(r.run.id)).toEqual(["not retried: its agent was stopped"]);
+  expect(warningsOf(r.run.id)).toEqual([STOPPED]);
   expect(wire.sessions).toHaveLength(1);
 });
 
@@ -380,9 +507,9 @@ test("an environment reassigned while a challenge retry waits leaves a warning o
     .run();
   await vi.advanceTimersByTimeAsync(10 * CHALLENGE_DELAY_MS);
   await vi.waitFor(() => expect(warningsOf(r.run.id)).toHaveLength(1));
-  expect(warningsOf(r.run.id)[0]).toContain(
-    "no longer assigns Claude credential personal",
-  );
+  expect(warningsOf(r.run.id)).toEqual([
+    "not retried after the Cloudflare challenge: its environment is not ready or no longer assigns Claude credential personal",
+  ]);
   expect(wire.sessions).toHaveLength(1);
 });
 
@@ -396,6 +523,8 @@ test.each([
     name === "an unrelated error" ? {} : { claudeCredential: null },
   );
   const r = await launchedRun(env);
+  // a failure that is a retry candidate, handled after the one under test
+  const sentinel = await launchedRun(readyEnv());
   if (name !== "an unrelated error") {
     // run on the API key, as after a limit retry
     db.update(runs)
@@ -404,7 +533,11 @@ test.each([
       .run();
   }
   await failWith(r, error);
-  await vi.waitFor(() => expect(runRow(r.run.id)?.status).toBe("failed"));
+  await failWith(sentinel, FIVE_HOUR);
+  // the sentinel's retry launching shows failures are being acted on, so an absent retry is a decision
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(3));
+  expect(retryOf(sentinel.run.id)).toBeDefined();
+  expect(runRow(r.run.id)?.status).toBe("failed");
   expect(warningsOf(r.run.id)).toEqual([]);
-  expect(wire.sessions).toHaveLength(1);
+  expect(retryOf(r.run.id)).toBeUndefined();
 });
