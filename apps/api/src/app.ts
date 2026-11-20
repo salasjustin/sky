@@ -41,6 +41,8 @@ export type AppDeps = {
   launchWatchMs?: number;
   /** How long after its runner starts a run that hasn't reported in gets its sprite woken; 90 s unless a test shortens it. */
   launchWakeMs?: number;
+  /** The pauses between a failed run's retry waiting on its runner to exit, one per extra wait; 5, 15, 30 and 60 s unless a test shortens them. */
+  runnerExitBackoffMs?: number[];
   /** The bound on a Sprites call that should answer promptly; 60 s unless a test shortens it. */
   spritesTimeoutMs?: number;
   /** How long the sprite calls before a launch may take (the follow-up's wait for the previous runner, the branch check); 20 s, inside the CLI's 30 s request timeout, unless a test shortens it. */
@@ -69,6 +71,7 @@ export function createApp({
   longPollMs = 25_000,
   launchWatchMs = 3_000,
   launchWakeMs = 90_000,
+  runnerExitBackoffMs,
   spritesTimeoutMs = SPRITES_TIMEOUT_MS,
   preLaunchDeadlineMs = 20_000,
   previewBuildCapMs,
@@ -112,6 +115,7 @@ export function createApp({
     nudgeDeliveries,
     watchMs: launchWatchMs,
     wakeAfterMs: launchWakeMs,
+    runnerExitBackoffMs,
     wake: (runId, spriteName) => wakeLaunch(spriteOps, runId, spriteName, log),
   });
   const checkBranch = createBranchChecker({

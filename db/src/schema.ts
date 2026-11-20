@@ -260,6 +260,8 @@ export const runs = sqliteTable(
     claudeCredential: text("claude_credential"),
     // the failed run this one retries after a usage limit, on the API key or a pool's next subscription; null for any other run
     retryOf: text("retry_of").$type<RunId>(),
+    // what a retry of this run needs from its launch (JSON, never a secret), so one survives an API restart; null before the launch is recorded. No CHECK, for the same reason as rollup
+    launch: text(),
     createdAt: createdAt(),
   },
   (t) => [
