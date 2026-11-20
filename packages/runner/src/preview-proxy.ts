@@ -90,12 +90,16 @@ function swapOrigin(value: string, from: string, to: string): string {
  * holds the preview's token as a cookie, which the link's one path hands out; everything else gets a
  * plain 404 that names nothing. The app sees the request as if it came from localhost: the
  * `Host` is rewritten, since app servers refuse a host they weren't told of, and the preview cookie is
- * stripped. An `Origin` or `Referer` that is the preview's own (`https://` plus the `Host` received) is
- * rewritten to `http://localhost:<port>` as well: frameworks compare `Origin` with the host of the
- * request URL built from `Host` (React Router, SvelteKit, Next.js, Astro) and refuse a form post when
- * they differ. Any other `Origin` or `Referer` goes through untouched, so the app's cross-site checks
- * still turn other sites away. A response `Location` back to `http://localhost:<port>` is pointed at
- * the preview's own origin, so a redirect stays on the preview.
+ * stripped. The received `Host` goes on as `X-Forwarded-Host`, with `X-Forwarded-Proto: https`. An
+ * `Origin` or `Referer` that is the preview's own (`https://` plus the `Host` received) is rewritten
+ * to `http://localhost:<port>`, and on a request whose `Origin` was rewritten `X-Forwarded-Host`
+ * becomes `localhost:<port>` too: frameworks refuse a form post whose `Origin` differs from the
+ * origin they build for the request. That passes React Router under `@react-router/serve`, Next.js
+ * Server Actions and SvelteKit under `vite preview`; an app that builds its origin from
+ * `X-Forwarded-Proto` still sees `https` and refuses the rewritten `http` origin. Any other `Origin`
+ * or `Referer` goes through untouched, so the app's cross-site checks still turn other sites away. A
+ * response `Location` back to `http://` or `https://localhost:<port>` is pointed at the preview's own
+ * origin, so a redirect stays on the preview.
  */
 export function createPreviewProxy({
   tokenHash,
@@ -126,15 +130,19 @@ export function createPreviewProxy({
     const cookie = withoutPreviewCookie(req.headers);
     if (cookie !== undefined) headers.cookie = cookie;
     headers.host = `localhost:${upstreamPort}`;
-    // the preview's own origin is what the browser sent as Host, which the app never sees
+    // the preview's own origin is what the browser sent as Host; the app gets that Host as X-Forwarded-Host
     const own = previewOrigin(req.headers.host);
+    if (req.headers.host) headers["x-forwarded-host"] = req.headers.host;
     if (own !== undefined) {
-      if (headers.origin === own) headers.origin = upstreamOrigin;
+      if (headers.origin === own) {
+        headers.origin = upstreamOrigin;
+        // Next.js Server Actions compare Origin's host with X-Forwarded-Host when it is set
+        headers["x-forwarded-host"] = `localhost:${upstreamPort}`;
+      }
       if (headers.referer !== undefined) {
         headers.referer = swapOrigin(headers.referer, own, upstreamOrigin);
       }
     }
-    if (req.headers.host) headers["x-forwarded-host"] = req.headers.host;
     headers["x-forwarded-proto"] = "https";
     if (req.socket.remoteAddress) {
       headers["x-forwarded-for"] = req.socket.remoteAddress;
@@ -198,8 +206,8 @@ export function createPreviewProxy({
           for (let i = 0; i < rawHeaders.length; i += 2) {
             if (rawHeaders[i]?.toLowerCase() === "location") {
               rawHeaders[i + 1] = swapOrigin(
-                rawHeaders[i + 1] ?? "",
-                upstreamOrigin,
+                swapOrigin(rawHeaders[i + 1] ?? "", upstreamOrigin, own),
+                `https://localhost:${upstreamPort}`,
                 own,
               );
             }

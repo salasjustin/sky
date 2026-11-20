@@ -395,6 +395,22 @@ test("a POST with the preview's own Origin reaches the app as http://localhost:<
   expect(app.seen[0]?.headers.origin).toBe(`http://localhost:${app.port}`);
 });
 
+test("X-Forwarded-Host agrees with a rewritten Origin, and stays the preview host otherwise", async () => {
+  const app = await devServer();
+  const { port } = await proxyTo(app.port);
+  const post = (headers: Record<string, string>) =>
+    get(port, "/", { cookie, host: PREVIEW_HOST, ...headers }, "POST");
+  await post({ origin: PREVIEW_ORIGIN });
+  await post({ origin: "https://evil.example" });
+  await post({});
+  // Next.js Server Actions compare Origin's host with X-Forwarded-Host when it is set
+  expect(app.seen[0]?.headers.origin).toBe(`http://localhost:${app.port}`);
+  expect(app.seen[0]?.headers["x-forwarded-host"]).toBe(`localhost:${app.port}`);
+  expect(app.seen[0]?.headers["x-forwarded-proto"]).toBe("https");
+  expect(app.seen[1]?.headers["x-forwarded-host"]).toBe(PREVIEW_HOST);
+  expect(app.seen[2]?.headers["x-forwarded-host"]).toBe(PREVIEW_HOST);
+});
+
 test("a same-origin Referer keeps its path, query and fragment and gets the app's origin", async () => {
   const app = await devServer();
   const { port } = await proxyTo(app.port);
@@ -495,6 +511,10 @@ test("a redirect to the app's own localhost origin is pointed back at the previe
     (await get(port, "/", { cookie, host: PREVIEW_HOST, "x-redirect-to": to }))
       .headers.location;
   expect(await via("http://localhost:APP/dashboard?tab=1#x")).toBe(
+    `${PREVIEW_ORIGIN}/dashboard?tab=1#x`,
+  );
+  // an app that assumes https (SvelteKit adapter-node, or X-Forwarded-Proto honoured) redirects there
+  expect(await via("https://localhost:APP/dashboard?tab=1#x")).toBe(
     `${PREVIEW_ORIGIN}/dashboard?tab=1#x`,
   );
   // relative and other-host values are not touched
