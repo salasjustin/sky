@@ -22,7 +22,7 @@ test.each([
   ["172.16/12, high end", "https://172.31.255.255/hook"],
   ["192.168/16", "https://192.168.1.1/hook"],
   ["100.64/10 (shared address space)", "https://100.64.0.1/hook"],
-  ["link-local / cloud metadata", "http://169.254.169.254/latest/meta-data"],
+  ["link-local / cloud metadata", "https://169.254.169.254/latest/meta-data"],
   ["IPv6 loopback", "https://[::1]/hook"],
   ["the unspecified IPv6 address", "https://[::]/hook"],
   ["IPv6 link-local", "https://[fe80::1]/hook"],
@@ -47,6 +47,10 @@ test.each([
   ["Fly's 6PN fdaa::/16", "https://[fdaa:0:1234::3]/hook"],
   ["NAT64 embedding loopback", "https://[64:ff9b::7f00:1]/hook"],
   ["NAT64 embedding 10/8, dotted", "https://[64:ff9b::10.0.0.1]/hook"],
+  [
+    "a 64:ff9b::/96 address that embeds no IPv4",
+    "https://[64:ff9b::1:2:3]/hook",
+  ],
   ["IPv4-mapped IPv6 public", "https://[::ffff:8.8.8.8]/hook"],
   ["a plain-http URL", "http://hooks.example.com/hook"],
   ["a non-default port", "https://hooks.example.com:8443/hook"],
@@ -107,8 +111,55 @@ test("the connect-time lookup resolves again on every connect", async () => {
   const answers = ["8.8.8.8", "10.0.0.5"];
   const resolve: LookupFn = (host, options, callback) =>
     resolvesTo(answers.shift() as string)(host, options, callback);
-  expect((await lookupOf(resolve)).err).toBeNull();
-  expect((await lookupOf(resolve)).err).toBeInstanceOf(BlockedAddressError);
+  const lookup = guardedLookup(resolve);
+  const connect = () =>
+    new Promise<Error | null>((done) =>
+      lookup("hooks.example.com", {}, (err) => done(err)),
+    );
+  expect(await connect()).toBeNull();
+  expect(await connect()).toBeInstanceOf(BlockedAddressError);
+});
+
+test("the connect-time lookup asks the resolver for every address", async () => {
+  const received: unknown[] = [];
+  const resolve: LookupFn = (host, options, callback) => {
+    received.push(options);
+    resolvesTo("8.8.8.8")(host, options, callback);
+  };
+  await lookupOf(resolve, false);
+  expect(received).toEqual([{ all: true }]);
+});
+
+const resolvesToString =
+  (address: string, family: number): LookupFn =>
+  (_host, _options, callback) =>
+    callback(null, address, family);
+
+test("the connect-time lookup refuses a resolver's single internal string address", async () => {
+  const { err } = await lookupOf(resolvesToString("10.0.0.5", 4));
+  expect(err).toBeInstanceOf(BlockedAddressError);
+});
+
+test("the connect-time lookup passes a resolver's single public string address through", async () => {
+  expect(await lookupOf(resolvesToString("8.8.8.8", 4))).toEqual({
+    err: null,
+    address: "8.8.8.8",
+  });
+});
+
+test("the connect-time lookup refuses an empty address list", async () => {
+  const { err } = await lookupOf(resolvesTo());
+  expect(err).toBeInstanceOf(BlockedAddressError);
+});
+
+test("the connect-time lookup passes a resolver's error through", async () => {
+  const failure = Object.assign(new Error("getaddrinfo ENOTFOUND"), {
+    code: "ENOTFOUND",
+  });
+  const { err } = await lookupOf((_host, _options, callback) =>
+    callback(failure, "", 0),
+  );
+  expect(err).toBe(failure);
 });
 
 test.each([
