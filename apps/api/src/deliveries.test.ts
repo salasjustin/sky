@@ -1362,15 +1362,88 @@ test("the streak counts deliveries failed or retrying since the last delivered o
   expect((await summaryOf(id)).failedStreak).toBe(0);
 });
 
+test("the webhook list gives each webhook the results of its own deliveries only", async () => {
+  const flaky = await subscribe(
+    ["claude.Message"],
+    "https://flaky.example.com/h",
+  );
+  const steady = await subscribe(
+    ["claude.Message"],
+    "https://steady.example.com/h",
+  );
+  server.use(
+    http.post(
+      "https://flaky.example.com/h",
+      () => new HttpResponse(null, { status: 500 }),
+    ),
+    http.post(
+      "https://steady.example.com/h",
+      () => new HttpResponse(null, { status: 200 }),
+    ),
+  );
+  const { runId, token } = runningRun();
+  const listed = async () => {
+    const res = await app.request("/v1/webhooks", { headers: auth });
+    const { data } = (await res.json()) as { data: Summary[] };
+    return new Map(data.map((w) => [w.id, w]));
+  };
+
+  // steady delivers at T0 and flaky fails then; flaky retries 10 s later, after steady's last attempt
+  await chatter(runId, token);
+  await chatter(runId, token);
+  await dispatcher.drain();
+  const deliveredAt = clock.toISOString();
+  advance(10_000);
+  await dispatcher.drain();
+  const retriedAt = clock.toISOString();
+
+  let rows = await listed();
+  expect(rows.get(steady)).toMatchObject({
+    lastAttempt: { at: deliveredAt, status: 200, error: null, attempt: 1 },
+    failedStreak: 0,
+  });
+  expect(rows.get(steady)).not.toHaveProperty("failing");
+  expect(rows.get(flaky)).toMatchObject({
+    lastAttempt: { at: retriedAt, status: 500, error: null, attempt: 2 },
+    failedStreak: 2,
+  });
+  expect(rows.get(flaky)).not.toHaveProperty("failing");
+
+  await giveUp();
+  rows = await listed();
+  expect(rows.get(flaky)).toMatchObject({
+    lastAttempt: { status: 500, attempt: 30 },
+    failedStreak: 2,
+    failing: true,
+  });
+  expect(rows.get(steady)).toMatchObject({
+    lastAttempt: { at: deliveredAt, status: 200, attempt: 1 },
+    failedStreak: 0,
+  });
+  expect(rows.get(steady)).not.toHaveProperty("failing");
+});
+
 test("an attempt with no response shows its error kind, not a status", async () => {
   const id = await subscribe(["run.finished"]);
   server.use(http.post(subscriberUrl, () => HttpResponse.error()));
   const { runId, token } = runningRun();
   await finished(runId, token);
   await dispatcher.drain();
-  const { lastAttempt } = await summaryOf(id);
-  expect(lastAttempt?.status).toBeNull();
-  expect(lastAttempt?.error).toEqual(expect.any(String));
+  expect((await summaryOf(id)).lastAttempt?.status).toBeNull();
+
+  // the stored text is the raw, unredacted error; the summary carries its kind and nothing of it
+  const raw = "TypeError: fetch failed: connect ECONNREFUSED 10.0.0.1:443";
+  db.update(webhookDeliveries).set({ lastError: raw }).run();
+  const res = await app.request(`/v1/webhooks/${id}`, { headers: auth });
+  const text = await res.text();
+  expect((JSON.parse(text) as Summary).lastAttempt).toEqual({
+    at: clock.toISOString(),
+    status: null,
+    error: "connection_refused",
+    attempt: 1,
+  });
+  expect(text).not.toContain("fetch failed");
+  expect(text).not.toContain("10.0.0.1");
 });
 
 test.each([
@@ -1437,21 +1510,38 @@ test("the 30th failed attempt flags the webhook and warns the run; a delivered o
   expect(cleared.failedStreak).toBe(0);
 });
 
-test("a give-up on a runner.warning delivery flags the webhook but posts no further warning", async () => {
-  const id = await subscribe(["run.finished", "runner.warning"]);
+test("a give-up on a runner.warning delivery flags a webhook that wasn't failing but posts no warning about it", async () => {
+  // subscribed to warnings only, so no earlier give-up can have set the flag
+  const id = await subscribe(["runner.warning"]);
   server.use(
     http.post(subscriberUrl, () => new HttpResponse(null, { status: 503 })),
   );
   const { runId, token } = runningRun();
-  await finished(runId, token);
-  // 30 attempts of the finish; the warning that follows is delivered 30 times too
-  for (let i = 0; i < 70; i++) {
-    await dispatcher.drain();
-    advance(3_600_000);
-  }
-  expect(warnings(runId)).toHaveLength(1);
-  expect(deliveries().map((d) => d.status)).toEqual(["failed", "failed"]);
+  await postEvent(token, {
+    runId,
+    type: "runner.warning",
+    payload: { message: "disk low" },
+  });
+  await dispatcher.drain();
+  expect(await summaryOf(id)).not.toHaveProperty("failing");
+
+  await giveUp();
+  expect(deliveries().map((d) => d.status)).toEqual(["failed"]);
   expect((await summaryOf(id)).failing).toBe(true);
+  // only the warning the run posted itself
+  expect(warnings(runId)).toEqual(["disk low"]);
+});
+
+test("a give-up with no response from the receiver warns with the error kind, not the raw error", async () => {
+  await subscribe(["run.finished"]);
+  server.use(http.post(subscriberUrl, () => HttpResponse.error()));
+  const { runId, token } = runningRun();
+  await finished(runId, token);
+  await giveUp();
+  const [message, ...more] = warnings(runId);
+  expect(more).toEqual([]);
+  expect(message).toMatch(/after 30 attempts; last result: [a-z_]+$/);
+  expect(message).not.toMatch(/fetch|Failed|TypeError|status/);
 });
 
 test("a give-up while the webhook is already failing posts no second warning", async () => {
@@ -1523,14 +1613,18 @@ const getDeliveries = (webhookId: string, query = "", token = config.apiKey) =>
 
 /** `n` deliveries of one webhook, each on its own run.finished event, oldest first. */
 let seeded = 0;
-function seedDeliveries(webhookId: string, n: number) {
+function seedDeliveries(
+  webhookId: string,
+  n: number,
+  eventType = "run.finished",
+) {
   const { runId } = runningRun(`seed${seeded++}`);
   for (let i = 0; i < n; i++) {
     const event = db.$client
       .prepare(
-        "insert into events (run_id, ts, type, payload) values (?, ?, 'run.finished', '{}') returning id",
+        "insert into events (run_id, ts, type, payload) values (?, ?, ?, '{}') returning id",
       )
-      .get(runId, new Date().toISOString()) as { id: number };
+      .get(runId, new Date().toISOString(), eventType) as { id: number };
     db.insert(webhookDeliveries)
       .values({
         webhookId: webhookId as WebhookId,
@@ -1565,14 +1659,40 @@ test("the limit is at most 100, and a bad limit or cursor is a 400", async () =>
   const all = (await (await getDeliveries(id, "?limit=100")).json()) as Page;
   expect(all.data).toHaveLength(100);
   expect(all.nextCursor).toBeDefined();
-  for (const query of ["?limit=101", "?limit=0", "?limit=abc", "?limit=-1"]) {
+  for (const query of [
+    "?limit=101",
+    "?limit=0",
+    "?limit=abc",
+    "?limit=-1",
+    "?cursor=abc",
+    "?cursor=-1",
+    "?cursor=1.5",
+    "?cursor=",
+    // 16 digits: past what a number holds exactly
+    "?cursor=1234567890123456",
+  ]) {
     const res = await getDeliveries(id, query);
-    expect(res.status).toBe(400);
-    expect(await res.json()).toMatchObject({
+    expect(res.status, query).toBe(400);
+    expect(await res.json(), query).toMatchObject({
       error: { code: "invalid_query" },
     });
   }
-  expect((await getDeliveries(id, "?cursor=abc")).status).toBe(400);
+});
+
+test("a page that ends exactly at the limit has no cursor to a next page", async () => {
+  const id = await subscribe(["run.finished"]);
+  seedDeliveries(id, 20);
+  const whole = (await (await getDeliveries(id)).json()) as Page;
+  expect(whole.data).toHaveLength(20);
+  expect(whole).not.toHaveProperty("nextCursor");
+
+  const first = (await (await getDeliveries(id, "?limit=10")).json()) as Page;
+  expect(first.data).toHaveLength(10);
+  const second = (await (
+    await getDeliveries(id, `?limit=10&cursor=${first.nextCursor}`)
+  ).json()) as Page;
+  expect(second.data).toHaveLength(10);
+  expect(second).not.toHaveProperty("nextCursor");
 });
 
 test("a delivery shows its event, run, attempts, status, error and times, and nothing of the request", async () => {
@@ -1602,12 +1722,37 @@ test("a delivery shows its event, run, attempts, status, error and times, and no
       lastErrorKind: null,
       createdAt: expect.stringMatching(/Z$/),
       lastAttemptAt: clock.toISOString(),
-      nextAttemptAt: expect.stringMatching(/Z$/),
+      nextAttemptAt: new Date(
+        clock.getTime() + retryDelayMs(1, 0.5),
+      ).toISOString(),
     },
   ]);
   expect(text).not.toContain(secret);
   expect(text).not.toContain("hooks.example.com");
   expect(text).not.toMatch(/signature|payload|body|header/i);
+});
+
+test("only a pending delivery shows when it is next tried, however stale the stored time", async () => {
+  const id = await subscribe(["run.finished"]);
+  seedDeliveries(id, 3);
+  const stale = "2030-01-01T00:00:00.000Z";
+  const [done, gaveUp, retrying] = deliveries().map((d) => d.id);
+  for (const [status, rowId] of [
+    ["delivered", done],
+    ["failed", gaveUp],
+    ["pending", retrying],
+  ] as const) {
+    db.update(webhookDeliveries)
+      .set({ status, nextAttemptAt: stale })
+      .where(eq(webhookDeliveries.id, rowId ?? -1))
+      .run();
+  }
+  const { data } = (await (await getDeliveries(id)).json()) as Page;
+  expect(data.map((d) => [d.id, d.status, d.nextAttemptAt])).toEqual([
+    [retrying, "pending", stale],
+    [gaveUp, "failed", null],
+    [done, "delivered", null],
+  ]);
 });
 
 test("a delivery's last error is redacted", async () => {
@@ -1625,40 +1770,100 @@ test("a delivery's last error is redacted", async () => {
   expect(text).toContain("[redacted]");
 });
 
-test("a runs key reads the deliveries of its own webhooks only", async () => {
-  const { envId } = runningRun();
+async function runsKey(name: string, envId: EnvironmentId) {
   const created = await app.request("/v1/keys", {
     method: "POST",
     headers: { ...auth, "Content-Type": "application/json" },
-    body: JSON.stringify({ name: "ci", role: "runs", environmentIds: [envId] }),
+    body: JSON.stringify({ name, role: "runs", environmentIds: [envId] }),
   });
   expect(created.status).toBe(201);
-  const { secret } = (await created.json()) as { secret: string };
-  const make = async (token: string) =>
-    (
-      (await (
-        await app.request("/v1/webhooks", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            url: subscriberUrl,
-            eventTypes: ["run.finished"],
-          }),
-        })
-      ).json()) as { id: string }
-    ).id;
-  const mine = await make(secret);
-  const admins = await make(config.apiKey);
+  return ((await created.json()) as { secret: string }).secret;
+}
+
+async function subscribeAs(token: string, url: string) {
+  const res = await app.request("/v1/webhooks", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ url, eventTypes: ["run.finished"] }),
+  });
+  expect(res.status).toBe(201);
+  return ((await res.json()) as { id: string }).id;
+}
+
+const deliveryIdsOf = (webhookId: string) =>
+  deliveries()
+    .filter((d) => d.webhookId === webhookId)
+    .map((d) => d.id);
+
+const pageIds = async (res: Response) =>
+  ((await res.json()) as Page).data.map((d) => d.id);
+
+test("a webhook's deliveries page holds its own deliveries only, whatever the cursor", async () => {
+  const a = await subscribe(["run.finished"], "https://a.example.com/h");
+  const b = await subscribe(["claude.Message"], "https://b.example.com/h");
+  seedDeliveries(a, 2);
+  seedDeliveries(b, 2, "claude.Message");
+  seedDeliveries(a, 1);
+  const aIds = deliveryIdsOf(a);
+  const bIds = deliveryIdsOf(b);
+  expect(aIds).toHaveLength(3);
+  expect(bIds).toHaveLength(2);
+
+  expect(await pageIds(await getDeliveries(a))).toEqual([...aIds].reverse());
+  const bPage = (await (await getDeliveries(b)).json()) as Page;
+  expect(bPage.data.map((d) => d.id)).toEqual([...bIds].reverse());
+  expect(bPage.data.map((d) => d.eventType)).toEqual([
+    "claude.Message",
+    "claude.Message",
+  ]);
+  // a cursor just past the other webhook's newest delivery still pages a's own rows only
+  const past = Math.max(...bIds) + 1;
+  expect(await pageIds(await getDeliveries(a, `?cursor=${past}`))).toEqual(
+    aIds.filter((id) => id < past).reverse(),
+  );
+  expect(
+    await pageIds(await getDeliveries(b, `?cursor=${Math.max(...bIds)}`)),
+  ).toEqual([Math.min(...bIds)]);
+});
+
+test("a runs key reads the deliveries of its own webhooks only, not another key's nor an admin's", async () => {
+  const { envId } = runningRun();
+  const other = runningRun("other");
+  const first = await runsKey("ci", envId);
+  const second = await runsKey("ci-two", other.envId);
+  const mine = await subscribeAs(first, "https://mine.example.com/h");
+  const theirs = await subscribeAs(second, "https://theirs.example.com/h");
+  const admins = await subscribeAs(
+    config.apiKey,
+    "https://admins.example.com/h",
+  );
   seedDeliveries(mine, 1);
+  seedDeliveries(theirs, 1);
   seedDeliveries(admins, 1);
-  expect((await getDeliveries(mine, "", secret)).status).toBe(200);
-  const denied = await getDeliveries(admins, "", secret);
-  expect(denied.status).toBe(404);
-  const missing = await getDeliveries("whk_0000000000000000000000", "", secret);
-  expect(await denied.json()).toEqual(await missing.json());
-  expect((await getDeliveries(mine)).status).toBe(200);
-  expect((await getDeliveries(admins)).status).toBe(200);
+
+  const own = await getDeliveries(mine, "", first);
+  expect(own.status).toBe(200);
+  expect(await pageIds(own)).toEqual(deliveryIdsOf(mine));
+
+  const missing = await (
+    await getDeliveries("whk_0000000000000000000000", "", first)
+  ).json();
+  for (const [webhookId, token] of [
+    [theirs, first],
+    [mine, second],
+    [admins, first],
+  ] as const) {
+    const denied = await getDeliveries(webhookId, "", token);
+    expect(denied.status).toBe(404);
+    expect(await denied.json()).toEqual(missing);
+  }
+
+  for (const webhookId of [mine, theirs, admins]) {
+    expect(await pageIds(await getDeliveries(webhookId))).toEqual(
+      deliveryIdsOf(webhookId),
+    );
+  }
 });
