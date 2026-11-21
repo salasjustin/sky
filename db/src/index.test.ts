@@ -291,11 +291,11 @@ test("migrating a populated 0000 file keeps every row, cascade children included
   expect(createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
 });
 
-test("migrating existing deliveries backfills each one's last attempt and flags a webhook whose newest finished delivery gave up", () => {
+test("migrating existing deliveries backfills each one's last attempt and flags a webhook failing since its first give-up after its newest delivery", () => {
   migrateThrough("0022_aberrant_wolverine");
   seedRun();
   const events = [insertEvent(), insertEvent(), insertEvent()];
-  for (const id of ["a", "b", "c"]) {
+  for (const id of ["a", "b", "c", "d", "e"]) {
     run(
       `insert into webhooks (id, url, event_types) values ('wh_${id}', 'https://x', '["run.started"]')`,
     );
@@ -317,6 +317,7 @@ test("migrating existing deliveries backfills each one's last attempt and flags 
     );
   const t1 = "2026-11-01T00:00:00.000Z";
   const t2 = "2026-11-02T00:00:00.000Z";
+  const t3 = "2026-11-03T00:00:00.000Z";
   // a: delivered, then a give-up: failing. b: a give-up, then delivered: fine. c: still retrying
   deliver("wh_a", events[0] as number, "delivered", 1, t1);
   deliver("wh_a", events[1] as number, "failed", 30, t2);
@@ -329,6 +330,13 @@ test("migrating existing deliveries backfills each one's last attempt and flags 
     3,
     "2026-12-01T00:00:00.000Z",
   );
+  // d: delivered, then two give-ups: failing since the first. e: a give-up, delivered, a give-up: since the second
+  deliver("wh_d", events[0] as number, "delivered", 1, t1);
+  deliver("wh_d", events[1] as number, "failed", 30, t2);
+  deliver("wh_d", events[2] as number, "failed", 30, t3);
+  deliver("wh_e", events[0] as number, "failed", 30, t1);
+  deliver("wh_e", events[1] as number, "delivered", 2, t2);
+  deliver("wh_e", events[2] as number, "failed", 30, t3);
 
   migrate(db);
 
@@ -340,6 +348,8 @@ test("migrating existing deliveries backfills each one's last attempt and flags 
     { id: "wh_a", failing_since: t2 },
     { id: "wh_b", failing_since: null },
     { id: "wh_c", failing_since: null },
+    { id: "wh_d", failing_since: t2 },
+    { id: "wh_e", failing_since: t3 },
   ]);
   expect(
     db.$client
@@ -353,6 +363,12 @@ test("migrating existing deliveries backfills each one's last attempt and flags 
     { webhook_id: "wh_b", status: "failed", last_attempt_at: t1 },
     { webhook_id: "wh_b", status: "delivered", last_attempt_at: t2 },
     { webhook_id: "wh_c", status: "pending", last_attempt_at: null },
+    { webhook_id: "wh_d", status: "delivered", last_attempt_at: t1 },
+    { webhook_id: "wh_d", status: "failed", last_attempt_at: t2 },
+    { webhook_id: "wh_d", status: "failed", last_attempt_at: t3 },
+    { webhook_id: "wh_e", status: "failed", last_attempt_at: t1 },
+    { webhook_id: "wh_e", status: "delivered", last_attempt_at: t2 },
+    { webhook_id: "wh_e", status: "failed", last_attempt_at: t3 },
   ]);
 });
 
