@@ -413,3 +413,20 @@ test("webhook deliveries refuses a bad id, limit or cursor with exit 2 and a str
   // refused before any request
   expect(queries).toEqual([]);
 });
+
+test("--help documents webhook deliveries and the list summary", async () => {
+  const r = await runCli(["--help"]);
+  const text = r.stdout.replace(/\s+/g, " ");
+  expect(text).toContain(
+    "sky webhook deliveries <id> [--limit=<1-100>] [--cursor=<cursor>]",
+  );
+  expect(text).toContain(
+    'webhook deliveries: the page {"data": [deliveries], "nextCursor"?: …}',
+  );
+  expect(text).toContain(
+    '"| FAILING, last 401 at 2026-11-21T09:30:00.000Z (attempt 30), 13 failed in a row"',
+  );
+  expect(text).toContain(
+    "a script reads lastAttempt, failedStreak and failing from --json",
+  );
+});
