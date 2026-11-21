@@ -78,7 +78,7 @@ export function webhookRoutes() {
           c,
           400,
           "url_not_allowed",
-          "url must use the default port, carry no username or password, and must not name localhost, an internal name or a loopback, private, link-local, unique-local or reserved address",
+          "url must use the default port, carry no username or password, and name a public host, not an internal name or a private, reserved or otherwise non-public address",
         );
       }
       if (!Webhook.shape.url.safeParse(input.url).success) {
