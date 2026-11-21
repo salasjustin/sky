@@ -461,12 +461,14 @@ describe("refreshPlugins record", () => {
     expect(result.outcome).toBe("failed: spawn c ENOENT");
   });
 
-  test("a listing of more user-scope plugins than run.started carries is recorded within its bounds", async () => {
+  test("a listing of more user-scope plugins than run.started carries updates them all and is recorded within its bounds", async () => {
     const installed = Object.fromEntries(
       Array.from({ length: 150 }, (_, n) => [`p${n}@m`, "1.0.0"]),
     );
-    const { run } = fakeClaude(installed, "2.0.0");
+    const { run, versions } = fakeClaude(installed, "2.0.0");
     const result = await record({ run });
+    const updated = Object.values(versions).filter((v) => v === "2.0.0");
+    expect(updated).toHaveLength(150);
     expect(() => PluginRefresh.parse({ ...result, loaded: [] })).not.toThrow();
     expect(result.before).toHaveLength(100);
     expect(result.after).toHaveLength(100);

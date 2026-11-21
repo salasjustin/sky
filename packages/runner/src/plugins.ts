@@ -134,10 +134,7 @@ const idOf = (plugin: PluginVersion) =>
     ? plugin.name
     : `${plugin.name}@${plugin.marketplace}`;
 
-/**
- * The user-scope plugins of a `claude plugin list --json`, each once, as `name@marketplace` split;
- * the first `PLUGINS_MAX` of them, so a refresh updates and records no more than that.
- */
+/** The user-scope plugins of a `claude plugin list --json`, each once, as `name@marketplace` split. */
 function userPlugins(stdout: string): PluginVersion[] {
   const installed = JSON.parse(stdout) as {
     id: string;
@@ -147,7 +144,6 @@ function userPlugins(stdout: string): PluginVersion[] {
   const seen = new Set<string>();
   const plugins: PluginVersion[] = [];
   for (const { id, scope, version } of installed) {
-    if (plugins.length === PLUGINS_MAX) break;
     if (scope !== "user" || seen.has(id)) continue;
     seen.add(id);
     const at = id.lastIndexOf("@");
@@ -198,9 +194,9 @@ export async function refreshPlugins(options: {
         ? `${outcome.slice(0, OUTCOME_MAX - 1)}…`
         : outcome,
     durationMs: Math.max(0, Math.round(now() - started)),
-    before,
+    before: before.slice(0, PLUGINS_MAX),
     // empty, not `before`, when the refresh never read the list back
-    after: after ?? [],
+    after: (after ?? []).slice(0, PLUGINS_MAX),
   });
   if (stop?.aborted) {
     warn("runner: plugin refresh skipped (stopped)");
