@@ -25,9 +25,10 @@ const exec = promisify(execFile);
 export const PLUGIN_REFRESH_TIMEOUT_MS = 30_000;
 
 /**
- * What one `claude` command of the refresh may take. A command that stalls on the network (measured
- * on a sprite: a marketplace update 2.8 s, any other command 0.6 s) is cut here and counted as a
- * failed update, so the commands after it still run inside the overall budget instead of being starved.
+ * What the marketplace update and each plugin update may take; the listings run under the overall
+ * budget only. An update that stalls on the network (measured on a sprite: a marketplace update
+ * 2.8 s, any other command 0.6 s) is cut here and counted as a failed update, so the updates after it
+ * still run inside the overall budget instead of being starved.
  */
 export const PLUGIN_STEP_TIMEOUT_MS = 10_000;
 
@@ -229,7 +230,7 @@ function sameDir(a: string, b: string): boolean {
  * Resolves to the record of what it did: the user-scope plugins before and after (null for a list
  * it never read; a waiting run with nothing to update has its one listing as both), the outcome
  * code (`refreshed`, `timed_out`, `failed` or `skipped`), the reason for a `failed` or `skipped`
- * one, how long it took and how long each command did (`steps`). A command is also cut at
+ * one, how long it took and how long each command did (`steps`). An update is also cut at
  * `stepTimeoutMs`: a marketplace update cut there is a failed update, and the plugin updates after it
  * still run from the cached marketplace. Never throws.
  */
@@ -238,7 +239,7 @@ export async function refreshPlugins(options: {
   warn: (line: string) => void;
   signal?: AbortSignal;
   timeoutMs?: number;
-  /** How long one `claude` command of the refresh may take; `PLUGIN_STEP_TIMEOUT_MS` when absent. */
+  /** How long the marketplace update or one plugin update may take; `PLUGIN_STEP_TIMEOUT_MS` when absent. */
   stepTimeoutMs?: number;
   /** How long the read-back after a refresh that ended early may take; `LIST_TIMEOUT_MS` when absent. */
   listTimeoutMs?: number;
