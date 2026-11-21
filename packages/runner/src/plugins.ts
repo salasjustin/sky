@@ -25,8 +25,8 @@ const exec = promisify(execFile);
 export const PLUGIN_REFRESH_TIMEOUT_MS = 30_000;
 
 /**
- * What the marketplace update and each plugin update may take; the listings run under the overall
- * budget only. An update that stalls on the network (measured on a sprite: a marketplace update
+ * What the marketplace update and each plugin update may take; `list before` and `list after` run
+ * under the overall budget only. An update that stalls on the network (measured on a sprite: a marketplace update
  * 2.8 s, any other command 0.6 s) is cut here and counted as a failed update, so the updates after it
  * still run inside the overall budget instead of being starved.
  */
