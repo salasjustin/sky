@@ -31,12 +31,20 @@ export function pluginLines(plugins: PluginRefresh): string[] {
       loaded?: string;
     };
   };
-  for (const p of plugins.before) entry(p).before = p.version;
-  for (const p of plugins.after) entry(p).after = p.version;
+  for (const p of plugins.before ?? []) entry(p).before = p.version;
+  for (const p of plugins.after ?? []) entry(p).after = p.version;
   for (const p of plugins.loaded) entry(p).loaded = p.version;
+  const reason = plugins.reason ? `: ${plugins.reason}` : "";
   const lines = [
-    `plugins: ${plugins.outcome} (${(plugins.durationMs / 1000).toFixed(1)}s)`,
+    `plugins: ${plugins.outcome}${reason} (${(plugins.durationMs / 1000).toFixed(1)}s)`,
   ];
+  // a list that was never read says so, rather than looking like a list with no plugins in it
+  const unread = [
+    plugins.before === null && "before",
+    plugins.after === null && "after",
+  ].filter((side) => side !== false);
+  if (unread.length > 0)
+    lines.push(`  not read: ${unread.join(" and ")} the refresh`);
   for (const { id, before, after, loaded } of byName.values()) {
     const behind =
       loaded !== undefined && after !== undefined && loaded !== after

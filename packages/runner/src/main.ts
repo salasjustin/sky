@@ -1,4 +1,5 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import {
   removeCredentialFilesNow,
@@ -162,7 +163,10 @@ async function main(): Promise<void> {
   // a stop while the hold was landing skips setup; the session reports it as run.failed
   const pluginRefresh = controller.signal.aborted
     ? undefined
-    : await setUpSession(controller.signal);
+    : await setUpSession(
+        controller.signal,
+        join(config.worktreesDir, config.agentId),
+      );
   warn("runner: session starting");
   try {
     process.exitCode = await runSession(config, {
@@ -187,14 +191,23 @@ async function main(): Promise<void> {
   else stopListening();
 }
 
-async function setUpSession(signal: AbortSignal): Promise<PluginRefreshRecord> {
+async function setUpSession(
+  signal: AbortSignal,
+  worktree: string,
+): Promise<PluginRefreshRecord> {
   // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
   await step("store sync", () => syncStoreQuietly("pull", process.env, warn));
   // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails
   // the run. The marketplaces need no Claude login, and these `claude` processes are neither sealed nor
-  // pinned, so they get the env with the credential taken out. What it did rides the run's `run.started`
+  // pinned, so they get the env with the credential taken out. What it did rides the run's `run.started`.
+  // The worktree's own project-scope plugin records are updated too; a first run has no worktree yet
   return step("plugin refresh", () =>
-    refreshPlugins({ env: process.env, warn, signal }),
+    refreshPlugins({
+      env: process.env,
+      warn,
+      signal,
+      ...(existsSync(worktree) && { projectDir: worktree }),
+    }),
   );
 }
 

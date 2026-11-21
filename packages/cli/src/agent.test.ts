@@ -463,7 +463,8 @@ test("status prints a failed or skipped refresh's reason and a plugin that is mi
     runs(
       run({
         plugins: record({
-          outcome: "failed: could not resolve host",
+          outcome: "failed",
+          reason: "could not resolve host",
           before: [],
           after: [],
           loaded: [pkg("kru", "0.214.0")],
@@ -476,6 +477,56 @@ test("status prints a failed or skipped refresh's reason and a plugin that is mi
     "plugins: failed: could not resolve host (4.2s)\n",
   );
   expect(r.stdout).toContain("  kru@mk  before -  after -  loaded 0.214.0\n");
+  // lists that were read and empty are not "never read"
+  expect(r.stdout).not.toContain("not read");
+});
+
+test("status says which list a refresh never read, apart from one it read and found empty", async () => {
+  server.use(
+    runs(
+      run({
+        plugins: record({
+          outcome: "skipped",
+          reason: "stopped",
+          before: null,
+          after: null,
+          loaded: [pkg("kru", "0.214.0")],
+        }),
+      }),
+    ),
+  );
+  const r = await runCli(["status", agentId]);
+  expect(r.stdout).toBe(
+    [
+      "run_1 running",
+      "plugins: skipped: stopped (4.2s)",
+      "  not read: before and after the refresh",
+      "  kru@mk  before -  after -  loaded 0.214.0",
+      "",
+    ].join("\n"),
+  );
+  server.use(
+    runs(
+      run({ plugins: record({ before: [pkg("kru", "1.0.0")], after: null }) }),
+    ),
+  );
+  expect((await runCli(["status", agentId])).stdout).toContain(
+    "  not read: after the refresh\n",
+  );
+});
+
+test("status reads a record written before outcome was a code", async () => {
+  server.use(
+    runs(
+      run({
+        plugins: record({ outcome: "failed: could not resolve host" }),
+      }),
+    ),
+  );
+  const r = await runCli(["status", agentId]);
+  expect(r.stdout).toContain(
+    "plugins: failed: could not resolve host (4.2s)\n",
+  );
 });
 
 test("status prints no plugins line for an older API, a run that hasn't started, or a record this CLI can't read, and --json passes the field through", async () => {

@@ -1,6 +1,12 @@
 import { EventEmitter } from "node:events";
 import type { events } from "@sky/db";
-import type { AgentId, EnvironmentId, Event, RunId } from "@sky/shared";
+import {
+  type AgentId,
+  type EnvironmentId,
+  type Event,
+  PluginRefresh,
+  type RunId,
+} from "@sky/shared";
 
 const emitter = new EventEmitter().setMaxListeners(0);
 
@@ -26,6 +32,29 @@ export const runEvents = {
   listenerCount: (runId: RunId | typeof anyRun) => emitter.listenerCount(runId),
 };
 
+/**
+ * A stored `run.started`'s plugin record as it reads today: `PluginRefresh` splits a record from before
+ * `outcome` was a code. Null for no record, or one that doesn't parse.
+ */
+export function storedPlugins(plugins: unknown): PluginRefresh | null {
+  const parsed = PluginRefresh.safeParse(plugins);
+  return parsed.success ? parsed.data : null;
+}
+
+/** A stored payload as sent; only a `run.started`'s plugin record is re-read, and dropped when it doesn't parse. */
+function presentPayload(type: string, payload: unknown): unknown {
+  if (
+    type !== "run.started" ||
+    typeof payload !== "object" ||
+    payload === null ||
+    !("plugins" in payload)
+  )
+    return payload;
+  const { plugins, ...rest } = payload;
+  const parsed = storedPlugins(plugins);
+  return parsed ? { ...rest, plugins: parsed } : rest;
+}
+
 /** The shared Event shape webhooks, the event streams and the long poll send for a stored row of `agent`'s run. */
 export const presentEvent = (
   row: typeof events.$inferSelect,
@@ -38,5 +67,5 @@ export const presentEvent = (
     runId: row.runId,
     ts: row.ts,
     type: row.type,
-    payload: row.payload,
+    payload: presentPayload(row.type, row.payload),
   }) as Event;

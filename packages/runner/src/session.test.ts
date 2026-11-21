@@ -417,6 +417,42 @@ test("a refresh that didn't end refreshed also posts a runner.warning naming the
   });
 });
 
+test("a failed refresh's warning carries its reason, and its run.started the code and the reason apart", async () => {
+  const { sent, post } = apiPoster();
+  await runSession(config, {
+    query: scripted([
+      initWithPlugins([
+        {
+          name: "kru",
+          path: "/home/sprite/.claude/plugins/cache/kru/kru/0.214.0",
+        },
+      ]),
+      success,
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    pluginRefresh: {
+      outcome: "failed",
+      reason: "could not resolve host",
+      durationMs: 1000,
+      before: null,
+      after: null,
+    },
+  });
+  expect(sent.find((e) => e.type === "run.started")?.payload).toMatchObject({
+    plugins: {
+      outcome: "failed",
+      reason: "could not resolve host",
+      before: null,
+    },
+  });
+  expect(sent.find((e) => e.type === "runner.warning")?.payload).toEqual({
+    message:
+      "plugin refresh failed: could not resolve host; the session loaded kru@0.214.0",
+  });
+});
+
 test("a run without a refresh record posts the bare run.started an older API expects", async () => {
   const { posted, post } = recorder();
   await runSession(config, {

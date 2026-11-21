@@ -298,6 +298,8 @@ export const events = sqliteTable(
   (t) => [
     // a run's stream resumes with `run_id = ? and id > ?`
     index("events_run_id_id").on(t.runId, t.id),
+    // a run's latest event of one type (`run.started`'s plugin record, once per run in a list) without walking all its events
+    index("events_run_id_type_id").on(t.runId, t.type, t.id),
     // the 7-day prune: the query must spell `type glob 'claude.*'` verbatim for the planner to pick a partial index
     index("events_claude_ts")
       .on(t.ts)
