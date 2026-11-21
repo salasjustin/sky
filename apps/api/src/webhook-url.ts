@@ -16,8 +16,13 @@ internal.addSubnet("192.168.0.0", 16, "ipv4");
 internal.addSubnet("198.18.0.0", 15, "ipv4");
 internal.addSubnet("224.0.0.0", 4, "ipv4");
 internal.addSubnet("240.0.0.0", 4, "ipv4");
-internal.addAddress("::", "ipv6");
-internal.addAddress("::1", "ipv6");
+// IPv4-compatible ::/96 (which holds :: and ::1), discard, Teredo, documentation, 6to4, local-use NAT64
+internal.addSubnet("::", 96, "ipv6");
+internal.addSubnet("100::", 64, "ipv6");
+internal.addSubnet("2001::", 32, "ipv6");
+internal.addSubnet("2001:db8::", 32, "ipv6");
+internal.addSubnet("2002::", 16, "ipv6");
+internal.addSubnet("64:ff9b:1::", 48, "ipv6");
 internal.addSubnet("fc00::", 7, "ipv6");
 internal.addSubnet("fe80::", 10, "ipv6");
 internal.addSubnet("ff00::", 8, "ipv6");
@@ -46,9 +51,15 @@ function nat64Embedded(address: string): string | null {
 /** Whether a literal IPv4 or IPv6 address (no brackets) is one a webhook may not reach. */
 export function isInternalAddress(address: string): boolean {
   if (isIPv4(address)) return internal.check(address, "ipv4");
-  if (!isIPv6(address)) return true;
+  // a zone id ("fe80::1%eth0") is link-local by nature, and URL can't parse it
+  if (!isIPv6(address) || address.includes("%")) return true;
   // the parser may hand back any spelling; normalize through URL so "64:ff9b::7f00:1" matches
-  const canonical = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+  let canonical: string;
+  try {
+    canonical = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+  } catch {
+    return true;
+  }
   const embedded = nat64Embedded(canonical);
   if (embedded) return isInternalAddress(embedded);
   if (canonical.toLowerCase().startsWith("64:ff9b::")) return true;
@@ -66,28 +77,43 @@ export function isInternalAddress(address: string): boolean {
  * `guardedLookup`.
  */
 export function isAllowedWebhookUrl(url: string): boolean {
+  return refusalOf(url) === null;
+}
+
+/**
+ * Why a stored or submitted URL is refused: `url_not_allowed` for its form (not https, a port, a
+ * username or password, unparseable) and `blocked_address` for the host it names; null when allowed.
+ */
+export function refusalOf(url: string): RefusalKind | null {
   let hostname: string;
   try {
     const parsed = new URL(url);
     // https on the default port only; the WHATWG parser drops an explicit :443
-    if (parsed.protocol !== "https:" || parsed.port !== "") return false;
-    if (parsed.username !== "" || parsed.password !== "") return false;
+    if (parsed.protocol !== "https:" || parsed.port !== "") {
+      return "url_not_allowed";
+    }
+    if (parsed.username !== "" || parsed.password !== "") {
+      return "url_not_allowed";
+    }
     hostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
   } catch {
-    return false;
+    return "url_not_allowed";
   }
-  if (hostname === "localhost") return false;
-  if (isIPv4(hostname)) return !isInternalAddress(hostname);
+  const blocked = (refused: boolean) => (refused ? "blocked_address" : null);
+  if (hostname === "localhost") return "blocked_address";
+  if (isIPv4(hostname)) return blocked(isInternalAddress(hostname));
   const bare = hostname.replace(/^\[|\]$/g, "");
-  if (isIPv6(bare)) return !isInternalAddress(bare);
-  if (!hostname.includes(".")) return false;
-  return !internalSuffixes.some((s) => hostname.endsWith(s));
+  if (isIPv6(bare)) return blocked(isInternalAddress(bare));
+  if (!hostname.includes(".")) return "blocked_address";
+  return blocked(internalSuffixes.some((s) => hostname.endsWith(s)));
 }
 
-/** Thrown by the connect-time check; its text names no address, host or port. */
+export type RefusalKind = "url_not_allowed" | "blocked_address";
+
+/** Thrown by the connect-time and stored-URL checks; its text is the kind alone, naming no address, host or port. */
 export class BlockedAddressError extends Error {
-  constructor() {
-    super("blocked_address");
+  constructor(readonly kind: RefusalKind = "blocked_address") {
+    super(kind);
     this.name = "BlockedAddressError";
   }
 }

@@ -18,6 +18,7 @@ import { createApp } from "./app.js";
 import {
   createDispatcher,
   type Dispatcher,
+  describeError,
   openbotSignature,
   retryDelayMs,
   signatureHeader,
@@ -474,15 +475,45 @@ test("a webhook stored with an internal name is refused and stays listed", async
 });
 
 test.each([
-  ["a literal private IP", "https://10.0.0.5/hook"],
-  ["a 6PN address", "https://[fdaa:0:1::3]/hook"],
-  ["a non-default port", "https://hooks.example.com:4280/hook"],
-  ["plain http", "http://hooks.example.com/hook"],
-  ["credentials in the URL", "https://user:secret@hooks.example.com/hook"],
-])("a webhook stored with %s is refused at once", async (_, url) => {
+  ["a literal private IP", "https://10.0.0.5/hook", "blocked_address"],
+  ["a 6PN address", "https://[fdaa:0:1::3]/hook", "blocked_address"],
+  [
+    "a non-default port",
+    "https://hooks.example.com:4280/hook",
+    "url_not_allowed",
+  ],
+  ["plain http", "http://hooks.example.com/hook", "url_not_allowed"],
+  [
+    "credentials in the URL",
+    "https://user:secret@hooks.example.com/hook",
+    "url_not_allowed",
+  ],
+])("a webhook stored with %s is refused at once", async (_, url, kind) => {
   await failedBlocked(() => {}, url);
-  expect(deliveries()).toEqual([expect.objectContaining(blockedRow)]);
+  expect(deliveries()).toEqual([
+    expect.objectContaining({ ...blockedRow, lastError: kind }),
+  ]);
   expect(logs.filter((l) => l.includes("secret"))).toEqual([]);
+});
+
+test("describeError leaves no address or host:port of its error's cause", () => {
+  const err = new TypeError("fetch failed", {
+    cause: new Error(
+      "connect ECONNREFUSED 203.0.113.9:443, connect ECONNREFUSED [fdaa:0:1::3]:8080, getaddrinfo ENOTFOUND db.internal:5432",
+    ),
+  });
+  const text = describeError(err);
+  expect(text).toMatch(/^TypeError: fetch failed: connect ECONNREFUSED/);
+  for (const leaked of [
+    "203.0.113.9",
+    "443",
+    "fdaa",
+    "8080",
+    "db.internal",
+    "5432",
+  ]) {
+    expect(text).not.toContain(leaked);
+  }
 });
 
 test("a redirect is a failed attempt, never followed", async () => {

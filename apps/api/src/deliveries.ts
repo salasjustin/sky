@@ -22,8 +22,9 @@ import type { Tx } from "./runs.js";
 import {
   BlockedAddressError,
   guardedAgent,
-  isAllowedWebhookUrl,
   type LookupFn,
+  type RefusalKind,
+  refusalOf,
   scrubAddresses,
 } from "./webhook-url.js";
 
@@ -156,15 +157,18 @@ export function enqueueDeliveries(
   return matching.length;
 }
 
-/** The error text stored as `last_error` for a delivery the connect-time check refused. */
-export const BLOCKED_ADDRESS = "blocked_address";
+/** The refusal an error or its cause carries; its kind is the whole `last_error` text of a refused delivery. */
+const refusalKind = (err: unknown): RefusalKind | null => {
+  if (err instanceof BlockedAddressError) return err.kind;
+  return err instanceof Error && err.cause !== undefined
+    ? refusalKind(err.cause)
+    : null;
+};
 
-const isBlocked = (err: unknown): boolean =>
-  err instanceof BlockedAddressError ||
-  (err instanceof Error && err.cause !== undefined && isBlocked(err.cause));
-
-const describeError = (err: unknown): string => {
-  if (isBlocked(err)) return BLOCKED_ADDRESS;
+/** The text stored as `last_error` for a failed attempt, with addresses and `host:port` pairs scrubbed out. */
+export const describeError = (err: unknown): string => {
+  const refusal = refusalKind(err);
+  if (refusal) return refusal;
   if (err instanceof Error && err.name === "TimeoutError") {
     return `timed out after ${TIMEOUT_MS / 1000}s`;
   }
@@ -304,7 +308,8 @@ export function createDispatcher({
     let retryAfter: number | null = null;
     try {
       // a stored webhook that predates the URL rules, and a literal IP (which never reaches the lookup)
-      if (!isAllowedWebhookUrl(row.url)) throw new BlockedAddressError();
+      const refusal = refusalOf(row.url);
+      if (refusal) throw new BlockedAddressError(refusal);
       const request = buildRequest(row, id, presented, t);
       const res = await fetch(row.url, {
         method: "POST",
@@ -329,9 +334,9 @@ export function createDispatcher({
     }
     const attempts = row.attempts + 1;
     const delivered = status !== null && status >= 200 && status < 300;
-    // a refused address is not a transient failure: fail at once rather than retry
-    const failed =
-      !delivered && (error === BLOCKED_ADDRESS || attempts >= MAX_ATTEMPTS);
+    // a refused URL or address is not a transient failure: fail at once rather than retry
+    const refused = error === "blocked_address" || error === "url_not_allowed";
+    const failed = !delivered && (refused || attempts >= MAX_ATTEMPTS);
     const nextAttemptAt =
       delivered || failed
         ? undefined
