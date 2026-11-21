@@ -51,6 +51,8 @@ test.each([
   ["a plain-http URL", "http://hooks.example.com/hook"],
   ["a non-default port", "https://hooks.example.com:8443/hook"],
   ["Fly's internal API port", "https://hooks.example.com:4280/hook"],
+  ["a username and password", "https://user:pass@hooks.example.com/hook"],
+  ["a public-looking username", "https://hooks.example.com@10.0.0.1/hook"],
 ])("rejects %s", (_, url) => {
   expect(isAllowedWebhookUrl(url)).toBe(false);
 });

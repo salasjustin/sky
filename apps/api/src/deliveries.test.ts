@@ -478,9 +478,11 @@ test.each([
   ["a 6PN address", "https://[fdaa:0:1::3]/hook"],
   ["a non-default port", "https://hooks.example.com:4280/hook"],
   ["plain http", "http://hooks.example.com/hook"],
+  ["credentials in the URL", "https://user:secret@hooks.example.com/hook"],
 ])("a webhook stored with %s is refused at once", async (_, url) => {
   await failedBlocked(() => {}, url);
   expect(deliveries()).toEqual([expect.objectContaining(blockedRow)]);
+  expect(logs.filter((l) => l.includes("secret"))).toEqual([]);
 });
 
 test("a redirect is a failed attempt, never followed", async () => {
