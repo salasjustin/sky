@@ -138,9 +138,41 @@ export const RunRollup = z.object({
 });
 export type RunRollup = z.infer<typeof RunRollup>;
 
+/** A plugin at one version; `marketplace` is null when the runner couldn't tell where it came from. */
+export const PluginVersion = z.object({
+  name: z.string().min(1).max(100),
+  marketplace: z.string().max(100).nullable(),
+  version: z.string().min(1).max(100),
+});
+export type PluginVersion = z.infer<typeof PluginVersion>;
+
+/**
+ * What the start-of-run plugin refresh did, as the run records it. `outcome` is `refreshed`,
+ * `timed_out`, `failed: <reason>` or `skipped: <reason>`. `before` and `after` are the user-scope
+ * plugins either side of the refresh, per `claude plugin list`, each cut to its first 100. `after`
+ * is empty on every skip, and `before` is too unless the run was stopped after reading it. Either is
+ * empty when the refresh ended before reading that list, so an empty `after` means "not read", not
+ * "removed". `loaded` is what the session's own init reports it
+ * loaded, from any scope, which is what counts when `plugin update` and the session disagree.
+ */
+export const PluginRefresh = z.object({
+  outcome: z.string().min(1).max(300),
+  durationMs: z.number().int().nonnegative(),
+  before: z.array(PluginVersion).max(100),
+  after: z.array(PluginVersion).max(100),
+  loaded: z.array(PluginVersion).max(100),
+});
+export type PluginRefresh = z.infer<typeof PluginRefresh>;
+
 const runPayloads = {
-  /** `sessionId` is the Claude session the API stores to resume the agent's next run. */
-  "run.started": z.object({ sessionId: z.string().min(1) }),
+  /**
+   * `sessionId` is the Claude session the API stores to resume the agent's next run. `plugins` is the
+   * run's plugin record; absent from an older runner.
+   */
+  "run.started": z.object({
+    sessionId: z.string().min(1),
+    plugins: PluginRefresh.optional(),
+  }),
   "run.waiting": z.object({ request: PendingRequest }),
   /** `requestId` closed before anyone answered it (`reason`: why); the run goes back to `running`, or finishes on `run_finished`. */
   "run.withdrawn": z.object({

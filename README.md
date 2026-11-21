@@ -254,7 +254,7 @@ A profile holds:
 - `sessionEnv`: non-secret variables set in every session, such as a plugin's own switch. Never put a secret here. A name the runner sets or reads itself is rejected: `PATH`, `HOME`, `NODE_OPTIONS`, `AGENT_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, the runner's own variables (the `SKY_` ones among them), and anything starting `GIT_`.
 - `checks`: lines the runner tells the agent to follow before it finishes, each an instruction or a command on a single line, run in order from the repo root. A command that calls `claude -p` runs as a nested headless session on a subscription or pool run's own token, never the project's key. On a subscription or pool run with `checks`, before the session starts, the runner marks the repo root trusted (`projects[<path>].hasTrustDialogAccepted`) in the sprite user's `~/.claude.json` (the `.claude.json` in `CLAUDE_CONFIG_DIR` when the session's env sets it), merging into the file and leaving its other keys and mode alone. Claude Code applies a repo's `permissions.allow` entries only once it is trusted, and a nested session without them has just its built-in read-only allowances, so tests and builds are denied. Claude Code keys trust on the main checkout's root, so the entry covers a session in a worktree too. The trust is permanent and covers every Claude session in that repo on the sprite, the run's own included, not only nested ones. Beyond `permissions.allow` it adds only `additionalDirectories`, allow rules in a tracked `settings.local.json`, subagent frontmatter hooks and `mcpServers`, project skills-dir plugins, `extraKnownMarketplaces` and the `.mcp.json` `headersHelper`; deny and ask rules, settings hooks, `env`, `apiKeyHelper` and `.mcp.json` servers apply without it. The runner reads the file back right after writing, and if that write fails or the entry is already gone (another process rewrote the file in between) the run posts a `runner.warning` and goes on; a rewrite later in the run that drops the entry posts nothing. The nested command prints JSON (`--output-format json`): the agent finds the JSON object in the log (which also holds stderr), reads `.result` for the report, quotes `subtype` and `errors` when there is none, and treats a non-empty `permission_denials`, `is_error: true` or a missing `.result` as a gap to report, never as a clean pass. The nested command reads the run's token through a link named for the agent, in a directory of the sprite user's own (mode 0700) that holds every agent's link, which each run points at its own credential file in the runner's directory under the sprite's temp dir; the prompt names the link, so a follow-up that resumes the session finds a live login at the same path. The runner makes the link under a temporary name and renames it into place, and, before it writes into a directory, refuses one that isn't a directory of the sprite's user and sets it to mode 0700. Every process of the sprite's user can read the file and the link while they exist, other agents' sessions on the sprite included. The runner deletes the file, and the link while it still points there, when the run ends or the runner crashes, and a runner killed outright leaves them until the next runner starts on the sprite and sweeps them. An API-key run, the API-key retry of a run that hit its subscription limit included, writes no such file, since every process of the sprite's user could read Sky's key there: the agent is told not to run its checks that call `claude`, and to report them as not run.
 
-Provisioning applies the profile after the clone and before `setup`, so `setup` can use what it installs; the env's own plugins from `.claude/settings.json` follow `setup`. Plugins are updated on each provision; a run does not update them again. Reprovision to refresh.
+Provisioning applies the profile after the clone and before `setup`, so `setup` can use what it installs; the env's own plugins from `.claude/settings.json` follow `setup`. Plugins are installed and updated on each provision. Each run also refreshes the user-scope ones before its session starts: the runner runs `claude plugin marketplace update`, then `claude plugin update <plugin> --scope user` for each, one run at a time per sprite. The refresh gets 30 seconds, plus up to 5 more to read the plugin list back after a refresh that ended early. It is best effort: a slow or unreachable marketplace, a failed update or a stop never fails the run, and the session starts with whatever is installed. `--scope user` moves only the user-scope install record: a project-scope install of the same plugin keeps its own record, at the version it was installed with. Claude Code also treats a `version` set in a plugin's manifest as a pin, so an update that finds the same version changes nothing. Claude Code loads plugins at session start, so the record described after the example says what each run actually loaded.
 
 ```json
 {
@@ -279,6 +279,31 @@ Provisioning applies the profile after the clone and before `setup`, so `setup` 
 ```
 
 Here `DOCS_API_KEY` on the left is the variable the server sees, and on the right the env secret that fills it; the `SEARCH_AUTH` secret holds `Bearer <token>`. [`docs/examples/base-profile.kru.json`](docs/examples/base-profile.kru.json) is a full profile with a store layout. Set it with `fly secrets set SKY_BASE_PROFILES="$(jq -c . profiles.json)"`. A bad value stops the API at boot, naming the field.
+
+**Which plugin versions a run loaded.** The start-of-run refresh's record is on the run's `run.started` event as `plugins`, and on the run object as `plugins` (`null` before the run starts, and for a run from an older runner):
+
+```json
+{
+  "outcome": "timed_out",
+  "durationMs": 30012,
+  "before": [{ "name": "review", "marketplace": "acme", "version": "0.214.0" }],
+  "after": [{ "name": "review", "marketplace": "acme", "version": "0.214.0" }],
+  "loaded": [{ "name": "review", "marketplace": "acme", "version": "0.214.0" }]
+}
+```
+
+- `outcome` is `refreshed`, `timed_out`, `failed: <reason>` (the first line of the command's error output, stderr when it has one, each at most 200 characters, and the whole outcome at most 300) or `skipped: <reason>`: `stopped` when the run was stopped first, `another run refreshed the plugins` when a run on the same sprite held the lock. A `failed` outcome also names a plugin whose update failed while the others updated.
+- `before` and `after` list the user-scope plugins either side of the refresh, read from `claude plugin list`, at most 100 each; both are empty when the refresh never got a listing, `after` is empty when the refresh never read the list back, and a run that skipped for another run's refresh lists none. `loaded` is what the session itself reports loading, read from Claude Code's start message, so it is the version the run actually used: compare it with `after`. A `refreshed` outcome with `loaded` behind `after` is an update that landed without changing what the session loaded. No credential or token goes into the record.
+- Any outcome but `refreshed` is also posted as a `runner.warning` ("plugin refresh timed_out; the session loaded review@0.214.0"), the event for a problem that didn't end the run, so a client that watches warnings, such as the MCP `wait` tool, sees it without reading `run.started`.
+
+`sky status <agent>` prints it without JSON, after the compare link:
+
+```
+plugins: timed_out (30.0s)
+  review@acme  before 0.214.0  after 0.214.0  loaded 0.214.0
+```
+
+A line ends with `(the session loaded X, not the installed Y)` when the two differ. `sky status --json` and `GET /v1/agents/:id/runs` carry the whole record.
 
 ### Approvals
 

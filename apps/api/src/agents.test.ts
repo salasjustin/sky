@@ -2011,6 +2011,7 @@ test("GET of an ended run returns its branch and its diff against the env's base
     rollup: null,
     compareUrl: null,
     secretNames: [],
+    plugins: null,
   });
   expect(lastExec()).toMatch(
     new RegExp(
@@ -2407,6 +2408,54 @@ const listRuns = async (agentId: string) => {
     body: (await res.json()) as { data: { id: string }[] },
   };
 };
+
+const pluginRecord = {
+  outcome: "timed_out",
+  durationMs: 30_000,
+  before: [{ name: "kru", marketplace: "kru", version: "0.214.0" }],
+  after: [{ name: "kru", marketplace: "kru", version: "0.214.0" }],
+  loaded: [{ name: "kru", marketplace: "kru", version: "0.214.0" }],
+};
+
+test("a run's plugin record from its run.started is on the run, in the list and on its own", async () => {
+  const { agent, run, token } = await runningRun();
+  expect((await getRun(agent.id, run.id)).body.plugins).toBeNull();
+  expect(
+    (
+      await postEvent(token, {
+        runId: run.id,
+        type: "run.started",
+        payload: { sessionId: "sess-1", plugins: pluginRecord },
+      })
+    ).status,
+  ).toBe(201);
+  expect((await getRun(agent.id, run.id)).body.plugins).toEqual(pluginRecord);
+  const listed = await listRuns(agent.id);
+  expect(listed.body.data[0]).toMatchObject({ plugins: pluginRecord });
+});
+
+test("a run.started whose plugin record is malformed is refused, and one without a record leaves plugins null", async () => {
+  const { agent, run, token } = await runningRun();
+  const bad = await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: {
+      sessionId: "sess-1",
+      plugins: { ...pluginRecord, durationMs: -1 },
+    },
+  });
+  expect(bad.status).toBe(400);
+  expect(
+    (
+      await postEvent(token, {
+        runId: run.id,
+        type: "run.started",
+        payload: { sessionId: "sess-1" },
+      })
+    ).status,
+  ).toBe(201);
+  expect((await getRun(agent.id, run.id)).body.plugins).toBeNull();
+});
 
 test("GET runs lists the agent's runs newest first, ties by insert order, without diffs or waking the sprite", async () => {
   const { agent, run } = await finishedRun();

@@ -5,6 +5,7 @@ import {
   CreatedApiKey,
   Environment,
   type KeyInput,
+  PluginRefresh,
   PreviewState,
   RunStatus,
 } from "@sky/shared";
@@ -44,6 +45,8 @@ export const ApiRun = z
     compareUrl: z.string().nullable(),
     /** The Claude credential the run used, by name; absent from an older API. */
     claudeCredential: z.string().nullable().optional(),
+    /** What the start-of-run plugin refresh did and the plugin versions the session loaded; absent from an older API, null before the run starts. A shape this CLI can't read is dropped, not an error. */
+    plugins: PluginRefresh.nullish().catch(undefined),
   })
   .loose();
 export type ApiRun = z.infer<typeof ApiRun>;

@@ -184,7 +184,10 @@ const help = (io: Io) => `Usage:
       the run and any outage take; --timeout bounds both.
   sky status <agent> [options]
       Print "<runId> <status>", then its summary, error, the Claude
-      credential it used and its compare link.
+      credential it used, its compare link and the plugins it ran with: how
+      the plugin refresh at the start ended (refreshed, timed_out, failed or
+      skipped, with the reason) and, per plugin, the version before the
+      refresh, after it and the one the session loaded.
   sky approve <agent> <requestId> [--reason=<text>] [options]
   sky deny <agent> <requestId> --reason=<text> [options]
   sky answer <agent> <requestId> -- <text>
