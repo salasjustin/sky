@@ -178,8 +178,8 @@ function splitLegacyOutcome(raw: unknown): unknown {
  * are the user-scope plugins either side of the refresh, per `claude plugin list`, each cut to its
  * first 100. Either is null when the refresh never read that list (a skip before any listing, or a
  * refresh cut short before the read), and `[]` when it read the list and found no plugins, so null means "not
- * read", not "none". A record from before the codes, whose lists are always arrays, reads as it was
- * written. `loaded` is what the session's own init reports it loaded, from any scope, which is what
+ * read", not "none". A record from before the codes has its `<code>: <reason>` outcome split into the
+ * two, and keeps its lists as arrays, where `[]` can also be a list it never read. `loaded` is what the session's own init reports it loaded, from any scope, which is what
  * counts when `plugin update` and the session disagree.
  */
 export const PluginRefresh = z.preprocess(
