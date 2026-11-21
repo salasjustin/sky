@@ -16,10 +16,12 @@ internal.addSubnet("192.168.0.0", 16, "ipv4");
 internal.addSubnet("198.18.0.0", 15, "ipv4");
 internal.addSubnet("224.0.0.0", 4, "ipv4");
 internal.addSubnet("240.0.0.0", 4, "ipv4");
-// IPv4-compatible ::/96 (which holds :: and ::1), discard, Teredo, documentation, 6to4, local-use NAT64
+// IPv4-compatible ::/96 (which holds :: and ::1), discard, Teredo, benchmarking, documentation, 6to4,
+// local-use NAT64
 internal.addSubnet("::", 96, "ipv6");
 internal.addSubnet("100::", 64, "ipv6");
 internal.addSubnet("2001::", 32, "ipv6");
+internal.addSubnet("2001:2::", 48, "ipv6");
 internal.addSubnet("2001:db8::", 32, "ipv6");
 internal.addSubnet("2002::", 16, "ipv6");
 internal.addSubnet("64:ff9b:1::", 48, "ipv6");
