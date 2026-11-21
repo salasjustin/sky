@@ -134,7 +134,7 @@ const idOf = (plugin: PluginVersion) =>
     ? plugin.name
     : `${plugin.name}@${plugin.marketplace}`;
 
-/** The user-scope plugins of a `claude plugin list --json`, each once, as `name@marketplace` split. */
+/** The user-scope plugins of a `claude plugin list --json`, each once, its `name@marketplace` id split. */
 function userPlugins(stdout: string): PluginVersion[] {
   const installed = JSON.parse(stdout) as {
     id: string;
@@ -238,7 +238,7 @@ export async function refreshPlugins(options: {
           }
           after = await list(signal);
         } catch (error) {
-          // still under the lock: what the session starts with, which an update that landed before the cut changed
+          // still under the lock, read back what the session will start with: an update that landed before the cut changed it
           if (!stop?.aborted) {
             // its own timeout, since the refresh's is spent by now, but still ended by a stop
             const listTimeout = AbortSignal.timeout(

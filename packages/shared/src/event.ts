@@ -147,7 +147,7 @@ export const PluginVersion = z.object({
 export type PluginVersion = z.infer<typeof PluginVersion>;
 
 /**
- * What the start-of-run plugin refresh did, for a PM to read from the run. `outcome` is `refreshed`,
+ * What the start-of-run plugin refresh did, as the run records it. `outcome` is `refreshed`,
  * `timed_out`, `failed: <reason>` or `skipped: <reason>`. `before` and `after` are the user-scope
  * plugins either side of the refresh, per `claude plugin list`; `loaded` is what the session's own
  * init reports it loaded, which is what counts when `plugin update` and the session disagree.

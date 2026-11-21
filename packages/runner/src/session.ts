@@ -1423,8 +1423,8 @@ export async function runSession(
               : { signal: abortController.signal }),
           },
         );
-        // a refresh that didn't end in `refreshed` is also a warning, the channel a problem that
-        // didn't end the run already has, so it reaches whoever watches warnings, not only run.started's readers
+        // a refresh that didn't end in `refreshed` is also posted as a warning, so a client that
+        // watches warnings sees it without reading run.started
         if (plugins && plugins.outcome !== "refreshed") {
           const loaded =
             plugins.loaded.map((p) => `${p.name}@${p.version}`).join(", ") ||
