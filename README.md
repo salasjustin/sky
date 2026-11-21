@@ -10,6 +10,8 @@ Sky runs Claude Code agents on your own servers while you're away. Point it at a
 
 Sky is not affiliated with or endorsed by Anthropic.
 
+[![Watch a 44-second film about Sky: agents move their builds off your computer and into sprites](https://marketing-justin.fly.storage.tigris.dev/sky/film/v6/sky-film-v6-poster.jpg)](https://marketing-justin.fly.storage.tigris.dev/sky/film/v6/sky-film-v6.mp4)
+
 ## Where to use it
 
 Sky is self-hosted: there is no shared instance. Deploy your own with [CONTRIBUTING.md](CONTRIBUTING.md#deploy); every example below uses `https://<your-app>.fly.dev`.
