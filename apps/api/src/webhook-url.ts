@@ -72,7 +72,7 @@ export function isInternalAddress(address: string): boolean {
 
 /**
  * Whether a subscriber URL's host is a public name or address: not `localhost`, not a name under
- * `.internal`, `.flycast`, `.local` or `.home.arpa`, not a single-label name, and not a literal
+ * `.localhost`, `.internal`, `.flycast`, `.local` or `.home.arpa`, not a single-label name, and not a literal
  * internal IP. Checks the WHATWG-parsed host, which canonicalizes hex, octal and dword IPv4 spellings.
  * A URL carrying a username or password is refused.
  * A public-looking name that resolves to an internal address is refused at connect time, by
