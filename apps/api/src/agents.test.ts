@@ -2497,6 +2497,51 @@ test("an event already stored with a free-text outcome and plain lists still rea
   });
 });
 
+const storeRunStarted = (runId: string, payload: unknown) =>
+  db.$client
+    .prepare(
+      "insert into events (run_id, ts, type, payload) values (?, ?, 'run.started', ?)",
+    )
+    .run(runId, new Date().toISOString(), JSON.stringify(payload));
+
+const listedRunStarted = async (agentId: string) => {
+  const res = await app.request(
+    `/v1/events?after=evt_0&wait=0&types=run.started&agentId=${agentId}`,
+    { headers: auth },
+  );
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { data: { payload: object }[] }).data.map(
+    (e) => e.payload,
+  );
+};
+
+test("an event already stored with a free-text outcome reads as a code and a reason in the events list", async () => {
+  const { agent, run } = await runningRun();
+  storeRunStarted(run.id, {
+    sessionId: "sess-1",
+    plugins: { ...pluginRecord, outcome: "failed: could not resolve host" },
+  });
+  expect(await listedRunStarted(agent.id)).toEqual([
+    {
+      sessionId: "sess-1",
+      plugins: {
+        ...pluginRecord,
+        outcome: "failed",
+        reason: "could not resolve host",
+      },
+    },
+  ]);
+});
+
+test("an event already stored with a plugin record that doesn't parse is listed without it", async () => {
+  const { agent, run } = await runningRun();
+  storeRunStarted(run.id, {
+    sessionId: "sess-1",
+    plugins: { ...pluginRecord, durationMs: -1 },
+  });
+  expect(await listedRunStarted(agent.id)).toEqual([{ sessionId: "sess-1" }]);
+});
+
 test("a run.started carries never-read lists as null, apart from lists with no plugins", async () => {
   const { agent, run, token } = await runningRun();
   const record = {

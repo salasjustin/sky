@@ -12,7 +12,7 @@ import {
   type AgentStatus,
   type EventType,
   HEARTBEAT_INTERVAL_MS,
-  PluginRefresh,
+  type PluginRefresh,
   type RunId,
   RunStatus,
   runTransitions,
@@ -33,7 +33,7 @@ import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { mintAgentToken } from "./agent-token.js";
 import { enqueueDeliveries } from "./deliveries.js";
 import { eventText } from "./redact.js";
-import { runEvents } from "./run-events.js";
+import { runEvents, storedPlugins } from "./run-events.js";
 
 export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type RunRow = typeof runs.$inferSelect;
@@ -139,10 +139,9 @@ export function runPlugins(tx: Db | Tx, runId: RunId): PluginRefresh | null {
     .where(and(eq(events.runId, runId), eq(events.type, "run.started")))
     .orderBy(desc(events.id))
     .get();
-  const parsed = PluginRefresh.safeParse(
+  return storedPlugins(
     (row?.payload as { plugins?: unknown } | undefined)?.plugins,
   );
-  return parsed.success ? parsed.data : null;
 }
 
 /**
