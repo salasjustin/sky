@@ -668,6 +668,74 @@ describe("refreshPlugins with a worktree", () => {
     await refreshHere({ run, projectDir: undefined });
     expect(calls.some((c) => c.args.includes("project"))).toBe(false);
   });
+
+  /** A lock another live run holds for 50ms, as when a second agent of the project starts beside it. */
+  const heldBriefly = () => {
+    const lockFile = join(lockDir, "held");
+    writeFileSync(lockFile, String(process.pid));
+    setTimeout(() => rmSync(lockFile), 50);
+    return lockFile;
+  };
+
+  test("a run that waited out another run's refresh still updates its own worktree's record, and nothing else", async () => {
+    const lockFile = heldBriefly();
+    // the holder moved the user scope; this worktree's record is where setup left it
+    const { run, versions, calls } = pinned("0.239.0", "0.161.0", "0.239.0");
+    const warn = vi.fn();
+    const result = await refreshHere({ run, lockFile, warn });
+    expect(calls).toEqual([
+      { args: ["plugin", "list", "--json"] },
+      {
+        args: ["plugin", "update", "kru@kru", "--scope", "project"],
+        cwd: worktree,
+      },
+      { args: ["plugin", "list", "--json"] },
+    ]);
+    expect(versions).toEqual({ user: "0.239.0", project: "0.239.0" });
+    expect(result).toMatchObject({
+      outcome: "refreshed",
+      before: [{ name: "kru", marketplace: "kru", version: "0.239.0" }],
+      after: [{ name: "kru", marketplace: "kru", version: "0.239.0" }],
+    });
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0]?.[0]).toMatch(
+      /^runner: another run refreshed the plugins; this worktree's records updated in \d+\.\ds \(kru@kru \(project\)\)$/,
+    );
+    expect(existsSync(lockFile)).toBe(false);
+  });
+
+  test("a waiting run whose worktree has no record lists once and is skipped with that reason", async () => {
+    const lockFile = heldBriefly();
+    const { run, calls } = pinned("1.0.0", "1.0.0", "2.0.0");
+    const result = await refreshHere({
+      run,
+      lockFile,
+      projectDir: "/work/fresh",
+    });
+    expect(calls).toEqual([{ args: ["plugin", "list", "--json"] }]);
+    expect(result).toMatchObject({
+      outcome: "skipped",
+      reason: "another run refreshed the plugins",
+      before: [{ name: "kru", marketplace: "kru", version: "1.0.0" }],
+      after: [{ name: "kru", marketplace: "kru", version: "1.0.0" }],
+    });
+  });
+
+  test("a waiting run's failing worktree update is a failed outcome naming it", async () => {
+    const lockFile = heldBriefly();
+    const { run } = pinned("1.0.0", "0.1.0", "2.0.0");
+    const result = await refreshHere({
+      lockFile,
+      run: async (f, args, options) => {
+        if (args.at(-1) === "project") throw new Error("marketplace gone");
+        return run(f, args, options);
+      },
+    });
+    expect(result).toMatchObject({
+      outcome: "failed",
+      reason: "update failed for kru@kru project scope (marketplace gone)",
+    });
+  });
 });
 
 describe("PluginRefresh", () => {

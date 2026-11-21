@@ -63,15 +63,19 @@ const alive = (pid: number) => {
 /**
  * Runs `task` holding a lock file, so concurrent runs on a sprite refresh one at a time: each
  * `claude` a refresh runs rewrites the shared `~/.claude.json`. A run that waited on a live holder
- * and then saw the lock released doesn't run `task`: the holder just ran the same refresh. A lock
- * whose holder is gone is taken over and `task` runs. Resolves to "aborted", without running `task`,
- * when `signal` aborts while it waits; a lock that can't be made at all runs `task` unlocked.
+ * and then saw the lock released doesn't run `task`, since the holder just ran it: it takes the lock,
+ * runs `afterHolder` and resolves to "after-holder", or, given none, resolves to "done-by-holder"
+ * having run nothing. A live holder that takes the lock again first is waited out the same way, for
+ * as long as `signal` allows. A lock whose holder is gone is taken over and `task` runs. Resolves to
+ * "aborted", having run nothing, when `signal` aborts while it waits; a lock that can't be made at
+ * all runs `task` unlocked.
  */
 export async function withRefreshLock(
   lockFile: string,
   signal: AbortSignal,
   task: () => Promise<void>,
-): Promise<"ran" | "done-by-holder" | "aborted"> {
+  afterHolder?: () => Promise<void>,
+): Promise<"ran" | "after-holder" | "done-by-holder" | "aborted"> {
   let waitedOnLiveHolder = false;
   for (;;) {
     let fd: number;
@@ -104,14 +108,15 @@ export async function withRefreshLock(
       continue;
     }
     try {
-      if (waitedOnLiveHolder) {
+      const next = waitedOnLiveHolder ? afterHolder : task;
+      if (!next) {
         closeSync(fd);
         return "done-by-holder";
       }
       writeSync(fd, String(process.pid));
       closeSync(fd);
-      await task();
-      return "ran";
+      await next();
+      return waitedOnLiveHolder ? "after-holder" : "ran";
     } finally {
       try {
         unlinkSync(lockFile);
@@ -203,12 +208,16 @@ function sameDir(a: string, b: string): boolean {
  * installed, and a session can load it over the user's. The repo's own files are never touched.
  * The marketplaces are reached the way
  * provisioning added them, by the same `claude` and env. A run that waited out another run's
- * refresh on the sprite skips its own and says so on `warn`. Best effort: one overall timeout, a
+ * refresh on the sprite skips the marketplace and user-scope updates, since that run just made them,
+ * but takes the lock after it to update its own worktree's project-scope records the same way, which
+ * that run's refresh didn't touch; with none to update, or no `projectDir`, it records `skipped`, and
+ * either way says so on `warn`. Best effort: one overall timeout, the wait included, a
  * failure is one line on `warn`, and the session carries on with the cached versions. `signal` is
  * the run's stop: aborting it ends the refresh at once, and an already-aborted one spawns nothing.
  * Resolves to the record of what it did: the user-scope plugins before and after (null for a list
- * it never read), the outcome code (`refreshed`, `timed_out`, `failed` or `skipped`), the reason for
- * a `failed` or `skipped` one, and how long it took. Never throws.
+ * it never read; a waiting run with nothing to update has its one listing as both), the outcome
+ * code (`refreshed`, `timed_out`, `failed` or `skipped`), the reason for a `failed` or `skipped`
+ * one, and how long it took. Never throws.
  */
 export async function refreshPlugins(options: {
   env: NodeJS.ProcessEnv;
@@ -264,21 +273,28 @@ export async function refreshPlugins(options: {
         .stdout,
       options.projectDir,
     );
+  const claudeRun = (...args: string[]) => run(claude, args, { env, signal });
   let failedUpdates = "";
-  try {
-    // the wait for another run's refresh counts against this one's budget; ending it skips ours
-    const outcome = await withRefreshLock(lockFile, signal, async () => {
-      const claudeRun = (...args: string[]) =>
-        run(claude, args, { env, signal });
-      const read = await list(signal);
-      before = read.plugins;
-      const updated: string[] = [];
-      const failed: string[] = [];
-      if (before.length === 0) {
-        // nothing installed, so nothing for the refresh to change
-        after = [];
-      } else {
-        try {
+  // set by a waiting run whose own pass found no record of its worktree to update
+  let nothingPinnedHere = false;
+  /** One pass under the lock: the whole refresh, or, after another run's, this worktree's records only. */
+  const pass = (whole: boolean) => async () => {
+    const read = await list(signal);
+    before = read.plugins;
+    if (!whole && read.pinnedHere.length === 0) {
+      // no command ran since the listing, so it is the state either side
+      after = before;
+      nothingPinnedHere = true;
+      return;
+    }
+    const updated: string[] = [];
+    const failed: string[] = [];
+    if (before.length === 0) {
+      // nothing installed, so nothing for the refresh to change
+      after = [];
+    } else {
+      try {
+        if (whole) {
           await claudeRun("plugin", "marketplace", "update");
           for (const plugin of before.map(idOf)) {
             try {
@@ -289,51 +305,70 @@ export async function refreshPlugins(options: {
               failed.push(`${plugin} (${firstLine(error)})`);
             }
           }
-          // the worktree's own record of a plugin, which the user-scope update leaves where it was
-          for (const plugin of read.pinnedHere) {
-            try {
-              await run(
-                claude,
-                ["plugin", "update", plugin, "--scope", "project"],
-                { env, signal, cwd: options.projectDir },
-              );
-              updated.push(`${plugin} (project)`);
-            } catch (error) {
-              if (signal.aborted) throw error;
-              failed.push(`${plugin} project scope (${firstLine(error)})`);
-            }
-          }
-          after = (await list(signal)).plugins;
-        } catch (error) {
-          // still under the lock, read back what is installed now: an update that landed before the cut may have changed it
-          if (!stop?.aborted) {
-            // its own timeout, since the refresh's is spent by now, but still ended by a stop
-            const listTimeout = AbortSignal.timeout(
-              options.listTimeoutMs ?? LIST_TIMEOUT_MS,
-            );
-            try {
-              after = (
-                await list(
-                  stop ? AbortSignal.any([stop, listTimeout]) : listTimeout,
-                )
-              ).plugins;
-            } catch {}
-          }
-          throw error;
         }
+        // the worktree's own record of a plugin, which the user-scope update leaves where it was
+        for (const plugin of read.pinnedHere) {
+          try {
+            await run(
+              claude,
+              ["plugin", "update", plugin, "--scope", "project"],
+              { env, signal, cwd: options.projectDir },
+            );
+            updated.push(`${plugin} (project)`);
+          } catch (error) {
+            if (signal.aborted) throw error;
+            failed.push(`${plugin} project scope (${firstLine(error)})`);
+          }
+        }
+        after = (await list(signal)).plugins;
+      } catch (error) {
+        // still under the lock, read back what is installed now: an update that landed before the cut may have changed it
+        if (!stop?.aborted) {
+          // its own timeout, since the refresh's is spent by now, but still ended by a stop
+          const listTimeout = AbortSignal.timeout(
+            options.listTimeoutMs ?? LIST_TIMEOUT_MS,
+          );
+          try {
+            after = (
+              await list(
+                stop ? AbortSignal.any([stop, listTimeout]) : listTimeout,
+              )
+            ).plugins;
+          } catch {}
+        }
+        throw error;
       }
-      failedUpdates =
-        failed.length > 0 ? `update failed for ${failed.join(", ")}` : "";
-      const failures = failedUpdates === "" ? "" : `; ${failedUpdates}`;
-      warn(
-        `runner: plugins refreshed in ${seconds(now() - started)}s (${updated.join(", ") || (before.length > 0 ? "none updated" : "none installed")})${failures}`,
-      );
-    });
-    if (outcome === "done-by-holder") {
+    }
+    failedUpdates =
+      failed.length > 0 ? `update failed for ${failed.join(", ")}` : "";
+    const failures = failedUpdates === "" ? "" : `; ${failedUpdates}`;
+    const took = seconds(now() - started);
+    const what =
+      updated.join(", ") ||
+      (before.length > 0 ? "none updated" : "none installed");
+    warn(
+      whole
+        ? `runner: plugins refreshed in ${took}s (${what})${failures}`
+        : `runner: another run refreshed the plugins; this worktree's records updated in ${took}s (${what})${failures}`,
+    );
+  };
+  try {
+    // the wait for another run's refresh counts against this one's budget; ending it skips ours.
+    // That run updated only its own worktree's project-scope records, so this one still updates its own.
+    const outcome = await withRefreshLock(
+      lockFile,
+      signal,
+      pass(true),
+      options.projectDir === undefined ? undefined : pass(false),
+    );
+    if (
+      outcome === "done-by-holder" ||
+      (outcome === "after-holder" && nothingPinnedHere)
+    ) {
       warn(
         `runner: plugin refresh skipped, another run refreshed the plugins (waited ${seconds(now() - started)}s)`,
       );
-      // no `claude` runs outside the lock, so this run records only what its session loaded
+      // `before` and `after` are null unless this run listed the plugins under the lock itself
       return record("skipped", "another run refreshed the plugins");
     }
     // ended while another run held the lock
