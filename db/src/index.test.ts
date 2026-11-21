@@ -953,6 +953,7 @@ test("migrating a populated 0010 file keeps every event id, payload and delivery
     "events_claude_ts",
     "events_heartbeat_ts",
     "events_run_id_id",
+    "events_run_id_type_id",
     "webhook_deliveries_event_id",
     "webhook_deliveries_status_next_attempt_at",
     "webhook_deliveries_webhook_id_event_id",
@@ -1238,7 +1239,12 @@ test("migrating a populated 0017 file keeps every event, id, index and remaining
       )
       .pluck()
       .all(),
-  ).toEqual(["events_claude_ts", "events_heartbeat_ts", "events_run_id_id"]);
+  ).toEqual([
+    "events_claude_ts",
+    "events_heartbeat_ts",
+    "events_run_id_id",
+    "events_run_id_type_id",
+  ]);
   expect(
     planOf(
       "select id from events where type glob 'claude.*' and ts < ?",
@@ -1346,7 +1352,7 @@ test("the refusal names the pending migrations, the sizes in MB and the fix, on 
     message = err instanceof Error ? err.message : String(err);
   }
   expect(message).toBe(
-    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine, 0021_magical_klaw needs ${mb(needed)} (${mb(2 * events)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
+    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine, 0021_magical_klaw, 0022_aberrant_wolverine needs ${mb(needed)} (${mb(2 * events)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
   );
 });
 

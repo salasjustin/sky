@@ -2434,7 +2434,7 @@ test("a run's plugin record from its run.started is on the run, in the list and 
   expect(listed.body.data[0]).toMatchObject({ plugins: pluginRecord });
 });
 
-test("a run.started whose plugin record is malformed is refused, and one without a record leaves plugins null", async () => {
+test("a run.started whose plugin record is malformed is stored without it, with a log line, and the run starts", async () => {
   const { agent, run, token } = await runningRun();
   const bad = await postEvent(token, {
     runId: run.id,
@@ -2444,17 +2444,90 @@ test("a run.started whose plugin record is malformed is refused, and one without
       plugins: { ...pluginRecord, durationMs: -1 },
     },
   });
-  expect(bad.status).toBe(400);
+  expect(bad.status).toBe(201);
+  expect(
+    logs.some((l) => l.includes("plugin record") && l.includes(run.id)),
+  ).toBe(true);
+  const stored = db.$client
+    .prepare("select payload from events where type = 'run.started'")
+    .all() as { payload: string }[];
+  expect(stored.map((e) => JSON.parse(e.payload))).toEqual([
+    { sessionId: "sess-1" },
+  ]);
+  expect((await getRun(agent.id, run.id)).body.plugins).toBeNull();
+});
+
+test("a run.started with a record from before outcome was a code stores it as a code and a reason", async () => {
+  const { agent, run, token } = await runningRun();
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: {
+      sessionId: "sess-1",
+      plugins: { ...pluginRecord, outcome: "failed: could not resolve host" },
+    },
+  });
+  expect(res.status).toBe(201);
+  expect((await getRun(agent.id, run.id)).body.plugins).toEqual({
+    ...pluginRecord,
+    outcome: "failed",
+    reason: "could not resolve host",
+  });
+});
+
+test("an event already stored with a free-text outcome and plain lists still reads on the run", async () => {
+  const { agent, run } = await runningRun();
+  db.$client
+    .prepare(
+      "insert into events (run_id, ts, type, payload) values (?, ?, 'run.started', ?)",
+    )
+    .run(
+      run.id,
+      new Date().toISOString(),
+      JSON.stringify({
+        sessionId: "sess-1",
+        plugins: { ...pluginRecord, outcome: "skipped: stopped", before: [] },
+      }),
+    );
+  expect((await getRun(agent.id, run.id)).body.plugins).toEqual({
+    ...pluginRecord,
+    outcome: "skipped",
+    reason: "stopped",
+    before: [],
+  });
+});
+
+test("a run.started carries never-read lists as null, apart from lists with no plugins", async () => {
+  const { agent, run, token } = await runningRun();
+  const record = {
+    outcome: "skipped",
+    reason: "stopped",
+    durationMs: 0,
+    before: null,
+    after: [],
+    loaded: [],
+  };
   expect(
     (
       await postEvent(token, {
         runId: run.id,
         type: "run.started",
-        payload: { sessionId: "sess-1" },
+        payload: { sessionId: "sess-1", plugins: record },
       })
     ).status,
   ).toBe(201);
-  expect((await getRun(agent.id, run.id)).body.plugins).toBeNull();
+  expect((await getRun(agent.id, run.id)).body.plugins).toEqual(record);
+});
+
+test("the plugin record's lookup of a run's latest run.started walks an index on run, type and id", () => {
+  const plan = db.$client
+    .prepare(
+      "explain query plan select payload from events where run_id = ? and type = 'run.started' order by id desc limit 1",
+    )
+    .all("run_x") as { detail: string }[];
+  expect(plan.map((p) => p.detail).join("\n")).toContain(
+    "events_run_id_type_id",
+  );
 });
 
 test("GET runs lists the agent's runs newest first, ties by insert order, without diffs or waking the sprite", async () => {

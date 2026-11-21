@@ -146,28 +146,60 @@ export const PluginVersion = z.object({
 });
 export type PluginVersion = z.infer<typeof PluginVersion>;
 
+/** How the start-of-run plugin refresh ended. */
+export const PluginRefreshOutcome = z.enum([
+  "refreshed",
+  "timed_out",
+  "failed",
+  "skipped",
+]);
+export type PluginRefreshOutcome = z.infer<typeof PluginRefreshOutcome>;
+
 /**
- * What the start-of-run plugin refresh did, as the run records it. `outcome` is `refreshed`,
- * `timed_out`, `failed: <reason>` or `skipped: <reason>`. `before` and `after` are the user-scope
- * plugins either side of the refresh, per `claude plugin list`, each cut to its first 100. `after`
- * is empty on every skip, and `before` is too unless the run was stopped after reading it. Either is
- * empty when the refresh ended before reading that list, so an empty `after` means "not read", not
- * "removed". `loaded` is what the session's own init reports it
- * loaded, from any scope, which is what counts when `plugin update` and the session disagree.
+ * A record from before `outcome` was a code carried the reason in it (`failed: <reason>`,
+ * `skipped: <reason>`); split it so the old record reads as a new one. Anything else is left alone.
  */
-export const PluginRefresh = z.object({
-  outcome: z.string().min(1).max(300),
-  durationMs: z.number().int().nonnegative(),
-  before: z.array(PluginVersion).max(100),
-  after: z.array(PluginVersion).max(100),
-  loaded: z.array(PluginVersion).max(100),
-});
+function splitLegacyOutcome(raw: unknown): unknown {
+  if (typeof raw !== "object" || raw === null || !("outcome" in raw))
+    return raw;
+  const match =
+    typeof raw.outcome === "string"
+      ? /^(failed|skipped|timed_out|refreshed)(?:: ([\s\S]*))?$/.exec(
+          raw.outcome,
+        )
+      : null;
+  if (!match?.[2]) return raw;
+  return { ...raw, outcome: match[1], reason: match[2] };
+}
+
+/**
+ * What the start-of-run plugin refresh did, as the run records it. `outcome` is a code: `refreshed`,
+ * `timed_out`, `failed` or `skipped`; `reason` says why for a `failed` or `skipped` one. `before` and `after`
+ * are the user-scope plugins either side of the refresh, per `claude plugin list`, each cut to its
+ * first 100. Either is null when the refresh never read that list (every skip, and a refresh cut
+ * short before the read), and `[]` when it read the list and found no plugins, so null means "not
+ * read", not "none". A record from before the codes, whose lists are always arrays, reads as it was
+ * written. `loaded` is what the session's own init reports it loaded, from any scope, which is what
+ * counts when `plugin update` and the session disagree.
+ */
+export const PluginRefresh = z.preprocess(
+  splitLegacyOutcome,
+  z.object({
+    outcome: PluginRefreshOutcome,
+    reason: z.string().min(1).max(300).optional(),
+    durationMs: z.number().int().nonnegative(),
+    before: z.array(PluginVersion).max(100).nullable(),
+    after: z.array(PluginVersion).max(100).nullable(),
+    loaded: z.array(PluginVersion).max(100),
+  }),
+);
 export type PluginRefresh = z.infer<typeof PluginRefresh>;
 
 const runPayloads = {
   /**
    * `sessionId` is the Claude session the API stores to resume the agent's next run. `plugins` is the
-   * run's plugin record; absent from an older runner.
+   * run's plugin record; absent from an older runner, and from a start whose record the API couldn't
+   * read.
    */
   "run.started": z.object({
     sessionId: z.string().min(1),

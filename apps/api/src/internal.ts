@@ -5,6 +5,7 @@ import {
   EVENT_TEXT_MAX,
   type EventType,
   type PendingRequest,
+  PluginRefresh,
   RequestId,
   RunId,
   RunnerEventPost,
@@ -129,10 +130,23 @@ const answered = (decision: StoredDecision | null | undefined) =>
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 
-/** `RunnerEventPost`, except a rollup that fails `RunRollup` is dropped with a log line rather than failing the event. */
+/**
+ * `RunnerEventPost`, except a rollup that fails `RunRollup`, or a `run.started`'s plugin record that
+ * fails `PluginRefresh`, is dropped with a log line rather than failing the event.
+ */
 const eventPost = (log: (line: string) => void) =>
   z.preprocess((raw) => {
     if (!isRecord(raw) || !isRecord(raw.payload)) return raw;
+    if (raw.type === "run.started") {
+      const { plugins, ...payload } = raw.payload;
+      if (plugins === undefined) return raw;
+      const parsed = PluginRefresh.safeParse(plugins);
+      if (parsed.success) return raw;
+      log(
+        `dropped unparseable plugin record on run.started for ${JSON.stringify(raw.runId)}: ${z.prettifyError(parsed.error)}`,
+      );
+      return { ...raw, payload };
+    }
     if (raw.type !== "run.finished" && raw.type !== "run.failed") return raw;
     const { rollup, ...payload } = raw.payload;
     if (rollup === undefined) return raw;

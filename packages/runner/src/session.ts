@@ -1432,7 +1432,7 @@ export async function runSession(
           void post({
             type: "runner.warning",
             payload: {
-              message: `plugin refresh ${plugins.outcome}; the session loaded ${loaded}`,
+              message: `plugin refresh ${plugins.outcome}${plugins.reason ? `: ${plugins.reason}` : ""}; the session loaded ${loaded}`,
             },
           }).catch(() => {});
         }

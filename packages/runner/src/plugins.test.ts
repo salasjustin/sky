@@ -332,9 +332,12 @@ describe("refreshPlugins record", () => {
         return fake.run(f, args);
       },
     });
-    expect(result.outcome).toBe("failed: update failed for kru@kru (delisted)");
-    expect(result.before.map((p) => p.version)).toEqual(["0.214.0", "1.0.0"]);
-    expect(result.after.map((p) => p.version)).toEqual(["0.214.0", "2.0.0"]);
+    expect(result).toMatchObject({
+      outcome: "failed",
+      reason: "update failed for kru@kru (delisted)",
+    });
+    expect(result.before?.map((p) => p.version)).toEqual(["0.214.0", "1.0.0"]);
+    expect(result.after?.map((p) => p.version)).toEqual(["0.214.0", "2.0.0"]);
   });
 
   test("a marketplace that can't be reached is a failed outcome with the reason and the versions it left", async () => {
@@ -346,7 +349,10 @@ describe("refreshPlugins record", () => {
         return fake.run(f, args);
       },
     });
-    expect(result.outcome).toBe("failed: could not resolve host");
+    expect(result).toMatchObject({
+      outcome: "failed",
+      reason: "could not resolve host",
+    });
     expect(result.before).toEqual(result.after);
     expect(result.before).toHaveLength(1);
   });
@@ -368,11 +374,11 @@ describe("refreshPlugins record", () => {
       },
     });
     expect(result.outcome).toBe("timed_out");
-    expect(result.before.map((p) => p.version)).toEqual(["0.214.0", "1.0.0"]);
-    expect(result.after.map((p) => p.version)).toEqual(["0.216.0", "1.0.0"]);
+    expect(result.before?.map((p) => p.version)).toEqual(["0.214.0", "1.0.0"]);
+    expect(result.after?.map((p) => p.version)).toEqual(["0.216.0", "1.0.0"]);
   });
 
-  test("a hung first listing is timed_out with nothing listed", async () => {
+  test("a hung first listing is timed_out with both lists never read", async () => {
     const result = await record({
       timeoutMs: 50,
       run: (_f, _a, { signal }) =>
@@ -382,8 +388,8 @@ describe("refreshPlugins record", () => {
     });
     expect(result).toMatchObject({
       outcome: "timed_out",
-      before: [],
-      after: [],
+      before: null,
+      after: null,
     });
   });
 
@@ -392,9 +398,10 @@ describe("refreshPlugins record", () => {
     const result = await record({ run, signal: AbortSignal.abort("SIGTERM") });
     expect(run).not.toHaveBeenCalled();
     expect(result).toMatchObject({
-      outcome: "skipped: stopped",
-      before: [],
-      after: [],
+      outcome: "skipped",
+      reason: "stopped",
+      before: null,
+      after: null,
     });
   });
 
@@ -405,10 +412,15 @@ describe("refreshPlugins record", () => {
     const run = vi.fn();
     const result = await record({ run, lockFile });
     expect(run).not.toHaveBeenCalled();
-    expect(result.outcome).toBe("skipped: another run refreshed the plugins");
+    expect(result).toMatchObject({
+      outcome: "skipped",
+      reason: "another run refreshed the plugins",
+      before: null,
+      after: null,
+    });
   });
 
-  test("no user-scope plugins is a refreshed outcome with nothing listed", async () => {
+  test("no user-scope plugins is a refreshed outcome with both lists read and empty", async () => {
     const result = await record({
       run: async () => ({
         stdout: JSON.stringify([
@@ -445,11 +457,12 @@ describe("refreshPlugins record", () => {
       },
     });
     expect(() => PluginRefresh.parse({ ...result, loaded: [] })).not.toThrow();
-    expect(result.outcome).toMatch(
-      /^failed: update failed for plugin-number-1@marketplace \(error: plugin plugin-number-1 not found in marketplace marketplace\), /,
+    expect(result.outcome).toBe("failed");
+    expect(result.reason).toMatch(
+      /^update failed for plugin-number-1@marketplace \(error: plugin plugin-number-1 not found in marketplace marketplace\), /,
     );
-    expect(result.outcome).not.toMatch(/Command failed/);
-    expect(result.outcome.endsWith("…")).toBe(true);
+    expect(result.reason).not.toMatch(/Command failed/);
+    expect(result.reason?.endsWith("…")).toBe(true);
   });
 
   test("an error with no stderr is recorded by its message", async () => {
@@ -458,7 +471,10 @@ describe("refreshPlugins record", () => {
         throw Object.assign(new Error("spawn c ENOENT\nmore"), { stderr: "" });
       },
     });
-    expect(result.outcome).toBe("failed: spawn c ENOENT");
+    expect(result).toMatchObject({
+      outcome: "failed",
+      reason: "spawn c ENOENT",
+    });
   });
 
   test("a listing of more user-scope plugins than run.started carries updates them all and is recorded within its bounds", async () => {
@@ -474,7 +490,7 @@ describe("refreshPlugins record", () => {
     expect(result.after).toHaveLength(100);
   });
 
-  test("a refresh cut at the timeout whose read-back fails records after as empty, not as before", async () => {
+  test("a refresh cut at the timeout whose read-back fails records after as never read, not as before", async () => {
     const fake = fakeClaude({ "kru@kru": "0.214.0" }, "0.216.0");
     let lists = 0;
     const result = await record({
@@ -492,7 +508,7 @@ describe("refreshPlugins record", () => {
     });
     expect(result.outcome).toBe("timed_out");
     expect(result.before).toHaveLength(1);
-    expect(result.after).toEqual([]);
+    expect(result.after).toBeNull();
   });
 
   test("a stop during the read-back after a timeout ends it promptly as stopped", async () => {
@@ -520,7 +536,7 @@ describe("refreshPlugins record", () => {
       },
     });
     expect(readBackAborted).toBe(true);
-    expect(result.outcome).toBe("skipped: stopped");
+    expect(result).toMatchObject({ outcome: "skipped", reason: "stopped" });
   });
 
   test("a listing that can't be read is a failed outcome, and a long reason is cut", async () => {
@@ -529,8 +545,169 @@ describe("refreshPlugins record", () => {
         throw new Error(`x${"y".repeat(500)}`);
       },
     });
-    expect(result.outcome.startsWith("failed: xyyy")).toBe(true);
-    expect(result.outcome.length).toBeLessThanOrEqual(210);
+    expect(result.outcome).toBe("failed");
+    expect(result.reason?.startsWith("xyyy")).toBe(true);
+    expect(result.reason?.length).toBeLessThanOrEqual(200);
+  });
+
+  test("a reason past the record's bound is cut so the run.started post still parses", async () => {
+    const result = await record({
+      run: async (_f, args) => {
+        if (args[1] === "list")
+          return {
+            stdout: JSON.stringify(
+              Array.from({ length: 20 }, (_, n) => ({
+                id: `plugin-${n}@m`,
+                scope: "user",
+              })),
+            ),
+          };
+        if (args[1] === "update") throw new Error("a".repeat(150));
+        return { stdout: "" };
+      },
+    });
+    expect(result.reason?.length).toBe(300);
+    expect(() => PluginRefresh.parse({ ...result, loaded: [] })).not.toThrow();
+  });
+});
+
+describe("refreshPlugins with a worktree", () => {
+  const worktree = "/work/agent";
+  /** A `claude` whose user-scope plugin is `userVersion` and whose worktree record is pinned at `projectVersion`. */
+  function pinned(userVersion: string, projectVersion: string, latest: string) {
+    const versions = { user: userVersion, project: projectVersion };
+    const calls: { args: string[]; cwd?: string }[] = [];
+    const run = async (
+      _f: string,
+      args: string[],
+      options: { cwd?: string },
+    ) => {
+      calls.push({ args, cwd: options.cwd });
+      if (args[1] === "list")
+        return {
+          stdout: JSON.stringify([
+            { id: "kru@kru", scope: "user", version: versions.user },
+            {
+              id: "kru@kru",
+              scope: "project",
+              version: versions.project,
+              projectPath: worktree,
+            },
+            // another agent's worktree: not this run's to touch
+            {
+              id: "kru@kru",
+              scope: "project",
+              version: "0.1.0",
+              projectPath: "/work/other",
+            },
+          ]),
+        };
+      if (args[1] === "update") {
+        const scope = args.at(-1) as "user" | "project";
+        // `--scope project` acts on the project of the directory it is run from
+        if (scope === "project" && options.cwd !== worktree)
+          throw new Error("not installed at project scope here");
+        versions[scope] = latest;
+      }
+      return { stdout: "" };
+    };
+    return { run, versions, calls };
+  }
+
+  const refreshHere = (
+    options: Partial<Parameters<typeof refreshPlugins>[0]>,
+  ) =>
+    refreshPlugins({
+      env: {},
+      warn: vi.fn(),
+      claude: "c",
+      lockFile: join(lockDir, "lock"),
+      projectDir: worktree,
+      ...options,
+    });
+
+  test("a stale project-scope record is updated from the worktree, so the session ends on the refreshed version", async () => {
+    const { run, versions, calls } = pinned("0.239.0", "0.161.0", "0.239.0");
+    // user scope already current: only the project record is behind
+    const result = await refreshHere({ run });
+    expect(result.outcome).toBe("refreshed");
+    expect(versions).toEqual({ user: "0.239.0", project: "0.239.0" });
+    const projectUpdates = calls.filter((c) => c.args.includes("project"));
+    expect(projectUpdates).toEqual([
+      {
+        args: ["plugin", "update", "kru@kru", "--scope", "project"],
+        cwd: worktree,
+      },
+    ]);
+    // the user-scope commands still run where the runner is
+    expect(calls.find((c) => c.args.at(-1) === "user")?.cwd).toBeUndefined();
+  });
+
+  test("another worktree's record, and a worktree without one, are left alone", async () => {
+    const { run, calls } = pinned("1.0.0", "1.0.0", "2.0.0");
+    await refreshHere({ run, projectDir: "/work/fresh" });
+    expect(calls.some((c) => c.args.includes("project"))).toBe(false);
+  });
+
+  test("a failing project-scope update is a failed outcome naming it, and the run carries on", async () => {
+    const { run } = pinned("1.0.0", "0.1.0", "2.0.0");
+    const result = await refreshHere({
+      run: async (f, args, options) => {
+        if (args.at(-1) === "project") throw new Error("marketplace gone");
+        return run(f, args, options);
+      },
+    });
+    expect(result).toMatchObject({
+      outcome: "failed",
+      reason: "update failed for kru@kru project scope (marketplace gone)",
+    });
+  });
+
+  test("without a worktree no project-scope update runs", async () => {
+    const { run, calls } = pinned("1.0.0", "0.1.0", "2.0.0");
+    await refreshHere({ run, projectDir: undefined });
+    expect(calls.some((c) => c.args.includes("project"))).toBe(false);
+  });
+});
+
+describe("PluginRefresh", () => {
+  const base = { durationMs: 1200, before: [], after: [], loaded: [] };
+
+  test.each([
+    ["failed: could not resolve host", "failed", "could not resolve host"],
+    ["skipped: stopped", "skipped", "stopped"],
+    [
+      "skipped: another run refreshed the plugins",
+      "skipped",
+      "another run refreshed the plugins",
+    ],
+    ["timed_out", "timed_out", undefined],
+    ["refreshed", "refreshed", undefined],
+  ])(
+    "a record written with the outcome %j reads as a code and a reason",
+    (outcome, code, reason) => {
+      const parsed = PluginRefresh.parse({ ...base, outcome });
+      expect(parsed.outcome).toBe(code);
+      expect(parsed.reason).toBe(reason);
+      expect(parsed.before).toEqual([]);
+    },
+  );
+
+  test("an outcome that is neither a code nor an old one is rejected", () => {
+    expect(
+      PluginRefresh.safeParse({ ...base, outcome: "exploded" }).success,
+    ).toBe(false);
+  });
+
+  test("a list that was never read is null, apart from a list with no plugins", () => {
+    const parsed = PluginRefresh.parse({
+      ...base,
+      outcome: "skipped",
+      reason: "stopped",
+      before: null,
+    });
+    expect(parsed.before).toBeNull();
+    expect(parsed.after).toEqual([]);
   });
 });
 
