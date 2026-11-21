@@ -607,6 +607,10 @@ Three ways to receive them:
 
   `GET /v1/webhooks` returns each webhook's `format` and `environmentIds` when set. A secret is never returned.
 
+  **Refused URLs.** A webhook URL must be `https` on the default port (443) and must name a public host. `POST /v1/webhooks` answers `400 url_not_allowed` for `localhost`, names ending in `.internal`, `.flycast`, `.local` or `.home.arpa`, single-label names, and addresses in private, loopback, link-local, unique-local (including Fly's private `fdaa::/16`), shared, multicast and reserved ranges, as well as IPv4-mapped and NAT64 forms of them. Sky also resolves the host when it connects and refuses the delivery if any resolved address is in one of those ranges, so a public name that points at a private address is refused too. A refused delivery is marked `failed` at once, with the error `blocked_address`, and is not retried. Addresses and ports never appear in a delivery's error text; they are replaced with `<addr>`.
+
+  A webhook created before these rules, whose host now fails them, is not deleted and still shows in `sky webhook list`, but each of its deliveries is refused. Delete it and add it again with a public URL.
+
 **`sky` format.** The body is the event itself. Each delivery carries `Sky-Event-Type`, `Sky-Event-Id`, and
 
 ```

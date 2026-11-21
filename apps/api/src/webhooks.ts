@@ -78,7 +78,7 @@ export function webhookRoutes() {
           c,
           400,
           "url_not_allowed",
-          "url must not name localhost or a loopback, private, link-local or unique-local address",
+          "url must be https on the default port and must not name localhost, an internal name or a loopback, private, link-local, unique-local or reserved address",
         );
       }
       if (!Webhook.shape.url.safeParse(input.url).success) {

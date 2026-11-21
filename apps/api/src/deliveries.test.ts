@@ -10,7 +10,7 @@ import {
 } from "@sky/db";
 import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
 import { eq } from "drizzle-orm";
-import { HttpResponse, http } from "msw";
+import { HttpResponse, http, passthrough } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { mintAgentToken } from "./agent-token.js";
@@ -24,6 +24,7 @@ import {
 } from "./deliveries.js";
 import { failStaleRuns } from "./runs.js";
 import { spritesToken, stubSprites, testConfig } from "./testing/sprites.js";
+import type { LookupFn } from "./webhook-url.js";
 
 const key = "webhook-signing-key-for-tests-0123456789";
 
@@ -404,6 +405,82 @@ test("a network error records no status, the reason, and a retry", async () => {
       nextAttemptAt: new Date(clock.getTime() + 10_000).toISOString(),
     }),
   ]);
+});
+
+async function failedBlocked(
+  setup: (dispatcher: Dispatcher) => void | Promise<void>,
+  url = subscriberUrl,
+  lookup?: LookupFn,
+) {
+  await subscribe(["run.finished"]);
+  db.$client.prepare("update webhooks set url = ?").run(url);
+  await dispatcher.stop();
+  dispatcher = createDispatcher({
+    db,
+    signingKey: config.webhookSigningKey,
+    secretEncryptionKey: config.secretEncryptionKey,
+    log: (line) => logs.push(line),
+    now: () => clock,
+    random: () => 0.5,
+    lookup,
+  });
+  await setup(dispatcher);
+  const { runId, token } = runningRun();
+  await postEvent(token, {
+    runId,
+    type: "run.finished",
+    payload: { summary: "ok", usage },
+  });
+  await dispatcher.drain();
+}
+
+const blockedRow = {
+  status: "failed",
+  attempts: 1,
+  lastStatus: null,
+  lastError: "blocked_address",
+};
+
+test("a public name that resolves to a private address is refused at connect, failed with no retry", async () => {
+  const resolved: string[] = [];
+  server.use(http.post(subscriberUrl, () => passthrough()));
+  await failedBlocked(
+    () => {},
+    subscriberUrl,
+    (host, _options, callback) => {
+      resolved.push(host);
+      callback(null, [{ address: "10.0.0.5", family: 4 }]);
+    },
+  );
+  expect(resolved).toEqual(["hooks.example.com"]);
+  expect(deliveries()).toEqual([expect.objectContaining(blockedRow)]);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toMatch(/failed: blocked_address; giving up$/);
+  expect(logs[0]).not.toMatch(/10\.0\.0\.5|hooks\.example\.com:/);
+  advance(3_600_000);
+  await dispatcher.drain();
+  expect(deliveries()[0]?.attempts).toBe(1);
+});
+
+test("a webhook stored with an internal name is refused and stays listed", async () => {
+  await failedBlocked(() => {}, "https://sky-api.internal/hook");
+  expect(deliveries()).toEqual([expect.objectContaining(blockedRow)]);
+  const listed = await app.request("/v1/webhooks", { headers: auth });
+  expect(
+    ((await listed.json()) as { data: { url: string }[] }).data.map(
+      (w) => w.url,
+    ),
+  ).toEqual(["https://sky-api.internal/hook"]);
+});
+
+test.each([
+  ["a literal private IP", "https://10.0.0.5/hook"],
+  ["a 6PN address", "https://[fdaa:0:1::3]/hook"],
+  ["a non-default port", "https://hooks.example.com:4280/hook"],
+  ["plain http", "http://hooks.example.com/hook"],
+])("a webhook stored with %s is refused at once", async (_, url) => {
+  await failedBlocked(() => {}, url);
+  expect(deliveries()).toEqual([expect.objectContaining(blockedRow)]);
 });
 
 test("a redirect is a failed attempt, never followed", async () => {
