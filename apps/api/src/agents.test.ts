@@ -42,6 +42,7 @@ import {
   failStaleRuns,
   failUnlaunchedRuns,
   pruneClaudeEvents,
+  runPlugins,
 } from "./runs.js";
 import {
   execInSprite,
@@ -2564,15 +2565,22 @@ test("a run.started carries never-read lists as null, apart from lists with no p
   expect((await getRun(agent.id, run.id)).body.plugins).toEqual(record);
 });
 
-test("the plugin record's lookup of a run's latest run.started walks an index on run, type and id", () => {
-  const plan = db.$client
-    .prepare(
-      "explain query plan select payload from events where run_id = ? and type = 'run.started' order by id desc limit 1",
-    )
-    .all("run_x") as { detail: string }[];
-  expect(plan.map((p) => p.detail).join("\n")).toContain(
-    "events_run_id_type_id",
-  );
+test("the plugin record's lookup of a run's latest run.started walks an index on run, type and id, with no sort", () => {
+  // the statement `runPlugins` really prepares, taken off the driver, then planned with its own bindings
+  const prepare = vi.spyOn(db.$client, "prepare");
+  try {
+    runPlugins(db, "run_x" as RunId);
+    const [sql] = prepare.mock.calls.map(([text]) => text);
+    expect(sql).toMatch(/from "events"/);
+    const plan = db.$client
+      .prepare(`explain query plan ${sql}`)
+      .all("run_x", "run.started") as { detail: string }[];
+    const detail = plan.map((p) => p.detail).join("\n");
+    expect(detail).toContain("events_run_id_type_id");
+    expect(detail).not.toContain("USE TEMP B-TREE");
+  } finally {
+    prepare.mockRestore();
+  }
 });
 
 test("GET runs lists the agent's runs newest first, ties by insert order, without diffs or waking the sprite", async () => {

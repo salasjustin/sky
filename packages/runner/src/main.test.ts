@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -826,4 +827,82 @@ describe("the runner's own commands", () => {
     },
     20_000,
   );
+
+  describe("the plugin refresh's project-scope update", () => {
+    /**
+     * A `claude` that lists a user plugin plus a project record at `projectPath`, and logs each
+     * call's argv and the directory it ran in.
+     */
+    function listingClaude(bin: string, projectPath: string) {
+      const listed = join(bin, "listing.json");
+      writeFileSync(
+        listed,
+        JSON.stringify([
+          { id: "kru@kru", scope: "user", version: "1.0.0" },
+          { id: "kru@kru", scope: "project", version: "0.1.0", projectPath },
+        ]),
+      );
+      const path = join(bin, "claude");
+      writeFileSync(
+        path,
+        `#!/bin/sh\n{ echo "argv: $*"; echo "cwd: $(pwd -P)"; } >> '${path}.seen'\ncat '${listed}'\n`,
+      );
+      chmodSync(path, 0o755);
+      return `${path}.seen`;
+    }
+
+    async function startRun(worktrees: string, bin: string) {
+      const { base } = await apiAndGateway();
+      return runBundle({
+        AGENT_ID: "agt_1",
+        RUN_ID: newRunId(),
+        PROMPT: "do it",
+        API_BASE_URL: base,
+        AGENT_TOKEN: "agent-secret",
+        CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+        // a directory git can start in; failing git ends the run after the refresh
+        REPO_DIR: dir,
+        WORKTREES_DIR: worktrees,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        SKY_CLAUDE: join(bin, "claude"),
+        TMPDIR: dir,
+      });
+    }
+
+    const failingGit = (bin: string) => recorder(bin, "git", "", 1);
+
+    test("an agent that has a worktree has its project-scope record updated from it", async () => {
+      const bin = join(dir, "bin");
+      mkdirSync(bin);
+      failingGit(bin);
+      const worktrees = join(dir, "worktrees");
+      const worktree = join(worktrees, "agt_1");
+      mkdirSync(worktree, { recursive: true });
+      const real = realpathSync(worktree);
+      const seen = listingClaude(bin, real);
+      const { stderr } = await startRun(worktrees, bin);
+      expect(stderr).toMatch(
+        /runner: plugins refreshed .*\(kru@kru, kru@kru \(project\)\)/,
+      );
+      // the update ran in the worktree named for the agent, not the run
+      expect(readFileSync(seen, "utf8")).toContain(
+        `argv: plugin update kru@kru --scope project\ncwd: ${real}\n`,
+      );
+    }, 20_000);
+
+    test("an agent with no worktree yet has none passed, so no project-scope update is tried", async () => {
+      const bin = join(dir, "bin");
+      mkdirSync(bin);
+      failingGit(bin);
+      const worktrees = join(dir, "worktrees");
+      // the record is for where the worktree will be, which doesn't exist
+      const seen = listingClaude(bin, join(worktrees, "agt_1"));
+      const { stderr } = await startRun(worktrees, bin);
+      // a refresh run with a bad cwd would instead report `update failed for kru@kru project scope`
+      expect(stderr).toMatch(
+        /runner: plugins refreshed in [\d.]+s \(kru@kru\)$/m,
+      );
+      expect(readFileSync(seen, "utf8")).not.toContain("--scope project");
+    }, 20_000);
+  });
 });

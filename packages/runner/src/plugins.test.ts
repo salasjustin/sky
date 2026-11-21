@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -735,6 +736,105 @@ describe("refreshPlugins with a worktree", () => {
       outcome: "failed",
       reason: "update failed for kru@kru project scope (marketplace gone)",
     });
+  });
+
+  /** `pinned`'s `claude`, except a project-scope update that never answers: only its signal ends it. */
+  const hangingProjectUpdate = (
+    base: ReturnType<typeof pinned>["run"],
+    onHang: () => void = () => {},
+  ) => {
+    const hung: string[][] = [];
+    const run = (
+      f: string,
+      args: string[],
+      options: { cwd?: string; signal: AbortSignal },
+    ) => {
+      if (args.at(-1) !== "project") return base(f, args, options);
+      hung.push(args);
+      onHang();
+      return new Promise<{ stdout: string }>((_, reject) =>
+        options.signal.addEventListener("abort", () =>
+          reject(options.signal.reason),
+        ),
+      );
+    };
+    return { run, hung };
+  };
+
+  test("a project-scope update that outlasts the timeout is timed_out, not failed", async () => {
+    const { run, hung } = hangingProjectUpdate(
+      pinned("1.0.0", "0.1.0", "2.0.0").run,
+    );
+    const result = await refreshHere({
+      run,
+      timeoutMs: 50,
+      listTimeoutMs: 1000,
+    });
+    expect(hung).toHaveLength(1);
+    expect(result.outcome).toBe("timed_out");
+    expect(result.reason).toBeUndefined();
+  });
+
+  test("a stop during a project-scope update ends the refresh as stopped, not failed", async () => {
+    const stop = new AbortController();
+    const warn = vi.fn();
+    const { run, hung } = hangingProjectUpdate(
+      pinned("1.0.0", "0.1.0", "2.0.0").run,
+      () => {
+        setTimeout(() => stop.abort("SIGTERM"), 10);
+      },
+    );
+    const result = await refreshHere({ run, warn, signal: stop.signal });
+    expect(hung).toHaveLength(1);
+    expect(result).toMatchObject({ outcome: "skipped", reason: "stopped" });
+    expect(warn.mock.calls.at(-1)?.[0]).toMatch(/plugin refresh stopped after/);
+  });
+
+  describe("a worktree reached through a link or a trailing slash", () => {
+    const viaSymlink = (real: string, dir: string) => {
+      const link = join(dir, "link");
+      symlinkSync(real, link);
+      return link;
+    };
+    const withTrailingSlash = (real: string) => `${real}/`;
+    test.each([
+      ["a symlink to it", viaSymlink],
+      ["a trailing slash", withTrailingSlash],
+    ])(
+      "a project record whose path is %s is the worktree's own, and is updated from it",
+      async (_, recordedAs) => {
+        const real = join(lockDir, "worktree");
+        mkdirSync(real);
+        const recorded = recordedAs(real, lockDir);
+        const calls: { args: string[]; cwd?: string }[] = [];
+        await refreshHere({
+          projectDir: real,
+          run: async (_f, args, options) => {
+            calls.push({ args, cwd: options.cwd });
+            return {
+              stdout:
+                args[1] === "list"
+                  ? JSON.stringify([
+                      { id: "kru@kru", scope: "user", version: "1.0.0" },
+                      {
+                        id: "kru@kru",
+                        scope: "project",
+                        version: "0.1.0",
+                        projectPath: recorded,
+                      },
+                    ])
+                  : "",
+            };
+          },
+        });
+        expect(calls.filter((c) => c.args.at(-1) === "project")).toEqual([
+          {
+            args: ["plugin", "update", "kru@kru", "--scope", "project"],
+            cwd: real,
+          },
+        ]);
+      },
+    );
   });
 });
 
