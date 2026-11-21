@@ -417,6 +417,85 @@ describe("refreshPlugins record", () => {
     ]);
   });
 
+  /** Never answers: only the command's signal ends it. */
+  const hangs = (signal: AbortSignal) =>
+    new Promise<{ stdout: string }>((_, reject) =>
+      signal.addEventListener("abort", () => reject(signal.reason)),
+    );
+
+  test("a stalled user-scope plugin update is cut at the step budget, named in the failure, and the updates after it still run", async () => {
+    const fake = fakeClaude(
+      { "kru@kru": "0.214.0", "tool@acme": "1.0.0" },
+      "0.216.0",
+    );
+    const result = await record({
+      timeoutMs: 5000,
+      stepTimeoutMs: 30,
+      run: (f, args, { signal }) => {
+        if (args[1] === "update" && args[2] === "kru@kru") return hangs(signal);
+        return fake.run(f, args);
+      },
+    });
+    expect(result.outcome).toBe("failed");
+    expect(result.reason).toMatch(
+      /^update failed for kru@kru \(timed out after /,
+    );
+    expect(result.after?.map((p) => p.version)).toEqual(["0.214.0", "0.216.0"]);
+    expect(result.steps?.map((s) => s.name)).toEqual([
+      "list before",
+      "marketplace update",
+      "update kru@kru",
+      "update tool@acme",
+      "list after",
+    ]);
+  });
+
+  test("each command gets its own step budget, so commands that together outlast one budget all finish", async () => {
+    const fake = fakeClaude(
+      { "kru@kru": "0.214.0", "tool@acme": "1.0.0" },
+      "0.216.0",
+    );
+    const result = await record({
+      timeoutMs: 5000,
+      // three commands of ~150ms each: 450ms in all, past one 300ms budget, each well inside its own
+      stepTimeoutMs: 300,
+      run: async (f, args, { signal }) => {
+        if (args[1] !== "list")
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(resolve, 150);
+            signal.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(signal.reason);
+            });
+          });
+        return fake.run(f, args);
+      },
+    });
+    expect(result.outcome).toBe("refreshed");
+    expect(result.reason).toBeUndefined();
+    expect(result.after?.map((p) => p.version)).toEqual(["0.216.0", "0.216.0"]);
+  });
+
+  test("the seconds in a step-budget failure are the budget, not how long the command ran", async () => {
+    const fake = fakeClaude({ "kru@kru": "0.214.0" }, "0.216.0");
+    let t = 0;
+    let s = 0;
+    const result = await record({
+      timeoutMs: 5000,
+      stepTimeoutMs: 60,
+      // clocks that read far from 60ms, so a reason built from either shows
+      now: () => (t += 4000),
+      stepNow: () => (s += 3000),
+      run: (f, args, { signal }) => {
+        if (args[1] === "update") return hangs(signal);
+        return fake.run(f, args);
+      },
+    });
+    expect(result.reason).toBe(
+      "update failed for kru@kru (timed out after 0.1s)",
+    );
+  });
+
   test("a command that outlasts the refresh's budget is the last step, counted up to the cut", async () => {
     const fake = fakeClaude({ "kru@kru": "0.214.0" }, "0.216.0");
     let s = 0;
@@ -857,6 +936,23 @@ describe("refreshPlugins with a worktree", () => {
     expect(hung).toHaveLength(1);
     expect(result.outcome).toBe("timed_out");
     expect(result.reason).toBeUndefined();
+  });
+
+  test("a stalled project-scope update is cut at the step budget and recorded as failed, not the whole refresh timed_out", async () => {
+    const { run, hung } = hangingProjectUpdate(
+      pinned("1.0.0", "0.1.0", "2.0.0").run,
+    );
+    const result = await refreshHere({
+      run,
+      timeoutMs: 5000,
+      stepTimeoutMs: 30,
+    });
+    expect(hung).toHaveLength(1);
+    expect(result.outcome).toBe("failed");
+    expect(result.reason).toMatch(
+      /^update failed for kru@kru project scope \(timed out after /,
+    );
+    expect(result.steps?.at(-1)?.name).toBe("list after");
   });
 
   test("a stop during a project-scope update ends the refresh as stopped, not failed", async () => {
