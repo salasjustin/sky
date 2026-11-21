@@ -1454,6 +1454,43 @@ test("a give-up on a runner.warning delivery flags the webhook but posts no furt
   expect((await summaryOf(id)).failing).toBe(true);
 });
 
+test("a give-up while the webhook is already failing posts no second warning", async () => {
+  const id = await subscribe(["run.finished"]);
+  subscriber([]);
+  const first = runningRun("first");
+  await finished(first.runId, first.token);
+  await giveUp();
+  const second = runningRun("second");
+  await finished(second.runId, second.token);
+  await giveUp();
+  expect(deliveries().map((d) => d.status)).toEqual(["failed", "failed"]);
+  expect(warnings(first.runId)).toHaveLength(1);
+  expect(warnings(second.runId)).toEqual([]);
+  expect((await summaryOf(id)).failing).toBe(true);
+});
+
+test("a give-up after a delivered attempt cleared the flag warns again", async () => {
+  const id = await subscribe(["run.finished"]);
+  subscriber([]);
+  const first = runningRun("first");
+  await finished(first.runId, first.token);
+  await giveUp();
+
+  advance(1_000);
+  subscriber([200]);
+  seedDeliveries(id, 1);
+  await dispatcher.drain();
+  expect(await summaryOf(id)).not.toHaveProperty("failing");
+
+  subscriber([]);
+  const second = runningRun("second");
+  await finished(second.runId, second.token);
+  await giveUp();
+  expect(warnings(first.runId)).toHaveLength(1);
+  expect(warnings(second.runId)).toHaveLength(1);
+  expect((await summaryOf(id)).failing).toBe(true);
+});
+
 test("a webhook that never gave up isn't flagged by one that did", async () => {
   const bad = await subscribe(["run.finished"], "https://bad.example.com/h");
   const good = await subscribe(["run.finished"], "https://good.example.com/h");

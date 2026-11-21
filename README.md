@@ -612,11 +612,11 @@ Three ways to receive them:
   - `failedStreak`: how many deliveries in a row, since the last delivered one, ended failed or are still retrying after a failed attempt.
   - `failing`: `true` once a delivery gave up after its 30th attempt, until the webhook's next delivered one clears it. Absent otherwise.
 
-  A webhook with no deliveries has none of these fields; they are optional, so older clients ignore them. `sky webhook list` prints them after the webhook, such as `| FAILING, last 401 at 2026-11-21T09:30:00.000Z (attempt 30), 13 failed in a row`.
+  `lastAttempt` and `failedStreak` are absent until the webhook has an attempt on record, and `failing` is absent unless set; all three are optional, so older clients ignore them. `sky webhook list` prints them after the webhook, such as `| FAILING, last 401 at 2026-11-21T09:30:00.000Z (attempt 30), 13 failed in a row`.
 
   `GET /v1/webhooks/:id/deliveries` (or `sky webhook deliveries <id>`) lists the webhook's deliveries, newest first, 20 by default and at most 100 (`?limit=`, or `--limit`). When older ones remain the page carries a `nextCursor`; pass it back as `?cursor=` (or `--cursor`). Each delivery has `id`, `eventType`, `runId`, `status` (`pending`, `delivered` or `failed`), `attempts`, `lastStatus`, `lastError` (redacted) with its `lastErrorKind`, and `createdAt`, `lastAttemptAt` and `nextAttemptAt` (only while pending). The request body, headers, signature and secret are never included. A `runs` key reads the deliveries of its own webhooks only; another's is `404 not_found`.
 
-  When a delivery gives up, the run it was for also gets a `runner.warning` event naming the webhook id, the event and the last status or error kind, never its URL or secret. A webhook subscribed to `runner.warning` whose own warning delivery gives up is flagged but not warned about again.
+  When a delivery's give-up makes the webhook `failing`, the run it was for also gets a `runner.warning` event naming the webhook id, the event and the last status or error kind, never its URL or secret. That is once per stretch of failing: later give-ups post nothing until a delivered attempt clears `failing`, and the next give-up after that warns again. A webhook subscribed to `runner.warning` whose own warning delivery gives up is flagged but not warned about again.
 
 **`sky` format.** The body is the event itself. Each delivery carries `Sky-Event-Type`, `Sky-Event-Id`, and
 

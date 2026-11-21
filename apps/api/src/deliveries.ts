@@ -16,7 +16,7 @@ import type {
   EventType,
   WebhookFormat,
 } from "@sky/shared";
-import { and, asc, eq, isNull, lt, lte, ne, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, lt, lte, ne } from "drizzle-orm";
 import { open, type Sealed, webhookSecretAad } from "./crypto.js";
 import { presentEvent } from "./run-events.js";
 import { recordEvent, type Tx } from "./runs.js";
@@ -291,8 +291,9 @@ export function createDispatcher({
   }
 
   /**
-   * Flags the webhook as failing and tells the run the delivery was for (a delivery can't outlive its
-   * run: the event row references it). The warning
+   * Flags the webhook as failing and, when this give-up is the one that flips it to failing, tells the
+   * run the delivery was for (a delivery can't outlive its run: the event row references it). Later
+   * give-ups while it stays failing post nothing, until a delivered attempt clears the flag. The warning
    * names the webhook and what the receiver answered, never its URL or secret, and is skipped for a
    * `runner.warning` delivery: a webhook subscribed to those would otherwise warn about its own warnings.
    */
@@ -303,11 +304,15 @@ export function createDispatcher({
     error: string | null,
     at: string,
   ) {
-    tx.update(webhooks)
-      .set({ failingSince: sql`coalesce(${webhooks.failingSince}, ${at})` })
-      .where(eq(webhooks.id, row.webhookId))
-      .run();
-    if (row.event.type === "runner.warning") return;
+    const flipped =
+      tx
+        .update(webhooks)
+        .set({ failingSince: at })
+        .where(
+          and(eq(webhooks.id, row.webhookId), isNull(webhooks.failingSince)),
+        )
+        .run().changes > 0;
+    if (!flipped || row.event.type === "runner.warning") return;
     const last =
       status === null ? (errorKind(error) ?? "error") : `status ${status}`;
     recordEvent(tx, row.event.runId, "runner.warning", {
