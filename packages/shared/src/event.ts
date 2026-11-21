@@ -146,6 +146,13 @@ export const PluginVersion = z.object({
 });
 export type PluginVersion = z.infer<typeof PluginVersion>;
 
+/** One command of the refresh and how long it ran, in the order they ran; the one a timeout cut short counts up to the cut. */
+export const PluginRefreshStep = z.object({
+  name: z.string().min(1).max(100),
+  ms: z.number().int().nonnegative(),
+});
+export type PluginRefreshStep = z.infer<typeof PluginRefreshStep>;
+
 /** How the start-of-run plugin refresh ended. */
 export const PluginRefreshOutcome = z.enum([
   "refreshed",
@@ -180,7 +187,9 @@ function splitLegacyOutcome(raw: unknown): unknown {
  * refresh cut short before the read), and `[]` when it read the list and found no plugins, so null means "not
  * read", not "none". A record from before the codes has its `<code>: <reason>` outcome split into the
  * two, and keeps its lists as arrays, where `[]` can also be a list it never read. `loaded` is what the session's own init reports it loaded, from any scope, which is what
- * counts when `plugin update` and the session disagree.
+ * counts when `plugin update` and the session disagree. `steps` is where the time went, one entry per
+ * command in order, at most 50; it is absent from a record made before it existed, and from one that
+ * ran no command.
  */
 export const PluginRefresh = z.preprocess(
   splitLegacyOutcome,
@@ -190,6 +199,7 @@ export const PluginRefresh = z.preprocess(
     durationMs: z.number().int().nonnegative(),
     before: z.array(PluginVersion).max(100).nullable(),
     after: z.array(PluginVersion).max(100).nullable(),
+    steps: z.array(PluginRefreshStep).max(50).optional(),
     loaded: z.array(PluginVersion).max(100),
   }),
 );

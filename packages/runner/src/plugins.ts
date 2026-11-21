@@ -13,12 +13,23 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
-import type { PluginRefresh, PluginVersion } from "@sky/shared";
+import type {
+  PluginRefresh,
+  PluginRefreshStep,
+  PluginVersion,
+} from "@sky/shared";
 
 const exec = promisify(execFile);
 
 /** Overall budget for the refresh; a slow or unreachable marketplace costs a session this at most. */
 export const PLUGIN_REFRESH_TIMEOUT_MS = 30_000;
+
+/**
+ * What one `claude` command of the refresh may take. A command that stalls on the network (measured
+ * on a sprite: a marketplace update 2.8 s, any other command 0.6 s) is cut here and counted as a
+ * failed update, so the commands after it still run inside the overall budget instead of being starved.
+ */
+export const PLUGIN_STEP_TIMEOUT_MS = 10_000;
 
 type Exec = (
   file: string,
@@ -134,6 +145,7 @@ const LIST_TIMEOUT_MS = 5_000;
 /** `PluginRefresh`'s bounds in `@sky/shared`: a record past them is dropped from the `run.started` post. */
 const REASON_MAX = 300;
 const PLUGINS_MAX = 100;
+const STEPS_MAX = 50;
 
 const idOf = (plugin: PluginVersion) =>
   plugin.marketplace === null
@@ -217,13 +229,17 @@ function sameDir(a: string, b: string): boolean {
  * Resolves to the record of what it did: the user-scope plugins before and after (null for a list
  * it never read; a waiting run with nothing to update has its one listing as both), the outcome
  * code (`refreshed`, `timed_out`, `failed` or `skipped`), the reason for a `failed` or `skipped`
- * one, and how long it took. Never throws.
+ * one, how long it took and how long each command did (`steps`). A command is also cut at
+ * `stepTimeoutMs`: a marketplace update cut there is a failed update, and the plugin updates after it
+ * still run from the cached marketplace. Never throws.
  */
 export async function refreshPlugins(options: {
   env: NodeJS.ProcessEnv;
   warn: (line: string) => void;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** How long one `claude` command of the refresh may take; `PLUGIN_STEP_TIMEOUT_MS` when absent. */
+  stepTimeoutMs?: number;
   /** How long the read-back after a refresh that ended early may take; `LIST_TIMEOUT_MS` when absent. */
   listTimeoutMs?: number;
   claude?: string;
@@ -233,6 +249,8 @@ export async function refreshPlugins(options: {
   lockFile?: string;
   run?: Exec;
   now?: () => number;
+  /** The clock the commands' durations are read from, in ms; `performance.now` when absent. */
+  stepNow?: () => number;
 }): Promise<PluginRefreshRecord> {
   const { env, warn, signal: stop } = options;
   const now = options.now ?? Date.now;
@@ -240,6 +258,23 @@ export async function refreshPlugins(options: {
   // null until the list is read: a read that found no plugins is `[]`
   let before: PluginVersion[] | null = null;
   let after: PluginVersion[] | null = null;
+  // its own clock, so timing the commands doesn't add reads to `now`
+  const stepNow = options.stepNow ?? (() => performance.now());
+  // each command's duration, in the order they ran, kept to `STEPS_MAX`
+  const steps: PluginRefreshStep[] = [];
+  const timed = async <T>(name: string, task: () => Promise<T>): Promise<T> => {
+    const began = stepNow();
+    try {
+      return await task();
+    } finally {
+      // a command a timeout cut short is counted up to the cut
+      if (steps.length < STEPS_MAX)
+        steps.push({
+          name: name.slice(0, 100),
+          ms: Math.max(0, Math.round(stepNow() - began)),
+        });
+    }
+  };
   const record = (
     outcome: PluginRefreshRecord["outcome"],
     reason?: string,
@@ -254,6 +289,7 @@ export async function refreshPlugins(options: {
     durationMs: Math.max(0, Math.round(now() - started)),
     before: before?.slice(0, PLUGINS_MAX) ?? null,
     after: after?.slice(0, PLUGINS_MAX) ?? null,
+    ...(steps.length > 0 && { steps: [...steps] }),
   });
   if (stop?.aborted) {
     warn("runner: plugin refresh skipped (stopped)");
@@ -267,19 +303,39 @@ export async function refreshPlugins(options: {
   const signal = stop ? AbortSignal.any([stop, timeout]) : timeout;
   const lockFile =
     options.lockFile ?? join(tmpdir(), "sky-plugin-refresh.lock");
-  const list = async (within: AbortSignal) =>
+  const stepMs = options.stepTimeoutMs ?? PLUGIN_STEP_TIMEOUT_MS;
+  const list = async (name: string, within: AbortSignal) =>
     readListing(
-      (await run(claude, ["plugin", "list", "--json"], { env, signal: within }))
-        .stdout,
+      (
+        await timed(name, () =>
+          run(claude, ["plugin", "list", "--json"], { env, signal: within }),
+        )
+      ).stdout,
       options.projectDir,
     );
-  const claudeRun = (...args: string[]) => run(claude, args, { env, signal });
+  /** One command, cut at `stepMs` as well as at the refresh's end; the cut is an error that says so. */
+  const claudeRun = async (name: string, args: string[], cwd?: string) => {
+    const own = AbortSignal.timeout(stepMs);
+    try {
+      await timed(name, () =>
+        run(claude, args, {
+          env,
+          signal: AbortSignal.any([signal, own]),
+          ...(cwd !== undefined && { cwd }),
+        }),
+      );
+    } catch (error) {
+      if (!signal.aborted && own.aborted)
+        throw new Error(`timed out after ${seconds(stepMs)}s`);
+      throw error;
+    }
+  };
   let failedUpdates = "";
   // set by a waiting run whose own pass found no record of its worktree to update
   let nothingPinnedHere = false;
   /** One pass under the lock: the whole refresh, or, after another run's, this worktree's records only. */
   const pass = (whole: boolean) => async () => {
-    const read = await list(signal);
+    const read = await list("list before", signal);
     before = read.plugins;
     if (!whole && read.pinnedHere.length === 0) {
       // no command ran since the listing, so it is the state either side
@@ -295,10 +351,27 @@ export async function refreshPlugins(options: {
     } else {
       try {
         if (whole) {
-          await claudeRun("plugin", "marketplace", "update");
+          try {
+            await claudeRun("marketplace update", [
+              "plugin",
+              "marketplace",
+              "update",
+            ]);
+          } catch (error) {
+            // a stalled marketplace is not the whole refresh: the updates after it still run, from what is cached
+            if (signal.aborted || !/^timed out/.test(firstLine(error)))
+              throw error;
+            failed.push(`marketplace (${firstLine(error)})`);
+          }
           for (const plugin of before.map(idOf)) {
             try {
-              await claudeRun("plugin", "update", plugin, "--scope", "user");
+              await claudeRun(`update ${plugin}`, [
+                "plugin",
+                "update",
+                plugin,
+                "--scope",
+                "user",
+              ]);
               updated.push(plugin);
             } catch (error) {
               if (signal.aborted) throw error;
@@ -309,10 +382,10 @@ export async function refreshPlugins(options: {
         // the worktree's own record of a plugin, which the user-scope update leaves where it was
         for (const plugin of read.pinnedHere) {
           try {
-            await run(
-              claude,
+            await claudeRun(
+              `update ${plugin} (project)`,
               ["plugin", "update", plugin, "--scope", "project"],
-              { env, signal, cwd: options.projectDir },
+              options.projectDir,
             );
             updated.push(`${plugin} (project)`);
           } catch (error) {
@@ -320,7 +393,7 @@ export async function refreshPlugins(options: {
             failed.push(`${plugin} project scope (${firstLine(error)})`);
           }
         }
-        after = (await list(signal)).plugins;
+        after = (await list("list after", signal)).plugins;
       } catch (error) {
         // still under the lock, read back what is installed now: an update that landed before the cut may have changed it
         if (!stop?.aborted) {
@@ -331,6 +404,7 @@ export async function refreshPlugins(options: {
           try {
             after = (
               await list(
+                "list after (cut short)",
                 stop ? AbortSignal.any([stop, listTimeout]) : listTimeout,
               )
             ).plugins;
