@@ -56,12 +56,20 @@ test.each([
   ["IPv4-mapped IPv6 public", "https://[::ffff:8.8.8.8]/hook"],
   ["IPv4-compatible ::/96, loopback", "https://[::7f00:1]/hook"],
   ["IPv4-compatible ::/96, public IPv4", "https://[::808:808]/hook"],
+  ["IPv4-compatible ::/96, high end", "https://[::ffff:ffff]/hook"],
   ["6to4 2002::/16", "https://[2002:808:808::1]/hook"],
+  ["6to4 2002::/16, high half", "https://[2002:ffff::1]/hook"],
   ["Teredo 2001::/32", "https://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/hook"],
+  ["Teredo 2001::/32, high half", "https://[2001:0:ffff::1]/hook"],
   ["local-use NAT64 64:ff9b:1::/48", "https://[64:ff9b:1::808:808]/hook"],
+  [
+    "local-use NAT64 64:ff9b:1::/48, high end",
+    "https://[64:ff9b:1:ffff::1]/hook",
+  ],
   ["discard 100::/64", "https://[100::1]/hook"],
+  ["discard 100::/64, high end", "https://[100::ffff:ffff:ffff:ffff]/hook"],
   ["documentation 2001:db8::/32", "https://[2001:db8::1]/hook"],
-  ["an IPv6 literal with a zone id", "https://[fe80::1%25eth0]/hook"],
+  ["documentation 2001:db8::/32, high half", "https://[2001:db8:ffff::1]/hook"],
   ["a plain-http URL", "http://hooks.example.com/hook"],
   ["a non-default port", "https://hooks.example.com:8443/hook"],
   ["Fly's internal API port", "https://hooks.example.com:4280/hook"],
@@ -128,8 +136,15 @@ test("a stored URL is refused as url_not_allowed for its form and blocked_addres
     "url_not_allowed",
   );
   expect(refusalOf("not a url")).toBe("url_not_allowed");
+  // the URL parser rejects a zone id, before any host check
+  expect(refusalOf("https://[fe80::1%25eth0]/hook")).toBe("url_not_allowed");
+  // the URL's form is checked before its host
+  expect(refusalOf("https://10.0.0.5:8443/hook")).toBe("url_not_allowed");
+  expect(refusalOf("https://u:p@10.0.0.5/hook")).toBe("url_not_allowed");
   expect(refusalOf("https://sky-api.internal/hook")).toBe("blocked_address");
   expect(refusalOf("https://10.0.0.5/hook")).toBe("blocked_address");
+  expect(refusalOf("https://localhost/hook")).toBe("blocked_address");
+  expect(refusalOf("https://intranet/hook")).toBe("blocked_address");
 });
 
 test("the connect-time lookup passes public addresses through", async () => {
@@ -223,10 +238,14 @@ test.each([
   ["an address just outside 172.16/12", "https://172.32.0.1/hook"],
   ["an address just outside 100.64/10", "https://100.128.0.1/hook"],
   ["a public IPv6", "https://[2606:4700:4700::1111]/hook"],
-  [
-    "a public IPv6 just outside 2001::/32",
-    "https://[2001:4860:4860::8888]/hook",
-  ],
+  ["a public IPv6 in 2001::/23", "https://[2001:4860:4860::8888]/hook"],
+  ["an address just outside 2001::/32", "https://[2001:1::1]/hook"],
+  ["an address just outside 2001:db8::/32", "https://[2001:db9::1]/hook"],
+  ["an address just below 2001:db8::/32", "https://[2001:db7:ffff::1]/hook"],
+  ["an address just outside 2002::/16", "https://[2003::1]/hook"],
+  ["an address just outside 64:ff9b:1::/48", "https://[64:ff9b:2::1]/hook"],
+  ["an address just outside ::/96", "https://[::1:0:0]/hook"],
+  ["an address outside 100::/64", "https://[100:0:0:2::1]/hook"],
   [
     "a NAT64 address embedding a public IPv4",
     "https://[64:ff9b::808:808]/hook",

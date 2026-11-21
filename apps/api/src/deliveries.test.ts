@@ -502,18 +502,9 @@ test("describeError leaves no address or host:port of its error's cause", () => 
       "connect ECONNREFUSED 203.0.113.9:443, connect ECONNREFUSED [fdaa:0:1::3]:8080, getaddrinfo ENOTFOUND db.internal:5432",
     ),
   });
-  const text = describeError(err);
-  expect(text).toMatch(/^TypeError: fetch failed: connect ECONNREFUSED/);
-  for (const leaked of [
-    "203.0.113.9",
-    "443",
-    "fdaa",
-    "8080",
-    "db.internal",
-    "5432",
-  ]) {
-    expect(text).not.toContain(leaked);
-  }
+  expect(describeError(err)).toBe(
+    "TypeError: fetch failed: connect ECONNREFUSED <addr>, connect ECONNREFUSED <addr>, getaddrinfo ENOTFOUND <addr>",
+  );
 });
 
 test("a redirect is a failed attempt, never followed", async () => {
