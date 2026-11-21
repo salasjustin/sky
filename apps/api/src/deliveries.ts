@@ -10,6 +10,7 @@ import {
 } from "@sky/db";
 import type {
   AgentId,
+  DeliveryErrorKind,
   EnvironmentId,
   Event,
   EventType,
@@ -18,7 +19,7 @@ import type {
 import { and, asc, eq, isNull, lt, lte, ne } from "drizzle-orm";
 import { open, type Sealed, webhookSecretAad } from "./crypto.js";
 import { presentEvent } from "./run-events.js";
-import type { Tx } from "./runs.js";
+import { recordEvent, type Tx } from "./runs.js";
 
 const TICK_MS = 5_000;
 const BATCH = 20;
@@ -159,6 +160,20 @@ const describeError = (err: unknown): string => {
   return text.slice(0, MAX_ERROR_LENGTH);
 };
 
+const errorKinds: [RegExp, DeliveryErrorKind][] = [
+  [/timed out|timeout|ETIMEDOUT/i, "timeout"],
+  [/ECONNREFUSED/, "connection_refused"],
+  [/ECONNRESET|EPIPE|socket hang up|other side closed/i, "connection_reset"],
+  [/ENOTFOUND|EAI_AGAIN|EAI_NODATA|getaddrinfo/, "dns"],
+  [/certificate|\bSSL\b|\bTLS\b|self[- ]signed|ERR_TLS/i, "tls"],
+];
+
+/** The kind of a stored `last_error`, read from the text `describeError` wrote; null for no error. */
+export function errorKind(error: string | null): DeliveryErrorKind | null {
+  if (error === null) return null;
+  return errorKinds.find(([pattern]) => pattern.test(error))?.[1] ?? "other";
+}
+
 export type Dispatcher = ReturnType<typeof createDispatcher>;
 
 /**
@@ -275,6 +290,36 @@ export function createDispatcher({
     }
   }
 
+  /**
+   * Flags the webhook as failing and, when this give-up is the one that flips it to failing, tells the
+   * run the delivery was for (a delivery can't outlive its run: the event row references it). Later
+   * give-ups while it stays failing post nothing, until a delivered attempt clears the flag. The warning
+   * names the webhook and what the receiver answered, never its URL or secret, and is skipped for a
+   * `runner.warning` delivery: a webhook subscribed to those would otherwise warn about its own warnings.
+   */
+  function markFailing(
+    tx: Tx,
+    row: Due,
+    status: number | null,
+    error: string | null,
+    at: string,
+  ) {
+    const flipped =
+      tx
+        .update(webhooks)
+        .set({ failingSince: at })
+        .where(
+          and(eq(webhooks.id, row.webhookId), isNull(webhooks.failingSince)),
+        )
+        .run().changes > 0;
+    if (!flipped || row.event.type === "runner.warning") return;
+    const last =
+      status === null ? (errorKind(error) ?? "error") : `status ${status}`;
+    recordEvent(tx, row.event.runId, "runner.warning", {
+      message: `webhook ${row.webhookId} gave up delivering evt_${row.event.id} after ${MAX_ATTEMPTS} attempts; last result: ${last}`,
+    });
+  }
+
   async function attempt(row: Due): Promise<void> {
     const { event } = row;
     const id = `evt_${event.id}` as const;
@@ -315,6 +360,7 @@ export function createDispatcher({
             now().getTime() + (retryAfter ?? retryDelayMs(attempts, random())),
           ).toISOString();
     const holdUntil = status === 429 ? nextAttemptAt : undefined;
+    const at = now().toISOString();
     db.transaction((tx) => {
       tx.update(webhookDeliveries)
         .set({
@@ -322,10 +368,18 @@ export function createDispatcher({
           attempts,
           lastStatus: status,
           lastError: error,
+          lastAttemptAt: at,
           ...(nextAttemptAt ? { nextAttemptAt } : {}),
         })
         .where(eq(webhookDeliveries.id, row.id))
         .run();
+      if (delivered) {
+        tx.update(webhooks)
+          .set({ failingSince: null })
+          .where(eq(webhooks.id, row.webhookId))
+          .run();
+      }
+      if (failed) markFailing(tx, row, status, error, at);
       if (!holdUntil) return;
       tx.update(webhookDeliveries)
         .set({ nextAttemptAt: holdUntil })

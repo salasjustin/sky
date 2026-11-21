@@ -92,7 +92,22 @@ const help = (io: Io) => `Usage:
       without echoing it. Prints the line webhook list prints.
   sky webhook list [options]
       Print "<id> <format> <url> <types> [<env ids>]" per webhook; secrets
-      are never printed.
+      are never printed. Once the webhook has had a delivery attempt, the
+      line goes on with " | " and how its deliveries are going: FAILING
+      while a give-up after the 30th attempt stands, the last attempt's
+      status or error, its attempt number, and how many deliveries failed
+      in a row, such as "| FAILING, last 401 at 2026-11-21T09:30:00.000Z
+      (attempt 30), 13 failed in a row". That part is for reading; a
+      script reads lastAttempt, failedStreak and failing from --json.
+  sky webhook deliveries <id> [--limit=<1-100>] [--cursor=<cursor>]
+      [options]
+      Print "<created> <status> <event type> <run> attempts <n> [last
+      <status|error>]" per delivery, newest first: status is pending,
+      delivered or failed. --limit is at most 100 (20 without it); when
+      older deliveries remain, a note on stderr gives the --cursor for the
+      next page, which --json output also carries as nextCursor. Request
+      bodies, headers and secrets are never printed. A runs key sees only
+      its own webhooks' deliveries.
   sky webhook delete <id> [options]
       Remove a webhook.
   sky key create <name> --env=<id|name>,... [--role=runs] [options]
@@ -208,6 +223,8 @@ Options:
                          key create: the key with its secret; key list:
                          {"data": [keys]}, never a secret; agent list: the
                          page {"data": [agents], "nextCursor"?: …};
+                         webhook deliveries: the page {"data":
+                         [deliveries], "nextCursor"?: …};
                          agent preview: {"preview": {…, "link"}}, or
                          {"preview": null, "stopped": {…}|null} for --stop;
                          key revoke: {"id": …, "revoked": true})
