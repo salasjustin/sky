@@ -125,12 +125,19 @@ export type PluginRefreshRecord = Omit<PluginRefresh, "loaded">;
 /** Bounds the `claude plugin list` that reads the plugins back after a refresh that ended early. */
 const LIST_TIMEOUT_MS = 5_000;
 
+/** `PluginRefresh`'s bounds in `@sky/shared`: a record past them fails the `run.started` post. */
+const OUTCOME_MAX = 300;
+const PLUGINS_MAX = 100;
+
 const idOf = (plugin: PluginVersion) =>
   plugin.marketplace === null
     ? plugin.name
     : `${plugin.name}@${plugin.marketplace}`;
 
-/** The user-scope plugins of a `claude plugin list --json`, each once, as `name@marketplace` split. */
+/**
+ * The user-scope plugins of a `claude plugin list --json`, each once, as `name@marketplace` split;
+ * the first `PLUGINS_MAX` of them, so a refresh updates and records no more than that.
+ */
 function userPlugins(stdout: string): PluginVersion[] {
   const installed = JSON.parse(stdout) as {
     id: string;
@@ -140,6 +147,7 @@ function userPlugins(stdout: string): PluginVersion[] {
   const seen = new Set<string>();
   const plugins: PluginVersion[] = [];
   for (const { id, scope, version } of installed) {
+    if (plugins.length === PLUGINS_MAX) break;
     if (scope !== "user" || seen.has(id)) continue;
     seen.add(id);
     const at = id.lastIndexOf("@");
@@ -185,10 +193,14 @@ export async function refreshPlugins(options: {
   let before: PluginVersion[] = [];
   let after: PluginVersion[] | undefined;
   const record = (outcome: string): PluginRefreshRecord => ({
-    outcome,
+    outcome:
+      outcome.length > OUTCOME_MAX
+        ? `${outcome.slice(0, OUTCOME_MAX - 1)}…`
+        : outcome,
     durationMs: Math.max(0, Math.round(now() - started)),
     before,
-    after: after ?? before,
+    // empty, not `before`, when the refresh never read the list back
+    after: after ?? [],
   });
   if (stop?.aborted) {
     warn("runner: plugin refresh skipped (stopped)");
@@ -232,9 +244,13 @@ export async function refreshPlugins(options: {
         } catch (error) {
           // still under the lock: what the session starts with, which an update that landed before the cut changed
           if (!stop?.aborted) {
+            // its own timeout, since the refresh's is spent by now, but still ended by a stop
+            const listTimeout = AbortSignal.timeout(
+              options.listTimeoutMs ?? LIST_TIMEOUT_MS,
+            );
             try {
               after = await list(
-                AbortSignal.timeout(options.listTimeoutMs ?? LIST_TIMEOUT_MS),
+                stop ? AbortSignal.any([stop, listTimeout]) : listTimeout,
               );
             } catch {}
           }
@@ -296,8 +312,22 @@ export function loadedPlugins(
 
 const seconds = (ms: number) => (ms / 1000).toFixed(1);
 
-/** The reason a failed refresh is recorded with: one line, short, never the command's whole output. */
-const firstLine = (error: unknown) =>
-  (error instanceof Error ? error.message : String(error))
-    .split("\n")[0]
-    ?.slice(0, 200) ?? "";
+/**
+ * The reason a failed refresh is recorded with: one line, short, never the command's whole output.
+ * A failed `execFile` says `Command failed: <binary> <args>`, so its stderr names the cause instead.
+ */
+const firstLine = (error: unknown) => {
+  const stderr =
+    typeof error === "object" && error !== null && "stderr" in error
+      ? error.stderr
+      : undefined;
+  const cause =
+    typeof stderr === "string"
+      ? stderr.split("\n").find((line) => line.trim() !== "")
+      : undefined;
+  const line =
+    cause?.trim() ??
+    (error instanceof Error ? error.message : String(error)).split("\n")[0] ??
+    "";
+  return line.slice(0, 200);
+};

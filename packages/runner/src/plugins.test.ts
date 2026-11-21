@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PluginRefresh } from "@sky/shared";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { claudeBinary, loadedPlugins, refreshPlugins } from "./plugins.js";
 
@@ -420,6 +421,104 @@ describe("refreshPlugins record", () => {
       before: [],
       after: [],
     });
+  });
+
+  test("several failed updates are recorded with each one's stderr cause, within the run.started bounds", async () => {
+    const ids = [1, 2, 3, 4, 5].map((n) => `plugin-number-${n}@marketplace`);
+    const fake = fakeClaude(
+      Object.fromEntries(ids.map((id) => [id, "1.0.0"])),
+      "2.0.0",
+    );
+    const result = await record({
+      run: async (f, args) => {
+        if (args[1] === "update") {
+          const [name, marketplace] = String(args[2]).split("@");
+          // the shape a failed execFile rejects with
+          const error = new Error(
+            `Command failed: /long/path/claude plugin update ${args[2]} --scope user`,
+          );
+          throw Object.assign(error, {
+            stderr: `\nerror: plugin ${name} not found in marketplace ${marketplace}\nmore\n`,
+          });
+        }
+        return fake.run(f, args);
+      },
+    });
+    expect(() => PluginRefresh.parse({ ...result, loaded: [] })).not.toThrow();
+    expect(result.outcome).toMatch(
+      /^failed: update failed for plugin-number-1@marketplace \(error: plugin plugin-number-1 not found in marketplace marketplace\), /,
+    );
+    expect(result.outcome).not.toMatch(/Command failed/);
+    expect(result.outcome.endsWith("…")).toBe(true);
+  });
+
+  test("an error with no stderr is recorded by its message", async () => {
+    const result = await record({
+      run: async () => {
+        throw Object.assign(new Error("spawn c ENOENT\nmore"), { stderr: "" });
+      },
+    });
+    expect(result.outcome).toBe("failed: spawn c ENOENT");
+  });
+
+  test("a listing of more user-scope plugins than run.started carries is recorded within its bounds", async () => {
+    const installed = Object.fromEntries(
+      Array.from({ length: 150 }, (_, n) => [`p${n}@m`, "1.0.0"]),
+    );
+    const { run } = fakeClaude(installed, "2.0.0");
+    const result = await record({ run });
+    expect(() => PluginRefresh.parse({ ...result, loaded: [] })).not.toThrow();
+    expect(result.before).toHaveLength(100);
+    expect(result.after).toHaveLength(100);
+  });
+
+  test("a refresh cut at the timeout whose read-back fails records after as empty, not as before", async () => {
+    const fake = fakeClaude({ "kru@kru": "0.214.0" }, "0.216.0");
+    let lists = 0;
+    const result = await record({
+      timeoutMs: 50,
+      listTimeoutMs: 1000,
+      run: (f, args, { signal }) => {
+        if (args[1] === "list" && ++lists > 1)
+          return Promise.reject(new Error("list failed"));
+        if (args[1] === "update")
+          return new Promise((_, reject) =>
+            signal.addEventListener("abort", () => reject(signal.reason)),
+          );
+        return fake.run(f, args);
+      },
+    });
+    expect(result.outcome).toBe("timed_out");
+    expect(result.before).toHaveLength(1);
+    expect(result.after).toEqual([]);
+  });
+
+  test("a stop during the read-back after a timeout ends it promptly as stopped", async () => {
+    const fake = fakeClaude({ "kru@kru": "0.214.0" }, "0.216.0");
+    const stop = new AbortController();
+    let lists = 0;
+    let readBackAborted = false;
+    const result = await record({
+      timeoutMs: 50,
+      // longer than the test's own timeout: only the stop can end the read-back in time
+      listTimeoutMs: 60_000,
+      signal: stop.signal,
+      run: (f, args, { signal }) => {
+        if (args[1] === "update" || (args[1] === "list" && ++lists > 1)) {
+          const pending = new Promise<{ stdout: string }>((_, reject) =>
+            signal.addEventListener("abort", () => {
+              if (args[1] === "list") readBackAborted = true;
+              reject(signal.reason);
+            }),
+          );
+          if (args[1] === "list") setTimeout(() => stop.abort("SIGTERM"), 20);
+          return pending;
+        }
+        return fake.run(f, args);
+      },
+    });
+    expect(readBackAborted).toBe(true);
+    expect(result.outcome).toBe("skipped: stopped");
   });
 
   test("a listing that can't be read is a failed outcome, and a long reason is cut", async () => {
