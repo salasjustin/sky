@@ -289,3 +289,127 @@ test("webhook list prints one line per webhook and delete removes one", async ()
   expect(del.code).toBe(0);
   expect(deleted).toEqual(["whk_1"]);
 });
+
+test("webhook list shows the last attempt, the failed streak and the failing flag", async () => {
+  server.use(
+    http.get(`${apiUrl}/v1/webhooks`, () =>
+      HttpResponse.json({
+        data: [
+          {
+            ...created,
+            failing: true,
+            failedStreak: 13,
+            lastAttempt: {
+              at: "2026-11-21T09:30:00.000Z",
+              status: 401,
+              error: null,
+              attempt: 30,
+            },
+          },
+          {
+            ...created,
+            id: "whk_2",
+            failedStreak: 1,
+            lastAttempt: {
+              at: "2026-11-21T09:31:00.000Z",
+              status: null,
+              error: "timeout",
+              attempt: 2,
+            },
+          },
+          { ...created, id: "whk_3" },
+        ],
+      }),
+    ),
+  );
+  const list = await runCli(["webhook", "list"]);
+  expect(list.stdout).toBe(
+    [
+      "whk_1 standard https://hooks.example.com/x run.waiting env_1 | FAILING, last 401 at 2026-11-21T09:30:00.000Z (attempt 30), 13 failed in a row",
+      "whk_2 standard https://hooks.example.com/x run.waiting env_1 | last timeout at 2026-11-21T09:31:00.000Z (attempt 2), 1 failed in a row",
+      "whk_3 standard https://hooks.example.com/x run.waiting env_1",
+      "",
+    ].join("\n"),
+  );
+});
+
+const delivery = {
+  id: 7,
+  eventType: "run.finished",
+  runId: "run_1",
+  status: "failed",
+  attempts: 30,
+  lastStatus: 401,
+  lastError: null,
+  lastErrorKind: null,
+  createdAt: "2026-11-20T09:00:00.000Z",
+  lastAttemptAt: "2026-11-21T09:30:00.000Z",
+  nextAttemptAt: null,
+};
+
+test("webhook deliveries prints one line per delivery and points at the next page", async () => {
+  const queries: string[] = [];
+  server.use(
+    http.get(`${apiUrl}/v1/webhooks/whk_1/deliveries`, ({ request }) => {
+      queries.push(new URL(request.url).search);
+      return HttpResponse.json({
+        data: [
+          delivery,
+          {
+            ...delivery,
+            id: 6,
+            status: "pending",
+            attempts: 2,
+            lastStatus: null,
+            lastError:
+              "TypeError: fetch failed: connect ECONNREFUSED 10.0.0.1:443",
+            lastErrorKind: "connection_refused",
+          },
+        ],
+        nextCursor: "6",
+      });
+    }),
+  );
+  const r = await runCli(["webhook", "deliveries", "whk_1", "--limit=2"]);
+  expect(r.code).toBe(0);
+  expect(queries).toEqual(["?limit=2"]);
+  expect(r.stdout).toBe(
+    [
+      "2026-11-20T09:00:00.000Z failed run.finished run_1 attempts 30 last 401",
+      "2026-11-20T09:00:00.000Z pending run.finished run_1 attempts 2 last connection_refused (TypeError: fetch failed: connect ECONNREFUSED 10.0.0.1:443)",
+      "",
+    ].join("\n"),
+  );
+  expect(r.stderr).toContain("--cursor=6");
+});
+
+test("webhook deliveries refuses a bad id, limit or cursor with exit 2 and a stray flag elsewhere", async () => {
+  const queries: string[] = [];
+  server.use(
+    http.get(`${apiUrl}/v1/webhooks/whk_1/deliveries`, ({ request }) => {
+      queries.push(new URL(request.url).search);
+      return HttpResponse.json({ data: [] });
+    }),
+  );
+  // the bounds themselves are accepted
+  expect(
+    (await runCli(["webhook", "deliveries", "whk_1", "--limit=100"])).code,
+  ).toBe(0);
+  expect(
+    (await runCli(["webhook", "deliveries", "whk_1", "--cursor=5"])).code,
+  ).toBe(0);
+  expect(queries).toEqual(["?limit=100", "?cursor=5"]);
+  queries.length = 0;
+  for (const args of [
+    ["webhook", "deliveries"],
+    ["webhook", "deliveries", "whk_1", "--limit=101"],
+    ["webhook", "deliveries", "whk_1", "--limit=0"],
+    ["webhook", "deliveries", "whk_1", "--limit=x"],
+    ["webhook", "deliveries", "whk_1", "--cursor="],
+    ["webhook", "list", "--limit=5"],
+  ]) {
+    expect((await runCli(args)).code).toBe(2);
+  }
+  // refused before any request
+  expect(queries).toEqual([]);
+});

@@ -92,9 +92,37 @@ const ApiWebhook = z
     format: z.string(),
     eventTypes: z.array(z.string()),
     environmentIds: z.array(z.string()).optional(),
+    // optional: an older API sends none of the delivery results
+    lastAttempt: z
+      .object({
+        at: z.string(),
+        status: z.number().nullable(),
+        error: z.string().nullable(),
+        attempt: z.number(),
+      })
+      .loose()
+      .optional(),
+    failedStreak: z.number().optional(),
+    failing: z.boolean().optional(),
   })
   .loose();
 export type ApiWebhook = z.infer<typeof ApiWebhook>;
+
+const ApiDelivery = z
+  .object({
+    id: z.number(),
+    eventType: z.string(),
+    runId: z.string(),
+    status: z.string(),
+    attempts: z.number(),
+    lastStatus: z.number().nullable(),
+    lastError: z.string().nullable(),
+    lastErrorKind: z.string().nullable(),
+    createdAt: z.string(),
+    lastAttemptAt: z.string().nullable(),
+  })
+  .loose();
+export type ApiDelivery = z.infer<typeof ApiDelivery>;
 
 /** A preview as the API describes it; the link only comes with a start. */
 const ApiPreview = z.looseObject({
@@ -450,6 +478,27 @@ export function createApi(config: Config) {
         );
       }
       return { raw: json, webhooks: parsed.data.data };
+    },
+    /** Newest first; `nextCursor` when older deliveries remain. */
+    async listWebhookDeliveries(id: string, query: URLSearchParams) {
+      const { status, json } = await request(
+        "GET",
+        `/v1/webhooks/${encodeURIComponent(id)}/deliveries${query.size > 0 ? `?${query}` : ""}`,
+      );
+      const parsed = z
+        .object({
+          data: z.array(ApiDelivery),
+          nextCursor: z.string().optional(),
+        })
+        .safeParse(json);
+      if (!parsed.success) {
+        throw new ApiError(
+          status,
+          "bad_response",
+          "the API returned a delivery list this CLI can't read",
+        );
+      }
+      return { raw: json, ...parsed.data };
     },
     async deleteWebhook(id: string): Promise<void> {
       await request("DELETE", `/v1/webhooks/${encodeURIComponent(id)}`);

@@ -291,6 +291,71 @@ test("migrating a populated 0000 file keeps every row, cascade children included
   expect(createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
 });
 
+test("migrating existing deliveries backfills each one's last attempt and flags a webhook whose newest finished delivery gave up", () => {
+  migrateThrough("0022_aberrant_wolverine");
+  seedRun();
+  const events = [insertEvent(), insertEvent(), insertEvent()];
+  for (const id of ["a", "b", "c"]) {
+    run(
+      `insert into webhooks (id, url, event_types) values ('wh_${id}', 'https://x', '["run.started"]')`,
+    );
+  }
+  const deliver = (
+    hook: string,
+    event: number,
+    status: string,
+    attempts: number,
+    next: string,
+  ) =>
+    run(
+      "insert into webhook_deliveries (webhook_id, event_id, status, attempts, next_attempt_at) values (?, ?, ?, ?, ?)",
+      hook,
+      event,
+      status,
+      attempts,
+      next,
+    );
+  const t1 = "2026-11-01T00:00:00.000Z";
+  const t2 = "2026-11-02T00:00:00.000Z";
+  // a: delivered, then a give-up: failing. b: a give-up, then delivered: fine. c: still retrying
+  deliver("wh_a", events[0] as number, "delivered", 1, t1);
+  deliver("wh_a", events[1] as number, "failed", 30, t2);
+  deliver("wh_b", events[0] as number, "failed", 30, t1);
+  deliver("wh_b", events[1] as number, "delivered", 2, t2);
+  deliver(
+    "wh_c",
+    events[0] as number,
+    "pending",
+    3,
+    "2026-12-01T00:00:00.000Z",
+  );
+
+  migrate(db);
+
+  expect(
+    db.$client
+      .prepare("select id, failing_since from webhooks order by id")
+      .all(),
+  ).toEqual([
+    { id: "wh_a", failing_since: t2 },
+    { id: "wh_b", failing_since: null },
+    { id: "wh_c", failing_since: null },
+  ]);
+  expect(
+    db.$client
+      .prepare(
+        "select webhook_id, status, last_attempt_at from webhook_deliveries order by id",
+      )
+      .all(),
+  ).toEqual([
+    { webhook_id: "wh_a", status: "delivered", last_attempt_at: t1 },
+    { webhook_id: "wh_a", status: "failed", last_attempt_at: t2 },
+    { webhook_id: "wh_b", status: "failed", last_attempt_at: t1 },
+    { webhook_id: "wh_b", status: "delivered", last_attempt_at: t2 },
+    { webhook_id: "wh_c", status: "pending", last_attempt_at: null },
+  ]);
+});
+
 test("the claude_limits and claude_usage timestamps reject any form but UTC ISO-8601", () => {
   migrate(db);
   const iso = "2026-11-12T10:20:00.000Z";
@@ -939,7 +1004,12 @@ test("migrating a populated 0010 file keeps every event id, payload and delivery
     eventsBefore,
   );
   expect(
-    db.$client.prepare("select * from webhook_deliveries order by id").all(),
+    // every column but last_attempt_at, which 0023 added
+    db.$client
+      .prepare(
+        "select id, webhook_id, event_id, status, attempts, next_attempt_at, last_status, last_error, created_at from webhook_deliveries order by id",
+      )
+      .all(),
   ).toEqual(deliveriesBefore);
   expect(insertEvent("run.probed")).toBe(tail + 1);
   expect(
@@ -957,6 +1027,7 @@ test("migrating a populated 0010 file keeps every event id, payload and delivery
     "webhook_deliveries_event_id",
     "webhook_deliveries_status_next_attempt_at",
     "webhook_deliveries_webhook_id_event_id",
+    "webhook_deliveries_webhook_id_last_attempt_at",
   ]);
 });
 
@@ -1176,7 +1247,12 @@ test("migrating a populated 0015 file keeps a sealed webhook's columns byte for 
     owner_key_id: "key_1",
   });
   expect(
-    db.$client.prepare("select * from webhook_deliveries order by id").all(),
+    // every column but last_attempt_at, which 0023 added
+    db.$client
+      .prepare(
+        "select id, webhook_id, event_id, status, attempts, next_attempt_at, last_status, last_error, created_at from webhook_deliveries order by id",
+      )
+      .all(),
   ).toEqual(deliveriesBefore);
   expect(deliveriesBefore).toHaveLength(2);
 
@@ -1229,7 +1305,12 @@ test("migrating a populated 0017 file keeps every event, id, index and remaining
     eventsBefore,
   );
   expect(
-    db.$client.prepare("select * from webhook_deliveries order by id").all(),
+    // every column but last_attempt_at, which 0023 added
+    db.$client
+      .prepare(
+        "select id, webhook_id, event_id, status, attempts, next_attempt_at, last_status, last_error, created_at from webhook_deliveries order by id",
+      )
+      .all(),
   ).toEqual(deliveriesBefore);
   expect(seq()).toBe(seqBefore);
   expect(
@@ -1352,7 +1433,7 @@ test("the refusal names the pending migrations, the sizes in MB and the fix, on 
     message = err instanceof Error ? err.message : String(err);
   }
   expect(message).toBe(
-    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine, 0021_magical_klaw, 0022_aberrant_wolverine needs ${mb(needed)} (${mb(2 * events)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
+    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine, 0021_magical_klaw, 0022_aberrant_wolverine, 0023_tiny_madame_hydra needs ${mb(needed)} (${mb(2 * events)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
   );
 });
 

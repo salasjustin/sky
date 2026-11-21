@@ -137,7 +137,8 @@ sky env delete web --yes        # the same without asking; required off a termin
 sky webhook add https://example.com/hook --events=run.waiting,run.finished   # a Sky-format webhook
 sky webhook add https://example.com/hook --events=run.waiting --format=standard --secret=@secret.txt --env=web
 sky webhook add https://example.com/hook --events=run.waiting --format=openbot --secret=@secret.txt --env=web
-sky webhook list                # id, format, url, event types and environments; secrets are never printed
+sky webhook list                # id, format, url, event types and environments, then the last attempt and a FAILING flag; secrets are never printed
+sky webhook deliveries whk_…    # newest deliveries first (--limit=<1-100>, --cursor=<from the last page>)
 sky webhook delete whk_…
 sky key create <name> --role=runs --env=web,api   # admin only: a key limited to those environments; prints the secret once
 sky key list
@@ -463,6 +464,7 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | `POST /v1/agents/:id/stop` · `…/archive`                                | stop the current run; archive the agent                |
 | `POST`, `GET`, `DELETE /v1/agents/:id/preview`                          | start, read and stop the agent's [preview](#previews)  |
 | `POST`, `GET /v1/webhooks` · `GET`, `DELETE /v1/webhooks/:id`           | subscribe an https URL to events; list, read, remove   |
+| `GET /v1/webhooks/:id/deliveries`                                       | a webhook's recent deliveries and their results        |
 | `POST`, `GET /v1/keys` · `DELETE /v1/keys/:id`                          | admin only: mint, list and revoke `runs` keys          |
 | `GET /v1/claude-credentials`                                            | admin only: the Claude credentials, by name            |
 
@@ -605,7 +607,16 @@ Three ways to receive them:
   - `format`: `"sky"` (the default), `"standard"` or `"openbot"`, below.
   - `environmentIds`: a non-empty array of environment ids. The webhook then receives only events from agents in those environments; an id that doesn't exist is `400 invalid_body`. Left out, it receives every environment's events. An environment a webhook filters on can't be deleted until that webhook is (`409 webhooks_filter`).
 
-  `GET /v1/webhooks` returns each webhook's `format` and `environmentIds` when set. A secret is never returned.
+  `GET /v1/webhooks` returns each webhook's `format` and `environmentIds` when set. A secret is never returned. Once a webhook has had a delivery attempt it also carries, so a receiver that answers 401 on every try shows up here and not only in the server logs:
+  - `lastAttempt`: `at` (when it ran), `status` (the HTTP status, or `null` when the receiver never answered), `error` (why there was no response: `timeout`, `connection_refused`, `connection_reset`, `dns`, `tls` or `other`; `null` when there was one) and `attempt` (the attempt number within its delivery, from 1).
+  - `failedStreak`: how many deliveries in a row, since the last delivered one, ended failed or are still retrying after a failed attempt.
+  - `failing`: `true` once a delivery gave up after its 30th attempt, until the webhook's next delivered one clears it. Absent otherwise.
+
+  A webhook with no deliveries has none of these fields; they are optional, so older clients ignore them. `sky webhook list` prints them after the webhook, such as `| FAILING, last 401 at 2026-11-21T09:30:00.000Z (attempt 30), 13 failed in a row`.
+
+  `GET /v1/webhooks/:id/deliveries` (or `sky webhook deliveries <id>`) lists the webhook's deliveries, newest first, 20 by default and at most 100 (`?limit=`, or `--limit`). When older ones remain the page carries a `nextCursor`; pass it back as `?cursor=` (or `--cursor`). Each delivery has `id`, `eventType`, `runId`, `status` (`pending`, `delivered` or `failed`), `attempts`, `lastStatus`, `lastError` (redacted) with its `lastErrorKind`, and `createdAt`, `lastAttemptAt` and `nextAttemptAt` (only while pending). The request body, headers, signature and secret are never included. A `runs` key reads the deliveries of its own webhooks only; another's is `404 not_found`.
+
+  When a delivery gives up, the run it was for also gets a `runner.warning` event naming the webhook id, the event and the last status or error kind, never its URL or secret. A webhook subscribed to `runner.warning` whose own warning delivery gives up is flagged but not warned about again.
 
 **`sky` format.** The body is the event itself. Each delivery carries `Sky-Event-Type`, `Sky-Event-Id`, and
 
