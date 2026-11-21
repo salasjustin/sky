@@ -19,6 +19,14 @@ import { and, asc, eq, isNull, lt, lte, ne } from "drizzle-orm";
 import { open, type Sealed, webhookSecretAad } from "./crypto.js";
 import { presentEvent } from "./run-events.js";
 import type { Tx } from "./runs.js";
+import {
+  BlockedAddressError,
+  guardedAgent,
+  type LookupFn,
+  type RefusalKind,
+  refusalOf,
+  scrubAddresses,
+} from "./webhook-url.js";
 
 const TICK_MS = 5_000;
 const BATCH = 20;
@@ -149,14 +157,25 @@ export function enqueueDeliveries(
   return matching.length;
 }
 
-const describeError = (err: unknown): string => {
+/** The refusal an error or its cause carries; its kind is the whole `last_error` text of a refused delivery. */
+const refusalKind = (err: unknown): RefusalKind | null => {
+  if (err instanceof BlockedAddressError) return err.kind;
+  return err instanceof Error && err.cause !== undefined
+    ? refusalKind(err.cause)
+    : null;
+};
+
+/** The text stored as `last_error` for a failed attempt, with addresses and `host:port` pairs scrubbed out. */
+export const describeError = (err: unknown): string => {
+  const refusal = refusalKind(err);
+  if (refusal) return refusal;
   if (err instanceof Error && err.name === "TimeoutError") {
     return `timed out after ${TIMEOUT_MS / 1000}s`;
   }
   // fetch's own message is a bare "fetch failed"; the cause says why
   const cause = err instanceof Error ? err.cause : undefined;
   const text = cause instanceof Error ? `${err}: ${cause.message}` : `${err}`;
-  return text.slice(0, MAX_ERROR_LENGTH);
+  return scrubAddresses(text).slice(0, MAX_ERROR_LENGTH);
 };
 
 export type Dispatcher = ReturnType<typeof createDispatcher>;
@@ -175,6 +194,7 @@ export function createDispatcher({
   log,
   now = () => new Date(),
   random = Math.random,
+  lookup,
 }: {
   db: Db;
   signingKey: string;
@@ -183,7 +203,10 @@ export function createDispatcher({
   log: (line: string) => void;
   now?: () => Date;
   random?: () => number;
+  /** resolves a webhook's host at connect time; the system resolver unless a test stubs it */
+  lookup?: LookupFn;
 }) {
+  const agent = guardedAgent(lookup);
   const stopping = new AbortController();
   let timer: NodeJS.Timeout | undefined;
   let inflight: Promise<void> | null = null;
@@ -284,12 +307,16 @@ export function createDispatcher({
     let error: string | null = null;
     let retryAfter: number | null = null;
     try {
+      // a stored webhook that predates the URL rules, and a literal IP (which never reaches the lookup)
+      const refusal = refusalOf(row.url);
+      if (refusal) throw new BlockedAddressError(refusal);
       const request = buildRequest(row, id, presented, t);
       const res = await fetch(row.url, {
         method: "POST",
         headers: request.headers,
         body: request.body,
         redirect: "manual",
+        dispatcher: agent,
         signal: AbortSignal.any([
           AbortSignal.timeout(TIMEOUT_MS),
           stopping.signal,
@@ -307,7 +334,9 @@ export function createDispatcher({
     }
     const attempts = row.attempts + 1;
     const delivered = status !== null && status >= 200 && status < 300;
-    const failed = !delivered && attempts >= MAX_ATTEMPTS;
+    // a refused URL or address is not a transient failure: fail at once rather than retry
+    const refused = error === "blocked_address" || error === "url_not_allowed";
+    const failed = !delivered && (refused || attempts >= MAX_ATTEMPTS);
     const nextAttemptAt =
       delivered || failed
         ? undefined
