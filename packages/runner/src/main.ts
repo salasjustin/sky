@@ -10,7 +10,7 @@ import { type Config, ConfigError, loadConfig } from "./config.js";
 import { removeSkyLogin } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
 import { holdSprite, spriteApiFrom } from "./keepalive.js";
-import { refreshPlugins } from "./plugins.js";
+import { type PluginRefreshRecord, refreshPlugins } from "./plugins.js";
 import { previewProxyMain } from "./preview-proxy.js";
 import { publishMain } from "./publish.js";
 import { endSessionProcesses } from "./reap.js";
@@ -160,7 +160,9 @@ async function main(): Promise<void> {
   });
   await step("sprite hold", () => hold.ready);
   // a stop while the hold was landing skips setup; the session reports it as run.failed
-  if (!controller.signal.aborted) await setUpSession(controller.signal);
+  const pluginRefresh = controller.signal.aborted
+    ? undefined
+    : await setUpSession(controller.signal);
   warn("runner: session starting");
   try {
     process.exitCode = await runSession(config, {
@@ -171,6 +173,7 @@ async function main(): Promise<void> {
       warn,
       credentialEnv,
       seal,
+      pluginRefresh,
     });
   } finally {
     // the run is over, whatever way: nothing it started may keep its memory on a sprite other runs share
@@ -184,13 +187,13 @@ async function main(): Promise<void> {
   else stopListening();
 }
 
-async function setUpSession(signal: AbortSignal): Promise<void> {
+async function setUpSession(signal: AbortSignal): Promise<PluginRefreshRecord> {
   // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
   await step("store sync", () => syncStoreQuietly("pull", process.env, warn));
   // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails
   // the run. The marketplaces need no Claude login, and these `claude` processes are neither sealed nor
-  // pinned, so they get the env with the credential taken out
-  await step("plugin refresh", () =>
+  // pinned, so they get the env with the credential taken out. What it did rides the run's `run.started`
+  return step("plugin refresh", () =>
     refreshPlugins({ env: process.env, warn, signal }),
   );
 }

@@ -12,6 +12,7 @@ import {
 import { type Api, ApiError, type ApiListedAgent, type ApiRun } from "./api.js";
 import type { Io } from "./cli.js";
 import { type Output, UsageError } from "./output.js";
+import { pluginLines } from "./plugins.js";
 import { resolveEnvId } from "./secret.js";
 
 type Values = {
@@ -586,6 +587,7 @@ const status: AgentCommand = {
         lines.push(`claude credential: ${run.claudeCredential}`);
       }
       if (run.compareUrl) lines.push(`compare: ${run.compareUrl}`);
+      if (run.plugins) lines.push(...pluginLines(run.plugins));
       out.result(newest.raw, lines.join("\n"));
       return runExitCodes[run.status];
     };

@@ -9,7 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { claudeBinary, refreshPlugins } from "./plugins.js";
+import { claudeBinary, loadedPlugins, refreshPlugins } from "./plugins.js";
 
 const listing = JSON.stringify([
   { id: "kru@kru", scope: "user" },
@@ -48,6 +48,8 @@ describe("refreshPlugins", () => {
       ["plugin", "marketplace", "update"],
       ["plugin", "update", "kru@kru", "--scope", "user"],
       ["plugin", "update", "other@kru", "--scope", "user"],
+      // read back, for the record of what the refresh left installed
+      ["plugin", "list", "--json"],
     ]);
     expect(warn).toHaveBeenCalledOnce();
     expect(warn.mock.calls[0]?.[0]).toBe(
@@ -245,6 +247,228 @@ describe("refreshPlugins on odd listings", () => {
   });
 });
 
+/**
+ * A `claude` over a table of installed versions: `plugin list` reports it, and `plugin update`
+ * moves a plugin to `latest` unless `stuck` names it (the update says it worked, the version stays).
+ */
+function fakeClaude(
+  installed: Record<string, string>,
+  latest: string,
+  stuck: string[] = [],
+) {
+  const versions = { ...installed };
+  const run = async (_f: string, args: string[]) => {
+    if (args[1] === "list")
+      return {
+        stdout: JSON.stringify([
+          ...Object.entries(versions).map(([id, version]) => ({
+            id,
+            version,
+            scope: "user",
+          })),
+          { id: "kru@kru", version: "0.1.0", scope: "project" },
+        ]),
+      };
+    if (args[1] === "update" && !stuck.includes(args[2] as string))
+      versions[args[2] as string] = latest;
+    return { stdout: "" };
+  };
+  return { run, versions };
+}
+
+describe("refreshPlugins record", () => {
+  const record = (options: Partial<Parameters<typeof refreshPlugins>[0]>) =>
+    refreshPlugins({
+      env: {},
+      warn: vi.fn(),
+      claude: "c",
+      lockFile: join(lockDir, "lock"),
+      ...options,
+    });
+
+  test("a refresh that moved the plugins records each one's version before and after, with its marketplace", async () => {
+    const { run } = fakeClaude(
+      { "kru@kru": "0.214.0", "tool@acme": "1.0.0" },
+      "0.216.0",
+    );
+    let t = 0;
+    const result = await record({ run, now: () => (t += 2000) });
+    expect(result).toEqual({
+      outcome: "refreshed",
+      durationMs: 4000, // the fake clock steps 2s per read: start, the log line, the record
+      before: [
+        { name: "kru", marketplace: "kru", version: "0.214.0" },
+        { name: "tool", marketplace: "acme", version: "1.0.0" },
+      ],
+      after: [
+        { name: "kru", marketplace: "kru", version: "0.216.0" },
+        { name: "tool", marketplace: "acme", version: "0.216.0" },
+      ],
+    });
+  });
+
+  test("an update that says it worked but leaves the version is recorded as unchanged", async () => {
+    const { run } = fakeClaude({ "kru@kru": "0.214.0" }, "0.216.0", [
+      "kru@kru",
+    ]);
+    const result = await record({ run });
+    expect(result.outcome).toBe("refreshed");
+    expect(result.before).toEqual(result.after);
+    expect(result.after).toEqual([
+      { name: "kru", marketplace: "kru", version: "0.214.0" },
+    ]);
+  });
+
+  test("a failing plugin update is a failed outcome naming the plugin and why, with the versions as they stand", async () => {
+    const fake = fakeClaude(
+      { "kru@kru": "0.214.0", "tool@acme": "1.0.0" },
+      "2.0.0",
+    );
+    const result = await record({
+      run: async (f, args) => {
+        if (args[1] === "update" && args[2] === "kru@kru")
+          throw new Error("delisted\nmore");
+        return fake.run(f, args);
+      },
+    });
+    expect(result.outcome).toBe("failed: update failed for kru@kru (delisted)");
+    expect(result.before.map((p) => p.version)).toEqual(["0.214.0", "1.0.0"]);
+    expect(result.after.map((p) => p.version)).toEqual(["0.214.0", "2.0.0"]);
+  });
+
+  test("a marketplace that can't be reached is a failed outcome with the reason and the versions it left", async () => {
+    const fake = fakeClaude({ "kru@kru": "0.214.0" }, "0.216.0");
+    const result = await record({
+      run: async (f, args) => {
+        if (args[1] === "marketplace")
+          throw new Error("could not resolve host\nmore");
+        return fake.run(f, args);
+      },
+    });
+    expect(result.outcome).toBe("failed: could not resolve host");
+    expect(result.before).toEqual(result.after);
+    expect(result.before).toHaveLength(1);
+  });
+
+  test("a refresh cut at the timeout is timed_out, and an update that landed before the cut shows in after", async () => {
+    const fake = fakeClaude(
+      { "kru@kru": "0.214.0", "tool@acme": "1.0.0" },
+      "0.216.0",
+    );
+    const result = await record({
+      timeoutMs: 50,
+      listTimeoutMs: 1000,
+      run: (f, args, { signal }) => {
+        if (args[1] === "update" && args[2] === "tool@acme")
+          return new Promise((_, reject) =>
+            signal.addEventListener("abort", () => reject(signal.reason)),
+          );
+        return fake.run(f, args);
+      },
+    });
+    expect(result.outcome).toBe("timed_out");
+    expect(result.before.map((p) => p.version)).toEqual(["0.214.0", "1.0.0"]);
+    expect(result.after.map((p) => p.version)).toEqual(["0.216.0", "1.0.0"]);
+  });
+
+  test("a hung first listing is timed_out with nothing listed", async () => {
+    const result = await record({
+      timeoutMs: 50,
+      run: (_f, _a, { signal }) =>
+        new Promise((_, reject) =>
+          signal.addEventListener("abort", () => reject(signal.reason)),
+        ),
+    });
+    expect(result).toMatchObject({
+      outcome: "timed_out",
+      before: [],
+      after: [],
+    });
+  });
+
+  test("an already-stopped run is skipped: stopped, and spawns nothing", async () => {
+    const run = vi.fn();
+    const result = await record({ run, signal: AbortSignal.abort("SIGTERM") });
+    expect(run).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      outcome: "skipped: stopped",
+      before: [],
+      after: [],
+    });
+  });
+
+  test("a run that waited out another run's refresh is skipped with that reason, and runs no claude", async () => {
+    const lockFile = join(lockDir, "held");
+    writeFileSync(lockFile, String(process.pid));
+    setTimeout(() => rmSync(lockFile), 50);
+    const run = vi.fn();
+    const result = await record({ run, lockFile });
+    expect(run).not.toHaveBeenCalled();
+    expect(result.outcome).toBe("skipped: another run refreshed the plugins");
+  });
+
+  test("no user-scope plugins is a refreshed outcome with nothing listed", async () => {
+    const result = await record({
+      run: async () => ({
+        stdout: JSON.stringify([
+          { id: "kru@kru", version: "1", scope: "project" },
+        ]),
+      }),
+    });
+    expect(result).toMatchObject({
+      outcome: "refreshed",
+      before: [],
+      after: [],
+    });
+  });
+
+  test("a listing that can't be read is a failed outcome, and a long reason is cut", async () => {
+    const result = await record({
+      run: async () => {
+        throw new Error(`x${"y".repeat(500)}`);
+      },
+    });
+    expect(result.outcome.startsWith("failed: xyyy")).toBe(true);
+    expect(result.outcome.length).toBeLessThanOrEqual(210);
+  });
+});
+
+describe("loadedPlugins", () => {
+  test("takes the marketplace and resolved version from the cache path", () => {
+    expect(
+      loadedPlugins([
+        {
+          name: "kru",
+          path: "/home/sprite/.claude/plugins/cache/kru/kru/0.214.0",
+          version: "0.214.0",
+        },
+      ]),
+    ).toEqual([{ name: "kru", marketplace: "kru", version: "0.214.0" }]);
+  });
+
+  test("a commit-named version folder wins over the manifest's version", () => {
+    expect(
+      loadedPlugins([
+        {
+          name: "p",
+          path: "/x/plugins/cache/mk/p/abc123def456/",
+          version: "1.0.0",
+        },
+      ]),
+    ).toEqual([{ name: "p", marketplace: "mk", version: "abc123def456" }]);
+  });
+
+  test("a plugin from outside the cache keeps the manifest's version and no marketplace", () => {
+    expect(
+      loadedPlugins([{ name: "local", path: "/work/local", version: "2.0.0" }]),
+    ).toEqual([{ name: "local", marketplace: null, version: "2.0.0" }]);
+    expect(loadedPlugins([{ name: "local", path: "/work/local" }])).toEqual([
+      { name: "local", marketplace: null, version: "unknown" },
+    ]);
+    expect(loadedPlugins(undefined)).toEqual([]);
+  });
+});
+
 describe("claudeBinary", () => {
   let dir: string;
   let runnerPath: string;
@@ -329,7 +553,8 @@ describe("refresh lock", () => {
       ),
     );
     expect(peak).toBe(1);
-    expect(calls.filter((a) => a[1] === "list")).toHaveLength(1);
+    // the one refresh lists before and after its updates; the two that waited list nothing
+    expect(calls.filter((a) => a[1] === "list")).toHaveLength(2);
     const lines = warn.mock.calls.map((c) => String(c[0]));
     const refreshed = lines.filter((l) => /plugins refreshed in/.test(l));
     const skipped = lines.filter((l) => /another run refreshed/.test(l));

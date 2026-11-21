@@ -67,6 +67,7 @@ import {
   readRuleCovers,
   stageRead,
 } from "./outside-reads.js";
+import { loadedPlugins, type PluginRefreshRecord } from "./plugins.js";
 import { policyOutcome } from "./policy.js";
 import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
@@ -654,6 +655,8 @@ export async function runSession(
     credentialEnv: NodeJS.ProcessEnv;
     /** Keeps the credential out of the repo's processes' reach; a seal with a problem fails the run before it starts. */
     seal: Seal;
+    /** What the start-of-run plugin refresh did; `run.started` carries it with the plugins the session loaded. */
+    pluginRefresh?: PluginRefreshRecord;
   },
 ): Promise<0 | 1> {
   const { runId } = config;
@@ -1394,10 +1397,21 @@ export async function runSession(
         const exposed = deps.seal.check();
         if (exposed)
           stopSession(`credential_exposed: ${exposed}; the run was stopped.`);
+        // what the session itself loaded, which a refresh that says it worked doesn't promise
+        const plugins =
+          deps.pluginRefresh === undefined
+            ? undefined
+            : {
+                ...deps.pluginRefresh,
+                loaded: loadedPlugins(message.plugins),
+              };
         startLanded = post(
           {
             type: "run.started",
-            payload: { sessionId: message.session_id },
+            payload: {
+              sessionId: message.session_id,
+              ...(plugins && { plugins }),
+            },
           },
           {
             deadline: Date.now() + startBudgetMs(config, launchElapsedMs()),
@@ -1409,6 +1423,19 @@ export async function runSession(
               : { signal: abortController.signal }),
           },
         );
+        // a refresh that didn't end in `refreshed` is also a warning, the channel a problem that
+        // didn't end the run already has, so it reaches whoever watches warnings, not only run.started's readers
+        if (plugins && plugins.outcome !== "refreshed") {
+          const loaded =
+            plugins.loaded.map((p) => `${p.name}@${p.version}`).join(", ") ||
+            "no plugins";
+          void post({
+            type: "runner.warning",
+            payload: {
+              message: `plugin refresh ${plugins.outcome}; the session loaded ${loaded}`,
+            },
+          }).catch(() => {});
+        }
         try {
           await startLanded;
         } catch (error) {

@@ -41,6 +41,7 @@ import {
   isActive,
   presentRun,
   runError,
+  runPlugins,
   stopActiveRun,
   type Tx,
 } from "./runs.js";
@@ -124,6 +125,8 @@ const presentRunDetail = (
     : null,
   // null until the launch records what it injected
   secretNames: run.secretNames,
+  // the plugin refresh and the versions the session loaded; null before the run starts, or from an older runner
+  plugins: runPlugins(db, run.id),
 });
 
 const presentAgent = (row: AgentRow) => ({

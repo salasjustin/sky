@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
+import type { PluginRefresh, PluginVersion } from "@sky/shared";
 
 const exec = promisify(execFile);
 
@@ -118,6 +119,42 @@ export async function withRefreshLock(
   }
 }
 
+/** What a refresh did, as the run's `run.started` carries it; the session adds what it loaded. */
+export type PluginRefreshRecord = Omit<PluginRefresh, "loaded">;
+
+/** Bounds the `claude plugin list` that reads the plugins back after a refresh that ended early. */
+const LIST_TIMEOUT_MS = 5_000;
+
+const idOf = (plugin: PluginVersion) =>
+  plugin.marketplace === null
+    ? plugin.name
+    : `${plugin.name}@${plugin.marketplace}`;
+
+/** The user-scope plugins of a `claude plugin list --json`, each once, as `name@marketplace` split. */
+function userPlugins(stdout: string): PluginVersion[] {
+  const installed = JSON.parse(stdout) as {
+    id: string;
+    scope: string;
+    version?: unknown;
+  }[];
+  const seen = new Set<string>();
+  const plugins: PluginVersion[] = [];
+  for (const { id, scope, version } of installed) {
+    if (scope !== "user" || seen.has(id)) continue;
+    seen.add(id);
+    const at = id.lastIndexOf("@");
+    plugins.push({
+      name: (at > 0 ? id.slice(0, at) : id).slice(0, 100),
+      marketplace: at > 0 ? id.slice(at + 1).slice(0, 100) : null,
+      version:
+        typeof version === "string" && version !== ""
+          ? version.slice(0, 100)
+          : "unknown",
+    });
+  }
+  return plugins;
+}
+
 /**
  * Refreshes the plugin marketplaces and updates the user-scope plugins installed in them, so a
  * sandbox doesn't keep the versions its env setup installed. The marketplaces are reached the way
@@ -125,6 +162,8 @@ export async function withRefreshLock(
  * refresh on the sprite skips its own and says so on `warn`. Best effort: one overall timeout, a
  * failure is one line on `warn`, and the session carries on with the cached versions. `signal` is
  * the run's stop: aborting it ends the refresh at once, and an already-aborted one spawns nothing.
+ * Resolves to the record of what it did: the user-scope plugins before and after, the outcome
+ * (`refreshed`, `timed_out`, `failed: <reason>` or `skipped: <reason>`) and how long it took.
  * Never throws.
  */
 export async function refreshPlugins(options: {
@@ -132,70 +171,100 @@ export async function refreshPlugins(options: {
   warn: (line: string) => void;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** How long the read-back after a refresh that ended early may take; `LIST_TIMEOUT_MS` when absent. */
+  listTimeoutMs?: number;
   claude?: string;
   /** The sprite-wide lock file a refresh holds while it runs; in the temp dir when absent. */
   lockFile?: string;
   run?: Exec;
   now?: () => number;
-}): Promise<void> {
+}): Promise<PluginRefreshRecord> {
   const { env, warn, signal: stop } = options;
+  const now = options.now ?? Date.now;
+  const started = now();
+  let before: PluginVersion[] = [];
+  let after: PluginVersion[] | undefined;
+  const record = (outcome: string): PluginRefreshRecord => ({
+    outcome,
+    durationMs: Math.max(0, Math.round(now() - started)),
+    before,
+    after: after ?? before,
+  });
   if (stop?.aborted) {
     warn("runner: plugin refresh skipped (stopped)");
-    return;
+    return record("skipped: stopped");
   }
   const run = options.run ?? exec;
-  const now = options.now ?? Date.now;
   const claude = options.claude ?? claudeBinary(env);
   const timeout = AbortSignal.timeout(
     options.timeoutMs ?? PLUGIN_REFRESH_TIMEOUT_MS,
   );
   const signal = stop ? AbortSignal.any([stop, timeout]) : timeout;
-  const started = now();
   const lockFile =
     options.lockFile ?? join(tmpdir(), "sky-plugin-refresh.lock");
+  const list = async (within: AbortSignal) =>
+    userPlugins(
+      (await run(claude, ["plugin", "list", "--json"], { env, signal: within }))
+        .stdout,
+    );
+  let failedUpdates = "";
   try {
     // the wait for another run's refresh counts against this one's budget; ending it skips ours
     const outcome = await withRefreshLock(lockFile, signal, async () => {
       const claudeRun = (...args: string[]) =>
         run(claude, args, { env, signal });
-      const { stdout } = await claudeRun("plugin", "list", "--json");
-      const installed = JSON.parse(stdout) as { id: string; scope: string }[];
-      const plugins = [
-        ...new Set(
-          installed.filter((p) => p.scope === "user").map((p) => p.id),
-        ),
-      ];
+      before = await list(signal);
       const updated: string[] = [];
       const failed: string[] = [];
-      if (plugins.length > 0) {
-        await claudeRun("plugin", "marketplace", "update");
-        for (const plugin of plugins) {
-          try {
-            await claudeRun("plugin", "update", plugin, "--scope", "user");
-            updated.push(plugin);
-          } catch (error) {
-            if (signal.aborted) throw error;
-            failed.push(`${plugin} (${firstLine(error)})`);
+      if (before.length > 0) {
+        try {
+          await claudeRun("plugin", "marketplace", "update");
+          for (const plugin of before.map(idOf)) {
+            try {
+              await claudeRun("plugin", "update", plugin, "--scope", "user");
+              updated.push(plugin);
+            } catch (error) {
+              if (signal.aborted) throw error;
+              failed.push(`${plugin} (${firstLine(error)})`);
+            }
           }
+          after = await list(signal);
+        } catch (error) {
+          // still under the lock: what the session starts with, which an update that landed before the cut changed
+          if (!stop?.aborted) {
+            try {
+              after = await list(
+                AbortSignal.timeout(options.listTimeoutMs ?? LIST_TIMEOUT_MS),
+              );
+            } catch {}
+          }
+          throw error;
         }
       }
-      const failures =
-        failed.length > 0 ? `; update failed for ${failed.join(", ")}` : "";
+      failedUpdates =
+        failed.length > 0 ? `update failed for ${failed.join(", ")}` : "";
+      const failures = failedUpdates === "" ? "" : `; ${failedUpdates}`;
       warn(
-        `runner: plugins refreshed in ${seconds(now() - started)}s (${updated.join(", ") || (plugins.length > 0 ? "none updated" : "none installed")})${failures}`,
+        `runner: plugins refreshed in ${seconds(now() - started)}s (${updated.join(", ") || (before.length > 0 ? "none updated" : "none installed")})${failures}`,
       );
     });
-    if (outcome === "done-by-holder")
+    if (outcome === "done-by-holder") {
       warn(
         `runner: plugin refresh skipped, another run refreshed the plugins (waited ${seconds(now() - started)}s)`,
       );
+      // no `claude` runs outside the lock, so this run records only what its session loaded
+      return record("skipped: another run refreshed the plugins");
+    }
     // ended while another run held the lock
     if (outcome === "aborted")
       throw new Error("waiting for another run's refresh");
+    return record(
+      failedUpdates === "" ? "refreshed" : `failed: ${failedUpdates}`,
+    );
   } catch (error) {
     if (stop?.aborted) {
       warn(`runner: plugin refresh stopped after ${seconds(now() - started)}s`);
-      return;
+      return record("skipped: stopped");
     }
     const why = timeout.aborted
       ? `timed out after ${seconds(now() - started)}s`
@@ -203,10 +272,32 @@ export async function refreshPlugins(options: {
     warn(
       `runner: plugin refresh failed (${why}); continuing with the installed versions`,
     );
+    return record(timeout.aborted ? "timed_out" : `failed: ${why}`);
   }
+}
+
+/**
+ * The plugins a session says it loaded, from its `init` message. Claude Code names a marketplace
+ * plugin's directory `<plugins root>/cache/<marketplace>/<plugin>/<version>`, so the marketplace and
+ * the version it resolved come from there; a plugin from anywhere else keeps the manifest's version.
+ */
+export function loadedPlugins(
+  plugins: { name: string; path: string; version?: string }[] | undefined,
+): PluginVersion[] {
+  return (plugins ?? []).slice(0, 100).map(({ name, path, version }) => {
+    const cached = /\/cache\/([^/]+)\/[^/]+\/([^/]+)\/?$/.exec(path);
+    return {
+      name: name.slice(0, 100) || "unknown",
+      marketplace: cached?.[1]?.slice(0, 100) ?? null,
+      version: (cached?.[2] ?? version ?? "unknown").slice(0, 100) || "unknown",
+    };
+  });
 }
 
 const seconds = (ms: number) => (ms / 1000).toFixed(1);
 
+/** The reason a failed refresh is recorded with: one line, short, never the command's whole output. */
 const firstLine = (error: unknown) =>
-  error instanceof Error ? error.message.split("\n")[0] : String(error);
+  (error instanceof Error ? error.message : String(error))
+    .split("\n")[0]
+    ?.slice(0, 200) ?? "";

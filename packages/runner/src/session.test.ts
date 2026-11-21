@@ -338,6 +338,100 @@ test("a finished run posts started, assistant text as claude.Message, then finis
   ]);
 });
 
+const kru = (version: string) => ({
+  name: "kru",
+  marketplace: "kru",
+  version,
+});
+const initWithPlugins = (plugins: unknown[]) => ({ ...init, plugins });
+
+test("run.started carries the plugin refresh with the versions the session loaded, which can differ from what the refresh installed", async () => {
+  const { posted, post } = recorder();
+  const code = await runSession(config, {
+    query: scripted([
+      initWithPlugins([
+        {
+          name: "kru",
+          path: "/home/sprite/.claude/plugins/cache/kru/kru/0.214.0",
+          version: "0.214.0",
+        },
+      ]),
+      success,
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    pluginRefresh: {
+      outcome: "refreshed",
+      durationMs: 4200,
+      before: [kru("0.214.0")],
+      after: [kru("0.216.0")],
+    },
+  });
+  expect(code).toBe(0);
+  expect(posted[0]).toEqual({
+    runId: "run_1",
+    type: "run.started",
+    payload: {
+      sessionId: "sess-new",
+      plugins: {
+        outcome: "refreshed",
+        durationMs: 4200,
+        before: [kru("0.214.0")],
+        after: [kru("0.216.0")],
+        loaded: [kru("0.214.0")],
+      },
+    },
+  });
+  expect(posted.map((e) => e.type)).not.toContain("runner.warning");
+});
+
+test("a refresh that didn't end refreshed also posts a runner.warning naming the outcome and what the session loaded", async () => {
+  const { sent, post } = apiPoster();
+  await runSession(config, {
+    query: scripted([
+      initWithPlugins([
+        {
+          name: "kru",
+          path: "/home/sprite/.claude/plugins/cache/kru/kru/0.214.0",
+        },
+      ]),
+      success,
+    ]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    pluginRefresh: {
+      outcome: "timed_out",
+      durationMs: 30_000,
+      before: [kru("0.214.0")],
+      after: [kru("0.214.0")],
+    },
+  });
+  const started = sent.find((e) => e.type === "run.started");
+  expect(started?.payload).toMatchObject({
+    plugins: { outcome: "timed_out", loaded: [kru("0.214.0")] },
+  });
+  expect(sent.find((e) => e.type === "runner.warning")?.payload).toEqual({
+    message: "plugin refresh timed_out; the session loaded kru@0.214.0",
+  });
+});
+
+test("a run without a refresh record posts the bare run.started an older API expects", async () => {
+  const { posted, post } = recorder();
+  await runSession(config, {
+    query: scripted([init, success]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(posted[0]).toEqual({
+    runId: "run_1",
+    type: "run.started",
+    payload: { sessionId: "sess-new" },
+  });
+});
+
 test("each hook reaches the API as its claude.* event, in hook order, and nothing posts run.progress", async () => {
   const { sent, post } = apiPoster();
   const query = scripted([

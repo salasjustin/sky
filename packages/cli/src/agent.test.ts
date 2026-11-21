@@ -402,6 +402,95 @@ test("status prints the run, its summary, error and compare link", async () => {
   );
 });
 
+const pkg = (
+  name: string,
+  version: string,
+  marketplace: string | null = "mk",
+) => ({
+  name,
+  marketplace,
+  version,
+});
+const record = (over: Record<string, unknown> = {}) => ({
+  outcome: "refreshed",
+  durationMs: 4200,
+  before: [pkg("kru", "0.214.0"), pkg("tool", "1.0.0")],
+  after: [pkg("kru", "0.216.0"), pkg("tool", "1.0.0")],
+  loaded: [pkg("kru", "0.216.0"), pkg("tool", "1.0.0")],
+  ...over,
+});
+
+test("status shows the plugin refresh and each plugin's version before, after and loaded, without JSON", async () => {
+  server.use(runs(run({ plugins: record() })));
+  const r = await runCli(["status", agentId]);
+  expect(r.stdout).toBe(
+    [
+      "run_1 running",
+      "plugins: refreshed (4.2s)",
+      "  kru@mk  before 0.214.0  after 0.216.0  loaded 0.216.0",
+      "  tool@mk  before 1.0.0  after 1.0.0  loaded 1.0.0",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("status says when the session loaded another version than the refresh left installed", async () => {
+  server.use(
+    runs(
+      run({
+        plugins: record({
+          outcome: "timed_out",
+          durationMs: 30_000,
+          loaded: [pkg("kru", "0.214.0", null), pkg("tool", "1.0.0", null)],
+        }),
+      }),
+    ),
+  );
+  const r = await runCli(["status", agentId]);
+  expect(r.stdout).toContain("plugins: timed_out (30.0s)\n");
+  expect(r.stdout).toContain(
+    "  kru@mk  before 0.214.0  after 0.216.0  loaded 0.214.0  (the session loaded 0.214.0, not the installed 0.216.0)\n",
+  );
+  // a loaded plugin that can't name its marketplace joins its installed line, not a second one
+  expect(r.stdout.match(/\n {2}kru/g)).toHaveLength(1);
+  expect(r.stdout).not.toContain(
+    "tool@mk  before 1.0.0  after 1.0.0  loaded 1.0.0  (",
+  );
+});
+
+test("status prints a failed or skipped refresh's reason and a plugin that is missing from a column as -", async () => {
+  server.use(
+    runs(
+      run({
+        plugins: record({
+          outcome: "failed: could not resolve host",
+          before: [],
+          after: [],
+          loaded: [pkg("kru", "0.214.0")],
+        }),
+      }),
+    ),
+  );
+  const r = await runCli(["status", agentId]);
+  expect(r.stdout).toContain(
+    "plugins: failed: could not resolve host (4.2s)\n",
+  );
+  expect(r.stdout).toContain("  kru@mk  before -  after -  loaded 0.214.0\n");
+});
+
+test("status prints no plugins line for an older API, a run that hasn't started, or a record this CLI can't read, and --json passes the field through", async () => {
+  for (const plugins of [undefined, null, { outcome: 7 }]) {
+    server.use(runs(run(plugins === undefined ? {} : { plugins })));
+    const r = await runCli(["status", agentId]);
+    expect(r.code).toBe(4);
+    expect(r.stdout).toBe("run_1 running\n");
+  }
+  const withRecord = run({ plugins: record() });
+  server.use(runs(withRecord));
+  const json = await runCli(["status", agentId, "--json"]);
+  expect(JSON.parse(json.stdout)).toEqual(withRecord);
+});
+
 test("status exits with every run state's code", async () => {
   for (const [state, code] of [
     ["finished", 0],

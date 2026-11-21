@@ -12,6 +12,7 @@ import {
   type AgentStatus,
   type EventType,
   HEARTBEAT_INTERVAL_MS,
+  PluginRefresh,
   type RunId,
   RunStatus,
   runTransitions,
@@ -125,6 +126,23 @@ export function runError(tx: Db | Tx, runId: RunId): string | null {
     .where(and(eq(events.runId, runId), eq(events.type, "run.failed")))
     .get();
   return row ? (row.payload as { error: string }).error : null;
+}
+
+/**
+ * The plugin record of the run's latest `run.started`: what the start-of-run refresh did and which
+ * plugin versions the session loaded. Null for a run whose runner predates it, or that hasn't started.
+ */
+export function runPlugins(tx: Db | Tx, runId: RunId): PluginRefresh | null {
+  const row = tx
+    .select({ payload: events.payload })
+    .from(events)
+    .where(and(eq(events.runId, runId), eq(events.type, "run.started")))
+    .orderBy(desc(events.id))
+    .get();
+  const parsed = PluginRefresh.safeParse(
+    (row?.payload as { plugins?: unknown } | undefined)?.plugins,
+  );
+  return parsed.success ? parsed.data : null;
 }
 
 /**
