@@ -238,7 +238,7 @@ export async function refreshPlugins(options: {
           }
           after = await list(signal);
         } catch (error) {
-          // still under the lock, read back what the session will start with: an update that landed before the cut changed it
+          // still under the lock, read back what is installed now: an update that landed before the cut may have changed it
           if (!stop?.aborted) {
             // its own timeout, since the refresh's is spent by now, but still ended by a stop
             const listTimeout = AbortSignal.timeout(
