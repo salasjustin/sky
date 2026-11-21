@@ -149,8 +149,10 @@ export type PluginVersion = z.infer<typeof PluginVersion>;
 /**
  * What the start-of-run plugin refresh did, as the run records it. `outcome` is `refreshed`,
  * `timed_out`, `failed: <reason>` or `skipped: <reason>`. `before` and `after` are the user-scope
- * plugins either side of the refresh, per `claude plugin list`; `loaded` is what the session's own
- * init reports it loaded, which is what counts when `plugin update` and the session disagree.
+ * plugins either side of the refresh, per `claude plugin list`, each cut to its first 100. Both are
+ * empty on a skip, and either is empty when the refresh ended before reading that list, so an empty
+ * `after` means "not read", not "removed". `loaded` is what the session's own init reports it
+ * loaded, from any scope, which is what counts when `plugin update` and the session disagree.
  */
 export const PluginRefresh = z.object({
   outcome: z.string().min(1).max(300),
