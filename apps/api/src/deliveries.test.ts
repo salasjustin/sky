@@ -1708,6 +1708,46 @@ test.each([
   },
 );
 
+test("a refused delivery warns once per failing stretch, and again after a delivered attempt clears it", async () => {
+  const refusedUrl = "https://10.0.0.5/hook";
+  await failedBlocked(() => {}, refusedUrl);
+  const id = webhookIdOf();
+  const first = db.$client
+    .prepare("select id from runs")
+    .pluck()
+    .get() as RunId;
+  expect(warnings(first)).toHaveLength(1);
+  expect(warnings(first)[0]).toContain("after 1 attempt;");
+
+  // a second refusal while the webhook is still failing posts nothing
+  const second = runningRun("second");
+  await finished(second.runId, second.token);
+  await dispatcher.drain();
+  expect(deliveries().map((d) => d.status)).toEqual(["failed", "failed"]);
+  expect((await summaryOf(id)).failing).toBe(true);
+  expect(warnings(second.runId)).toEqual([]);
+  expect(warnings(first)).toHaveLength(1);
+
+  // fixed, a delivered attempt clears the flag
+  db.$client.prepare("update webhooks set url = ?").run(subscriberUrl);
+  advance(1_000);
+  subscriber([200]);
+  seedDeliveries(id, 1);
+  await dispatcher.drain();
+  expect(await summaryOf(id)).not.toHaveProperty("failing");
+
+  // refused again, it is a new stretch and warns again
+  db.$client.prepare("update webhooks set url = ?").run(refusedUrl);
+  advance(1_000);
+  const third = runningRun("third");
+  await finished(third.runId, third.token);
+  await dispatcher.drain();
+  expect(warnings(third.runId)).toHaveLength(1);
+  expect(warnings(third.runId)[0]).toContain("after 1 attempt;");
+  expect((await summaryOf(id)).failing).toBe(true);
+  expect(warnings(second.runId)).toEqual([]);
+});
+
 /** Fails one event's delivery through all 30 attempts. */
 async function giveUp() {
   for (let i = 0; i < 30; i++) {
