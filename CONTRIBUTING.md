@@ -14,7 +14,7 @@ pnpm test                     # vitest; Sprites, GitHub and Anthropic are mocked
 pnpm build                    # bundles the API, the runner and the CLI
 ```
 
-All four commands must pass before a pull request is ready to merge.
+All four commands must pass before a pull request is ready to merge. CI also boots the built API bundle outside the Docker image (`ci/boot-check.sh`, after `pnpm --filter '@sky/api...' build`), so a bundle that crashes on start or just after fails the build. A green boot check covers `/healthz` only, run as the CI user; the image's entrypoint and every other route go unchecked.
 
 ## Running it locally
 

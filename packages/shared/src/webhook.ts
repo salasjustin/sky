@@ -47,6 +47,8 @@ export const DeliveryErrorKind = z.enum([
   "connection_reset",
   "dns",
   "tls",
+  "blocked_address",
+  "url_not_allowed",
   "other",
 ]);
 export type DeliveryErrorKind = z.infer<typeof DeliveryErrorKind>;

@@ -10,7 +10,7 @@ import {
 } from "@sky/db";
 import type { AgentId, EnvironmentId, RunId, WebhookId } from "@sky/shared";
 import { eq } from "drizzle-orm";
-import { HttpResponse, http } from "msw";
+import { HttpResponse, http, passthrough } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { mintAgentToken } from "./agent-token.js";
@@ -18,6 +18,7 @@ import { createApp } from "./app.js";
 import {
   createDispatcher,
   type Dispatcher,
+  describeError,
   errorKind,
   openbotSignature,
   retryDelayMs,
@@ -25,6 +26,7 @@ import {
 } from "./deliveries.js";
 import { failStaleRuns } from "./runs.js";
 import { spritesToken, stubSprites, testConfig } from "./testing/sprites.js";
+import type { LookupFn } from "./webhook-url.js";
 
 const key = "webhook-signing-key-for-tests-0123456789";
 
@@ -405,6 +407,105 @@ test("a network error records no status, the reason, and a retry", async () => {
       nextAttemptAt: new Date(clock.getTime() + 10_000).toISOString(),
     }),
   ]);
+});
+
+async function failedBlocked(
+  setup: (dispatcher: Dispatcher) => void | Promise<void>,
+  url = subscriberUrl,
+  lookup?: LookupFn,
+) {
+  await subscribe(["run.finished"]);
+  db.$client.prepare("update webhooks set url = ?").run(url);
+  await dispatcher.stop();
+  dispatcher = createDispatcher({
+    db,
+    signingKey: config.webhookSigningKey,
+    secretEncryptionKey: config.secretEncryptionKey,
+    log: (line) => logs.push(line),
+    now: () => clock,
+    random: () => 0.5,
+    lookup,
+  });
+  await setup(dispatcher);
+  const { runId, token } = runningRun();
+  await postEvent(token, {
+    runId,
+    type: "run.finished",
+    payload: { summary: "ok", usage },
+  });
+  await dispatcher.drain();
+}
+
+const blockedRow = {
+  status: "failed",
+  attempts: 1,
+  lastStatus: null,
+  lastError: "blocked_address",
+};
+
+test("a public name that resolves to a private address is refused at connect, failed with no retry", async () => {
+  const resolved: string[] = [];
+  server.use(http.post(subscriberUrl, () => passthrough()));
+  await failedBlocked(
+    () => {},
+    subscriberUrl,
+    (host, _options, callback) => {
+      resolved.push(host);
+      callback(null, [{ address: "10.0.0.5", family: 4 }]);
+    },
+  );
+  expect(resolved).toEqual(["hooks.example.com"]);
+  expect(deliveries()).toEqual([expect.objectContaining(blockedRow)]);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toMatch(/failed: blocked_address; giving up$/);
+  expect(logs[0]).not.toMatch(/10\.0\.0\.5|hooks\.example\.com:/);
+  advance(3_600_000);
+  await dispatcher.drain();
+  expect(deliveries()[0]?.attempts).toBe(1);
+});
+
+test("a webhook stored with an internal name is refused and stays listed", async () => {
+  await failedBlocked(() => {}, "https://sky-api.internal/hook");
+  expect(deliveries()).toEqual([expect.objectContaining(blockedRow)]);
+  const listed = await app.request("/v1/webhooks", { headers: auth });
+  expect(
+    ((await listed.json()) as { data: { url: string }[] }).data.map(
+      (w) => w.url,
+    ),
+  ).toEqual(["https://sky-api.internal/hook"]);
+});
+
+test.each([
+  ["a literal private IP", "https://10.0.0.5/hook", "blocked_address"],
+  ["a 6PN address", "https://[fdaa:0:1::3]/hook", "blocked_address"],
+  [
+    "a non-default port",
+    "https://hooks.example.com:4280/hook",
+    "url_not_allowed",
+  ],
+  ["plain http", "http://hooks.example.com/hook", "url_not_allowed"],
+  [
+    "credentials in the URL",
+    "https://user:secret@hooks.example.com/hook",
+    "url_not_allowed",
+  ],
+])("a webhook stored with %s is refused at once", async (_, url, kind) => {
+  await failedBlocked(() => {}, url);
+  expect(deliveries()).toEqual([
+    expect.objectContaining({ ...blockedRow, lastError: kind }),
+  ]);
+  expect(logs.filter((l) => l.includes("secret"))).toEqual([]);
+});
+
+test("describeError leaves no address or host:port of its error's cause", () => {
+  const err = new TypeError("fetch failed", {
+    cause: new Error(
+      "connect ECONNREFUSED 203.0.113.9:443, connect ECONNREFUSED [fdaa:0:1::3]:8080, getaddrinfo ENOTFOUND db.internal:5432",
+    ),
+  });
+  expect(describeError(err)).toBe(
+    "TypeError: fetch failed: connect ECONNREFUSED <addr>, connect ECONNREFUSED <addr>, getaddrinfo ENOTFOUND <addr>",
+  );
 });
 
 test("a redirect is a failed attempt, never followed", async () => {
@@ -1455,10 +1556,43 @@ test.each([
   ["TypeError: fetch failed: getaddrinfo ENOTFOUND hooks.example.com", "dns"],
   ["TypeError: fetch failed: read ECONNRESET", "connection_reset"],
   ["TypeError: fetch failed: certificate has expired", "tls"],
+  ["blocked_address", "blocked_address"],
+  ["url_not_allowed", "url_not_allowed"],
   ["TypeError: fetch failed", "other"],
 ])("the error %j is kind %s", (text, kind) => {
   expect(errorKind(text)).toBe(kind);
   expect(errorKind(null)).toBeNull();
+});
+
+test("a refused delivery fails at once, shows its kind, flags the webhook and warns the run once", async () => {
+  await failedBlocked(() => {}, "https://10.0.0.5/hook");
+  const id = db.$client
+    .prepare("select id from webhooks")
+    .pluck()
+    .get() as string;
+  const summary = await summaryOf(id);
+  expect(summary.failing).toBe(true);
+  expect(summary.failedStreak).toBe(1);
+  expect(summary.lastAttempt).toMatchObject({
+    status: null,
+    error: "blocked_address",
+    attempt: 1,
+  });
+  const page = (await (await getDeliveries(id)).json()) as Page;
+  expect(page.data[0]).toMatchObject({
+    lastError: "blocked_address",
+    lastErrorKind: "blocked_address",
+  });
+  const runId = db.$client
+    .prepare("select id from runs")
+    .pluck()
+    .get() as RunId;
+  const [message, ...more] = warnings(runId);
+  expect(more).toEqual([]);
+  expect(message).toContain(id);
+  expect(message).toContain("after 1 attempt;");
+  expect(message).toContain("blocked_address");
+  expect(message).not.toContain("10.0.0.5");
 });
 
 /** Fails one event's delivery through all 30 attempts. */
