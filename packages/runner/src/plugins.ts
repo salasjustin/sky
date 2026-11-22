@@ -38,14 +38,22 @@ export const PLUGIN_LIST_TIMEOUT_MS = 5_000;
 /** How long a cut command's process group gets to exit on SIGTERM before it is sent SIGKILL. */
 export const KILL_GRACE_MS = 2_000;
 
-/** How long after SIGKILL a command is waited on to close before it is given up on. */
+/** How long after SIGKILL a command is waited on to close, and its group to be gone, before it is given up on. */
 const KILL_WAIT_MS = 1_000;
+
+/** How often a cut command's group is checked for being gone. */
+const GROUP_POLL_MS = 50;
+
+/** What a command may write to stdout, and to stderr, before it is cut. */
+const OUTPUT_MAX_BYTES = 1024 * 1024;
 
 /**
  * Runs `file` as the leader of its own process group, so a cut reaches what it started too (a git
- * child of `claude` keeps writing otherwise). Settles only once the command has closed: aborting
- * `signal` sends the group SIGTERM, then SIGKILL after `graceMs`, and rejects with the abort's reason
- * once the group is gone, or `KILL_WAIT_MS` after the SIGKILL when something still holds on.
+ * child of `claude` keeps writing otherwise). Aborting `signal` cuts the command, and so does output
+ * past `OUTPUT_MAX_BYTES`: the group is sent SIGTERM, then SIGKILL after `graceMs`, and the promise
+ * rejects with the abort's reason, or an error naming the limit, once the command has closed and its
+ * group is gone. Something that still holds on is given up on `KILL_WAIT_MS` after the SIGKILL, its
+ * pipes destroyed so it can't hold the runner. A command that isn't cut settles once it has closed.
  */
 export function runInGroup(
   file: string,
@@ -71,50 +79,78 @@ export function runInGroup(
       return;
     }
     liveGroups.add(pid);
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
-      stderr += chunk;
-    });
     let cut = false;
+    let cutReason: unknown;
+    let closed = false;
+    let finished = false;
     const timers: NodeJS.Timeout[] = [];
     const done = (finish: () => void) => {
+      // `close` can follow a give-up, when the pid may lead a later command's group
+      if (finished) return;
+      finished = true;
       signal.removeEventListener("abort", onAbort);
       for (const timer of timers) clearTimeout(timer);
       liveGroups.delete(pid);
       finish();
     };
-    const onAbort = () => {
+    const settleCutIfGone = () => {
+      const groupLeft = killGroup(pid, 0);
+      if (closed && !groupLeft) done(() => reject(cutReason));
+    };
+    const giveUp = () =>
+      done(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+        reject(cutReason);
+      });
+    const cutShort = (reason: unknown) => {
+      if (cut) return;
       cut = true;
+      cutReason = reason;
       killGroup(pid, "SIGTERM");
       timers.push(
+        setInterval(settleCutIfGone, GROUP_POLL_MS),
         setTimeout(() => killGroup(pid, "SIGKILL"), graceMs),
-        setTimeout(
-          () => done(() => reject(signal.reason)),
-          graceMs + KILL_WAIT_MS,
-        ),
+        setTimeout(giveUp, graceMs + KILL_WAIT_MS),
       );
     };
+    const onAbort = () => cutShort(signal.reason);
+    const output = { stdout: "", stderr: "" };
+    for (const name of ["stdout", "stderr"] as const) {
+      let bytes = 0;
+      child[name].setEncoding("utf8").on("data", (chunk: string) => {
+        // still read once cut, so a full pipe can't block the command's exit, but not kept
+        if (cut) return;
+        bytes += Buffer.byteLength(chunk);
+        if (bytes > OUTPUT_MAX_BYTES)
+          cutShort(new Error(`wrote more than 1 MiB to ${name}`));
+        else output[name] += chunk;
+      });
+    }
     signal.addEventListener("abort", onAbort, { once: true });
     child.once("error", (error) => done(() => reject(error)));
-    child.once("close", (code, by) =>
+    // the leader is reaped by now, so an empty group's id is free for another process to take
+    child.once("exit", () => killGroup(pid, 0));
+    child.once("close", (code, by) => {
+      closed = true;
+      if (cut) {
+        settleCutIfGone();
+        return;
+      }
       done(() => {
-        if (cut) reject(signal.reason);
-        else if (code === 0) settle({ stdout });
+        if (code === 0) settle({ stdout: output.stdout });
         else
           reject(
             Object.assign(
               new Error(
                 `Command failed: ${file} ${args.join(" ")}${by ? ` (${by})` : ""}`,
               ),
-              { code, stderr },
+              { code, stderr: output.stderr },
             ),
           );
-      }),
-    );
+      });
+    });
     // the abort may have landed between the check above and the listener
     if (signal.aborted) onAbort();
   });
@@ -122,21 +158,31 @@ export function runInGroup(
 
 type Exec = typeof runInGroup;
 
-/** The process groups of commands still running, so the runner's end can take them along. */
+/**
+ * The only groups that may be signalled: those of commands still running or waited on after a cut,
+ * so the runner's end can take them along. A group that is gone leaves at once: its id can be reused.
+ */
 const liveGroups = new Set<number>();
 
-const killGroup = (pid: number, by: NodeJS.Signals) => {
+/** Signals a tracked group, or with 0 only looks for it; false when it is untracked or found gone. */
+const killGroup = (pid: number, by: NodeJS.Signals | 0): boolean => {
+  if (!liveGroups.has(pid)) return false;
   try {
     process.kill(-pid, by);
-  } catch {
-    // the group is already gone
+  } catch (error) {
+    // any other error (EPERM) is from a group that is still there
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+      liveGroups.delete(pid);
+      return false;
+    }
   }
+  return true;
 };
 
 /**
- * SIGKILLs every command a refresh still has running, each with what it started. Synchronous, for the
- * runner's own end: a signal's death skips `exit` handlers, and a command in its own group would
- * outlive the runner.
+ * SIGKILLs every command a refresh still has running or is waiting on, each with what it started.
+ * Synchronous, for the runner's own end: a signal's death skips `exit` handlers, and a command in its
+ * own group would outlive the runner.
  */
 export function killRefreshCommands(): void {
   for (const pid of liveGroups) killGroup(pid, "SIGKILL");

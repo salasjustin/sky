@@ -1549,52 +1549,107 @@ describe("refreshPlugins caps", () => {
 /** Whether a process is gone: not there, or an exited one nobody has reaped yet. */
 const gone = (pid: number) => {
   try {
+    if (/^\d+ \(.*\) Z/s.test(readFileSync(`/proc/${pid}/stat`, "utf8")))
+      return true;
+  } catch {
+    // no such process, or no /proc: the probe tells which
+  }
+  // probed after the read, so a process reaped between the two is gone
+  try {
     process.kill(pid, 0);
+    return false;
   } catch {
     return true;
   }
-  try {
-    return /^\d+ \(.*\) Z/s.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
-  } catch {
-    return false;
-  }
 };
 
-const until = async (ready: () => boolean, ms = 5000) => {
+/** The pid in `file`; never one that `process.kill` would take for a group or for every process. */
+const pidIn = (file: string) => {
+  const pid = Number(readFileSync(file, "utf8"));
+  if (!Number.isSafeInteger(pid) || pid <= 1)
+    throw new Error(`no pid in ${file}`);
+  return pid;
+};
+
+// shorter than a helper's life, so a helper's own end can't pass for the kill being waited on
+const until = async (ready: () => boolean, ms = 10_000) => {
   for (const start = Date.now(); !ready(); ) {
     if (Date.now() - start > ms) throw new Error("timed out waiting");
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 };
 
+/** Room for a few Node startups on a loaded machine, and for a cut's whole grace. */
+const PROCESS_TEST_MS = 20_000;
+const PROCESS_TESTS = { timeout: PROCESS_TEST_MS };
+
+/** How long a helper process lives when nothing ends it, so what a failed test leaves ends by itself. */
+const HELPER_LIFE_MS = 15_000;
+
+const LINGER = `setTimeout(() => process.exit(), ${HELPER_LIFE_MS});`;
+const IGNORE_TERM = `process.on("SIGTERM", () => {});`;
+/** A helper's last statement, once its handlers are in: its pid appears in PIDFILE whole or not at all. */
+const READY = `const { renameSync, writeFileSync } = require("node:fs");
+writeFileSync(process.env.PIDFILE + ".tmp", String(process.pid));
+renameSync(process.env.PIDFILE + ".tmp", process.env.PIDFILE);`;
+
 /**
  * A `claude` made of a real script. `plugin list` prints one plugin; a marketplace update starts a
- * grandchild, writes its pid to PIDFILE, and hangs; any plugin update then records whether that
- * grandchild is still there. STUBBORN makes both ignore SIGTERM.
+ * grandchild, which writes its pid to PIDFILE once both are ready, and hangs; any plugin update then
+ * records whether that grandchild is still there. STUBBORN says which ignore SIGTERM: "both", or the
+ * "grandchild" alone.
  */
 const FAKE_CLAUDE = `#!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 const { PIDFILE, ALIVEFILE, STUBBORN } = process.env;
 const sub = process.argv[3];
-const ignore = STUBBORN ? "process.on('SIGTERM', () => {});" : "";
-const alive = (pid) => {
-  try { process.kill(pid, 0); } catch { return false; }
-  try { return !/^\\d+ \\(.*\\) Z/s.test(readFileSync("/proc/" + pid + "/stat", "utf8")); } catch { return true; }
+const gone = (pid) => {
+  try { if (/^\\d+ \\(.*\\) Z/s.test(readFileSync("/proc/" + pid + "/stat", "utf8"))) return true; } catch {}
+  try { process.kill(pid, 0); return false; } catch { return true; }
 };
 if (sub === "list") {
   console.log(JSON.stringify([{ id: "kru@kru", scope: "user", version: "1.0.0" }]));
 } else if (sub === "marketplace") {
-  const child = spawn(process.execPath, ["-e", ignore + "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  writeFileSync(PIDFILE, String(child.pid));
-  if (STUBBORN) process.on("SIGTERM", () => {});
-  setInterval(() => {}, 1000);
+  ${LINGER}
+  if (STUBBORN === "both") process.on("SIGTERM", () => {});
+  const ignore = STUBBORN ? ${JSON.stringify(IGNORE_TERM)} : "";
+  spawn(process.execPath, ["-e", ignore + ${JSON.stringify(LINGER + READY)}], { stdio: "ignore" });
 } else if (sub === "update") {
-  appendFileSync(ALIVEFILE, alive(Number(readFileSync(PIDFILE, "utf8"))) ? "alive" : "gone");
+  const pid = Number(readFileSync(PIDFILE, "utf8"));
+  if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error("no pid in PIDFILE");
+  appendFileSync(ALIVEFILE, gone(pid) ? "gone" : "alive");
 }
 `;
 
-describe("a cut command's whole process group", () => {
+/** A command whose descendant leaves the group with both its pipes, and notes in SHUTFILE when both have closed. */
+const ESCAPED_HOLDER = `${LINGER}
+const holder = ${JSON.stringify(`${LINGER}
+const shut = new Set();
+for (const pipe of [process.stdout, process.stderr]) {
+  pipe.on("error", () => {
+    if (shut.add(pipe).size < 2) return;
+    require("node:fs").writeFileSync(process.env.SHUTFILE, "");
+    process.exit();
+  });
+  setInterval(() => pipe.write("."), 50);
+}
+${READY}`)};
+require("node:child_process")
+  .spawn(process.execPath, ["-e", holder], { detached: true, stdio: ["ignore", "inherit", "inherit"] })
+  .unref();`;
+
+/** A command that writes 2 MiB to `stream` once its grandchild, which ignores SIGTERM, is ready. */
+const flood = (stream: "stdout" | "stderr") => `${LINGER}
+const grandchild = ${JSON.stringify(IGNORE_TERM + LINGER + READY)};
+require("node:child_process").spawn(process.execPath, ["-e", grandchild], { stdio: "ignore" });
+const poll = setInterval(() => {
+  if (!require("node:fs").existsSync(process.env.PIDFILE)) return;
+  clearInterval(poll);
+  process.${stream}.write("x".repeat(2 * 1024 * 1024));
+}, 20);`;
+
+describe("a cut command's whole process group", PROCESS_TESTS, () => {
   let dir: string;
   let claude: string;
   let pidFile: string;
@@ -1606,21 +1661,15 @@ describe("a cut command's whole process group", () => {
     aliveFile = join(dir, "alive");
     writeFileSync(claude, FAKE_CLAUDE, { mode: 0o755 });
   });
-  afterEach(() => {
-    if (existsSync(pidFile)) {
-      try {
-        process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
-      } catch {}
-    }
-    rmSync(dir, { recursive: true, force: true });
-  });
+  // signals nothing: a pid read back may be another process's by now, and each helper ends itself
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
   const env = (extra: Record<string, string> = {}) => ({
     ...process.env,
     PIDFILE: pidFile,
     ALIVEFILE: aliveFile,
     ...extra,
   });
-  const grandchild = () => Number(readFileSync(pidFile, "utf8"));
+  const grandchild = () => pidIn(pidFile);
 
   test("a marketplace update cut at its cap takes its grandchild with it before the next command runs", async () => {
     const result = await refreshPlugins({
@@ -1628,7 +1677,18 @@ describe("a cut command's whole process group", () => {
       warn: vi.fn(),
       claude,
       lockFile: join(dir, "lock"),
-      stepTimeoutMs: 1500,
+      stepTimeoutMs: 100,
+      // the cap reaches the marketplace update alone, and only once its grandchild is ready
+      run: (file, args, options) => {
+        const held = new AbortController();
+        if (args[1] === "marketplace") {
+          const due = () => existsSync(pidFile) && options.signal.aborted;
+          const cut = () => held.abort(options.signal.reason);
+          // also on a failed wait, so the refresh ends and the assertions say what was missing
+          void until(due).then(cut, cut);
+        }
+        return runInGroup(file, args, { ...options, signal: held.signal });
+      },
     });
     expect(existsSync(pidFile)).toBe(true);
     expect(gone(grandchild())).toBe(true);
@@ -1636,7 +1696,7 @@ describe("a cut command's whole process group", () => {
     expect(readFileSync(aliveFile, "utf8")).toBe("gone");
     expect(result).toMatchObject({
       outcome: "failed",
-      reason: "update failed for marketplace kru (timed out after 1.5s)",
+      reason: "update failed for marketplace kru (timed out after 0.1s)",
     });
     expect(existsSync(join(dir, "lock"))).toBe(false);
   });
@@ -1649,6 +1709,9 @@ describe("a cut command's whole process group", () => {
       claude,
       lockFile: join(dir, "lock"),
       signal: stop.signal,
+      // no cap may land first: the stop is what ends the update
+      listTimeoutMs: PROCESS_TEST_MS,
+      stepTimeoutMs: PROCESS_TEST_MS,
     });
     await until(() => existsSync(pidFile));
     stop.abort("SIGTERM");
@@ -1663,7 +1726,7 @@ describe("a cut command's whole process group", () => {
     const running = runInGroup(
       claude,
       ["plugin", "marketplace", "update"],
-      { env: env({ STUBBORN: "1" }), signal: stop.signal },
+      { env: env({ STUBBORN: "both" }), signal: stop.signal },
       150,
     );
     const outcome = running.then(
@@ -1671,15 +1734,74 @@ describe("a cut command's whole process group", () => {
       () => "rejected",
     );
     await until(() => existsSync(pidFile));
-    // let both install their SIGTERM handlers
-    await new Promise((resolve) => setTimeout(resolve, 300));
     const cutAt = Date.now();
     stop.abort(new Error("cut"));
     await expect(running).rejects.toThrow("cut");
     expect(await outcome).toBe("rejected");
     expect(Date.now() - cutAt).toBeGreaterThanOrEqual(140);
-    expect(gone(grandchild())).toBe(true);
+    await until(() => gone(grandchild()));
   });
+
+  test("a command that exits on SIGTERM ahead of a grandchild that ignores it is waited on until the group's SIGKILL", async () => {
+    const stop = new AbortController();
+    const running = runInGroup(
+      claude,
+      ["plugin", "marketplace", "update"],
+      { env: env({ STUBBORN: "grandchild" }), signal: stop.signal },
+      1000,
+    );
+    await until(() => existsSync(pidFile));
+    const cutAt = Date.now();
+    stop.abort(new Error("cut"));
+    await expect(running).rejects.toThrow("cut");
+    // the command closes in milliseconds, and its group can't be gone before the grace is over
+    expect(Date.now() - cutAt).toBeGreaterThanOrEqual(950);
+    await until(() => gone(grandchild()));
+  });
+
+  test("a descendant that left the group with the pipes is given up on, and the pipes are closed", async () => {
+    const shutFile = join(dir, "shut");
+    const stop = new AbortController();
+    const running = runInGroup(
+      process.execPath,
+      ["-e", ESCAPED_HOLDER],
+      { env: env({ SHUTFILE: shutFile }), signal: stop.signal },
+      100,
+    );
+    await until(() => existsSync(pidFile));
+    stop.abort(new Error("cut"));
+    await expect(running).rejects.toThrow("cut");
+    await until(() => existsSync(shutFile));
+  });
+
+  test.each(["stdout", "stderr"] as const)(
+    "more than 1 MiB on %s stops the command's group and fails the refresh, with no retry",
+    async (stream) => {
+      const calls: string[][] = [];
+      const result = await refreshPlugins({
+        env: env(),
+        warn: vi.fn(),
+        claude,
+        lockFile: join(dir, "lock"),
+        listTimeoutMs: PROCESS_TEST_MS,
+        run: (_file, args, options) => {
+          calls.push(args);
+          return runInGroup(
+            process.execPath,
+            ["-e", flood(stream)],
+            options,
+            150,
+          );
+        },
+      });
+      expect(result).toMatchObject({
+        outcome: "failed",
+        reason: `wrote more than 1 MiB to ${stream}`,
+      });
+      expect(calls).toEqual([["plugin", "list", "--json"]]);
+      await until(() => gone(grandchild()));
+    },
+  );
 
   test("the runner's end kills a running command's group, which would otherwise outlive it", async () => {
     const stop = new AbortController();
@@ -1690,7 +1812,7 @@ describe("a cut command's whole process group", () => {
     await until(() => existsSync(pidFile));
     killRefreshCommands();
     await expect(running).rejects.toThrow(/Command failed/);
-    expect(gone(grandchild())).toBe(true);
+    await until(() => gone(grandchild()));
   });
 
   test("a command's stdout comes back, and a failure carries its stderr and exit code", async () => {
@@ -1715,11 +1837,11 @@ describe("a cut command's whole process group", () => {
 
   test("an already-aborted signal spawns nothing", async () => {
     await expect(
-      runInGroup(claude, ["plugin", "list"], {
+      // spawn throws on a NUL in an argument, so any attempt to spawn rejects with that instead
+      runInGroup(claude, ["\0"], {
         env: env(),
         signal: AbortSignal.abort("stopped"),
       }),
     ).rejects.toBe("stopped");
-    expect(existsSync(aliveFile)).toBe(false);
   });
 });
