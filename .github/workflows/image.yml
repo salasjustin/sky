@@ -6,7 +6,7 @@ on:
     workflows: [CI]
     types: [completed]
     branches: [main]
-  # a manual run deploys main's tip, for a redeploy or a rollback to main
+  # a manual run redeploys main's tip as it stands, without checking its CI
   workflow_dispatch:
 
 permissions:
