@@ -199,7 +199,7 @@ export function killRefreshCommands(): void {
 }
 process.on("exit", killRefreshCommands);
 
-/** A command cut by its own cap (not the refresh's end or the run's stop): which timer fired is the type. */
+/** A command cut by its own cap, not by the refresh's end or the run's stop: a type, as error text can't say which. */
 class CapExceeded extends Error {
   constructor(capMs: number) {
     super(`timed out after ${seconds(capMs)}s`);
@@ -534,7 +534,7 @@ export async function refreshPlugins(options: {
       read = await listWithRetry("list before", signal);
     } catch (error) {
       if (!(error instanceof CapExceeded)) throw error;
-      // what is installed is unknown, so nothing can be updated: said in the record, not left silent
+      // what is installed is unknown, so nothing can be updated
       failedReason = `list before ${error.message} twice; no plugin was updated`;
       warn(
         `runner: plugin refresh failed (${failedReason}); continuing with the installed versions`,
