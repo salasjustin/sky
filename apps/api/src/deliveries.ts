@@ -219,10 +219,10 @@ export type Dispatcher = ReturnType<typeof createDispatcher>;
 /**
  * Sends due webhook deliveries from the DB, one drain at a time: a 2xx delivers, anything else (a
  * redirect included, never followed) retries with backoff until the 30th attempt fails it. A refused
- * URL or address (`blocked_address`, `url_not_allowed`) fails on its first attempt instead. A 429
- * retries after its `Retry-After` when it parses (capped at 1 h), and holds every other pending
- * delivery of that webhook until then without spending their attempts. Each failed attempt logs
- * one line; the one that gives up is prefixed `warn:`.
+ * URL or address (`blocked_address`, `url_not_allowed`) fails on the attempt it is refused instead,
+ * with no retry. A 429 retries after its `Retry-After` when it parses (capped at 1 h), and holds
+ * every other pending delivery of that webhook until then without spending their attempts. Each
+ * failed attempt logs one line; the one that gives up is prefixed `warn:`.
  */
 export function createDispatcher({
   db,
