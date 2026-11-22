@@ -19,10 +19,12 @@ import type {
 } from "@sky/shared";
 
 /**
- * Overall budget for the refresh. Past it run only the stop of the command it cut (`KILL_GRACE_MS` and
- * `KILL_WAIT_MS`) and the read-back, under the listing cap and the same stop: 41 s in all at most.
+ * Overall budget for the refresh, the wait on another run's refresh included. It is sized so the updates
+ * still fit after a first listing of about 28 s on a sprite that has just woken. Past it run only the
+ * stop of the command it cut (`KILL_GRACE_MS` and `KILL_WAIT_MS`) and the read-back, under the listing
+ * cap and the same stop: 71 s in all at most (60, 3, 5 and 3).
  */
-export const PLUGIN_REFRESH_TIMEOUT_MS = 30_000;
+export const PLUGIN_REFRESH_TIMEOUT_MS = 60_000;
 
 /**
  * What one marketplace update or one plugin update may take. An update that stalls on the network
@@ -32,9 +34,17 @@ export const PLUGIN_REFRESH_TIMEOUT_MS = 30_000;
 export const PLUGIN_STEP_TIMEOUT_MS = 10_000;
 
 /**
- * What one `claude plugin list` may take. It reads local files only (measured on a sprite: 0.4 s warm,
- * 0.9 s cold, 0.8 s with six at once, the same with the network unreachable), so this is over five times
- * the slowest of them: one that stalls is cut and tried once more, not left to spend the overall budget.
+ * What the first `claude plugin list` of a refresh may take. On a sprite that has just woken it is slow,
+ * not stalled: measured over a day of runs, about half took under 4 s and most of the rest 11 to 28 s,
+ * then finished. It is cut at this, once, and not retried: a second try can't help one that needs 15 s.
+ */
+export const PLUGIN_FIRST_LIST_TIMEOUT_MS = 30_000;
+
+/**
+ * What a later `claude plugin list` (the read-back after the updates, and the one after a cut) may
+ * take. It runs warm, inside the run (measured on a sprite: 0.4 s warm, 0.9 s cold, 0.8 s with six at
+ * once), so this is over five times the slowest of them: one that stalls is cut, and the read-back
+ * tried once more, not left to spend the overall budget.
  */
 export const PLUGIN_LIST_TIMEOUT_MS = 5_000;
 
@@ -413,11 +423,13 @@ function sameDir(a: string, b: string): boolean {
  * budget ran out), how long it took and how long each command did (`steps`). Each marketplace the
  * installed plugins come from, `skills-dir` aside, is updated by name, and every command has a cap
  * of its own besides the overall budget: an
- * update is cut at `stepTimeoutMs`, a listing at `listTimeoutMs`. A marketplace update that fails, cut
+ * update is cut at `stepTimeoutMs`, the first listing at `firstListTimeoutMs` and a later one at
+ * `listTimeoutMs`. A marketplace update that fails, cut
  * or not, is a failed update named for that marketplace, and the plugin updates after it still run from
- * the cached marketplace while the budget lasts. A listing cut at its own cap is tried once more; if the
- * first one is cut twice nothing is updated and the outcome is `failed`, and if the last one is, `after`
- * stays null. A cut command's process group is killed, and waited on until it is gone or given up on
+ * the cached marketplace while the budget lasts. The first listing, which on a sprite that has just woken
+ * can take up to about 30 s, is cut at `firstListTimeoutMs` and not retried: a cut one means nothing is
+ * updated and the outcome is `failed`. The read-back listing is cut at `listTimeoutMs` and tried once
+ * more; if both are cut, `after` stays null. A cut command's process group is killed, and waited on until it is gone or given up on
  * (see `runInGroup`), before the next command or the lock's release.
  * Never throws.
  */
@@ -428,7 +440,9 @@ export async function refreshPlugins(options: {
   timeoutMs?: number;
   /** How long one marketplace update or one plugin update may take; `PLUGIN_STEP_TIMEOUT_MS` when absent. */
   stepTimeoutMs?: number;
-  /** How long one `claude plugin list` may take; `PLUGIN_LIST_TIMEOUT_MS` when absent. */
+  /** How long the first `claude plugin list` may take; `PLUGIN_FIRST_LIST_TIMEOUT_MS` when absent. */
+  firstListTimeoutMs?: number;
+  /** How long a later `claude plugin list` may take; `PLUGIN_LIST_TIMEOUT_MS` when absent. */
   listTimeoutMs?: number;
   claude?: string;
   /** The agent's worktree, whose project-scope plugin records are updated too; none are when absent. */
@@ -492,6 +506,8 @@ export async function refreshPlugins(options: {
   const lockFile =
     options.lockFile ?? join(tmpdir(), "sky-plugin-refresh.lock");
   const stepMs = options.stepTimeoutMs ?? PLUGIN_STEP_TIMEOUT_MS;
+  const firstListMs =
+    options.firstListTimeoutMs ?? PLUGIN_FIRST_LIST_TIMEOUT_MS;
   const listMs = options.listTimeoutMs ?? PLUGIN_LIST_TIMEOUT_MS;
   /**
    * One command, cut at `capMs` as well as when `within` ends; a cut by its own cap alone is a
@@ -522,9 +538,13 @@ export async function refreshPlugins(options: {
   const claudeRun = async (name: string, args: string[], cwd?: string) => {
     await capped(name, stepMs, signal, args, cwd);
   };
-  const list = async (name: string, within: AbortSignal) =>
+  const list = async (
+    name: string,
+    within: AbortSignal,
+    capMs: number = listMs,
+  ) =>
     readListing(
-      (await capped(name, listMs, within, ["plugin", "list", "--json"])).stdout,
+      (await capped(name, capMs, within, ["plugin", "list", "--json"])).stdout,
       options.projectDir,
     );
   /** A listing whose own cap cuts it is run once more; a second cut is the caller's. */
@@ -547,11 +567,12 @@ export async function refreshPlugins(options: {
   const pass = (whole: boolean) => async () => {
     let read: Listing;
     try {
-      read = await listWithRetry("list before", signal);
+      // once, with a cap sized for a sprite that has just woken: a retry can't help one that needs 15 s
+      read = await list("list before", signal, firstListMs);
     } catch (error) {
       if (!(error instanceof CapExceeded)) throw error;
       // what is installed is unknown, so nothing can be updated
-      failedReason = `list before ${error.message} twice; no plugin was updated`;
+      failedReason = `list before ${error.message}; no plugin was updated`;
       warn(
         `runner: plugin refresh failed (${failedReason}); continuing with the installed versions`,
       );
