@@ -14,9 +14,10 @@ permissions:
 
 concurrency:
   # repeats the job's `if:`: the group binds before it, and under workflow_run github.ref is always main, so a
-  # failed, cancelled, pull-request or fork CI run would otherwise join deploy-sky and cancel the deploy pending there
+  # failed, cancelled, pull-request, fork or other-branch CI run would otherwise join deploy-sky and cancel the deploy pending there
   group: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && 'deploy-sky' || github.run_id }}
-  # queued deploys run one after another, each re-reading what is running before it builds
+  # one deploy runs while at most one waits, a newer run replacing the waiting one; each re-reads what is
+  # running before it builds
   cancel-in-progress: false
 
 jobs:
@@ -56,10 +57,9 @@ jobs:
           # the guard below asks git whether the running commit descends from DEPLOY_SHA
           fetch-depth: 0
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
-      # An older passing CI run can be re-run after newer commits deployed. Skip when the app already runs
-      # DEPLOY_SHA or a descendant of it. A running tag that isn't a sha- tag, or names a commit this
-      # repository doesn't have, can't be shown to be newer, so it deploys; a failed read fails the job
-      # rather than guess, and a re-run settles it.
+      # an older passing CI run can be re-run after newer commits deployed, and must not roll the app back.
+      # A running tag that isn't a sha- tag, or names a commit this repository doesn't have, can't be shown
+      # to be newer, so it deploys; a failed read fails the job rather than guessing, and a re-run settles it
       - name: Skip if the app already runs this commit or a newer one
         id: guard
         # an explicit bash adds pipefail, so a failed flyctl fails the step instead of jq's exit 0 deploying
