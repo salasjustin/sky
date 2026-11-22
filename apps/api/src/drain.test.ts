@@ -2,7 +2,15 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
-import { agents, type Db, environments, migrate, openDb, runs } from "@sky/db";
+import {
+  agents,
+  type Db,
+  environments,
+  migrate,
+  openDb,
+  runEnvVars,
+  runs,
+} from "@sky/db";
 import type { AgentId, EnvironmentId, RunId, RunStatus } from "@sky/shared";
 import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -10,7 +18,9 @@ import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { open, runLaunchAad } from "./crypto.js";
 import { spriteNameFor } from "./sprites.js";
+import { fiveHourLimit } from "./testing/limits.js";
 import {
+  envFileOf,
   type SpritesWire,
   spritesToken,
   stubSprites,
@@ -25,8 +35,11 @@ let app: ReturnType<typeof createApp>;
 let wire: SpritesWire;
 
 // a restart is a second app over the same database: nothing but the rows carries over
-const buildApp = () => {
-  config = testConfig({ runnerBundlePath: join(dir, "runner.mjs") });
+const buildApp = (
+  over: Partial<Config> = {},
+  runnerExitBackoffMs?: number[],
+) => {
+  config = testConfig({ runnerBundlePath: join(dir, "runner.mjs"), ...over });
   app = createApp({
     db,
     config,
@@ -34,6 +47,7 @@ const buildApp = () => {
     log: (line) => logs.push(line),
     nudgeDeliveries: () => {},
     launchWatchMs: 50,
+    runnerExitBackoffMs,
   });
 };
 
@@ -273,6 +287,100 @@ test("a queued launch is not counted as active", async () => {
     active: [],
     ready: true,
   });
+});
+
+test("a run failed on a usage limit counts as active while its retry is pending, and the retry is held", async () => {
+  // a pause the test steps past by hand: until then the retry waits on the failed runner's exit
+  const pauseMs = 10 * 60_000;
+  buildApp({ anthropicApiKey: "anthropic-api-key-for-drain" }, [pauseMs]);
+  const envId = readyEnv();
+  const failed = await launch(envId);
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(1));
+  const token = envFileOf(wire, wire.sessions[0]).AGENT_TOKEN;
+  // the first exit wait finds the failed runner still running; later ones find it gone
+  let exitWaits = 0;
+  const exec = wire.exec;
+  wire.exec = (argv, sprite) =>
+    argv[0] === "bash" &&
+    argv[3] === "_" &&
+    argv[4]?.includes(failed.run.id) &&
+    ++exitWaits === 1
+      ? { exitCode: 1 }
+      : exec(argv, sprite);
+  vi.useFakeTimers({ toFake: ["setTimeout"] });
+  await startDrain();
+  for (const event of [
+    { type: "run.started", payload: { sessionId: "sess-1" } },
+    { type: "run.failed", payload: { error: fiveHourLimit().text } },
+  ]) {
+    const res = await app.request("/internal/events", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ runId: failed.run.id, ...event }),
+    });
+    expect(res.status).toBe(201);
+  }
+  await vi.waitFor(() => expect(exitWaits).toBe(1));
+  expect(statusOf(failed.run.id)).toBe("failed");
+  expect(await drainState()).toMatchObject({
+    active: [failed.run.id],
+    held: 0,
+    ready: false,
+  });
+
+  await vi.advanceTimersByTimeAsync(pauseMs);
+  const retryOf = () =>
+    db
+      .select({ id: runs.id, status: runs.status })
+      .from(runs)
+      .where(eq(runs.retryOf, failed.run.id as RunId))
+      .get();
+  await vi.waitFor(() => expect(retryOf()?.status).toBe("queued"));
+  await vi.waitFor(async () =>
+    expect(await drainState()).toMatchObject({
+      active: [],
+      held: 1,
+      ready: true,
+    }),
+  );
+  expect(wire.sessions).toHaveLength(1);
+});
+
+test("a held launch's envVars keep the lifetime it asked for, counted from its release", async () => {
+  const envId = readyEnv();
+  await startDrain();
+  const ttlSeconds = 4 * 3_600;
+  const res = await call("POST", "/v1/agents", {
+    envId,
+    prompt: "deploy the fix",
+    envVars: { DEPLOY_TOKEN: "held-deploy-token" },
+    ttlSeconds,
+  });
+  expect(res.status).toBe(202);
+  const { run } = (await res.json()) as { run: { id: string } };
+
+  // held 20 minutes, inside the drain's 30-minute default
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(Date.now() + 20 * 60_000);
+  const releasedAt = Date.now();
+  expect((await call("DELETE", "/v1/admin/drain")).status).toBe(200);
+  vi.useRealTimers();
+
+  expect(statusOf(run.id)).toBe("starting");
+  const rows = db
+    .select({ expiresAt: runEnvVars.expiresAt })
+    .from(runEnvVars)
+    .where(eq(runEnvVars.runId, run.id as RunId))
+    .all();
+  expect(rows).toHaveLength(1);
+  const expiresAt = Date.parse(rows[0]?.expiresAt as string);
+  expect(Math.abs(expiresAt - (releasedAt + ttlSeconds * 1000))).toBeLessThan(
+    5_000,
+  );
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(1));
 });
 
 test("a stopped queued run is not started by the release", async () => {

@@ -22,6 +22,7 @@ import {
   isNotNull,
   lt,
   ne,
+  or,
   sql,
 } from "drizzle-orm";
 import { z } from "zod";
@@ -72,11 +73,11 @@ import {
   type Tx,
 } from "./runs.js";
 import {
-  extendRunEnvVars,
   hasConnectorSecret,
   isReservedName,
   openEnvSecrets,
   openRunEnvVars,
+  postponeRunEnvVars,
   registerRunEnvVars,
   storeRunEnvVars,
 } from "./secrets.js";
@@ -1283,7 +1284,7 @@ export function createLauncher({
         return;
       }
       hold(launch);
-      // a drain cancelled between the run's insert and here has nobody left to release it
+      // a drain whose deadline passed between the run's insert and here has nobody left to release it
       if (!draining()) releaseQueued();
     },
     /** The status a run is inserted with: `queued` while the API drains, else `starting`. */
@@ -1339,10 +1340,19 @@ export function createLauncher({
 
   function drainStatus(): DrainStatus {
     const on = draining() ? drainState : undefined;
+    // a failed run whose retry is still in memory: a restart would lose that retry
+    const awaitingRetry = [...challengeRetries.keys(), ...limitRetries.keys()];
     const active = db
       .select({ id: runs.id })
       .from(runs)
-      .where(inArray(runs.status, ["starting", "running"]))
+      .where(
+        or(
+          inArray(runs.status, ["starting", "running"]),
+          awaitingRetry.length > 0
+            ? inArray(runs.id, awaitingRetry)
+            : undefined,
+        ),
+      )
       .orderBy(asc(runs.createdAt))
       .all()
       .map((r) => r.id);
@@ -1387,8 +1397,9 @@ export function createLauncher({
 
   /**
    * Moves every queued run to `starting`, oldest first, and launches it as a fresh launch would be.
-   * Its clock restarts, so the launch deadline counts from the release, not from the hold. A run
-   * whose launch can't be read fails, rather than sit queued. Returns how many it released.
+   * Its clock restarts, so the launch deadline counts from the release, not from the hold, and its
+   * envVars' expiry moves later by as long as it was held. A run whose launch can't be read fails,
+   * rather than sit queued. Returns how many it released.
    */
   function releaseQueued(): number {
     const queued = db
@@ -1401,13 +1412,21 @@ export function createLauncher({
     for (const { id } of queued) {
       const claimed = db.transaction(
         (tx) => {
-          const moved = tx
-            .update(runs)
-            .set({ status: "starting", createdAt: new Date().toISOString() })
-            .where(and(eq(runs.id, id), eq(runs.status, "queued")))
+          const isHeld = and(eq(runs.id, id), eq(runs.status, "queued"));
+          const heldSince = tx
+            .select({ createdAt: runs.createdAt })
+            .from(runs)
+            .where(isHeld)
+            .get()?.createdAt;
+          if (heldSince === undefined) return false;
+          const now = new Date();
+          tx.update(runs)
+            .set({ status: "starting", createdAt: now.toISOString() })
+            .where(isHeld)
             .run();
-          if (moved.changes === 0) return false;
-          extendRunEnvVars(tx, id, RETRY_ENV_VARS_TTL_S);
+          // clamped: a wall clock stepped back never shortens what the caller asked for
+          const heldMs = Math.max(0, now.getTime() - Date.parse(heldSince));
+          postponeRunEnvVars(tx, id, heldMs);
           return true;
         },
         { behavior: "immediate" },

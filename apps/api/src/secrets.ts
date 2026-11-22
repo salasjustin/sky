@@ -168,16 +168,21 @@ export function storeRunEnvVars(
     .run();
 }
 
-/** Moves the expiry of a run's envVars to `ttlSeconds` from now. */
-export function extendRunEnvVars(
-  tx: Tx,
-  runId: RunId,
-  ttlSeconds: number,
-): void {
-  tx.update(runEnvVars)
-    .set({ expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString() })
+/** Moves the expiry of each of a run's envVars `byMs` later, keeping the lifetime each was stored with. */
+export function postponeRunEnvVars(tx: Tx, runId: RunId, byMs: number): void {
+  const rows = tx
+    .select({ name: runEnvVars.name, expiresAt: runEnvVars.expiresAt })
+    .from(runEnvVars)
     .where(eq(runEnvVars.runId, runId))
-    .run();
+    .all();
+  for (const { name, expiresAt } of rows) {
+    tx.update(runEnvVars)
+      .set({
+        expiresAt: new Date(Date.parse(expiresAt) + byMs).toISOString(),
+      })
+      .where(and(eq(runEnvVars.runId, runId), eq(runEnvVars.name, name)))
+      .run();
+  }
 }
 
 /** Registers a run's envVars with redaction, until `purgeExpiredEnvVars` drops them. */
@@ -193,7 +198,7 @@ export function registerRunEnvVars(
 
 /**
  * Deletes envVars past their expiry and drops them from redaction. A queued launch keeps its own: its
- * clock starts when it is released (`extendRunEnvVars`).
+ * expiry moves later by as long as it was held when it is released (`postponeRunEnvVars`).
  */
 export function purgeExpiredEnvVars(
   db: Db,
