@@ -1288,9 +1288,9 @@ export function createLauncher({
       if (!draining()) releaseQueued();
     },
     /**
-     * The status a run is inserted with: `queued` while the API drains, else `starting`. Routes call
-     * it inside their own transaction, so a drain that has just passed its deadline releases the held
-     * launches there too, in a nested transaction.
+     * The status a run is inserted with: `queued` while the API drains, else `starting`. Its callers
+     * call it inside their own transaction, so a drain that has just passed its deadline releases
+     * the held launches there too, in a nested transaction.
      */
     entryStatus: (): "queued" | "starting" =>
       draining() ? "queued" : "starting",
