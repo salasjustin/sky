@@ -16,6 +16,7 @@ import {
   killRefreshCommands,
   loadedPlugins,
   OutputExceeded,
+  PLUGIN_FIRST_LIST_TIMEOUT_MS,
   PLUGIN_LIST_TIMEOUT_MS,
   PLUGIN_REFRESH_TIMEOUT_MS,
   PLUGIN_STEP_TIMEOUT_MS,
@@ -1352,6 +1353,117 @@ const stalls = (signal: AbortSignal) =>
     signal.addEventListener("abort", () => reject(signal.reason)),
   );
 
+// AbortSignal.timeout runs on Node's own timers, which fake time doesn't move: these follow the fake clock
+describe("refreshPlugins on a sprite that has just woken, with the default caps", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(
+        () =>
+          controller.abort(
+            new DOMException("The operation timed out.", "TimeoutError"),
+          ),
+        ms,
+      );
+      return controller.signal;
+    });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  /** A `claude` whose first listing takes `firstListMs`, then finishes unless it is cut first. */
+  const wakingClaude = (firstListMs: number) => {
+    const fake = fakeClaude({ "kru@kru": "1.0.0" }, "2.0.0");
+    const calls: string[] = [];
+    const run = (
+      f: string,
+      args: string[],
+      { signal }: { signal: AbortSignal },
+    ) => {
+      calls.push(args.slice(0, 2).join(" "));
+      if (
+        args[1] !== "list" ||
+        calls.filter((c) => c === "plugin list").length > 1
+      )
+        return fake.run(f, args);
+      return new Promise<{ stdout: string }>((resolve, reject) => {
+        const finish = setTimeout(
+          () => resolve(fake.run(f, args)),
+          firstListMs,
+        );
+        signal.addEventListener("abort", () => {
+          clearTimeout(finish);
+          reject(signal.reason);
+        });
+      });
+    };
+    return { run, calls, fake };
+  };
+  const refreshing = (
+    run: Parameters<typeof refreshPlugins>[0]["run"],
+    signal?: AbortSignal,
+  ) =>
+    refreshPlugins({
+      env: {},
+      warn: vi.fn(),
+      claude: "c",
+      lockFile: join(lockDir, "lock"),
+      run,
+      ...(signal && { signal }),
+    });
+
+  test.each([15_000, 28_000])(
+    "a first listing of %i ms finishes and the updates run",
+    async (firstListMs) => {
+      const { run, calls, fake } = wakingClaude(firstListMs);
+      const done = refreshing(run);
+      await vi.advanceTimersByTimeAsync(60_000);
+      const result = await done;
+      expect(result.outcome).toBe("refreshed");
+      expect(result.durationMs).toBeGreaterThanOrEqual(firstListMs);
+      expect(result.before?.map((p) => p.version)).toEqual(["1.0.0"]);
+      expect(result.after?.map((p) => p.version)).toEqual(["2.0.0"]);
+      expect(calls).toEqual([
+        "plugin list",
+        "plugin marketplace",
+        "plugin update",
+        "plugin list",
+      ]);
+      expect(fake.versions).toEqual({ "kru@kru": "2.0.0" });
+    },
+  );
+
+  test("a first listing past 30 s is cut once, with no retry, and updates nothing", async () => {
+    const { run, calls } = wakingClaude(45_000);
+    const done = refreshing(run);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await done;
+    expect(calls).toEqual(["plugin list"]);
+    expect(result).toMatchObject({
+      outcome: "failed",
+      reason: "list before timed out after 30.0s; no plugin was updated",
+      before: null,
+      after: null,
+    });
+    expect(result.reason).not.toMatch(/twice/);
+  });
+
+  test("a stop during a slow first listing ends the refresh at once", async () => {
+    const { run, calls } = wakingClaude(28_000);
+    const stop = new AbortController();
+    const done = refreshing(run, stop.signal);
+    await vi.advanceTimersByTimeAsync(5_000);
+    stop.abort("SIGTERM");
+    // no more time passes: the stop alone ends it
+    const result = await done;
+    expect(result).toMatchObject({ outcome: "skipped", reason: "stopped" });
+    expect(calls).toEqual(["plugin list"]);
+  });
+});
+
 describe("refreshPlugins caps", () => {
   const capped = (options: Partial<Parameters<typeof refreshPlugins>[0]>) =>
     refreshPlugins({
@@ -1363,17 +1475,18 @@ describe("refreshPlugins caps", () => {
       ...options,
     });
 
-  test("the defaults are a 30s refresh, a 10s cap per update and a 5s cap per listing", async () => {
+  test("the defaults are a 60s refresh, a 30s cap on the first listing, a 10s cap per update and a 5s cap on the last listing", async () => {
     const timeout = vi.spyOn(AbortSignal, "timeout");
     try {
       const fake = fakeClaude({ "kru@kru": "1.0.0" }, "2.0.0");
       await capped({ run: fake.run, timeoutMs: undefined });
       const caps = timeout.mock.calls.map(([ms]) => ms);
       expect(caps).toContain(PLUGIN_REFRESH_TIMEOUT_MS);
-      // the first listing, the marketplace and plugin updates, the last listing
-      expect(caps.filter((ms) => ms === 5_000)).toHaveLength(2);
+      expect(caps.filter((ms) => ms === 30_000)).toHaveLength(1);
+      expect(caps.filter((ms) => ms === 5_000)).toHaveLength(1);
       expect(caps.filter((ms) => ms === 10_000)).toHaveLength(2);
-      expect(PLUGIN_REFRESH_TIMEOUT_MS).toBe(30_000);
+      expect(PLUGIN_REFRESH_TIMEOUT_MS).toBe(60_000);
+      expect(PLUGIN_FIRST_LIST_TIMEOUT_MS).toBe(30_000);
       expect(PLUGIN_STEP_TIMEOUT_MS).toBe(10_000);
       expect(PLUGIN_LIST_TIMEOUT_MS).toBe(5_000);
     } finally {
@@ -1381,68 +1494,24 @@ describe("refreshPlugins caps", () => {
     }
   });
 
-  test("a first listing cut at its own cap is tried once more, and the refresh goes on", async () => {
-    const fake = fakeClaude({ "kru@kru": "1.0.0" }, "2.0.0");
-    let lists = 0;
-    const result = await capped({
-      listTimeoutMs: 30,
-      run: (f, args, options) => {
-        if (args[1] === "list" && ++lists === 1) return stalls(options.signal);
-        return fake.run(f, args);
-      },
-    });
-    expect(result.outcome).toBe("refreshed");
-    expect(result.before?.map((p) => p.version)).toEqual(["1.0.0"]);
-    expect(result.after?.map((p) => p.version)).toEqual(["2.0.0"]);
-    expect(result.steps?.map((s) => s.name)).toEqual([
-      "list before",
-      "list before (retry)",
-      "update marketplace kru",
-      "update kru@kru",
-      "list after",
-    ]);
-  });
-
-  test("a first listing cut twice is a failed outcome that says so, with no update attempted", async () => {
+  test("a first listing cut at its own cap is not retried, and ends the refresh as failed", async () => {
     const calls: string[][] = [];
-    const warn = vi.fn();
     const result = await capped({
-      warn,
-      listTimeoutMs: 30,
+      timeoutMs: 400,
+      firstListTimeoutMs: 100,
       run: (_f, args, { signal }) => {
         calls.push(args);
         return stalls(signal);
       },
     });
-    expect(calls).toEqual([
-      ["plugin", "list", "--json"],
-      ["plugin", "list", "--json"],
-    ]);
+    expect(calls).toEqual([["plugin", "list", "--json"]]);
+    // its own cap ended it, not the overall budget
     expect(result).toMatchObject({
       outcome: "failed",
-      reason: "list before timed out after 0.0s twice; no plugin was updated",
+      reason: "list before timed out after 0.1s; no plugin was updated",
       before: null,
       after: null,
     });
-    expect(warn).toHaveBeenCalledOnce();
-    expect(warn.mock.calls[0]?.[0]).toMatch(
-      /plugin refresh failed \(list before timed out/,
-    );
-  });
-
-  test("a cut first listing costs its own cap, not the refresh's budget, so the updates still run", async () => {
-    const fake = fakeClaude({ "kru@kru": "1.0.0" }, "2.0.0");
-    let lists = 0;
-    const result = await capped({
-      timeoutMs: 400,
-      listTimeoutMs: 100,
-      run: (f, args, options) => {
-        if (args[1] === "list" && ++lists === 1) return stalls(options.signal);
-        return fake.run(f, args);
-      },
-    });
-    // the overall budget was not what ended the stalled listing
-    expect(result.outcome).toBe("refreshed");
   });
 
   test("a last listing cut twice leaves after unread and says so, with the updates done", async () => {
@@ -1655,7 +1724,7 @@ describe("refreshPlugins caps", () => {
   test("output over the limit is not a timeout, though the cap fires before the command has ended, and is not retried", async () => {
     const calls: string[][] = [];
     const result = await capped({
-      listTimeoutMs: 30,
+      firstListTimeoutMs: 30,
       run: (_f, args, { signal }) => {
         calls.push(args);
         // rejects once the cap has fired, as when it fires while the command's group is waited on
@@ -1838,6 +1907,7 @@ describe("a cut command's whole process group", PROCESS_TESTS, () => {
       lockFile: join(dir, "lock"),
       signal: stop.signal,
       // no cap may land first: the stop is what ends the update
+      firstListTimeoutMs: PROCESS_TEST_MS,
       listTimeoutMs: PROCESS_TEST_MS,
       stepTimeoutMs: PROCESS_TEST_MS,
     });
@@ -1911,7 +1981,7 @@ describe("a cut command's whole process group", PROCESS_TESTS, () => {
         warn: vi.fn(),
         claude,
         lockFile: join(dir, "lock"),
-        listTimeoutMs: PROCESS_TEST_MS,
+        firstListTimeoutMs: PROCESS_TEST_MS,
         run: (_file, args, options) => {
           calls.push(args);
           return runInGroup(
