@@ -33,7 +33,10 @@ jobs:
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: blacksmith-4vcpu-ubuntu-2404
     # the deploy secrets live in this environment, which allows only main, so no other branch's workflow reads them
-    environment: production
+    environment:
+      name: production
+      # a deployment record would name main's tip, which may not be DEPLOY_SHA, and count a skipped deploy as one
+      deployment: false
     permissions:
       contents: read
       # lets a manual run list CI's runs for the commit
