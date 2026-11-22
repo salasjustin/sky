@@ -171,14 +171,17 @@ test("--wait names the runs active now when the drain ends early", async () => {
 test.each([
   ["unreachable", unreachable, "cannot reach"],
   ["a server error", failing(500, "start failed"), "start failed"],
-])("--wait exits 1 and does not retry the start when it is %s", async (_case, start, message) => {
-  waitApi(start);
-  const r = await cli(["admin", "drain", "--wait"]);
-  expect(r.code).toBe(1);
-  expect(r.stderr).toContain(message);
-  expect(requests).toEqual(["POST"]);
-  expect(r.sleeps).toEqual([]);
-});
+])(
+  "--wait exits 1 and does not retry the start when it is %s",
+  async (_case, start, message) => {
+    waitApi(start);
+    const r = await cli(["admin", "drain", "--wait"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain(message);
+    expect(requests).toEqual(["POST"]);
+    expect(r.sleeps).toEqual([]);
+  },
+);
 
 test("--wait exits 4 with no check made when the deadline is under a second away", async () => {
   waitApi(reply(busyUntil(0.5, "run_a")));
@@ -206,24 +209,29 @@ const failedChecks: [string, (() => Response)[], string][] = [
     "9s",
   ],
 ];
-test.each(failedChecks)("--wait exits 4, not 1, when %s, naming the runs of the last good poll", async (_case, checks, age) => {
-  // mirror admin.ts: a check every 5 s, the last one 1 s before the API's deadline
-  const pollMs = 5_000;
-  const marginMs = 1_000;
-  const polls = Math.ceil((deadlineS * 1000 - marginMs) / pollMs); // at 5 s, 10 s, 14 s
-  waitApi(reply(busyUntil(deadlineS, "run_a")), ...checks);
-  const r = await cli(["admin", "drain", "--wait", `--timeout=${deadlineS}`]);
-  expect(requests.filter((x) => x === "GET")).toHaveLength(polls);
-  expect(r.sleeps.reduce((a, b) => a + b, 0)).toBe(deadlineS * 1000 - marginMs);
-  expect(r.code).toBe(4);
-  // the age counts from the last answered check, and the last error sits beside it
-  expect(r.stderr).toContain(
-    `1 run still active after 15s (status from ${age} ago; the last check failed: last failure): run_b`,
-  );
-  expect(r.stderr).not.toContain("first failure");
-  expect(r.stdout).toContain("active run_b");
-  expect(r.stdout).not.toContain("run_a");
-});
+test.each(failedChecks)(
+  "--wait exits 4, not 1, when %s, naming the runs of the last good poll",
+  async (_case, checks, age) => {
+    // mirror admin.ts: a check every 5 s, the last one 1 s before the API's deadline
+    const pollMs = 5_000;
+    const marginMs = 1_000;
+    const polls = Math.ceil((deadlineS * 1000 - marginMs) / pollMs); // at 5 s, 10 s, 14 s
+    waitApi(reply(busyUntil(deadlineS, "run_a")), ...checks);
+    const r = await cli(["admin", "drain", "--wait", `--timeout=${deadlineS}`]);
+    expect(requests.filter((x) => x === "GET")).toHaveLength(polls);
+    expect(r.sleeps.reduce((a, b) => a + b, 0)).toBe(
+      deadlineS * 1000 - marginMs,
+    );
+    expect(r.code).toBe(4);
+    // the age counts from the last answered check, and the last error sits beside it
+    expect(r.stderr).toContain(
+      `1 run still active after 15s (status from ${age} ago; the last check failed: last failure): run_b`,
+    );
+    expect(r.stderr).not.toContain("first failure");
+    expect(r.stdout).toContain("active run_b");
+    expect(r.stdout).not.toContain("run_a");
+  },
+);
 
 test("--wait exits 4 with no stale suffix when the last check is answered after failures", async () => {
   // fails at 5 s and 10 s, answers at 14 s
@@ -290,13 +298,16 @@ const keyCases: [string, () => Response, (() => Response)[], string[]][] = [
     ["POST", "GET", "GET"],
   ],
 ];
-test.each(keyCases)("--wait exits 2 without retrying when the key is rejected at %s", async (_case, start, checks, sent) => {
-  waitApi(start, ...checks);
-  const r = await cli(["admin", "drain", "--wait"]);
-  expect(r.code).toBe(2);
-  expect(r.stderr).toContain("invalid API key (unauthorized); check the key");
-  expect(requests).toEqual(sent);
-});
+test.each(keyCases)(
+  "--wait exits 2 without retrying when the key is rejected at %s",
+  async (_case, start, checks, sent) => {
+    waitApi(start, ...checks);
+    const r = await cli(["admin", "drain", "--wait"]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("invalid API key (unauthorized); check the key");
+    expect(requests).toEqual(sent);
+  },
+);
 
 test("--wait retries a check whose answer is cut off and exits 4 by the last good one", async () => {
   drainApi(

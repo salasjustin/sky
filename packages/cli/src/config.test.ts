@@ -105,7 +105,8 @@ test.each([
   const env = { SKY_URL: "https://env.example", SKY_API_KEY: key };
   expect(resolveConfig({}, env, home())).toEqual({
     ok: false,
-    error: "SKY_API_KEY has a line break or NUL that a header can't carry; set it to the key alone",
+    error:
+      "SKY_API_KEY has a line break or NUL that a header can't carry; set it to the key alone",
   });
 });
 
