@@ -1505,6 +1505,77 @@ describe("refreshPlugins caps", () => {
     expect(result.outcome).toBe("timed_out");
   });
 
+  test("a refresh the overall budget ends still names the updates that failed before it", async () => {
+    const fake = fakeClaude({ "a@one": "1.0.0", "b@two": "1.0.0" }, "2.0.0");
+    const result = await capped({
+      timeoutMs: 100,
+      stepTimeoutMs: 5000,
+      listTimeoutMs: 1000,
+      run: (f, args, options) => {
+        if (args[4] === "one") throw new Error("host unreachable");
+        // a stall that only the overall budget ends
+        if (args[1] === "update") return stalls(options.signal);
+        return fake.run(f, args);
+      },
+    });
+    expect(result).toMatchObject({
+      outcome: "timed_out",
+      reason: "update failed for marketplace one (host unreachable)",
+    });
+    expect(PluginRefresh.safeParse({ ...result, loaded: [] }).success).toBe(
+      true,
+    );
+  });
+
+  test("a refresh that ends on an unreadable listing still names the updates that failed before it", async () => {
+    const fake = fakeClaude({ "a@one": "1.0.0" }, "2.0.0");
+    let lists = 0;
+    const result = await capped({
+      run: async (f, args) => {
+        if (args[4] === "one") throw new Error("host unreachable");
+        if (args[1] === "list" && ++lists === 2) return { stdout: "not json" };
+        return fake.run(f, args);
+      },
+    });
+    expect(result.outcome).toBe("failed");
+    expect(result.reason).toMatch(
+      /; update failed for marketplace one \(host unreachable\)$/,
+    );
+  });
+
+  test("a plugin from the skills-dir pseudo-marketplace is recorded but never updated, so it doesn't fail the refresh", async () => {
+    const installed = [
+      { id: "kru@kru", scope: "user", version: "1.0.0" },
+      { id: "kru@kru", scope: "project", projectPath: lockDir },
+      { id: "mine@skills-dir", scope: "user", version: "0.0.1" },
+      { id: "mine@skills-dir", scope: "project", projectPath: lockDir },
+    ];
+    const calls: string[][] = [];
+    const result = await capped({
+      projectDir: lockDir,
+      run: async (_f, args) => {
+        calls.push(args);
+        // a marketplace that isn't one is not found, as the real one says
+        if (args.at(-1) === "skills-dir")
+          throw new Error("Marketplace 'skills-dir' not found");
+        if (args[2] === "mine@skills-dir")
+          throw new Error("Plugin 'mine@skills-dir' not found");
+        return { stdout: args[1] === "list" ? JSON.stringify(installed) : "" };
+      },
+    });
+    expect(calls).toEqual([
+      ["plugin", "list", "--json"],
+      ["plugin", "marketplace", "update", "--", "kru"],
+      ["plugin", "update", "kru@kru", "--scope", "user"],
+      ["plugin", "update", "kru@kru", "--scope", "project"],
+      ["plugin", "list", "--json"],
+    ]);
+    expect(result.outcome).toBe("refreshed");
+    const mine = { name: "mine", marketplace: "skills-dir", version: "0.0.1" };
+    expect(result.before).toContainEqual(mine);
+    expect(result.after).toContainEqual(mine);
+  });
+
   test("a cut is told from a failure by which timer fired, whatever the error says", async () => {
     const fake = fakeClaude({ "a@one": "1.0.0", "b@two": "1.0.0" }, "2.0.0");
     const result = await capped({

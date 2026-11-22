@@ -313,10 +313,16 @@ const REASON_MAX = 300;
 const PLUGINS_MAX = 100;
 const STEPS_MAX = 50;
 
+/**
+ * The pseudo-marketplace Claude Code lists plugins loaded from a skills directory under. It has
+ * nothing to update, so such a plugin is recorded but is neither marketplace-updated nor plugin-updated.
+ */
+const SKILLS_DIR = "skills-dir";
+
 type Listing = {
   /** The user-scope plugins as recorded, each once: its `name@marketplace` id split, then cut to bounds. */
   plugins: PluginVersion[];
-  /** Their whole ids, which is what commands are given. */
+  /** The whole ids of those that can be updated, which is what commands are given. */
   ids: string[];
   /** The whole names of the marketplaces they come from, each once. */
   marketplaces: string[];
@@ -340,6 +346,7 @@ function readListing(stdout: string, projectDir?: string): Listing {
   const plugins: PluginVersion[] = [];
   const projectIds = new Set<string>();
   const marketplaces = new Set<string>();
+  const updatable: string[] = [];
   for (const { id, scope, version, projectPath } of installed) {
     if (
       scope === "project" &&
@@ -352,7 +359,10 @@ function readListing(stdout: string, projectDir?: string): Listing {
     seen.add(id);
     const at = id.lastIndexOf("@");
     const marketplace = at > 0 ? id.slice(at + 1) : null;
-    if (marketplace !== null) marketplaces.add(marketplace);
+    if (marketplace !== SKILLS_DIR) {
+      updatable.push(id);
+      if (marketplace !== null) marketplaces.add(marketplace);
+    }
     plugins.push({
       name: (at > 0 ? id.slice(0, at) : id).slice(0, 100),
       marketplace: marketplace?.slice(0, 100) ?? null,
@@ -364,9 +374,9 @@ function readListing(stdout: string, projectDir?: string): Listing {
   }
   return {
     plugins,
-    ids: [...seen],
+    ids: updatable,
     marketplaces: [...marketplaces],
-    pinnedHere: [...seen].filter((id) => projectIds.has(id)),
+    pinnedHere: updatable.filter((id) => projectIds.has(id)),
   };
 }
 
@@ -399,7 +409,7 @@ function sameDir(a: string, b: string): boolean {
  * Resolves to the record of what it did: the user-scope plugins before and after (null for a list
  * it never read; a waiting run with nothing to update has its one listing as both), the outcome
  * code (`refreshed`, `timed_out`, `failed` or `skipped`), the reason for a `failed` or `skipped`
- * one, how long it took and how long each command did (`steps`). Each marketplace the installed plugins
+ * one (and for a `timed_out` one that had already had updates cut or fail, naming them), how long it took and how long each command did (`steps`). Each marketplace the installed plugins
  * come from is updated by name, and every command has a cap of its own besides the overall budget: an
  * update is cut at `stepTimeoutMs`, a listing at `listTimeoutMs`. A marketplace update that fails, cut
  * or not, is a failed update named for that marketplace, and the plugin updates after it still run from
@@ -525,6 +535,10 @@ export async function refreshPlugins(options: {
     }
   };
   let failedReason = "";
+  // the updates cut or failed so far, kept outside the pass so a refresh the budget ends still names them
+  const failed: string[] = [];
+  const failedUpdates = () =>
+    failed.length > 0 ? `update failed for ${failed.join(", ")}` : "";
   // set by a waiting run whose own pass found no record of its worktree to update
   let nothingPinnedHere = false;
   /** One pass under the lock: the whole refresh, or, after another run's, this worktree's records only. */
@@ -549,7 +563,6 @@ export async function refreshPlugins(options: {
       return;
     }
     const updated: string[] = [];
-    const failed: string[] = [];
     let unreadAfter = "";
     if (before.length === 0) {
       // nothing installed, so nothing for the refresh to change
@@ -627,10 +640,7 @@ export async function refreshPlugins(options: {
         throw error;
       }
     }
-    failedReason = [
-      failed.length > 0 ? `update failed for ${failed.join(", ")}` : "",
-      unreadAfter,
-    ]
+    failedReason = [failedUpdates(), unreadAfter]
       .filter((part) => part !== "")
       .join("; ");
     const failures = failedReason === "" ? "" : `; ${failedReason}`;
@@ -677,10 +687,14 @@ export async function refreshPlugins(options: {
     const why = timeout.aborted
       ? `timed out after ${seconds(now() - started)}s`
       : firstLine(error);
+    // updates cut or failed before the refresh ended are still the record's to name
+    const cut = failedUpdates();
     warn(
-      `runner: plugin refresh failed (${why}); continuing with the installed versions`,
+      `runner: plugin refresh failed (${why}${cut === "" ? "" : `; ${cut}`}); continuing with the installed versions`,
     );
-    return timeout.aborted ? record("timed_out") : record("failed", why);
+    return timeout.aborted
+      ? record("timed_out", cut === "" ? undefined : cut)
+      : record("failed", cut === "" ? why : `${why}; ${cut}`);
   }
 }
 
