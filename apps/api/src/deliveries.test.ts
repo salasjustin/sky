@@ -508,6 +508,32 @@ test("describeError leaves no address or host:port of its error's cause", () => 
   );
 });
 
+test("describeError says why when no address of a many-address host connects", () => {
+  // Node's connect to a host with several addresses fails with an AggregateError whose message is empty
+  const failed = (code: string, errors: Error[]) =>
+    new TypeError("fetch failed", {
+      cause: Object.assign(new AggregateError(errors, ""), { code }),
+    });
+  const refused = (address: string) =>
+    Object.assign(new Error(`connect ECONNREFUSED ${address}`), {
+      code: "ECONNREFUSED",
+    });
+  const text = describeError(
+    failed("ECONNREFUSED", [
+      refused("203.0.113.9:443"),
+      refused("2001:db8::9:443"),
+    ]),
+  );
+  expect(text).toBe(
+    "TypeError: fetch failed: connect ECONNREFUSED <addr>, connect ECONNREFUSED <addr>",
+  );
+  expect(errorKind(text)).toBe("connection_refused");
+
+  const bare = describeError(failed("ETIMEDOUT", []));
+  expect(bare).toBe("TypeError: fetch failed: ETIMEDOUT");
+  expect(errorKind(bare)).toBe("timeout");
+});
+
 test("a redirect is a failed attempt, never followed", async () => {
   await subscribe(["run.finished"]);
   server.use(

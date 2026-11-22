@@ -166,6 +166,23 @@ const refusalKind = (err: unknown): RefusalKind | null => {
     : null;
 };
 
+/**
+ * Why a fetch failed, from its cause. Node's connect to a host with several addresses, when none
+ * connects, fails with an `AggregateError` whose message is empty: its per-address errors and its
+ * `code` say why instead.
+ */
+const causeText = (cause: Error): string => {
+  if (cause.message) return cause.message;
+  const each =
+    cause instanceof AggregateError
+      ? cause.errors
+          .filter((e): e is Error => e instanceof Error && e.message !== "")
+          .map((e) => e.message)
+      : [];
+  if (each.length > 0) return each.join(", ");
+  return "code" in cause && typeof cause.code === "string" ? cause.code : "";
+};
+
 /** The text stored as `last_error` for a failed attempt, with addresses and `host:port` pairs scrubbed out. */
 export const describeError = (err: unknown): string => {
   const refusal = refusalKind(err);
@@ -175,7 +192,8 @@ export const describeError = (err: unknown): string => {
   }
   // fetch's own message is a bare "fetch failed"; the cause says why
   const cause = err instanceof Error ? err.cause : undefined;
-  const text = cause instanceof Error ? `${err}: ${cause.message}` : `${err}`;
+  const text =
+    cause instanceof Error ? `${err}: ${causeText(cause)}` : `${err}`;
   return scrubAddresses(text).slice(0, MAX_ERROR_LENGTH);
 };
 
