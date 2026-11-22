@@ -146,7 +146,7 @@ export const PluginVersion = z.object({
 });
 export type PluginVersion = z.infer<typeof PluginVersion>;
 
-/** One `claude` command of the refresh and how long it ran, in ms; one a timeout cut short counts up to the cut. */
+/** One `claude` command of the refresh and how long it ran, in ms; one that was cut counts until it was stopped or given up on. */
 export const PluginRefreshStep = z.object({
   name: z.string().min(1).max(100),
   ms: z.number().int().nonnegative(),
@@ -181,11 +181,12 @@ function splitLegacyOutcome(raw: unknown): unknown {
 
 /**
  * What the start-of-run plugin refresh did, as the run records it. `outcome` is a code: `refreshed`,
- * `timed_out`, `failed` or `skipped`; `reason` says why for a `failed` or `skipped` one. `before` and `after`
- * are the user-scope plugins either side of the refresh, per `claude plugin list`, each cut to its
- * first 100. Either is null when the refresh never read that list (a skip before any listing, or a
- * refresh cut short before the read), and `[]` when it read the list and found no plugins, so null means "not
- * read", not "none". A record from before the codes has its `<code>: <reason>` outcome split into the
+ * `timed_out`, `failed` or `skipped`; `reason` says why for a `failed` or `skipped` one, and for a
+ * `timed_out` one names the updates, if any, that had failed or been cut and stopped before the
+ * budget ran out. `before` and `after` are the user-scope plugins either side of the refresh, per
+ * `claude plugin list`, each cut to its first 100. Either is null when the refresh never read that
+ * list (a skip before any listing, or a refresh cut short before the read), and `[]` when it read the
+ * list and found no plugins, so null means "not read", not "none". A record from before the codes has its `<code>: <reason>` outcome split into the
  * two, and keeps its lists as arrays, where `[]` can also be a list it never read. `loaded` is what the session's own init reports it loaded, from any scope, which is what
  * counts when `plugin update` and the session disagree. `steps` is where the time went, one entry per
  * command in order, at most 50; it is absent from a record made before it existed, and from one that
