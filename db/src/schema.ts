@@ -340,8 +340,9 @@ export const webhooks = sqliteTable(
     ownerKeyId: text("owner_key_id")
       .$type<ApiKeyId>()
       .references(() => apiKeys.id),
-    // when a delivery last gave up after its final attempt; cleared by the next delivered one. Stored, not
-    // derived, so pruning old deliveries never hides a dead webhook
+    // when the current failing stretch began: the first give-up since the last delivered attempt (a refused
+    // delivery gives up on its first attempt), kept by later give-ups and cleared by the next delivered one.
+    // Stored, not derived, so pruning old deliveries never hides a dead webhook
     // no CHECK: adding one makes drizzle-kit rebuild the table; the API writes it from its clock
     failingSince: text("failing_since"),
   },
