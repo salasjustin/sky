@@ -457,8 +457,10 @@ test("a public name that resolves to a private address is refused at connect, fa
   expect(resolved).toEqual(["hooks.example.com"]);
   expect(deliveries()).toEqual([expect.objectContaining(blockedRow)]);
   expect(logs).toHaveLength(1);
-  expect(logs[0]).toMatch(/failed: blocked_address; giving up$/);
-  expect(logs[0]).not.toMatch(/10\.0\.0\.5|hooks\.example\.com:/);
+  expect(logs[0]).toMatch(
+    /^warn: webhook \S+ evt_\d+: attempt 1\/30 failed: blocked_address; giving up$/,
+  );
+  expect(logs[0]).not.toMatch(/10\.0\.0\.5|hooks\.example\.com/);
   advance(3_600_000);
   await dispatcher.drain();
   expect(deliveries()[0]?.attempts).toBe(1);
@@ -494,7 +496,15 @@ test.each([
   expect(deliveries()).toEqual([
     expect.objectContaining({ ...blockedRow, lastError: kind }),
   ]);
-  expect(logs.filter((l) => l.includes("secret"))).toEqual([]);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toMatch(
+    new RegExp(
+      `^warn: webhook \\S+ evt_\\d+: attempt 1/30 failed: ${kind}; giving up$`,
+    ),
+  );
+  expect(logs[0]).not.toMatch(
+    /secret|hooks\.example\.com|4280|10\.0\.0\.5/,
+  );
 });
 
 test("describeError leaves no address or host:port of its error's cause", () => {
