@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Runs an already built image of the repo's Dockerfile detached, waits for GET /healthz to answer 200, then holds a few seconds and checks again, so an
-# image that dies on start or just after listening fails CI. This covers what the bundle boot check
-# (ci/boot-check.sh) cannot: the ENTRYPOINT that creates $DATA_DIR and drops to uid node, NODE_ENV and
-# DATA_DIR from the image's ENV, the image's own npm install of better-sqlite3 and the copied
-# migrations. Every secret below is a dummy. Needs Docker; nothing is pushed.
+# Runs an already built image of the repo's Dockerfile detached, waits for GET /healthz to answer
+# 200, then holds a few seconds and checks again, so an image that dies on start or just after
+# listening fails CI. This covers what the bundle boot check (ci/boot-check.sh) cannot: the
+# ENTRYPOINT that creates $DATA_DIR and drops to uid node, NODE_ENV and DATA_DIR from the image's
+# ENV, the image's own npm install of better-sqlite3 and the copied migrations. Every secret below
+# is a dummy. Needs Docker; nothing is pushed.
 #
 #   docker build -t sky-api:boot-check . && ci/image-boot-check.sh [image-tag]
 set -euo pipefail
@@ -44,7 +45,7 @@ fail_with_log() {
 
 # set before docker run: a run that fails to start the entrypoint still leaves a Created container behind
 STARTED=1
-# DATA_DIR and NODE_ENV come from the image's ENV, as in production; the dummy secrets match boot-check.sh
+# the dummy secrets match boot-check.sh
 docker run -d --name "$NAME" -p "127.0.0.1:$HOST_PORT:$APP_PORT" \
   -e SKY_API_KEY="boot-check-api-key-boot-check-api-key" \
   -e SPRITES_TOKEN="boot-check" \
