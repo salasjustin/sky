@@ -136,7 +136,7 @@ test("--wait stops at the deadline the API answers, not its own --timeout", asyn
   expect(r.sleeps.reduce((a, b) => a + b, 0)).toBe(59_000);
 });
 
-test("--wait exits 4 when the drain ends before the runs finish, even with none active", async () => {
+test("--wait exits 4 when the drain ends before the wait sees the runs finish, even with none active", async () => {
   drainApi(
     busy("run_a"),
     drain({ draining: false, since: null, deadline: null }),

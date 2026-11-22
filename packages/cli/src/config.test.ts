@@ -92,7 +92,7 @@ test("--api-key-env naming an unset variable is an error, not a fallback", () =>
   });
 });
 
-// fetch quotes a header value it refuses, so each of these would print the key
+// fetch's error for a CR, LF or NUL quotes the value, so each of these would print the key
 test.each([
   ["an inner LF", "secret\nkey"],
   ["an inner CR", "secret\rkey"],

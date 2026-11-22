@@ -117,7 +117,7 @@ function checkUrl(value: string): string | undefined {
   return "must use https (http only for localhost)";
 }
 
-/** Whether fetch takes `Bearer <key>`: it trims trailing HTTP whitespace, then refuses CR, LF and NUL with an error that quotes the value. */
+/** False for a key fetch would quote in an error: it trims trailing HTTP whitespace, then refuses CR, LF and NUL by quoting the value. Its other refusals don't quote it. */
 function fitsHeader(key: string): boolean {
   const sent = key.replace(/[\t\n\r ]+$/, "");
   return !["\r", "\n", "\0"].some((char) => sent.includes(char));
