@@ -97,7 +97,7 @@ jobs:
             -t "registry.fly.io/sky-justin:sha-${SHORT_SHA}" .
           docker push registry.fly.io/sky-justin:main
           docker push "registry.fly.io/sky-justin:sha-${SHORT_SHA}"
-      # holds new launches for the new API's boot and waits for the runs in flight, so the restart doesn't
+      # holds new launches until the new API boots and waits for the runs in flight, so the restart doesn't
       # cut one off. Of the CLI's exits only 4 stops the deploy: runs outlasted the wait (by the last status
       # answered, if the API was then lost) or the drain ended early. A failed start, no successful check
       # (nothing newer than the start's runs is known) or a refused or unreadable one doesn't: a broken

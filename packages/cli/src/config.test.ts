@@ -105,7 +105,7 @@ test.each([
   const env = { SKY_URL: "https://env.example", SKY_API_KEY: key };
   expect(resolveConfig({}, env, home())).toEqual({
     ok: false,
-    error: "SKY_API_KEY has a line break or NUL that a header can't carry",
+    error: "SKY_API_KEY has a line break or NUL that a header can't carry; set it to the key alone",
   });
 });
 
@@ -116,13 +116,13 @@ test("a key a header can't carry is named by where it came from", () => {
   const path = join(dir, ".config", "sky", "config.json");
   expect(resolveConfig({}, {}, dir)).toEqual({
     ok: false,
-    error: `apiKey in ${path} has a line break or NUL that a header can't carry`,
+    error: `apiKey in ${path} has a line break or NUL that a header can't carry; set it to the key alone`,
   });
   const env = { SKY_URL: "https://env.example", OTHER_KEY: "secret\nkey" };
   expect(resolveConfig({ apiKeyEnv: "OTHER_KEY" }, env, dir)).toEqual({
     ok: false,
     error:
-      "OTHER_KEY (--api-key-env) has a line break or NUL that a header can't carry",
+      "OTHER_KEY (--api-key-env) has a line break or NUL that a header can't carry; set it to the key alone",
   });
 });
 

@@ -85,7 +85,7 @@ export function resolveConfig(
     // never the value: unlike the URL, it is a secret
     return {
       ok: false,
-      error: `${apiKey.source} has a line break or NUL that a header can't carry`,
+      error: `${apiKey.source} has a line break or NUL that a header can't carry; set it to the key alone`,
     };
   }
   return {

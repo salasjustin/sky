@@ -581,7 +581,7 @@ function describe(err: unknown): string {
   if (err instanceof DOMException && err.name === "TimeoutError") {
     return `no response in ${requestTimeoutMs / 1000}s`;
   }
-  // a network failure's message is "fetch failed", or "terminated" in the body; the reason is in cause
+  // a network failure reads "fetch failed", or "terminated" mid-body; the reason is in cause
   const cause = (err as { cause?: { code?: unknown; message?: unknown } })
     .cause;
   if (typeof cause?.code === "string") return cause.code;
