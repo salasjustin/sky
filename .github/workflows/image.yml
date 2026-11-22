@@ -32,6 +32,8 @@ jobs:
         && github.event.workflow_run.head_repository.full_name == github.repository)
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    # the deploy secrets live in this environment, which allows only main, so no other branch's workflow reads them
+    environment: production
     permissions:
       contents: read
       # lets a manual run list CI's runs for the commit
@@ -40,6 +42,16 @@ jobs:
       # the commit CI checked, not whatever main points at when this run starts
       DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
+      # the name is deliberately not FLY_API_TOKEN: a repository secret of that name would answer for an
+      # environment without one, and a green deploy wouldn't show the environment's secret was read
+      - name: Require the deploy token
+        run: |
+          if [ -z "$FLY_DEPLOY_TOKEN" ]; then
+            echo "::error::FLY_DEPLOY_TOKEN is empty. Set it as a secret of the production environment (not a repository secret); nothing deployed."
+            exit 1
+          fi
+        env:
+          FLY_DEPLOY_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
       - name: Require a passing CI run for this commit
         if: github.event_name == 'workflow_dispatch'
         run: |
@@ -82,12 +94,12 @@ jobs:
           fi
           echo "deploy=${deploy}" >> "$GITHUB_OUTPUT"
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
       - name: Log in to Fly registry
         if: steps.guard.outputs.deploy == 'true'
         run: echo "$FLY_API_TOKEN" | docker login registry.fly.io -u x --password-stdin
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
       - name: Build and push
         if: steps.guard.outputs.deploy == 'true'
         run: |
@@ -114,7 +126,7 @@ jobs:
         timeout-minutes: 70
         run: |
           if [ -z "$SKY_API_KEY" ]; then
-            echo "SKY_ADMIN_KEY is not set; deploying without a drain"
+            echo "::warning::SKY_ADMIN_KEY is not set; deploying without a drain"
             exit 0
           fi
           # the CLI of the commit being deployed, from the image just built: it isn't downloaded from
@@ -154,7 +166,7 @@ jobs:
         if: steps.guard.outputs.deploy == 'true'
         run: flyctl deploy -a sky-justin --image "registry.fly.io/sky-justin:sha-${DEPLOY_SHA::7}" --ha=false
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
       # a successful deploy needs no cancel: the new API releases held launches on boot
       - name: End the drain
         if: (failure() || cancelled()) && steps.guard.outputs.deploy == 'true' && steps.drain.outcome != 'skipped'
