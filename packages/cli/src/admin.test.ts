@@ -53,6 +53,33 @@ function drainApi(
   );
 }
 
+/** POST answers `start`; each GET the next of `checks`, the last repeating. */
+function waitApi(start: () => Response, ...checks: (() => Response)[]) {
+  let n = 0;
+  server.use(
+    http.post(`${apiUrl}/v1/admin/drain`, () => {
+      requests.push("POST");
+      return start();
+    }),
+    http.get(`${apiUrl}/v1/admin/drain`, () => {
+      requests.push("GET");
+      // a check nobody scripted fails; `requests` shows it was made
+      return (
+        checks[Math.min(n++, checks.length - 1)]?.() ?? HttpResponse.error()
+      );
+    }),
+  );
+}
+const reply = (body: Record<string, unknown>) => () => HttpResponse.json(body);
+const failing =
+  (status: number, message: string, code = "unavailable") =>
+  () =>
+    HttpResponse.json({ error: { code, message } }, { status });
+const unreachable = () => HttpResponse.error();
+/** A drain with `active` runs and `s` seconds to its deadline. */
+const busyUntil = (s: number, ...active: string[]) =>
+  drain({ active, ready: false, deadline: at(s) });
+
 test("drain posts the timeout and prints the state without waiting", async () => {
   drainApi(busy("run_a"));
   const r = await cli(["admin", "drain", "--timeout=600"]);
@@ -123,7 +150,7 @@ test("--wait exits 4 when the drain ends before the runs finish, even with none 
   expect(r.stdout).toContain("idle");
 });
 
-test("--wait names the runs still active when the drain ends early", async () => {
+test("--wait names the runs active now when the drain ends early", async () => {
   drainApi(
     busy("run_a"),
     drain({
@@ -141,11 +168,26 @@ test("--wait names the runs still active when the drain ends early", async () =>
   );
 });
 
-test("--wait exits 1 when the API can't be reached to start", async () => {
-  server.use(http.post(`${apiUrl}/v1/admin/drain`, () => HttpResponse.error()));
+test.each([
+  ["unreachable", unreachable, "cannot reach"],
+  ["a server error", failing(500, "start failed"), "start failed"],
+])("--wait exits 1 and does not retry the start when it is %s", async (_case, start, message) => {
+  waitApi(start);
   const r = await cli(["admin", "drain", "--wait"]);
   expect(r.code).toBe(1);
-  expect(r.stderr).toContain("cannot reach");
+  expect(r.stderr).toContain(message);
+  expect(requests).toEqual(["POST"]);
+  expect(r.sleeps).toEqual([]);
+});
+
+test("--wait exits 4 with no check made when the deadline is under a second away", async () => {
+  waitApi(reply(busyUntil(0.5, "run_a")));
+  const r = await cli(["admin", "drain", "--wait", "--timeout=1"]);
+  expect(r.code).toBe(4);
+  expect(r.stderr).toContain("1 run still active after 1s: run_a\n");
+  expect(r.stdout).toContain("active run_a");
+  expect(requests).toEqual(["POST"]);
+  expect(r.sleeps).toEqual([]);
 });
 
 test("--wait exits 4, not 1, when only the final check fails, naming the runs of the last good poll", async () => {
@@ -154,36 +196,45 @@ test("--wait exits 4, not 1, when only the final check fails, naming the runs of
   const marginMs = 1_000;
   const deadlineS = 15;
   const checks = Math.ceil((deadlineS * 1000 - marginMs) / pollMs); // at 5 s, 10 s, 14 s
-  let gets = 0;
-  server.use(
-    http.post(`${apiUrl}/v1/admin/drain`, () =>
-      HttpResponse.json(
-        drain({ active: ["run_a"], ready: false, deadline: at(deadlineS) }),
-      ),
-    ),
-    http.get(`${apiUrl}/v1/admin/drain`, () => {
-      gets++;
-      // run_b differs from the POST's run_a so the exit shows which status it follows
-      return gets < checks
-        ? HttpResponse.json(
-            drain({ active: ["run_b"], ready: false, deadline: at(deadlineS) }),
-          )
-        : new HttpResponse(null, { status: 502 });
-    }),
+  // run_b differs from the POST's run_a so the exit shows which status it follows; the failures
+  // differ so the line shows the last one, and a 500 is as transient as a 502
+  waitApi(
+    reply(busyUntil(deadlineS, "run_a")),
+    reply(busyUntil(deadlineS, "run_b")),
+    failing(500, "first failure"),
+    failing(502, "last failure"),
   );
   const r = await cli(["admin", "drain", "--wait", `--timeout=${deadlineS}`]);
-  expect(gets).toBe(checks);
+  expect(requests.filter((x) => x === "GET")).toHaveLength(checks);
   expect(r.sleeps.reduce((a, b) => a + b, 0)).toBe(deadlineS * 1000 - marginMs);
   expect(r.code).toBe(4);
-  // the status is 4 s old (answered at 10 s, the check that failed at 14 s) and the error sits beside it
-  expect(r.stderr).toMatch(
-    /1 run still active after 15s \(status from 4s ago; the last check failed: .+\): run_b/,
+  // the status is 9 s old (answered at 5 s, the checks that failed at 10 s and 14 s) and the last error sits beside it
+  expect(r.stderr).toContain(
+    "1 run still active after 15s (status from 9s ago; the last check failed: last failure): run_b",
   );
+  expect(r.stderr).not.toContain("first failure");
   expect(r.stdout).toContain("active run_b");
   expect(r.stdout).not.toContain("run_a");
 });
 
-test("--wait exits 1, not 4, when no check after the start is ever answered, so a broken API can't block a deploy", async () => {
+test("--wait exits 4 with no stale suffix when the last check is answered after failures", async () => {
+  // fails at 5 s and 10 s, answers at 14 s
+  waitApi(
+    reply(busyUntil(15, "run_a")),
+    failing(502, "down"),
+    failing(502, "down"),
+    reply(busyUntil(15, "run_b")),
+  );
+  const r = await cli(["admin", "drain", "--wait", "--timeout=15"]);
+  expect(requests).toEqual(["POST", "GET", "GET", "GET"]);
+  expect(r.code).toBe(4);
+  expect(r.stderr).toContain("1 run still active after 15s: run_b\n");
+  expect(r.stderr).not.toContain("last check failed");
+  expect(r.stderr).not.toContain("down");
+  expect(r.stdout).toContain("active run_b");
+});
+
+test("--wait exits 1, not 4, when no check after the start is ever answered", async () => {
   server.use(
     http.post(`${apiUrl}/v1/admin/drain`, () =>
       HttpResponse.json(
@@ -202,6 +253,8 @@ test("--wait exits 1, not 4, when no check after the start is ever answered, so 
   );
   expect(r.stderr).toContain("last error");
   expect(r.stderr).not.toContain("still active");
+  // nothing newer than the start's status is known, so no status is printed
+  expect(r.stdout).toBe("");
 });
 
 test("--wait exits 1 when every check after the start is unreachable", async () => {
@@ -216,6 +269,25 @@ test("--wait exits 1 when every check after the start is unreachable", async () 
   const r = await cli(["admin", "drain", "--wait", "--timeout=15"]);
   expect(r.code).toBe(1);
   expect(r.stderr).toContain("stopped answering");
+  expect(r.stdout).toBe("");
+});
+
+const rejected = failing(401, "invalid API key", "unauthorized");
+const keyCases: [string, () => Response, (() => Response)[], string[]][] = [
+  ["the start", rejected, [], ["POST"]],
+  [
+    "a check after one was answered",
+    reply(busy("run_a")),
+    [reply(busy("run_a")), rejected],
+    ["POST", "GET", "GET"],
+  ],
+];
+test.each(keyCases)("--wait exits 2 without retrying when the key is rejected at %s", async (_case, start, checks, sent) => {
+  waitApi(start, ...checks);
+  const r = await cli(["admin", "drain", "--wait"]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain("invalid API key (unauthorized); check the key");
+  expect(requests).toEqual(sent);
 });
 
 test("--wait retries a check whose answer is cut off and exits 4 by the last good one", async () => {
