@@ -146,29 +146,41 @@ test("--wait exits 1 when the API can't be reached to start", async () => {
   expect(r.stderr).toContain("cannot reach");
 });
 
-test("--wait exits 4, not 1, when the one check made at the deadline fails", async () => {
+test("--wait exits 4, not 1, when only the final check fails, naming the runs of the last good poll", async () => {
+  // mirror admin.ts: a check every 5 s, the last one 1 s before the API's deadline
+  const pollMs = 5_000;
+  const marginMs = 1_000;
+  const deadlineS = 15;
+  const checks = Math.ceil((deadlineS * 1000 - marginMs) / pollMs); // at 5 s, 10 s, 14 s
   let gets = 0;
   server.use(
     http.post(`${apiUrl}/v1/admin/drain`, () =>
       HttpResponse.json(
-        drain({ active: ["run_a"], ready: false, deadline: at(15) }),
+        drain({ active: ["run_a"], ready: false, deadline: at(deadlineS) }),
       ),
     ),
     http.get(`${apiUrl}/v1/admin/drain`, () => {
       gets++;
-      // the API answers until the last check, which is the one that fails
-      return gets < 2
+      // run_b differs from the POST's run_a so the exit shows which status it follows
+      return gets < checks
         ? HttpResponse.json(
-            drain({ active: ["run_a"], ready: false, deadline: at(15) }),
+            drain({ active: ["run_b"], ready: false, deadline: at(deadlineS) }),
           )
         : new HttpResponse(null, { status: 502 });
     }),
   );
-  const r = await cli(["admin", "drain", "--wait", "--timeout=15"]);
-  expect(gets).toBeGreaterThanOrEqual(2);
+  const r = await cli([
+    "admin",
+    "drain",
+    "--wait",
+    `--timeout=${deadlineS}`,
+  ]);
+  expect(gets).toBe(checks);
+  expect(r.sleeps.reduce((a, b) => a + b, 0)).toBe(deadlineS * 1000 - marginMs);
   expect(r.code).toBe(4);
-  expect(r.stderr).toContain("1 run still active");
-  expect(r.stderr).toContain("run_a");
+  expect(r.stderr).toContain("1 run still active after 15s: run_b");
+  expect(r.stdout).toContain("active run_b");
+  expect(r.stdout).not.toContain("run_a");
 });
 
 test("--wait exits 4 when the API stops answering until the deadline, by the last status it gave", async () => {

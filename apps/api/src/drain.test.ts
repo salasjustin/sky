@@ -578,22 +578,26 @@ test("a deadline timer that fires early is set again for the rest, so the releas
   vi.useFakeTimers({ toFake: ["setTimeout"] });
   const realNow = Date.now();
   const clock = vi.spyOn(Date, "now").mockReturnValue(realNow);
-  await startDrain({ timeoutSeconds: 60 });
-  const held = await launch(envId);
-  expect(statusOf(held.run.id)).toBe("queued");
+  try {
+    await startDrain({ timeoutSeconds: 60 });
+    const held = await launch(envId);
+    expect(statusOf(held.run.id)).toBe("queued");
 
-  // the timer fires with the clock still 5 ms short of the deadline
-  clock.mockReturnValue(realNow + 59_995);
-  await vi.advanceTimersByTimeAsync(60_000);
-  expect(statusOf(held.run.id)).toBe("queued");
+    // the timer fires with the clock still 5 ms short of the deadline
+    clock.mockReturnValue(realNow + 59_995);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(statusOf(held.run.id)).toBe("queued");
 
-  // the timer set again for those 5 ms fires, and this time the deadline has passed
-  clock.mockReturnValue(realNow + 60_001);
-  await vi.advanceTimersByTimeAsync(10);
+    // the timer set again for those 5 ms fires, and this time the deadline has passed
+    clock.mockReturnValue(realNow + 60_001);
+    await vi.advanceTimersByTimeAsync(10);
 
-  // read from the row: a GET would release it through the lazy deadline check instead
-  expect(statusOf(held.run.id)).toBe("starting");
-  clock.mockRestore();
+    // read from the row: a GET would release it through the lazy deadline check instead
+    expect(statusOf(held.run.id)).toBe("starting");
+  } finally {
+    // a red run must not leave a frozen Date.now for the tests after it
+    clock.mockRestore();
+  }
 });
 
 test("held launches are released oldest first by createdAt, not by insertion order", async () => {
