@@ -567,7 +567,7 @@ sky admin drain --status
 sky admin drain --cancel
 ```
 
-`--wait` exits 0 once `ready` while the drain is still on. It stops just before the drain's deadline and exits 4 with the run ids still active, and exits 4 as soon as it finds the drain ended early (a `--cancel`, a restart); either way the drain is over and its held launches start. It exits 1 when the drain can't be started or its status read (an API it can't reach, an error answer). The [Image workflow](CONTRIBUTING.md#deploy) runs it before each deploy.
+`--wait` exits 0 once `ready` while the drain is still on. It stops just before the drain's deadline and exits 4 with the run ids still active, and exits 4 as soon as it finds the drain ended early (a `--cancel`, a restart); either way the drain is over and its held launches start. A status check that fails on the way (an unreachable API, a 5xx) is retried, and one failing at the deadline still exits 4 by the last status it got. It exits 1 when the drain can't be started, or a check is refused with an error that isn't a server error. The [Image workflow](CONTRIBUTING.md#deploy) runs it before each deploy.
 
 ### Run errors
 

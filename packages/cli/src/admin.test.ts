@@ -146,7 +146,32 @@ test("--wait exits 1 when the API can't be reached to start", async () => {
   expect(r.stderr).toContain("cannot reach");
 });
 
-test("--wait exits 1 when the API stops answering until the deadline", async () => {
+test("--wait exits 4, not 1, when the one check made at the deadline fails", async () => {
+  let gets = 0;
+  server.use(
+    http.post(`${apiUrl}/v1/admin/drain`, () =>
+      HttpResponse.json(
+        drain({ active: ["run_a"], ready: false, deadline: at(15) }),
+      ),
+    ),
+    http.get(`${apiUrl}/v1/admin/drain`, () => {
+      gets++;
+      // the API answers until the last check, which is the one that fails
+      return gets < 2
+        ? HttpResponse.json(
+            drain({ active: ["run_a"], ready: false, deadline: at(15) }),
+          )
+        : new HttpResponse(null, { status: 502 });
+    }),
+  );
+  const r = await cli(["admin", "drain", "--wait", "--timeout=15"]);
+  expect(gets).toBeGreaterThanOrEqual(2);
+  expect(r.code).toBe(4);
+  expect(r.stderr).toContain("1 run still active");
+  expect(r.stderr).toContain("run_a");
+});
+
+test("--wait exits 4 when the API stops answering until the deadline, by the last status it gave", async () => {
   server.use(
     http.post(`${apiUrl}/v1/admin/drain`, () =>
       HttpResponse.json(
@@ -159,7 +184,8 @@ test("--wait exits 1 when the API stops answering until the deadline", async () 
     ),
   );
   const r = await cli(["admin", "drain", "--wait", "--timeout=15"]);
-  expect(r.code).toBe(1);
+  expect(r.code).toBe(4);
+  expect(r.stderr).toContain("run_a");
 });
 
 test("--wait carries on past a 5xx mid-poll and exits 0 once the drain is ready", async () => {

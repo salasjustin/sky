@@ -483,9 +483,9 @@ test("a launch held at an environment's concurrency cap counts against it", asyn
   expect(await drainState()).toMatchObject({ held: 1 });
 
   // the slot frees once the held run ends
-  expect(
-    (await call("POST", `/v1/agents/${held.agent.id}/stop`)).status,
-  ).toBe(200);
+  expect((await call("POST", `/v1/agents/${held.agent.id}/stop`)).status).toBe(
+    200,
+  );
   expect((await launch(envId)).run.status).toBe("queued");
 });
 
@@ -571,6 +571,29 @@ test("the deadline timer alone releases the held launches, with no request to no
   // read from the row: a GET would release it through the lazy deadline check instead
   expect(statusOf(held.run.id)).toBe("starting");
   await vi.waitFor(() => expect(wire.sessions).toHaveLength(1));
+});
+
+test("a deadline timer that fires early is set again for the rest, so the release doesn't wait for a request", async () => {
+  const envId = readyEnv();
+  vi.useFakeTimers({ toFake: ["setTimeout"] });
+  const realNow = Date.now();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(realNow);
+  await startDrain({ timeoutSeconds: 60 });
+  const held = await launch(envId);
+  expect(statusOf(held.run.id)).toBe("queued");
+
+  // the timer fires with the clock still 5 ms short of the deadline
+  clock.mockReturnValue(realNow + 59_995);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(statusOf(held.run.id)).toBe("queued");
+
+  // the timer set again for those 5 ms fires, and this time the deadline has passed
+  clock.mockReturnValue(realNow + 60_001);
+  await vi.advanceTimersByTimeAsync(10);
+
+  // read from the row: a GET would release it through the lazy deadline check instead
+  expect(statusOf(held.run.id)).toBe("starting");
+  clock.mockRestore();
 });
 
 test("held launches are released oldest first by createdAt, not by insertion order", async () => {

@@ -1287,7 +1287,11 @@ export function createLauncher({
       // a drain whose deadline passed between the run's insert and here has nobody left to release it
       if (!draining()) releaseQueued();
     },
-    /** The status a run is inserted with: `queued` while the API drains, else `starting`. */
+    /**
+     * The status a run is inserted with: `queued` while the API drains, else `starting`. Routes call
+     * it inside their own transaction, so a drain that has just passed its deadline releases the held
+     * launches there too, in a nested transaction; left as it is.
+     */
     entryStatus: (): "queued" | "starting" =>
       draining() ? "queued" : "starting",
     /**
@@ -1300,9 +1304,7 @@ export function createLauncher({
         since: drainState?.since ?? now,
         deadline: now + timeoutMs,
       };
-      if (drainTimer) clearTimeout(drainTimer);
-      drainTimer = setTimeout(() => void draining(), timeoutMs);
-      drainTimer.unref();
+      armDrainTimer();
       log(`draining: new launches are held until ${iso(drainState.deadline)}`);
       return drainStatus();
     },
@@ -1321,6 +1323,21 @@ export function createLauncher({
   // in memory only: a restart ends the drain, and the boot releases what it held
   let drainState: { since: number; deadline: number } | undefined;
   let drainTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Ends the drain at its deadline without a request to notice it; a timer that fires early is set again for the rest. */
+  function armDrainTimer(): void {
+    if (drainTimer) clearTimeout(drainTimer);
+    drainTimer = undefined;
+    if (!drainState) return;
+    drainTimer = setTimeout(
+      () => {
+        drainTimer = undefined;
+        if (draining()) armDrainTimer();
+      },
+      Math.max(1, drainState.deadline - Date.now()),
+    );
+    drainTimer.unref();
+  }
 
   /** Whether a drain is on, ending one whose deadline has passed. */
   function draining(): boolean {

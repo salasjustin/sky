@@ -106,8 +106,8 @@ const stillActive = (d: DrainStatus) =>
  * Polls until nothing is starting or running while the drain is still on: 0, with the final status.
  * Polling stops just before the deadline `first` gives, the API's own; then it prints the runs still
  * active and exits `DRAIN_TIMED_OUT`, as it does at once for a status showing the drain already
- * ended. An API that stops answering is retried until that deadline, then reported as an error
- * (exit 1), since it says nothing of the runs.
+ * ended. An API that stops answering is retried until that deadline; the exit then follows the last
+ * status it did give, so a failed check at the deadline is still exit `DRAIN_TIMED_OUT`, never 1.
  */
 async function waitUntilReady(
   api: Api,
@@ -154,7 +154,8 @@ async function waitUntilReady(
       lastError = err;
     }
   }
-  if (lastError !== undefined) throw lastError;
+  // by the last good status, even when the final check failed: a deploy must not go ahead on an
+  // answer that never came while the runs it last showed may still be active
   io.stderr(
     `sky: ${stillActive(latest)} after ${timeoutS}s: ${latest.active.join(" ")}\n`,
   );
