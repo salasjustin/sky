@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   # repeats the job's `if:`: the group binds before it, and under workflow_run github.ref is always main, so a
-  # failed, cancelled, pull-request, fork or other-branch CI run would otherwise join deploy-sky and cancel the deploy pending there
+  # failed, cancelled, pull-request or fork CI run would otherwise join deploy-sky and cancel the deploy pending there
   group: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && 'deploy-sky' || github.run_id }}
   # one deploy runs while at most one waits, a newer run replacing the waiting one; each re-reads what is
   # running before it builds
