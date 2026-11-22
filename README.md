@@ -536,7 +536,7 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 
 ### Draining before a restart
 
-Restarting the API loses what a working run keeps in memory (a pending usage-limit retry, its waits), so a deploy should wait until nothing is starting or running. A drain does the waiting for you. With the admin key:
+Restarting the API loses what a working run keeps in memory (a pending usage-limit retry, its waits), so a deploy should wait until no run is starting, running or awaiting a retry. A drain does the waiting for you. With the admin key:
 
 ```
 POST /v1/admin/drain     { "timeoutSeconds": 1800 }   # optional; default 1800, at most 7200
