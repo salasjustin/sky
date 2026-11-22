@@ -559,7 +559,7 @@ While a drain is on, runs already `starting` or `running` carry on, and every ne
 }
 ```
 
-`active` lists the runs still `starting` or `running`; a run waiting on an approval or an answer is quiet and not listed, and neither is a queued one. `ready` is `true` when `active` is empty: it is safe to restart. `since` and `deadline` are `null` when no drain is on.
+`active` lists the runs still `starting` or `running`, and failed runs whose retry (after a usage limit or a Cloudflare challenge) is still pending, since a restart would lose that retry; a run waiting on an approval or an answer is quiet and not listed, and neither is a queued one. `ready` is `true` when `active` is empty: it is safe to restart. `since` and `deadline` are `null` when no drain is on.
 
 ```
 sky admin drain --wait             # start (--timeout=<seconds>), then poll until ready
@@ -567,7 +567,7 @@ sky admin drain --status
 sky admin drain --cancel
 ```
 
-`--wait` exits 0 once `ready`. At the deadline it exits 4 and prints the run ids still active, leaving the drain on for the caller to `--cancel`; an API it can't reach exits 1. The [Image workflow](CONTRIBUTING.md#deploy) runs it before each deploy.
+`--wait` exits 0 once `ready` while the drain is still on. It stops just before the drain's deadline and exits 4 with the run ids still active, and exits 4 as soon as it finds the drain ended early (a `--cancel`, a restart); either way the drain is over and its held launches start. It exits 1 when the drain can't be started or its status read (an API it can't reach, an error answer). The [Image workflow](CONTRIBUTING.md#deploy) runs it before each deploy.
 
 ### Run errors
 

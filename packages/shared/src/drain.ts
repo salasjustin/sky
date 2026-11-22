@@ -19,11 +19,14 @@ export const DrainStatus = z.object({
   draining: z.boolean(),
   since: z.iso.datetime().nullable(),
   deadline: z.iso.datetime().nullable(),
-  /** Runs still `starting` or `running`; a run waiting on an approval or an answer is quiet. */
+  /**
+   * Runs still `starting` or `running`, and failed runs whose retry is still pending in memory; a run
+   * waiting on an approval or an answer is quiet.
+   */
   active: z.array(RunId),
   /** Launches held in the queue, to start when the drain ends. */
   held: z.int().nonnegative(),
-  /** Nothing is starting or running. */
+  /** `active` is empty: a restart cuts nothing off. */
   ready: z.boolean(),
 });
 export type DrainStatus = z.infer<typeof DrainStatus>;
