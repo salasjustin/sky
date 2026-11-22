@@ -81,6 +81,13 @@ export function resolveConfig(
   if (urlError !== undefined) {
     return { ok: false, error: `${url.source} "${url.value}" ${urlError}` };
   }
+  if (!fitsHeader(apiKey.value)) {
+    // never the value: unlike the URL, it is a secret
+    return {
+      ok: false,
+      error: `${apiKey.source} has a line break or NUL that a header can't carry`,
+    };
+  }
   return {
     ok: true,
     config: {
@@ -108,6 +115,12 @@ function checkUrl(value: string): string | undefined {
   if (url.protocol === "http:" && localHosts.has(url.hostname))
     return undefined;
   return "must use https (http only for localhost)";
+}
+
+/** Whether fetch takes `Bearer <key>`: it trims trailing HTTP whitespace, then refuses CR, LF and NUL with an error that quotes the value. */
+function fitsHeader(key: string): boolean {
+  const sent = key.replace(/[\t\n\r ]+$/, "");
+  return !["\r", "\n", "\0"].some((char) => sent.includes(char));
 }
 
 function readConfigFile(
