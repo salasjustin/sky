@@ -1290,7 +1290,7 @@ export function createLauncher({
     /**
      * The status a run is inserted with: `queued` while the API drains, else `starting`. Routes call
      * it inside their own transaction, so a drain that has just passed its deadline releases the held
-     * launches there too, in a nested transaction; left as it is.
+     * launches there too, in a nested transaction.
      */
     entryStatus: (): "queued" | "starting" =>
       draining() ? "queued" : "starting",
@@ -1458,7 +1458,7 @@ export function createLauncher({
             failRun(
               tx,
               id,
-              "launch_failed: the launch held while the API drained could not be read after it",
+              "launch_failed: the launch held while the API drained could not be read back",
             ),
           { behavior: "immediate" },
         );

@@ -33,7 +33,7 @@ After that, the [Image workflow](.github/workflows/image.yml) deploys `main`. A 
 
 Before `flyctl deploy`, the workflow drains the live API (`sky admin drain --wait --timeout=3600`, using the CLI built into the image the job just built from the commit being deployed, never one downloaded from the live API), so a restart doesn't cut off a run that is starting or running. New launches are held while it waits, and the new API starts them when it boots. It needs the GitHub secret `SKY_ADMIN_KEY`, the API's admin key (`SKY_API_KEY`); the workflow never prints it. What the step does:
 
-- Nothing is starting or running: the drain succeeds at once, the step gives the drain a fresh 15-minute deadline so it can't end mid-deploy, and the deploy goes on.
+- Nothing is left starting or running within the hour: the drain succeeds, the step gives the drain a fresh 15-minute deadline so it can't end mid-deploy, and the deploy goes on.
 - The secret is unset, the CLI can't be taken from the image, or the API can't be reached or answers an error (the first deploy, an API that is down, one from before the drain existed): the step logs it and the deploy goes on, so a fix is never held back by a broken API.
 - Runs are still active when the hour is up: the step cancels the drain, which starts the held launches, and fails, so nothing deploys. Re-run Image once they are done, or stop them.
 

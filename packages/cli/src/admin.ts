@@ -9,8 +9,8 @@ import { type Output, UsageError } from "./output.js";
 
 /**
  * Exit status of `drain --wait` when the drain ended before the wait saw its runs finish: at its
- * deadline, or earlier by a --cancel or an API restart. 1 is a drain that couldn't be started or whose status
- * couldn't be read (an API it couldn't reach, an error answer); a rejected key is 2.
+ * deadline, or earlier by a --cancel or an API restart. 1 is a drain that couldn't be started, or a
+ * status check refused with an error that isn't a server error; a rejected key is 2.
  */
 export const DRAIN_TIMED_OUT = 4;
 
