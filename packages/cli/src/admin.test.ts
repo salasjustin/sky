@@ -1,5 +1,5 @@
 import { HttpResponse, http } from "msw";
-import { beforeEach, expect, test } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { apiUrl, runCli } from "./testing.js";
 
@@ -214,6 +214,37 @@ test("--wait exits 1 when every check after the start is unreachable", async () 
   const r = await cli(["admin", "drain", "--wait", "--timeout=15"]);
   expect(r.code).toBe(1);
   expect(r.stderr).toContain("stopped answering");
+});
+
+test("--wait retries a check whose answer is cut off and exits 4 by the last good one", async () => {
+  drainApi(
+    drain({ active: ["run_a"], ready: false, deadline: at(15) }),
+    drain({ active: ["run_b"], ready: false, deadline: at(15) }),
+  );
+  // the first check reaches MSW; each later one gets headers, then a body that fails
+  const fetchOf = globalThis.fetch;
+  let checks = 0;
+  const spy = vi.spyOn(globalThis, "fetch");
+  spy.mockImplementation(async (input, init) => {
+    if (init?.method !== "GET" || ++checks === 1) return fetchOf(input, init);
+    const cause = { code: "UND_ERR_SOCKET" };
+    const body = new ReadableStream<Uint8Array>({
+      start: (c) => c.error(new TypeError("terminated", { cause })),
+    });
+    return new Response(body);
+  });
+  try {
+    const r = await cli(["admin", "drain", "--wait", "--timeout=15"]);
+    // at 5 s, 10 s and 14 s
+    expect(checks).toBe(3);
+    expect(r.code).toBe(4);
+    expect(r.stderr).toContain(
+      "1 run still active after 15s (status from 9s ago; the last check failed: cannot reach https://sky.test: UND_ERR_SOCKET): run_b",
+    );
+    expect(r.stdout).toContain("active run_b");
+  } finally {
+    spy.mockRestore();
+  }
 });
 
 test("--wait carries on past a 5xx mid-poll and exits 0 once the drain is ready", async () => {
