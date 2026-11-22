@@ -190,27 +190,35 @@ test("--wait exits 4 with no check made when the deadline is under a second away
   expect(r.sleeps).toEqual([]);
 });
 
-test("--wait exits 4, not 1, when only the final check fails, naming the runs of the last good poll", async () => {
+const deadlineS = 15;
+// run_b differs from the POST's run_a so the exit shows which status it follows; the failures
+// differ so the line shows the last one, and a 500 is as transient as a 502
+const answeredB = reply(busyUntil(deadlineS, "run_b"));
+const failedChecks: [string, (() => Response)[], string][] = [
+  [
+    "only the final check fails",
+    [answeredB, answeredB, failing(502, "last failure")],
+    "4s",
+  ],
+  [
+    "every check after the first answered fails",
+    [answeredB, failing(500, "first failure"), failing(502, "last failure")],
+    "9s",
+  ],
+];
+test.each(failedChecks)("--wait exits 4, not 1, when %s, naming the runs of the last good poll", async (_case, checks, age) => {
   // mirror admin.ts: a check every 5 s, the last one 1 s before the API's deadline
   const pollMs = 5_000;
   const marginMs = 1_000;
-  const deadlineS = 15;
-  const checks = Math.ceil((deadlineS * 1000 - marginMs) / pollMs); // at 5 s, 10 s, 14 s
-  // run_b differs from the POST's run_a so the exit shows which status it follows; the failures
-  // differ so the line shows the last one, and a 500 is as transient as a 502
-  waitApi(
-    reply(busyUntil(deadlineS, "run_a")),
-    reply(busyUntil(deadlineS, "run_b")),
-    failing(500, "first failure"),
-    failing(502, "last failure"),
-  );
+  const polls = Math.ceil((deadlineS * 1000 - marginMs) / pollMs); // at 5 s, 10 s, 14 s
+  waitApi(reply(busyUntil(deadlineS, "run_a")), ...checks);
   const r = await cli(["admin", "drain", "--wait", `--timeout=${deadlineS}`]);
-  expect(requests.filter((x) => x === "GET")).toHaveLength(checks);
+  expect(requests.filter((x) => x === "GET")).toHaveLength(polls);
   expect(r.sleeps.reduce((a, b) => a + b, 0)).toBe(deadlineS * 1000 - marginMs);
   expect(r.code).toBe(4);
-  // the status is 9 s old (answered at 5 s, the checks that failed at 10 s and 14 s) and the last error sits beside it
+  // the age counts from the last answered check, and the last error sits beside it
   expect(r.stderr).toContain(
-    "1 run still active after 15s (status from 9s ago; the last check failed: last failure): run_b",
+    `1 run still active after 15s (status from ${age} ago; the last check failed: last failure): run_b`,
   );
   expect(r.stderr).not.toContain("first failure");
   expect(r.stdout).toContain("active run_b");
