@@ -1432,8 +1432,6 @@ test.each([
   },
 );
 
-// --- delivery results on a webhook, and its deliveries route ---
-
 type Summary = {
   id: string;
   lastAttempt?: {

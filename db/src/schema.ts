@@ -376,7 +376,7 @@ export const webhookDeliveries = sqliteTable(
     // HTTP status of the latest attempt; null until one gets a response
     lastStatus: integer("last_status"),
     lastError: text("last_error"),
-    // when the latest attempt ran (next_attempt_at is when the next one is due); null until one has. No CHECK, for the same reason
+    // when the latest attempt ran (next_attempt_at is when the next one is due); null until one has. No CHECK, for the same reason as failing_since
     lastAttemptAt: text("last_attempt_at"),
     createdAt: createdAt(),
   },
