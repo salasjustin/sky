@@ -131,10 +131,11 @@ const help = (io: Io) => `Usage:
       early (a --cancel, a restart). Either way the drain is over and its
       held launches start. A status check that fails on the way is
       retried, and one failing at the deadline still exits 4 by the last
-      status it got. It exits 1 when the drain can't be started, or a
-      check is refused (the API unreachable at the start, an error
-      answer that isn't a server error). --status only reports. Needs the
-      admin key.
+      status it got. Starting the drain isn't retried: any error then,
+      an unreachable API or a server error included, exits 1, and so does
+      a check on the way that gets an error that isn't a server error (a
+      rejected key exits 2, as for any command). --status only reports.
+      Needs the admin key.
   sky key create <name> --env=<id|name>,... [--role=runs] [options]
       Issue an API key that can run agents only in those environments.
       --env repeats or takes a comma list. Names are resolved to ids when
