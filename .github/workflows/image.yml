@@ -72,6 +72,13 @@ jobs:
           ref: ${{ env.DEPLOY_SHA }}
           # the guard below asks git whether the running commit descends from DEPLOY_SHA
           fetch-depth: 0
+      - name: Require a commit on main
+        # the full refs/remotes/origin/main path, so a tag named main can't answer for the branch
+        run: |
+          if ! git merge-base --is-ancestor "$DEPLOY_SHA" refs/remotes/origin/main; then
+            echo "::error::${DEPLOY_SHA::7} is not in main's history; nothing deployed."
+            exit 1
+          fi
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
         with:
           # the guard reads `flyctl image show --json`; a fixed version keeps that output's shape stable
