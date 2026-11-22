@@ -124,21 +124,21 @@ const help = (io: Io) => `Usage:
       --cancel, the held launches start, oldest first. A restart of the
       API starts them too. Prints "<draining|idle> deadline=<time|->
       active=<n> held=<n> ready=<yes|no>" and, while runs are active, a
-      line "active <run ids>". --wait polls until nothing is starting or
-      running while the drain is still on and exits 0. It stops polling
-      just before the deadline the API gives and exits 4 with the run ids
-      still active; it exits 4 too as soon as it finds the drain ended
-      early (a --cancel, a restart). Either way the drain is over and its
-      held launches start. A status check that fails on the way is
-      retried; if some check was answered, one failing at the deadline
+      line "active <run ids>". --wait polls until no run is active
+      (starting, running or awaiting a retry) while the drain is still on
+      and exits 0. It stops polling just before the deadline the start
+      gave and exits 4 with the run ids still active; it exits 4 too as
+      soon as it finds the drain ended early (a --cancel, a restart). A
+      check that fails on an unreachable API or a server error is
+      retried; if some check was answered, such a failure at the deadline
       still exits 4 by the last status it got, and the line names the
-      error and that status's age. If none was, the API stopped
-      answering, and --wait exits 1 saying so. Starting the drain isn't
-      retried: any error then,
-      an unreachable API or a server error included, exits 1, and so does
-      a check on the way that gets an error that isn't a server error (a
-      rejected key exits 2, as for any command). --status only reports.
-      Needs the admin key.
+      error and that status's age. If checks were made and none was
+      answered, the API stopped answering, and --wait exits 1 saying so.
+      With runs active and no time for a check, it exits 4 by the start's
+      status. Starting the drain isn't retried: any error then, an
+      unreachable API or a server error included, exits 1, and so does a
+      check that fails and isn't retried (a rejected key exits 2, as for
+      any command). --status only reports. Needs the admin key.
   sky key create <name> --env=<id|name>,... [--role=runs] [options]
       Issue an API key that can run agents only in those environments.
       --env repeats or takes a comma list. Names are resolved to ids when
@@ -272,8 +272,8 @@ Exit status: 0 done; 1 failed (API error, including a key not allowed the
   inbox, wait and status exit with the newest run's state:
   0 finished; 3 waiting (needs input); 4 queued, starting or running
   (wait: timed out); 5 failed; 6 stopped
-  admin drain --wait exits 4 when the drain ended, at its deadline or
-  earlier, before it saw the runs finish
+  admin drain --wait exits 4 when the wait ran out, or the drain ended,
+  before it saw the runs finish; 1 if it checked and got no answer
 `;
 
 const commonOptions = {

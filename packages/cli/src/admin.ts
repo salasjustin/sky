@@ -8,9 +8,10 @@ import type { Io } from "./cli.js";
 import { type Output, UsageError } from "./output.js";
 
 /**
- * Exit status of `drain --wait` when the drain ended before the wait saw its runs finish: at its
- * deadline, or earlier by a --cancel or an API restart. 1 is a drain that couldn't be started, or a
- * status check refused with an error that isn't a server error; a rejected key is 2.
+ * Exit status of `drain --wait` when it stopped before it saw the runs finish: at the deadline the
+ * start gave, or on finding the drain ended early (a --cancel, an API restart). 1 is a drain that
+ * couldn't be started, checks that were made and never answered, or a check that failed and isn't
+ * retried; a rejected key is 2.
  */
 export const DRAIN_TIMED_OUT = 4;
 
@@ -99,17 +100,19 @@ export function prepareAdmin(
 
 const isTransient = (err: ApiError) => err.status === 0 || err.status >= 500;
 
-const stillActive = (d: DrainStatus) =>
-  `${d.active.length} run${d.active.length === 1 ? "" : "s"} still active`;
+const runCount = (d: DrainStatus) =>
+  `${d.active.length} run${d.active.length === 1 ? "" : "s"}`;
 
 /**
- * Polls until nothing is starting or running while the drain is still on: 0, with the final status.
- * Polling stops just before the deadline `first` gives, the API's own; then it prints the runs still
- * active and exits `DRAIN_TIMED_OUT`, as it does at once for a status showing the drain already
- * ended. A check that fails with an unreachable API or a 5xx is retried until that deadline. If some
- * check was answered, the exit then follows the last status it gave, so a failure at the deadline is
- * still exit `DRAIN_TIMED_OUT`, and the line names the error and that status's age. If none was, the
- * API stopped answering and says nothing of the runs: exit 1. Any other error throws.
+ * Polls until no run is active (starting, running or awaiting a retry) while the drain is still on:
+ * 0, with the final status. Polling stops just before the deadline `first` gives, the API's own;
+ * then it prints the runs still active and exits `DRAIN_TIMED_OUT`, as it does at once for a status
+ * showing the drain already ended. A check that fails with an unreachable API or a 5xx is retried
+ * until that deadline. If some check was answered, the exit then follows the last status it gave, so
+ * a failure at the deadline is still exit `DRAIN_TIMED_OUT`, and the line names the error and that
+ * status's age. If checks were made and none was, the API stopped answering and nothing newer than
+ * `first` is known: exit 1. With no time for a check, the exit follows `first`. Any other error
+ * throws.
  */
 async function waitUntilReady(
   api: Api,
@@ -132,7 +135,7 @@ async function waitUntilReady(
     if (lastError === undefined) {
       if (!latest.draining) {
         io.stderr(
-          `sky: the drain ended before the runs finished${latest.active.length > 0 ? `; ${stillActive(latest)}: ${latest.active.join(" ")}` : ""}\n`,
+          `sky: the drain ended before the wait saw the runs finish${latest.active.length > 0 ? `; ${runCount(latest)} active now: ${latest.active.join(" ")}` : ""}\n`,
         );
         out.result(latest, statusLine(latest));
         return DRAIN_TIMED_OUT;
@@ -161,8 +164,8 @@ async function waitUntilReady(
       lastError = err;
     }
   }
-  // no check after the start was answered: nothing is known of the runs, and a caller such as the
-  // deploy workflow must not be held back by an API that is down
+  // checks were made and none was answered: nothing newer than the start's status is known, and a
+  // caller such as the deploy workflow must not be held back by an API that is down
   if (lastError !== undefined && !answered) {
     return out.fail(
       "api_stopped_answering",
@@ -177,7 +180,7 @@ async function waitUntilReady(
       ? ""
       : ` (status from ${Math.round((io.now() - answeredAt) / 1000)}s ago; the last check failed: ${lastError.message})`;
   io.stderr(
-    `sky: ${stillActive(latest)} after ${timeoutS}s${stale}: ${latest.active.join(" ")}\n`,
+    `sky: ${runCount(latest)} still active after ${timeoutS}s${stale}: ${latest.active.join(" ")}\n`,
   );
   out.result(latest, statusLine(latest));
   return DRAIN_TIMED_OUT;

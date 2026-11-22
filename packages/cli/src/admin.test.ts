@@ -117,7 +117,9 @@ test("--wait exits 4 when the drain ends before the runs finish, even with none 
   const r = await cli(["admin", "drain", "--wait"]);
   expect(r.code).toBe(4);
   expect(requests).toEqual(["POST", "GET"]);
-  expect(r.stderr).toContain("the drain ended before the runs finished");
+  expect(r.stderr).toContain(
+    "the drain ended before the wait saw the runs finish\n",
+  );
   expect(r.stdout).toContain("idle");
 });
 
@@ -135,7 +137,7 @@ test("--wait names the runs still active when the drain ends early", async () =>
   const r = await cli(["admin", "drain", "--wait"]);
   expect(r.code).toBe(4);
   expect(r.stderr).toContain(
-    "the drain ended before the runs finished; 2 runs still active: run_a run_b",
+    "the drain ended before the wait saw the runs finish; 2 runs active now: run_a run_b",
   );
 });
 
