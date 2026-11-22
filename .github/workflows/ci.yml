@@ -35,3 +35,4 @@ jobs:
       # the bundle the image runs, built as the Dockerfile builds it; a crash on start fails here
       - run: pnpm --filter '@sky/api...' build
       - run: ci/boot-check.sh
+        timeout-minutes: 5
