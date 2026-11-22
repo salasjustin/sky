@@ -18,20 +18,23 @@ import type {
   PluginVersion,
 } from "@sky/shared";
 
-/** Overall budget for the refresh; a slow or unreachable marketplace costs a session this at most. */
+/**
+ * Overall budget for the refresh. Past it run only the stop of the command it cut (`KILL_GRACE_MS` and
+ * `KILL_WAIT_MS`) and the read-back, under the listing cap and the same stop: 41 s in all at most.
+ */
 export const PLUGIN_REFRESH_TIMEOUT_MS = 30_000;
 
 /**
  * What one marketplace update or one plugin update may take. An update that stalls on the network
  * (measured on a sprite: a marketplace update 2.8 s, any other command 0.6 s) is cut here and counted
- * as a failed update, so the updates after it still run inside the overall budget instead of being starved.
+ * as a failed update, so the updates after it still run for as long as the overall budget lasts.
  */
 export const PLUGIN_STEP_TIMEOUT_MS = 10_000;
 
 /**
  * What one `claude plugin list` may take. It reads local files only (measured on a sprite: 0.4 s warm,
- * 0.9 s cold, 0.8 s with six at once, the same with the network unreachable), so this is over ten times
- * a normal listing: one that stalls is cut and tried once more, not left to spend the overall budget.
+ * 0.9 s cold, 0.8 s with six at once, the same with the network unreachable), so this is over five times
+ * the slowest of them: one that stalls is cut and tried once more, not left to spend the overall budget.
  */
 export const PLUGIN_LIST_TIMEOUT_MS = 5_000;
 
@@ -55,8 +58,8 @@ export class OutputExceeded extends Error {
 }
 
 /**
- * Runs `file` as the leader of its own process group, so a cut reaches what it started too (a git
- * child of `claude` keeps writing otherwise). Aborting `signal` cuts the command, and so does output
+ * Runs `file` as the leader of its own process group, so a cut reaches what it started in that group (a
+ * git child of `claude` keeps writing otherwise). Aborting `signal` cuts the command, and so does output
  * past `OUTPUT_MAX_BYTES`: the group is sent SIGTERM, then SIGKILL after `graceMs`, and the promise
  * rejects with the abort's reason, or an error naming the limit, once the command has closed and its
  * group is gone. Something that still holds on is given up on `KILL_WAIT_MS` after the SIGKILL, its
@@ -157,7 +160,7 @@ export function runInGroup(
           );
       });
     });
-    // the abort may have landed between the check above and the listener
+    // a listener isn't called for a signal that has already aborted
     if (signal.aborted) onAbort();
   });
 }
@@ -186,7 +189,7 @@ const killGroup = (pid: number, by: NodeJS.Signals | 0): boolean => {
 };
 
 /**
- * SIGKILLs every command a refresh still has running or is waiting on, each with what it started.
+ * SIGKILLs every command a refresh still has running or is waiting on, each with the rest of its group.
  * Synchronous, for the runner's own end: a signal's death skips `exit` handlers, and a command in its
  * own group would outlive the runner.
  */
@@ -392,7 +395,7 @@ function sameDir(a: string, b: string): boolean {
  * that run's refresh didn't touch; with none to update, or no `projectDir`, it records `skipped`, and
  * either way says so on `warn`. Best effort: one overall timeout, the wait included, a
  * failure is one line on `warn`, and the session carries on with the cached versions. `signal` is
- * the run's stop: aborting it ends the refresh at once, and an already-aborted one spawns nothing.
+ * the run's stop: aborting it cuts the running command, and an already-aborted one spawns nothing.
  * Resolves to the record of what it did: the user-scope plugins before and after (null for a list
  * it never read; a waiting run with nothing to update has its one listing as both), the outcome
  * code (`refreshed`, `timed_out`, `failed` or `skipped`), the reason for a `failed` or `skipped`
@@ -400,9 +403,10 @@ function sameDir(a: string, b: string): boolean {
  * come from is updated by name, and every command has a cap of its own besides the overall budget: an
  * update is cut at `stepTimeoutMs`, a listing at `listTimeoutMs`. A marketplace update that fails, cut
  * or not, is a failed update named for that marketplace, and the plugin updates after it still run from
- * the cached marketplace. A listing that is cut is tried once more; if the first one is cut twice
- * nothing is updated and the outcome is `failed`, and if the last one is, `after` stays null. A cut
- * command's whole process group is killed, and waited on, before the next command or the lock's release.
+ * the cached marketplace while the budget lasts. A listing cut at its own cap is tried once more; if the
+ * first one is cut twice nothing is updated and the outcome is `failed`, and if the last one is, `after`
+ * stays null. A cut command's process group is killed, and waited on until it is gone or given up on
+ * (see `runInGroup`), before the next command or the lock's release.
  * Never throws.
  */
 export async function refreshPlugins(options: {
@@ -439,7 +443,7 @@ export async function refreshPlugins(options: {
     try {
       return await task();
     } finally {
-      // a command a timeout cut short is counted up to the cut
+      // a command that was cut is counted until it was stopped or given up on
       if (steps.length < STEPS_MAX)
         steps.push({
           name: name.slice(0, 100),
@@ -611,7 +615,7 @@ export async function refreshPlugins(options: {
         // still under the lock, read back what is installed now: an update that landed before the cut may have changed it
         if (!stop?.aborted) {
           try {
-            // the refresh's budget is spent by now, so this runs under its own cap, ended only by a stop
+            // the refresh's budget may be spent by now, so this runs under its own cap, ended only by a stop
             after = (
               await list(
                 "list after (cut short)",
@@ -702,7 +706,7 @@ const seconds = (ms: number) => (ms / 1000).toFixed(1);
 
 /**
  * The reason a failed refresh is recorded with: one line, short, never the command's whole output.
- * A failed `execFile` says `Command failed: <binary> <args>`, so its stderr names the cause instead.
+ * A failed command's error says `Command failed: <binary> <args>`, so its stderr names the cause instead.
  */
 const firstLine = (error: unknown) => {
   const stderr =

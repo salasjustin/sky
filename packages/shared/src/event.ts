@@ -146,7 +146,7 @@ export const PluginVersion = z.object({
 });
 export type PluginVersion = z.infer<typeof PluginVersion>;
 
-/** One `claude` command of the refresh and how long it ran, in ms; one a timeout cut short counts up to the cut. */
+/** One `claude` command of the refresh and how long it ran, in ms; one that was cut counts until it was stopped or given up on. */
 export const PluginRefreshStep = z.object({
   name: z.string().min(1).max(100),
   ms: z.number().int().nonnegative(),
