@@ -1555,7 +1555,7 @@ describe("refreshPlugins caps", () => {
       projectDir: lockDir,
       run: async (_f, args) => {
         calls.push(args);
-        // a marketplace that isn't one is not found, as the real one says
+        // the real CLI refuses both updates, as no marketplace backs a skills-dir plugin
         if (args.at(-1) === "skills-dir")
           throw new Error("Marketplace 'skills-dir' not found");
         if (args[2] === "mine@skills-dir")
