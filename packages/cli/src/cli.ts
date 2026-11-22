@@ -94,9 +94,10 @@ const help = (io: Io) => `Usage:
       Print "<id> <format> <url> <types> [<env ids>]" per webhook; secrets
       are never printed. Once the webhook has had a delivery attempt, the
       line goes on with " | " and how its deliveries are going: FAILING
-      from a give-up (after the 30th attempt, or the first when refused)
-      until a delivery succeeds, the last attempt's status or error, its
-      attempt number, and how many deliveries failed in a row, such as
+      from a give-up (after the 30th attempt, or at once when the server
+      refuses the URL or its address) until a delivery succeeds, the last
+      attempt's status or error, its attempt number, and how many
+      deliveries failed in a row, such as
       "| FAILING, last 401 at 2026-11-21T09:30:00.000Z (attempt 30), 13
       failed in a row". That part is for reading; a script reads
       lastAttempt, failedStreak and failing from --json.
