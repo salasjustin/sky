@@ -600,6 +600,34 @@ test("a deadline timer that fires early is set again for the rest, so the releas
   }
 });
 
+test("cancelling a drain, or starting a new one, clears the re-armed deadline timer", async () => {
+  // clearTimeout too: a real one wouldn't remove a faked timer
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const realNow = Date.now();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(realNow);
+  expect(vi.getTimerCount()).toBe(0);
+
+  // an early fire leaves the timer set again for the 5 ms that are left
+  await startDrain({ timeoutSeconds: 60 });
+  clock.mockReturnValue(realNow + 59_995);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(vi.getTimerCount()).toBe(1);
+
+  // cancelling leaves none to fire a release afterwards
+  expect((await call("DELETE", "/v1/admin/drain")).status).toBe(200);
+  expect(vi.getTimerCount()).toBe(0);
+
+  // and a new drain replaces the re-armed timer of the one before it instead of adding to it
+  clock.mockReturnValue(realNow);
+  await startDrain({ timeoutSeconds: 60 });
+  clock.mockReturnValue(realNow + 59_995);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(vi.getTimerCount()).toBe(1);
+  await startDrain({ timeoutSeconds: 120 });
+  expect(vi.getTimerCount()).toBe(1);
+  clock.mockRestore();
+});
+
 test("held launches are released oldest first by createdAt, not by insertion order", async () => {
   const envId = readyEnv();
   await startDrain();

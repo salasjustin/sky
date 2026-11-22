@@ -98,14 +98,18 @@ jobs:
           docker push registry.fly.io/sky-justin:main
           docker push "registry.fly.io/sky-justin:sha-${SHORT_SHA}"
       # holds new launches and waits for the runs in flight, so the restart doesn't cut one off; the
-      # held launches start on the new API's boot. An API that can't be reached or errors when the drain
-      # starts doesn't stop the deploy; one lost after it started does, as its runs may still be active.
-      # Once drained, a fresh 15-minute deadline covers the deploy; a failed or cancelled run ends the drain
+      # held launches start on the new API's boot. Only runs that outlast the wait stop the deploy: an API
+      # that can't be reached or errors at the start, or that never answers a check once the drain is on
+      # (nothing is known of its runs, and a broken API is what a fix is for), doesn't. Once drained, a
+      # fresh 15-minute deadline covers the deploy; a failed or cancelled run ends the drain. Like the
+      # deploy, these steps run only when the guard above lets the deploy go ahead
       - uses: actions/setup-node@v7
+        if: steps.guard.outputs.deploy == 'true'
         with:
           node-version: 24
       - name: Drain the live API
         id: drain
+        if: steps.guard.outputs.deploy == 'true'
         # the hour-long wait, plus up to 30 s each for an in-flight poll and the refresh or cancel
         timeout-minutes: 70
         run: |
@@ -117,11 +121,12 @@ jobs:
           # beside the admin key, and the API isn't built twice
           cid=$(docker create --platform linux/amd64 "registry.fly.io/sky-justin:sha-${DEPLOY_SHA::7}") || cid=
           if [ -z "$cid" ] || ! docker cp "$cid:/app/bundle/sky.mjs" "$RUNNER_TEMP/sky.mjs"; then
-            [ -z "$cid" ] || docker rm "$cid" > /dev/null
+            [ -z "$cid" ] || docker rm "$cid" > /dev/null || true
             echo "could not take the CLI from the image; deploying without a drain"
             exit 0
           fi
-          docker rm "$cid" > /dev/null
+          # cleanup only: a failed removal never fails the step
+          docker rm "$cid" > /dev/null || true
           status=0
           node "$RUNNER_TEMP/sky.mjs" admin drain --wait --timeout=3600 || status=$?
           case "$status" in
@@ -134,12 +139,12 @@ jobs:
               fi
               ;;
             4)
-              echo "::error::runs were still active, or the API stopped answering, when the drain's hour ran out; not deploying"
+              echo "::error::runs were still active when the drain's hour ran out; not deploying"
               node "$RUNNER_TEMP/sky.mjs" admin drain --cancel || true
               exit 1
               ;;
             *)
-              echo "the drain could not be started or watched (exit $status); deploying anyway"
+              echo "the drain could not be started, or the API stopped answering during it (exit $status); deploying anyway"
               ;;
           esac
         env:
@@ -152,7 +157,7 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       # a successful deploy needs no cancel: the new API releases held launches on boot
       - name: End the drain
-        if: (failure() || cancelled()) && steps.drain.outcome != 'skipped'
+        if: (failure() || cancelled()) && steps.guard.outputs.deploy == 'true' && steps.drain.outcome != 'skipped'
         continue-on-error: true
         timeout-minutes: 2
         run: |

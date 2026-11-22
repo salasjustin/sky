@@ -169,21 +169,19 @@ test("--wait exits 4, not 1, when only the final check fails, naming the runs of
         : new HttpResponse(null, { status: 502 });
     }),
   );
-  const r = await cli([
-    "admin",
-    "drain",
-    "--wait",
-    `--timeout=${deadlineS}`,
-  ]);
+  const r = await cli(["admin", "drain", "--wait", `--timeout=${deadlineS}`]);
   expect(gets).toBe(checks);
   expect(r.sleeps.reduce((a, b) => a + b, 0)).toBe(deadlineS * 1000 - marginMs);
   expect(r.code).toBe(4);
-  expect(r.stderr).toContain("1 run still active after 15s: run_b");
+  // the status is 4 s old (answered at 10 s, the check that failed at 14 s) and the error sits beside it
+  expect(r.stderr).toMatch(
+    /1 run still active after 15s \(status from 4s ago; the last check failed: .+\): run_b/,
+  );
   expect(r.stdout).toContain("active run_b");
   expect(r.stdout).not.toContain("run_a");
 });
 
-test("--wait exits 4 when the API stops answering until the deadline, by the last status it gave", async () => {
+test("--wait exits 1, not 4, when no check after the start is ever answered, so a broken API can't block a deploy", async () => {
   server.use(
     http.post(`${apiUrl}/v1/admin/drain`, () =>
       HttpResponse.json(
@@ -196,8 +194,26 @@ test("--wait exits 4 when the API stops answering until the deadline, by the las
     ),
   );
   const r = await cli(["admin", "drain", "--wait", "--timeout=15"]);
-  expect(r.code).toBe(4);
-  expect(r.stderr).toContain("run_a");
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "the API stopped answering after the drain started",
+  );
+  expect(r.stderr).toContain("last error");
+  expect(r.stderr).not.toContain("still active");
+});
+
+test("--wait exits 1 when every check after the start is unreachable", async () => {
+  server.use(
+    http.post(`${apiUrl}/v1/admin/drain`, () =>
+      HttpResponse.json(
+        drain({ active: ["run_a"], ready: false, deadline: at(15) }),
+      ),
+    ),
+    http.get(`${apiUrl}/v1/admin/drain`, () => HttpResponse.error()),
+  );
+  const r = await cli(["admin", "drain", "--wait", "--timeout=15"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("stopped answering");
 });
 
 test("--wait carries on past a 5xx mid-poll and exits 0 once the drain is ready", async () => {

@@ -106,9 +106,10 @@ const stillActive = (d: DrainStatus) =>
  * Polls until nothing is starting or running while the drain is still on: 0, with the final status.
  * Polling stops just before the deadline `first` gives, the API's own; then it prints the runs still
  * active and exits `DRAIN_TIMED_OUT`, as it does at once for a status showing the drain already
- * ended. A check that fails with an unreachable API or a 5xx is retried until that deadline; the exit
- * then follows the last status it did give, so such a failure at the deadline is still exit
- * `DRAIN_TIMED_OUT`, never 1. Any other error throws.
+ * ended. A check that fails with an unreachable API or a 5xx is retried until that deadline. If some
+ * check was answered, the exit then follows the last status it gave, so a failure at the deadline is
+ * still exit `DRAIN_TIMED_OUT`, and the line names the error and that status's age. If none was, the
+ * API stopped answering and says nothing of the runs: exit 1. Any other error throws.
  */
 async function waitUntilReady(
   api: Api,
@@ -123,6 +124,9 @@ async function waitUntilReady(
       : Date.parse(first.deadline) - lastPollMarginMs;
   let latest = first;
   let lastError: ApiError | undefined;
+  // whether any check after the start was answered, and when the last one was
+  let answered = false;
+  let answeredAt = io.now();
   let announced = -1;
   for (;;) {
     if (lastError === undefined) {
@@ -150,15 +154,30 @@ async function waitUntilReady(
     try {
       latest = await api.getDrain();
       lastError = undefined;
+      answered = true;
+      answeredAt = io.now();
     } catch (err) {
       if (!(err instanceof ApiError && isTransient(err))) throw err;
       lastError = err;
     }
   }
-  // by the last good status, even when the final check failed: a caller such as the deploy workflow
-  // must not take a lost API for a drained one while the runs it last showed may still be active
+  // no check after the start was answered: nothing is known of the runs, and a caller such as the
+  // deploy workflow must not be held back by an API that is down
+  if (lastError !== undefined && !answered) {
+    return out.fail(
+      "api_stopped_answering",
+      `the API stopped answering after the drain started: no status check was answered in ${timeoutS}s (last error: ${lastError.message})`,
+    );
+  }
+  // by the last good status, even when the final check failed, with the error and the status's age
+  // beside it: a caller must not take a lost API for a drained one while the runs it last showed
+  // may still be active
+  const stale =
+    lastError === undefined
+      ? ""
+      : ` (status from ${Math.round((io.now() - answeredAt) / 1000)}s ago; the last check failed: ${lastError.message})`;
   io.stderr(
-    `sky: ${stillActive(latest)} after ${timeoutS}s: ${latest.active.join(" ")}\n`,
+    `sky: ${stillActive(latest)} after ${timeoutS}s${stale}: ${latest.active.join(" ")}\n`,
   );
   out.result(latest, statusLine(latest));
   return DRAIN_TIMED_OUT;

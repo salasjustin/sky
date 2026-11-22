@@ -130,8 +130,11 @@ const help = (io: Io) => `Usage:
       still active; it exits 4 too as soon as it finds the drain ended
       early (a --cancel, a restart). Either way the drain is over and its
       held launches start. A status check that fails on the way is
-      retried, and one failing at the deadline still exits 4 by the last
-      status it got. Starting the drain isn't retried: any error then,
+      retried; if some check was answered, one failing at the deadline
+      still exits 4 by the last status it got, and the line names the
+      error and that status's age. If none was, the API stopped
+      answering, and --wait exits 1 saying so. Starting the drain isn't
+      retried: any error then,
       an unreachable API or a server error included, exits 1, and so does
       a check on the way that gets an error that isn't a server error (a
       rejected key exits 2, as for any command). --status only reports.
