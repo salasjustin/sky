@@ -502,9 +502,7 @@ test.each([
       `^warn: webhook \\S+ evt_\\d+: attempt 1/30 failed: ${kind}; giving up$`,
     ),
   );
-  expect(logs[0]).not.toMatch(
-    /secret|hooks\.example\.com|4280|10\.0\.0\.5/,
-  );
+  expect(logs[0]).not.toMatch(/secret|hooks\.example\.com|4280|10\.0\.0\.5/);
 });
 
 test("describeError leaves no address or host:port of its error's cause", () => {
