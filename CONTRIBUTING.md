@@ -29,7 +29,7 @@ node packages/cli/dist/bundle/sky.mjs --help
 
 Sky runs as one Fly machine with a volume for its SQLite database. [`fly.toml`](fly.toml) names every secret and how to generate it; set your app name and region there, then `fly volumes create sky_data`, `fly secrets set …`, and `fly deploy`. Take volume snapshots: the database is a single copy.
 
-After that, the [Image workflow](.github/workflows/image.yml) deploys `main`. A push to `main` deploys only after its CI run passes, and it deploys the commit CI checked. A manual run of Image deploys the tip of `main` as it stands, without waiting on or checking CI.
+After that, the [Image workflow](.github/workflows/image.yml) deploys `main`. A push to `main` deploys only after its CI run passes, and it deploys the commit CI checked. Before building, the workflow reads the commit the app is running and skips the deploy, ending green, when that commit is the one to deploy or a newer one, so re-running an old CI run never rolls the app back. A manual run of Image deploys the tip of `main` and refuses it unless CI has passed on that commit.
 
 Before `flyctl deploy`, the workflow drains the live API (`sky admin drain --wait --timeout=3600`, using the CLI built into the image the job just built from the commit being deployed, never one downloaded from the live API), so a restart doesn't cut off a run that is starting or running. New launches are held while it waits, and the new API starts them when it boots. It needs the GitHub secret `SKY_ADMIN_KEY`, the API's admin key (`SKY_API_KEY`); the workflow never prints it. What the step does:
 
