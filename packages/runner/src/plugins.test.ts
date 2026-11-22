@@ -1462,6 +1462,69 @@ describe("refreshPlugins on a sprite that has just woken, with the default caps"
     expect(result).toMatchObject({ outcome: "skipped", reason: "stopped" });
     expect(calls).toEqual(["plugin list"]);
   });
+
+  test("a run that waited out another run's refresh gets the first listing's cap too, and updates its worktree's record", async () => {
+    const worktree = "/work/agent";
+    const versions = { user: "2.0.0", project: "1.0.0" };
+    const calls: { args: string[]; cwd?: string }[] = [];
+    const run = (
+      _f: string,
+      args: string[],
+      { signal, cwd }: { signal: AbortSignal; cwd?: string },
+    ) => {
+      calls.push({ args, ...(cwd !== undefined && { cwd }) });
+      if (args[1] === "update") {
+        versions.project = "2.0.0";
+        return Promise.resolve({ stdout: "" });
+      }
+      const stdout = JSON.stringify([
+        { id: "kru@kru", scope: "user", version: versions.user },
+        {
+          id: "kru@kru",
+          scope: "project",
+          version: versions.project,
+          projectPath: worktree,
+        },
+      ]);
+      if (calls.length > 1) return Promise.resolve({ stdout });
+      // the first listing is slow, as on a sprite that has just woken
+      return new Promise<{ stdout: string }>((resolve, reject) => {
+        const finish = setTimeout(() => resolve({ stdout }), 28_000);
+        signal.addEventListener("abort", () => {
+          clearTimeout(finish);
+          reject(signal.reason);
+        });
+      });
+    };
+    const lockFile = join(lockDir, "lock");
+    // a live holder: this run waits, then runs only its own worktree's pass
+    writeFileSync(lockFile, String(process.pid));
+    const done = refreshPlugins({
+      env: {},
+      warn: vi.fn(),
+      claude: "c",
+      lockFile,
+      projectDir: worktree,
+      run,
+    });
+    // it has seen the holder and is sleeping before its next look; the holder is done
+    rmSync(lockFile);
+    // the lock poll's sleep may run on real time or on the fake clock: this moves both
+    await vi.waitFor(() => expect(calls).toHaveLength(1), { timeout: 2_000 });
+    await vi.advanceTimersByTimeAsync(PLUGIN_REFRESH_TIMEOUT_MS);
+    const result = await done;
+    expect(result.outcome).toBe("refreshed");
+    expect(result.durationMs).toBeGreaterThanOrEqual(28_000);
+    expect(calls).toEqual([
+      { args: ["plugin", "list", "--json"] },
+      {
+        args: ["plugin", "update", "kru@kru", "--scope", "project"],
+        cwd: worktree,
+      },
+      { args: ["plugin", "list", "--json"] },
+    ]);
+    expect(versions.project).toBe("2.0.0");
+  });
 });
 
 describe("refreshPlugins caps", () => {
@@ -1721,7 +1784,7 @@ describe("refreshPlugins caps", () => {
     ]);
   });
 
-  test("output over the limit is not a timeout, though the cap fires before the command has ended, and is not retried", async () => {
+  test("output over the limit on the first listing is not a timeout, though the cap fires before the command has ended", async () => {
     const calls: string[][] = [];
     const result = await capped({
       firstListTimeoutMs: 30,
@@ -1740,6 +1803,36 @@ describe("refreshPlugins caps", () => {
       reason: "wrote more than 1 MiB to stdout",
     });
     expect(calls).toEqual([["plugin", "list", "--json"]]);
+  });
+
+  test("output over the limit on the last listing is not retried as a cut one would be, though its cap fires first", async () => {
+    const fake = fakeClaude({ "kru@kru": "1.0.0" }, "2.0.0");
+    let lists = 0;
+    const result = await capped({
+      listTimeoutMs: 30,
+      run: (f, args, { signal }) => {
+        if (args[1] === "list" && ++lists > 1)
+          // rejects once the cap has fired, as when it fires while the command's group is waited on
+          return new Promise((_, reject) =>
+            signal.addEventListener("abort", () =>
+              reject(new OutputExceeded("stdout")),
+            ),
+          );
+        return fake.run(f, args);
+      },
+    });
+    expect(result).toMatchObject({
+      outcome: "failed",
+      reason: "wrote more than 1 MiB to stdout",
+    });
+    // no `list after (retry)`: the read-back after a refresh that ended early is all that follows
+    expect(result.steps?.map((s) => s.name)).toEqual([
+      "list before",
+      "update marketplace kru",
+      "update kru@kru",
+      "list after",
+      "list after (cut short)",
+    ]);
   });
 });
 
