@@ -36,3 +36,21 @@ jobs:
       - run: pnpm --filter '@sky/api...' build
       - run: ci/boot-check.sh
         timeout-minutes: 5
+
+  # the image itself: its entrypoint, uid, ENV, runtime better-sqlite3 install and migrations
+  image-boot:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: sky-api:boot-check
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: ci/image-boot-check.sh sky-api:boot-check
+        timeout-minutes: 3
