@@ -1368,6 +1368,71 @@ test("migrating a populated 0017 file keeps every event, id, index and remaining
   expect(insertEvent("run.brand_new")).toBe(tail + 1);
 });
 
+test("migrating a populated 0023 file keeps every run column and every child row through the runs rebuild, keeps the agent index, and takes queued", () => {
+  migrateThrough("0023_tiny_madame_hydra");
+  seedRun();
+  run(
+    `update runs set summary = 's', input_tokens = 100, output_tokens = 50, cost_usd = 0.25, turns = 3, duration_ms = 4200,
+      rollup = '{"a":1}', secret_names = '["K"]', claude_credential = 'sub-a', retry_of = 'run_0',
+      launch_ciphertext = ?, launch_nonce = ?, launch_key_version = 3, created_at = '2026-10-29T11:00:00.000Z'
+      where id = 'run_1'`,
+    Buffer.from([1, 2, 3]),
+    Buffer.from([4, 5]),
+  );
+  for (const name of ["A", "B"]) {
+    run(
+      "insert into run_env_vars (run_id, name, ciphertext, nonce, key_version, expires_at, created_at) values ('run_1', ?, x'0a', x'0b', 1, '2026-10-29T13:00:00.000Z', '2026-10-29T11:00:00.000Z')",
+      name,
+    );
+  }
+  run(
+    "insert into run_requests (id, run_id, kind, request) values ('req_1', 'run_1', 'question', '{\"kind\":\"question\",\"requestId\":\"req_1\"}')",
+  );
+  insertEvent();
+  insertEvent("run.failed");
+  const insertQueued = () =>
+    run(
+      "insert into runs (id, agent_id, status) values ('run_2', 'agt_1', 'queued')",
+    );
+  expect(insertQueued).toThrow(/CHECK constraint failed: runs_status/);
+  const runBefore = db.$client.prepare("select * from runs").all();
+  const envVarsBefore = db.$client
+    .prepare("select * from run_env_vars order by name")
+    .all();
+  // every column is set, so the comparison below can't pass on a column the rebuild dropped
+  expect(Object.values(runBefore[0] as object)).not.toContain(null);
+
+  migrate(db);
+
+  expect(db.$client.prepare("select * from runs").all()).toEqual(runBefore);
+  expect(
+    db.$client.prepare("select * from run_env_vars order by name").all(),
+  ).toEqual(envVarsBefore);
+  const children = [
+    count("run_env_vars"),
+    count("run_requests"),
+    count("events"),
+  ];
+  expect(children).toEqual([2, 1, 2]);
+  expect(db.$client.pragma("foreign_key_check")).toEqual([]);
+  expect(
+    db.$client
+      .prepare(
+        "select name from sqlite_schema where type = 'index' and tbl_name = 'runs' and sql is not null",
+      )
+      .pluck()
+      .all(),
+  ).toEqual(["runs_agent_id_created_at"]);
+
+  // the rebuilt table takes queued, and the envVars' cascade still follows its runs
+  insertQueued();
+  run(
+    "insert into run_env_vars (run_id, name, ciphertext, nonce, key_version, expires_at) values ('run_2', 'C', x'0a', x'0b', 1, '2026-10-29T13:00:00.000Z')",
+  );
+  run("delete from runs where id = 'run_2'");
+  expect(count("run_env_vars")).toBe(2);
+});
+
 // a populated file as the previous release left it, ready to migrate
 const staleFile = () => {
   migrateThrough("0017_plain_ultimatum");
@@ -1424,7 +1489,8 @@ const journalTags = () =>
 test("migrate refuses when the volume can't hold the rebuild, and leaves the file untouched", () => {
   staleFile();
   const before = tables();
-  const needed = neededFor(bytesOf("events"));
+  // 0018 rebuilds events and 0024 runs
+  const needed = neededFor(bytesOf("events") + bytesOf("runs"));
 
   expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
     /not enough free disk space/,
@@ -1438,8 +1504,10 @@ test("the refusal names the pending migrations, the sizes in MB and the fix, on 
   seedRun();
   insertEvents(200);
   const events = bytesOf("events");
-  const growth = Math.max(0, 2 * events - freePageBytes());
-  const needed = neededFor(2 * events);
+  // events is rebuilt by 0017 and 0018, runs by 0024
+  const copied = 2 * events + bytesOf("runs");
+  const growth = Math.max(0, copied - freePageBytes());
+  const needed = neededFor(copied);
   const free = needed - 1;
 
   let message = "";
@@ -1449,7 +1517,7 @@ test("the refusal names the pending migrations, the sizes in MB and the fix, on 
     message = err instanceof Error ? err.message : String(err);
   }
   expect(message).toBe(
-    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine, 0021_magical_klaw, 0022_aberrant_wolverine, 0023_tiny_madame_hydra needs ${mb(needed)} (${mb(2 * events)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
+    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine, 0021_magical_klaw, 0022_aberrant_wolverine, 0023_tiny_madame_hydra, 0024_condemned_wild_pack needs ${mb(needed)} (${mb(copied)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
   );
 });
 
@@ -1457,7 +1525,7 @@ test("two pending rebuilds of one table are charged twice, since drizzle runs th
   migrateThrough("0016_silly_jetstream");
   seedRun();
   insertEvents(200);
-  const needed = neededFor(2 * bytesOf("events"));
+  const needed = neededFor(2 * bytesOf("events") + bytesOf("runs"));
 
   expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
     /not enough free disk space/,
@@ -1475,8 +1543,9 @@ test("migrate counts free pages as room already in the file, so they shrink what
   // part of the copy, not all of it, fits in the free pages
   expect(freePageBytes()).toBeGreaterThan(0);
   expect(freePageBytes()).toBeLessThan(events);
-  const needed = neededFor(events);
-  expect(needed).toBeLessThan(2 * events + MIGRATION_MARGIN_BYTES);
+  const copied = events + bytesOf("runs");
+  const needed = neededFor(copied);
+  expect(needed).toBeLessThan(2 * copied + MIGRATION_MARGIN_BYTES);
 
   expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
     /not enough free disk space/,
@@ -1489,7 +1558,7 @@ test("live data in tables no pending migration rebuilds isn't charged", () => {
   filler(2000);
   const events = bytesOf("events");
   expect(bytesOf("filler")).toBeGreaterThan(10 * events);
-  const needed = neededFor(events);
+  const needed = neededFor(events + bytesOf("runs"));
 
   expect(() => migrate(db, { freeBytes: () => needed })).not.toThrow();
   expect(count("filler")).toBe(2000);

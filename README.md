@@ -143,6 +143,9 @@ sky webhook delete whk_…
 sky key create <name> --role=runs --env=web,api   # admin only: a key limited to those environments; prints the secret once
 sky key list
 sky key revoke key_…
+sky admin drain --wait            # admin only: hold new launches and wait for running ones; see "Draining before a restart"
+sky admin drain --status
+sky admin drain --cancel
 ```
 
 `<env>` is an environment's name or id.
@@ -467,6 +470,7 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | `GET /v1/webhooks/:id/deliveries`                                       | a webhook's recent deliveries and their results        |
 | `POST`, `GET /v1/keys` · `DELETE /v1/keys/:id`                          | admin only: mint, list and revoke `runs` keys          |
 | `GET /v1/claude-credentials`                                            | admin only: the Claude credentials, by name            |
+| `POST`, `GET`, `DELETE /v1/admin/drain`                                 | admin only: [drain](#draining-before-a-restart)        |
 
 ### Listing agents
 
@@ -512,7 +516,7 @@ Newest activity first, where an agent's activity is the last event of its latest
 
 `run` is `null` for an agent that hasn't started one, and `nextCursor` is present only when more agents match. `lastEventAt` is the run's latest event, or the run's creation before its first; `endedAt` is when a finished, failed or stopped run ended, else `null`. `openRequests` counts the questions and tool-call requests a `waiting` run has open, and is `0` for a run in any other state. `remoteBranch` is the GitHub branch the agent was started on, `null` otherwise.
 
-`state` is the run's `status`, except that a `waiting` run is split by what it waits on: `waiting_approval` for a tool call to approve or deny, `waiting_answer` for a question. So the states are `starting`, `running`, `waiting_approval`, `waiting_answer`, `finished`, `failed` and `stopped`.
+`state` is the run's `status`, except that a `waiting` run is split by what it waits on: `waiting_approval` for a tool call to approve or deny, `waiting_answer` for a question. So the states are `queued`, `starting`, `running`, `waiting_approval`, `waiting_answer`, `finished`, `failed` and `stopped`. `queued` is a launch held while the API drains ([below](#draining-before-a-restart)); a client that doesn't know the state can treat it as `starting`, a run that hasn't begun.
 
 A `runs` key lists only the agents it started, and `env` names it may not use match nothing; the admin key lists every agent.
 
@@ -529,6 +533,41 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 | `request_closed`    | the request's run ended with the request still open; nothing was applied           |
 | `request_withdrawn` | the run stopped waiting on the request before it was answered; nothing was applied |
 | `webhooks_filter`   | webhooks filter on the environment; delete them first (ids in `webhookIds`)        |
+
+### Draining before a restart
+
+Restarting the API loses what a working run keeps in memory (a pending usage-limit retry, its waits), so a deploy should wait until no run is starting, running or awaiting a retry. A drain does the waiting for you. With the admin key:
+
+```
+POST /v1/admin/drain     { "timeoutSeconds": 1800 }   # optional; default 1800, at most 7200
+GET /v1/admin/drain
+DELETE /v1/admin/drain
+```
+
+While a drain is on, runs already `starting` or `running` carry on, and every new launch (an agent start, a follow-up, a retry after a usage limit) is **held, not refused**: the caller gets its usual `202` and a run whose `status` is `queued` (an agent's list `state` too). The run counts toward its environment's `concurrency` and its agent's one active run, and `POST /v1/agents/:id/stop` ends it like any other. When the drain ends, held launches become `starting` and launch as they would have, oldest first. A drain ends when you `DELETE` it, when its deadline passes (so a forgotten drain never blocks work), or when the API restarts. Held launches are stored sealed in the database, prompt included, so the API that boots after a deploy starts them. A run's launch deadline counts from its release, not from the hold.
+
+`GET` and the other two answer:
+
+```json
+{
+  "draining": true,
+  "since": "2026-11-22T10:00:00.000Z",
+  "deadline": "2026-11-22T10:30:00.000Z",
+  "active": ["run_…"],
+  "held": 2,
+  "ready": false
+}
+```
+
+`active` lists the runs still `starting` or `running`, and failed runs whose retry (after a usage limit or a Cloudflare challenge) is still pending, since a restart would lose that retry; a run waiting on an approval or an answer is quiet and not listed, and neither is a queued one. `ready` is `true` when `active` is empty: it is safe to restart. `since` and `deadline` are `null` when no drain is on.
+
+```
+sky admin drain --wait             # start (--timeout=<seconds>), then poll until ready
+sky admin drain --status
+sky admin drain --cancel
+```
+
+`--wait` exits 0 once `ready` while the drain is still on. It stops just before the deadline the start gave and exits 4 with the run ids still active, and exits 4 as soon as it finds the drain ended early (a `--cancel`, a restart). A status check that fails on an unreachable API or a 5xx is retried. If some check was answered, such a failure at the deadline still exits 4 by the last status it got, and the line names the error and how old that status is; if checks were made and none was answered, the API stopped answering and nothing newer than the start's status is known, so `--wait` exits 1 saying so. With runs active and no time for a check, it exits 4 by the start's status. Starting the drain isn't retried: any error then, an unreachable API or a 5xx included, exits 1, and so does a check that fails and isn't retried. A rejected key (`401`) exits 2. The [Image workflow](CONTRIBUTING.md#deploy) runs it before it deploys, when the `SKY_ADMIN_KEY` secret is set.
 
 ### Run errors
 

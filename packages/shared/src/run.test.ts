@@ -48,6 +48,7 @@ test("transition table matches the run lifecycle", () => {
     starting: ["running", "failed", "stopped"],
     running: ["waiting", "finished", "failed", "stopped"],
     waiting: ["running", "failed", "stopped"],
+    queued: ["starting", "failed", "stopped"],
     finished: [],
     failed: [],
     stopped: [],

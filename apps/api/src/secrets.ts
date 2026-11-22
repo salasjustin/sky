@@ -1,7 +1,7 @@
 import { zValidator } from "@hono/zod-validator";
-import { type Db, environments, runEnvVars, secrets } from "@sky/db";
+import { type Db, environments, runEnvVars, runs, secrets } from "@sky/db";
 import { EnvironmentId, type RunId } from "@sky/shared";
-import { and, asc, eq, isNotNull, lte } from "drizzle-orm";
+import { and, asc, eq, isNotNull, lte, notInArray } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
 import { adminOnly } from "./auth.js";
@@ -168,6 +168,23 @@ export function storeRunEnvVars(
     .run();
 }
 
+/** Moves the expiry of each of a run's envVars `byMs` later, keeping the lifetime each was stored with. */
+export function postponeRunEnvVars(tx: Tx, runId: RunId, byMs: number): void {
+  const rows = tx
+    .select({ name: runEnvVars.name, expiresAt: runEnvVars.expiresAt })
+    .from(runEnvVars)
+    .where(eq(runEnvVars.runId, runId))
+    .all();
+  for (const { name, expiresAt } of rows) {
+    tx.update(runEnvVars)
+      .set({
+        expiresAt: new Date(Date.parse(expiresAt) + byMs).toISOString(),
+      })
+      .where(and(eq(runEnvVars.runId, runId), eq(runEnvVars.name, name)))
+      .run();
+  }
+}
+
 /** Registers a run's envVars with redaction, until `purgeExpiredEnvVars` drops them. */
 export function registerRunEnvVars(
   known: KnownSecrets,
@@ -179,7 +196,10 @@ export function registerRunEnvVars(
   }
 }
 
-/** Deletes envVars past their expiry and drops them from redaction. */
+/**
+ * Deletes envVars past their expiry and drops them from redaction. A queued launch keeps its own: its
+ * expiry moves later by as long as it was held when it is released (`postponeRunEnvVars`).
+ */
 export function purgeExpiredEnvVars(
   db: Db,
   known: KnownSecrets,
@@ -187,7 +207,18 @@ export function purgeExpiredEnvVars(
 ): void {
   const purged = db
     .delete(runEnvVars)
-    .where(lte(runEnvVars.expiresAt, now.toISOString()))
+    .where(
+      and(
+        lte(runEnvVars.expiresAt, now.toISOString()),
+        notInArray(
+          runEnvVars.runId,
+          db
+            .select({ id: runs.id })
+            .from(runs)
+            .where(eq(runs.status, "queued")),
+        ),
+      ),
+    )
     .returning({ runId: runEnvVars.runId, name: runEnvVars.name })
     .all();
   for (const { runId, name } of purged) known.remove(runEnvVarAad(runId, name));

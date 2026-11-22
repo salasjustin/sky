@@ -81,6 +81,13 @@ export function resolveConfig(
   if (urlError !== undefined) {
     return { ok: false, error: `${url.source} "${url.value}" ${urlError}` };
   }
+  if (!fitsHeader(apiKey.value)) {
+    // never the value: unlike the URL, it is a secret
+    return {
+      ok: false,
+      error: `${apiKey.source} has a line break or NUL that a header can't carry; set it to the key alone`,
+    };
+  }
   return {
     ok: true,
     config: {
@@ -108,6 +115,12 @@ function checkUrl(value: string): string | undefined {
   if (url.protocol === "http:" && localHosts.has(url.hostname))
     return undefined;
   return "must use https (http only for localhost)";
+}
+
+/** False for a key fetch would quote in an error: it trims trailing HTTP whitespace, then refuses CR, LF and NUL by quoting the value. Its other refusals don't quote it. */
+function fitsHeader(key: string): boolean {
+  const sent = key.replace(/[\t\n\r ]+$/, "");
+  return !["\r", "\n", "\0"].some((char) => sent.includes(char));
 }
 
 function readConfigFile(

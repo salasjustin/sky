@@ -943,6 +943,7 @@ test("list_agents is listed read-only with its filters and the states", async ()
       type: "array",
       items: {
         enum: [
+          "queued",
           "starting",
           "running",
           "waiting_approval",

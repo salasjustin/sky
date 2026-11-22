@@ -92,6 +92,53 @@ test("--api-key-env naming an unset variable is an error, not a fallback", () =>
   });
 });
 
+// fetch's error for a CR, LF or NUL quotes the value, so each of these would print the key
+test.each([
+  ["an inner LF", "secret\nkey"],
+  ["an inner CR", "secret\rkey"],
+  ["an inner CRLF before a trailing one", "secret\r\nkey\r\n"],
+  ["a leading LF", "\nsecret-key"],
+  ["a leading CR", "\rsecret-key"],
+  ["an inner NUL", "secret\0key"],
+  ["a trailing NUL", "secret-key\0"],
+])("a key with %s is an error that doesn't show it", (_, key) => {
+  const env = { SKY_URL: "https://env.example", SKY_API_KEY: key };
+  expect(resolveConfig({}, env, home())).toEqual({
+    ok: false,
+    error:
+      "SKY_API_KEY has a line break or NUL that a header can't carry; set it to the key alone",
+  });
+});
+
+test("a key a header can't carry is named by where it came from", () => {
+  const dir = withConfigFile(
+    JSON.stringify({ url: "https://file.example", apiKey: "secret\0key" }),
+  );
+  const path = join(dir, ".config", "sky", "config.json");
+  expect(resolveConfig({}, {}, dir)).toEqual({
+    ok: false,
+    error: `apiKey in ${path} has a line break or NUL that a header can't carry; set it to the key alone`,
+  });
+  const env = { SKY_URL: "https://env.example", OTHER_KEY: "secret\nkey" };
+  expect(resolveConfig({ apiKeyEnv: "OTHER_KEY" }, env, dir)).toEqual({
+    ok: false,
+    error:
+      "OTHER_KEY (--api-key-env) has a line break or NUL that a header can't carry; set it to the key alone",
+  });
+});
+
+test.each([
+  ["LF", "key\n"],
+  ["CR", "key\r"],
+  ["CRLF and blanks", "key \r\n\t\n"],
+])("a key with a trailing %s is accepted as it is", (_, key) => {
+  const env = { SKY_URL: "https://env.example", SKY_API_KEY: key };
+  expect(resolveConfig({}, env, home())).toMatchObject({
+    ok: true,
+    config: { apiKey: key },
+  });
+});
+
 test("nothing configured names where to put it", () => {
   const result = resolveConfig({}, {}, home());
   expect(result.ok).toBe(false);

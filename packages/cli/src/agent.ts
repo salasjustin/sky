@@ -57,6 +57,7 @@ export interface AgentCommand {
 const runExitCodes = {
   finished: 0,
   waiting: 3,
+  queued: 4,
   starting: 4,
   running: 4,
   failed: 5,
@@ -625,7 +626,8 @@ function parseTimeout(raw: string | undefined): number | undefined {
   return n;
 }
 
-const isActive = (s: RunStatus) => s === "starting" || s === "running";
+const isActive = (s: RunStatus) =>
+  s === "queued" || s === "starting" || s === "running";
 const isTransient = (err: ApiError) => err.status === 0 || err.status >= 500;
 
 /** Polls until the newest run waits or ends; an unreachable API or a 5xx is retried with backoff. */

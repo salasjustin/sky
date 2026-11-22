@@ -320,7 +320,10 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
           and(
             inArray(
               runs.status,
-              activeRunStatuses.filter((s) => s !== "waiting"),
+              // a queued launch has no runner to go quiet
+              activeRunStatuses.filter(
+                (s) => s !== "waiting" && s !== "queued",
+              ),
             ),
             sql`${lastActivity} < ${cutoff}`,
           ),

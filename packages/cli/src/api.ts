@@ -3,6 +3,7 @@ import {
   ApiKey,
   ClaudeCredentialSummary,
   CreatedApiKey,
+  DrainStatus,
   Environment,
   type KeyInput,
   PluginRefresh,
@@ -191,6 +192,7 @@ export function createApi(config: Config) {
   ): Promise<{ status: number; json: unknown }> {
     const url = `${config.url}${path}`;
     let res: Response;
+    let text: string;
     try {
       res = await fetch(url, {
         method,
@@ -201,6 +203,8 @@ export function createApi(config: Config) {
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(requestTimeoutMs),
       });
+      // read on every path, the error one included, so the connection is released
+      text = await res.text();
     } catch (err) {
       throw new ApiError(
         0,
@@ -208,8 +212,6 @@ export function createApi(config: Config) {
         `cannot reach ${config.url}: ${describe(err)}`,
       );
     }
-    // read on every path, the error one included, so the connection is released
-    const text = await res.text();
     let json: unknown;
     try {
       json = text === "" ? null : JSON.parse(text);
@@ -521,6 +523,25 @@ export function createApi(config: Config) {
       );
       return parseKey(ApiKey, status, json, "a revoked key");
     },
+    /** Admin only: starts holding new launches, or moves the deadline of a drain already on. */
+    async startDrain(timeoutSeconds?: number): Promise<DrainStatus> {
+      const { status, json } = await request(
+        "POST",
+        "/v1/admin/drain",
+        timeoutSeconds === undefined ? {} : { timeoutSeconds },
+      );
+      return parseKey(DrainStatus, status, json, "a drain");
+    },
+    /** Admin only. */
+    async getDrain(): Promise<DrainStatus> {
+      const { status, json } = await request("GET", "/v1/admin/drain");
+      return parseKey(DrainStatus, status, json, "a drain");
+    },
+    /** Admin only: ends the drain and releases what it held; succeeds when none is on. */
+    async cancelDrain(): Promise<DrainStatus> {
+      const { status, json } = await request("DELETE", "/v1/admin/drain");
+      return parseKey(DrainStatus, status, json, "a drain");
+    },
     /** Admin only. Names, kinds, assignments, limits and counts; the API has no value to send. */
     async listClaudeCredentials(): Promise<ClaudeCredentialSummary[]> {
       const { status, json } = await request("GET", "/v1/claude-credentials");
@@ -560,7 +581,7 @@ function describe(err: unknown): string {
   if (err instanceof DOMException && err.name === "TimeoutError") {
     return `no response in ${requestTimeoutMs / 1000}s`;
   }
-  // fetch's own message is always "fetch failed"; the reason is in cause
+  // a network failure reads "fetch failed", or "terminated" mid-body; the reason is in cause
   const cause = (err as { cause?: { code?: unknown; message?: unknown } })
     .cause;
   if (typeof cause?.code === "string") return cause.code;

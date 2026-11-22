@@ -189,6 +189,6 @@ test("--help documents agent list", async () => {
     "sky agent list [--env=<id|name>,...] [--status=<state>,...] [--archived] [--limit=N] [--cursor=<c>]",
   );
   expect(text).toContain(
-    "States: starting, running, waiting_approval, waiting_answer, finished, failed, stopped.",
+    "States: starting, running, waiting_approval, waiting_answer, finished, failed, stopped (queued is a launch held while the API drains).",
   );
 });
