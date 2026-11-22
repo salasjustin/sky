@@ -57,6 +57,9 @@ jobs:
           # the guard below asks git whether the running commit descends from DEPLOY_SHA
           fetch-depth: 0
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
+        with:
+          # the guard reads `flyctl image show --json`; a fixed version keeps that output's shape stable
+          version: 0.5.3
       # an older passing CI run can be re-run after newer commits deployed, and must not roll the app back.
       # A running tag that isn't a sha- tag, or names a commit this repository doesn't have, can't be shown
       # to be newer, so it deploys; a failed read fails the job rather than guessing, and a re-run settles it
