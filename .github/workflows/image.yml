@@ -62,6 +62,8 @@ jobs:
       # rather than guess, and a re-run settles it.
       - name: Skip if the app already runs this commit or a newer one
         id: guard
+        # an explicit bash adds pipefail, so a failed flyctl fails the step instead of jq's exit 0 deploying
+        shell: bash
         run: |
           tag="$(flyctl image show -a sky-justin --json | jq -r '.[0].Tag // ""')"
           deploy=true
