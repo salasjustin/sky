@@ -15,6 +15,7 @@ import {
   claudeBinary,
   killRefreshCommands,
   loadedPlugins,
+  OutputExceeded,
   PLUGIN_LIST_TIMEOUT_MS,
   PLUGIN_REFRESH_TIMEOUT_MS,
   PLUGIN_STEP_TIMEOUT_MS,
@@ -56,7 +57,7 @@ describe("refreshPlugins", () => {
     });
     expect(calls).toEqual([
       ["plugin", "list", "--json"],
-      ["plugin", "marketplace", "update", "kru"],
+      ["plugin", "marketplace", "update", "--", "kru"],
       ["plugin", "update", "kru@kru", "--scope", "user"],
       ["plugin", "update", "other@kru", "--scope", "user"],
       // read back, for the record of what the refresh left installed
@@ -1473,8 +1474,8 @@ describe("refreshPlugins caps", () => {
       stepTimeoutMs: 30,
       run: (f, args, options) => {
         if (args[1] === "marketplace") {
-          marketplaces.push(String(args[3]));
-          if (args[3] === "one") return stalls(options.signal);
+          marketplaces.push(String(args[4]));
+          if (args[4] === "one") return stalls(options.signal);
         }
         return fake.run(f, args);
       },
@@ -1510,9 +1511,9 @@ describe("refreshPlugins caps", () => {
       stepTimeoutMs: 30,
       run: (f, args, options) => {
         // fails fast, with a message that reads like a cut
-        if (args[3] === "one") throw new Error("timed out connecting to host");
+        if (args[4] === "one") throw new Error("timed out connecting to host");
         // cut at its cap, but rejecting with an unrelated error
-        if (args[3] === "two")
+        if (args[4] === "two")
           return new Promise((_, reject) =>
             options.signal.addEventListener("abort", () =>
               reject(new Error("ECONNRESET")),
@@ -1528,21 +1529,77 @@ describe("refreshPlugins caps", () => {
   });
 
   test("a step name past 100 characters is cut in the record, and the command still gets the whole name", async () => {
-    const marketplace = "m".repeat(150);
-    const fake = fakeClaude({ [`p@${marketplace}`]: "1.0.0" }, "2.0.0");
-    const names: string[] = [];
+    // alike for their first 100 characters, so a cut name would also merge the two
+    const [one, two] = [`${"m".repeat(150)}1`, `${"m".repeat(150)}2`];
+    const [a, b] = [`${"p".repeat(150)}@${one}`, `${"p".repeat(150)}@${two}`];
+    const installed = [a, b].flatMap((id) => [
+      { id, scope: "user" },
+      { id, scope: "project", projectPath: lockDir },
+    ]);
+    const calls: string[][] = [];
     const result = await capped({
-      run: (f, args) => {
-        if (args[1] === "marketplace") names.push(String(args[3]));
-        return fake.run(f, args);
+      projectDir: lockDir,
+      run: async (_f, args) => {
+        calls.push(args);
+        return { stdout: args[1] === "list" ? JSON.stringify(installed) : "" };
       },
     });
     const long = result.steps?.find((s) => s.name.startsWith("update market"));
     expect(long?.name).toHaveLength(100);
-    expect(names).toEqual([marketplace.slice(0, 100)]);
+    expect(calls).toEqual([
+      ["plugin", "list", "--json"],
+      ["plugin", "marketplace", "update", "--", one],
+      ["plugin", "marketplace", "update", "--", two],
+      ["plugin", "update", a, "--scope", "user"],
+      ["plugin", "update", b, "--scope", "user"],
+      ["plugin", "update", a, "--scope", "project"],
+      ["plugin", "update", b, "--scope", "project"],
+      ["plugin", "list", "--json"],
+    ]);
+    const cut = {
+      name: "p".repeat(100),
+      marketplace: "m".repeat(100),
+      version: "unknown",
+    };
+    expect(result.before).toEqual([cut, cut]);
     expect(PluginRefresh.safeParse({ ...result, loaded: [] }).success).toBe(
       true,
     );
+  });
+
+  test("a marketplace name that starts with a dash reaches the command after --, as a name", async () => {
+    const fake = fakeClaude({ "p@--help": "1.0.0" }, "2.0.0");
+    const updates: string[][] = [];
+    await capped({
+      run: (f, args) => {
+        if (args[1] === "marketplace") updates.push(args);
+        return fake.run(f, args);
+      },
+    });
+    expect(updates).toEqual([
+      ["plugin", "marketplace", "update", "--", "--help"],
+    ]);
+  });
+
+  test("output over the limit is not a timeout, though the cap fires before the command has ended, and is not retried", async () => {
+    const calls: string[][] = [];
+    const result = await capped({
+      listTimeoutMs: 30,
+      run: (_f, args, { signal }) => {
+        calls.push(args);
+        // rejects once the cap has fired, as when it fires while the command's group is waited on
+        return new Promise((_, reject) =>
+          signal.addEventListener("abort", () =>
+            reject(new OutputExceeded("stdout")),
+          ),
+        );
+      },
+    });
+    expect(result).toMatchObject({
+      outcome: "failed",
+      reason: "wrote more than 1 MiB to stdout",
+    });
+    expect(calls).toEqual([["plugin", "list", "--json"]]);
   });
 });
 

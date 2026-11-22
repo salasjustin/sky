@@ -47,6 +47,13 @@ const GROUP_POLL_MS = 50;
 /** What a command may write to stdout, and to stderr, before it is cut. */
 const OUTPUT_MAX_BYTES = 1024 * 1024;
 
+/** A command cut for its output: never a `CapExceeded`, even when its cap fires while it is waited on. */
+export class OutputExceeded extends Error {
+  constructor(stream: "stdout" | "stderr") {
+    super(`wrote more than 1 MiB to ${stream}`);
+  }
+}
+
 /**
  * Runs `file` as the leader of its own process group, so a cut reaches what it started too (a git
  * child of `claude` keeps writing otherwise). Aborting `signal` cuts the command, and so does output
@@ -123,8 +130,7 @@ export function runInGroup(
         // still read once cut, so a full pipe can't block the command's exit, but not kept
         if (cut) return;
         bytes += Buffer.byteLength(chunk);
-        if (bytes > OUTPUT_MAX_BYTES)
-          cutShort(new Error(`wrote more than 1 MiB to ${name}`));
+        if (bytes > OUTPUT_MAX_BYTES) cutShort(new OutputExceeded(name));
         else output[name] += chunk;
       });
     }
@@ -304,14 +310,13 @@ const REASON_MAX = 300;
 const PLUGINS_MAX = 100;
 const STEPS_MAX = 50;
 
-const idOf = (plugin: PluginVersion) =>
-  plugin.marketplace === null
-    ? plugin.name
-    : `${plugin.name}@${plugin.marketplace}`;
-
 type Listing = {
-  /** The user-scope plugins, each once, its `name@marketplace` id split. */
+  /** The user-scope plugins as recorded, each once: its `name@marketplace` id split, then cut to bounds. */
   plugins: PluginVersion[];
+  /** Their whole ids, which is what commands are given. */
+  ids: string[];
+  /** The whole names of the marketplaces they come from, each once. */
+  marketplaces: string[];
   /**
    * The ids of user-scope plugins that also have a project-scope record for `projectDir`. Claude Code
    * writes one when a session opens a project whose settings enable a plugin installed for the user,
@@ -331,6 +336,7 @@ function readListing(stdout: string, projectDir?: string): Listing {
   const seen = new Set<string>();
   const plugins: PluginVersion[] = [];
   const projectIds = new Set<string>();
+  const marketplaces = new Set<string>();
   for (const { id, scope, version, projectPath } of installed) {
     if (
       scope === "project" &&
@@ -342,9 +348,11 @@ function readListing(stdout: string, projectDir?: string): Listing {
     if (scope !== "user" || seen.has(id)) continue;
     seen.add(id);
     const at = id.lastIndexOf("@");
+    const marketplace = at > 0 ? id.slice(at + 1) : null;
+    if (marketplace !== null) marketplaces.add(marketplace);
     plugins.push({
       name: (at > 0 ? id.slice(0, at) : id).slice(0, 100),
-      marketplace: at > 0 ? id.slice(at + 1).slice(0, 100) : null,
+      marketplace: marketplace?.slice(0, 100) ?? null,
       version:
         typeof version === "string" && version !== ""
           ? version.slice(0, 100)
@@ -353,7 +361,9 @@ function readListing(stdout: string, projectDir?: string): Listing {
   }
   return {
     plugins,
-    pinnedHere: plugins.map(idOf).filter((id) => projectIds.has(id)),
+    ids: [...seen],
+    marketplaces: [...marketplaces],
+    pinnedHere: [...seen].filter((id) => projectIds.has(id)),
   };
 }
 
@@ -467,7 +477,10 @@ export async function refreshPlugins(options: {
     options.lockFile ?? join(tmpdir(), "sky-plugin-refresh.lock");
   const stepMs = options.stepTimeoutMs ?? PLUGIN_STEP_TIMEOUT_MS;
   const listMs = options.listTimeoutMs ?? PLUGIN_LIST_TIMEOUT_MS;
-  /** One command, cut at `capMs` as well as when `within` ends; a cut by its own cap alone is a `CapExceeded`. */
+  /**
+   * One command, cut at `capMs` as well as when `within` ends; a cut by its own cap alone is a
+   * `CapExceeded`, unless its output had already cut it.
+   */
   const capped = async (
     name: string,
     capMs: number,
@@ -485,7 +498,8 @@ export async function refreshPlugins(options: {
         }),
       );
     } catch (error) {
-      if (!within.aborted && own.aborted) throw new CapExceeded(capMs);
+      if (!within.aborted && own.aborted && !(error instanceof OutputExceeded))
+        throw new CapExceeded(capMs);
       throw error;
     }
   };
@@ -540,15 +554,14 @@ export async function refreshPlugins(options: {
       try {
         if (whole) {
           // each by name, so a failure says which one; only the marketplaces the installed plugins come from
-          const marketplaces = new Set<string>();
-          for (const { marketplace } of before)
-            if (marketplace !== null) marketplaces.add(marketplace);
-          for (const name of marketplaces) {
+          for (const name of read.marketplaces) {
             try {
               await claudeRun(`update marketplace ${name}`, [
                 "plugin",
                 "marketplace",
                 "update",
+                // without it a name like `--help` is an option, and exits 0 having updated nothing
+                "--",
                 name,
               ]);
             } catch (error) {
@@ -557,7 +570,7 @@ export async function refreshPlugins(options: {
               failed.push(`marketplace ${name} (${firstLine(error)})`);
             }
           }
-          for (const plugin of before.map(idOf)) {
+          for (const plugin of read.ids) {
             try {
               await claudeRun(`update ${plugin}`, [
                 "plugin",
