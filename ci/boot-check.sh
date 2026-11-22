@@ -53,7 +53,7 @@ mkdir "$WORK/app/node_modules"
 # the copy pnpm already built; the image installs the same version with npm
 ln -s "$(realpath apps/api/node_modules/better-sqlite3)" "$WORK/app/node_modules/better-sqlite3"
 
-# the image's ENV (Dockerfile); bundled libraries read it at runtime
+# the image's ENV (Dockerfile); bundled libraries may read it at runtime
 export NODE_ENV=production
 export DATA_DIR="$WORK/data" PORT
 export SKY_API_KEY="boot-check-api-key-boot-check-api-key"
