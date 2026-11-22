@@ -315,7 +315,7 @@ const STEPS_MAX = 50;
 
 /**
  * The pseudo-marketplace Claude Code lists plugins loaded from a skills directory under. It has
- * nothing to update, so such a plugin is recorded but is neither marketplace-updated nor plugin-updated.
+ * nothing to update, so a user-scope one is recorded but is neither marketplace-updated nor plugin-updated.
  */
 const SKILLS_DIR = "skills-dir";
 
@@ -327,7 +327,7 @@ type Listing = {
   /** The whole names of the marketplaces they come from, each once. */
   marketplaces: string[];
   /**
-   * The ids of user-scope plugins that also have a project-scope record for `projectDir`. Claude Code
+   * Those of `ids` that also have a project-scope record for `projectDir`. Claude Code
    * writes one when a session opens a project whose settings enable a plugin installed for the user,
    * pinned to the version installed then, and `plugin update --scope user` never moves it.
    */
@@ -409,8 +409,10 @@ function sameDir(a: string, b: string): boolean {
  * Resolves to the record of what it did: the user-scope plugins before and after (null for a list
  * it never read; a waiting run with nothing to update has its one listing as both), the outcome
  * code (`refreshed`, `timed_out`, `failed` or `skipped`), the reason for a `failed` or `skipped`
- * one (and for a `timed_out` one that had already had updates cut or fail, naming them), how long it took and how long each command did (`steps`). Each marketplace the installed plugins
- * come from is updated by name, and every command has a cap of its own besides the overall budget: an
+ * one (and for a `timed_out` one, the updates that had failed or been cut and stopped before the
+ * budget ran out), how long it took and how long each command did (`steps`). Each marketplace the
+ * installed plugins come from, `skills-dir` aside, is updated by name, and every command has a cap
+ * of its own besides the overall budget: an
  * update is cut at `stepTimeoutMs`, a listing at `listTimeoutMs`. A marketplace update that fails, cut
  * or not, is a failed update named for that marketplace, and the plugin updates after it still run from
  * the cached marketplace while the budget lasts. A listing cut at its own cap is tried once more; if the
@@ -535,7 +537,7 @@ export async function refreshPlugins(options: {
     }
   };
   let failedReason = "";
-  // the updates cut or failed so far, kept outside the pass so a refresh the budget ends still names them
+  // updates that failed or were cut and stopped, outside the pass so a refresh the budget or a listing ends still names them
   const failed: string[] = [];
   const failedUpdates = () =>
     failed.length > 0 ? `update failed for ${failed.join(", ")}` : "";
@@ -570,7 +572,7 @@ export async function refreshPlugins(options: {
     } else {
       try {
         if (whole) {
-          // each by name, so a failure says which one; only the marketplaces the installed plugins come from
+          // each by name, so a failure says which one; only the marketplaces of plugins that can be updated
           for (const name of read.marketplaces) {
             try {
               await claudeRun(`update marketplace ${name}`, [
@@ -687,7 +689,6 @@ export async function refreshPlugins(options: {
     const why = timeout.aborted
       ? `timed out after ${seconds(now() - started)}s`
       : firstLine(error);
-    // updates cut or failed before the refresh ended are still the record's to name
     const cut = failedUpdates();
     warn(
       `runner: plugin refresh failed (${why}${cut === "" ? "" : `; ${cut}`}); continuing with the installed versions`,
