@@ -1,6 +1,14 @@
 import { zValidator } from "@hono/zod-validator";
-import { environments, webhooks } from "@sky/db";
 import {
+  type Db,
+  environments,
+  events,
+  webhookDeliveries,
+  webhooks,
+} from "@sky/db";
+import {
+  DELIVERY_LIST_DEFAULT_LIMIT,
+  DELIVERY_LIST_MAX_LIMIT,
   EnvironmentId,
   EventType,
   OpenBotWebhookSecret,
@@ -9,15 +17,29 @@ import {
   WebhookFormat,
   WebhookId,
 } from "@sky/shared";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNotNull,
+  lt,
+  max,
+  sql,
+} from "drizzle-orm";
 import { z } from "zod";
 import { canUseEnv, ownerKeyOf, type Principal } from "./auth.js";
 import { seal, webhookSecretAad } from "./crypto.js";
+import { errorKind } from "./deliveries.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
+import { redact } from "./redact.js";
 import { body, jsonBody } from "./validation.js";
-import { isAllowedWebhookUrl } from "./webhook-url.js";
+import { isAllowedWebhookUrl, scrubAddresses } from "./webhook-url.js";
 
 // any https URL here, so an internal host is refused as url_not_allowed before the shared schema's domain-only rule
 const WebhookInput = z.strictObject({
@@ -29,7 +51,65 @@ const WebhookInput = z.strictObject({
   environmentIds: z.tuple([EnvironmentId], EnvironmentId).optional(),
 });
 
-const present = (row: typeof webhooks.$inferSelect) => ({
+/** What a webhook's stored deliveries say about it; nothing before its first attempt. */
+function health(
+  db: Db,
+  row: typeof webhooks.$inferSelect,
+): Pick<Webhook, "lastAttempt" | "failedStreak" | "failing"> {
+  const failing = row.failingSince === null ? {} : { failing: true as const };
+  const last = db
+    .select({
+      at: webhookDeliveries.lastAttemptAt,
+      status: webhookDeliveries.lastStatus,
+      error: webhookDeliveries.lastError,
+      attempt: webhookDeliveries.attempts,
+    })
+    .from(webhookDeliveries)
+    .where(
+      and(
+        eq(webhookDeliveries.webhookId, row.id),
+        isNotNull(webhookDeliveries.lastAttemptAt),
+      ),
+    )
+    .orderBy(desc(webhookDeliveries.lastAttemptAt), desc(webhookDeliveries.id))
+    .limit(1)
+    .get();
+  if (!last?.at) return failing;
+  const delivered = db
+    .select({ at: max(webhookDeliveries.lastAttemptAt) })
+    .from(webhookDeliveries)
+    .where(
+      and(
+        eq(webhookDeliveries.webhookId, row.id),
+        eq(webhookDeliveries.status, "delivered"),
+      ),
+    )
+    .get();
+  // a delivery counts once it ended failed, or is retrying (pending with an attempt behind it)
+  const streak = db
+    .select({ n: count() })
+    .from(webhookDeliveries)
+    .where(
+      and(
+        eq(webhookDeliveries.webhookId, row.id),
+        inArray(webhookDeliveries.status, ["failed", "pending"]),
+        gt(webhookDeliveries.lastAttemptAt, delivered?.at ?? ""),
+      ),
+    )
+    .get();
+  return {
+    lastAttempt: {
+      at: last.at,
+      status: last.status,
+      error: last.status === null ? errorKind(last.error) : null,
+      attempt: last.attempt,
+    },
+    failedStreak: streak?.n ?? 0,
+    ...failing,
+  };
+}
+
+const present = (db: Db, row: typeof webhooks.$inferSelect) => ({
   ...({
     id: row.id,
     url: row.url,
@@ -38,8 +118,24 @@ const present = (row: typeof webhooks.$inferSelect) => ({
     ...(row.environmentIds === null
       ? {}
       : { environmentIds: row.environmentIds }),
+    ...health(db, row),
   } satisfies Webhook),
   createdAt: row.createdAt,
+});
+
+const DeliveriesQuery = z.object({
+  limit: z
+    .string()
+    .regex(/^\d+$/)
+    .transform(Number)
+    .pipe(z.int().min(1).max(DELIVERY_LIST_MAX_LIMIT))
+    .default(DELIVERY_LIST_DEFAULT_LIMIT),
+  // the id of the last delivery of the previous page
+  cursor: z
+    .string()
+    .regex(/^\d{1,15}$/)
+    .transform(Number)
+    .optional(),
 });
 
 const notFound = "no such webhook";
@@ -69,7 +165,7 @@ export function webhookRoutes() {
         // ties within a millisecond go by insert order (rowid); ids are random
         .orderBy(asc(webhooks.createdAt), asc(sql`rowid`))
         .all();
-      return c.json({ data: rows.map(present) }, 200);
+      return c.json({ data: rows.map((row) => present(c.var.db, row)) }, 200);
     })
     .post("/", jsonBody, body(WebhookInput), (c) => {
       const input = c.req.valid("json");
@@ -165,7 +261,7 @@ export function webhookRoutes() {
         .returning()
         .get();
       c.header("Location", `/v1/webhooks/${row.id}`);
-      return c.json(present(row), 201);
+      return c.json(present(c.var.db, row), 201);
     })
     .get("/:id", webhookParam, (c) => {
       const row = c.var.db
@@ -179,8 +275,81 @@ export function webhookRoutes() {
         )
         .get();
       if (!row) return apiError(c, 404, "not_found", notFound);
-      return c.json(present(row), 200);
+      return c.json(present(c.var.db, row), 200);
     })
+    .get(
+      "/:id/deliveries",
+      webhookParam,
+      zValidator("query", DeliveriesQuery, (result, c) => {
+        if (!result.success) {
+          return apiError(
+            c,
+            400,
+            "invalid_query",
+            z.prettifyError(result.error),
+          );
+        }
+      }),
+      (c) => {
+        const { id } = c.req.valid("param");
+        const { limit, cursor } = c.req.valid("query");
+        const owned = c.var.db
+          .select({ id: webhooks.id })
+          .from(webhooks)
+          .where(and(eq(webhooks.id, id), ownWebhooks(c.var.principal)))
+          .get();
+        if (!owned) return apiError(c, 404, "not_found", notFound);
+        // ids rise with creation, so newest first is id descending
+        const rows = c.var.db
+          .select({
+            id: webhookDeliveries.id,
+            eventType: events.type,
+            runId: events.runId,
+            status: webhookDeliveries.status,
+            attempts: webhookDeliveries.attempts,
+            lastStatus: webhookDeliveries.lastStatus,
+            lastError: webhookDeliveries.lastError,
+            createdAt: webhookDeliveries.createdAt,
+            lastAttemptAt: webhookDeliveries.lastAttemptAt,
+            nextAttemptAt: webhookDeliveries.nextAttemptAt,
+          })
+          .from(webhookDeliveries)
+          .innerJoin(events, eq(events.id, webhookDeliveries.eventId))
+          .where(
+            and(
+              eq(webhookDeliveries.webhookId, id),
+              cursor === undefined
+                ? undefined
+                : lt(webhookDeliveries.id, cursor),
+            ),
+          )
+          .orderBy(desc(webhookDeliveries.id))
+          .limit(limit + 1)
+          .all();
+        const page = rows.slice(0, limit);
+        const known = c.var.secrets.values();
+        const last = page.at(-1);
+        return c.json(
+          {
+            data: page.map(({ nextAttemptAt, lastError, ...row }) => ({
+              ...row,
+              // a row stored before addresses were scrubbed on write still holds them; redact first,
+              // so a scrub can't split a secret out of its match
+              lastError:
+                lastError === null
+                  ? null
+                  : scrubAddresses(redact(lastError, known)),
+              lastErrorKind: errorKind(lastError),
+              nextAttemptAt: row.status === "pending" ? nextAttemptAt : null,
+            })),
+            ...(rows.length > limit && last
+              ? { nextCursor: String(last.id) }
+              : {}),
+          },
+          200,
+        );
+      },
+    )
     .delete("/:id", webhookParam, (c) => {
       const deleted = c.var.db
         .delete(webhooks)

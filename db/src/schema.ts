@@ -340,6 +340,11 @@ export const webhooks = sqliteTable(
     ownerKeyId: text("owner_key_id")
       .$type<ApiKeyId>()
       .references(() => apiKeys.id),
+    // when the current failing stretch began: the first give-up since the last delivered attempt (a refused
+    // delivery gives up on its first attempt), kept by later give-ups and cleared by the next delivered one.
+    // Stored, not derived, so pruning old deliveries never hides a dead webhook
+    // no CHECK: adding one makes drizzle-kit rebuild the table; the API writes it from its clock
+    failingSince: text("failing_since"),
   },
   (t) => [
     check(
@@ -371,9 +376,16 @@ export const webhookDeliveries = sqliteTable(
     // HTTP status of the latest attempt; null until one gets a response
     lastStatus: integer("last_status"),
     lastError: text("last_error"),
+    // when the latest attempt ran (next_attempt_at is when the next one is due); null until one has. No CHECK, for the same reason as failing_since
+    lastAttemptAt: text("last_attempt_at"),
     createdAt: createdAt(),
   },
   (t) => [
+    // a webhook's newest attempt and its failed streak, as `webhook_id = ? and last_attempt_at > ?`
+    index("webhook_deliveries_webhook_id_last_attempt_at").on(
+      t.webhookId,
+      t.lastAttemptAt,
+    ),
     // one delivery per (subscriber, event); also serves the webhook_id foreign key
     uniqueIndex("webhook_deliveries_webhook_id_event_id").on(
       t.webhookId,

@@ -40,6 +40,31 @@ export const OpenBotWebhookSecret = z
     error: "an openbot secret has no leading or trailing whitespace",
   });
 
+/** Why an attempt got no HTTP response; `other` covers anything the API can't sort into the rest. */
+export const DeliveryErrorKind = z.enum([
+  "timeout",
+  "connection_refused",
+  "connection_reset",
+  "dns",
+  "tls",
+  "blocked_address",
+  "url_not_allowed",
+  "other",
+]);
+export type DeliveryErrorKind = z.infer<typeof DeliveryErrorKind>;
+
+/** The newest attempt on a webhook, whichever delivery it was for. */
+export const WebhookLastAttempt = z.object({
+  at: z.iso.datetime(),
+  /** the HTTP status the receiver answered; null when it never did */
+  status: z.int().nullable(),
+  /** why there was no response; null when there was one */
+  error: DeliveryErrorKind.nullable(),
+  /** the attempt number within its delivery, from 1 */
+  attempt: z.int().min(1),
+});
+export type WebhookLastAttempt = z.infer<typeof WebhookLastAttempt>;
+
 export const Webhook = z.object({
   id: WebhookId,
   /** https only: payloads carry tool input and output */
@@ -48,5 +73,36 @@ export const Webhook = z.object({
   format: WebhookFormat,
   /** only events from agents in these environments are delivered; absent means all */
   environmentIds: z.array(EnvironmentId).nonempty().optional(),
+  /** the newest attempt; absent until the webhook has had one */
+  lastAttempt: WebhookLastAttempt.optional(),
+  /**
+   * deliveries in a row, since the last delivered one, that ended failed or are retrying after a
+   * failed attempt; absent until the webhook has had an attempt
+   */
+  failedStreak: z.int().min(0).optional(),
+  /** true once a delivery gave up after its last attempt, until the next delivered one; absent otherwise */
+  failing: z.literal(true).optional(),
 });
 export type Webhook = z.infer<typeof Webhook>;
+
+export const DELIVERY_LIST_DEFAULT_LIMIT = 20;
+export const DELIVERY_LIST_MAX_LIMIT = 100;
+
+/** One delivery of an event to a webhook. Never carries the request body, headers or signature. */
+export const WebhookDelivery = z.object({
+  id: z.int(),
+  eventType: EventType,
+  runId: z.string(),
+  status: z.enum(["pending", "delivered", "failed"]),
+  attempts: z.int().min(0),
+  lastStatus: z.int().nullable(),
+  /** the failure text, redacted; null when the last attempt got a response */
+  lastError: z.string().nullable(),
+  lastErrorKind: DeliveryErrorKind.nullable(),
+  createdAt: z.iso.datetime(),
+  /** null until the first attempt */
+  lastAttemptAt: z.iso.datetime().nullable(),
+  /** when the next try is due; null once the delivery is delivered or failed */
+  nextAttemptAt: z.iso.datetime().nullable(),
+});
+export type WebhookDelivery = z.infer<typeof WebhookDelivery>;

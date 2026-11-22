@@ -1,25 +1,46 @@
 import { readFileSync } from "node:fs";
 import {
+  DELIVERY_LIST_MAX_LIMIT,
   EventType,
   OpenBotWebhookSecret,
   StandardWebhookSecret,
 } from "@sky/shared";
 import type { AgentCommand } from "./agent.js";
+import type { ApiDelivery, ApiWebhook } from "./api.js";
 import type { Io } from "./cli.js";
 import { readStdinValue, stripFinalNewline } from "./input.js";
 import { UsageError } from "./output.js";
 import { resolveEnvId } from "./secret.js";
 
-const webhookLine = (w: {
-  id: string;
-  format: string;
-  url: string;
-  eventTypes: string[];
-  environmentIds?: string[];
-}) =>
-  `${w.id} ${w.format} ${w.url} ${w.eventTypes.join(",")}${
+/** What the last attempt got: the HTTP status, else why there was no response. */
+const outcome = (status: number | null, error: string | null | undefined) =>
+  status !== null ? String(status) : (error ?? "no response");
+
+const webhookLine = (w: ApiWebhook) => {
+  const base = `${w.id} ${w.format} ${w.url} ${w.eventTypes.join(",")}${
     w.environmentIds ? ` ${w.environmentIds.join(",")}` : ""
   }`;
+  const results: string[] = [];
+  if (w.failing) results.push("FAILING");
+  if (w.lastAttempt) {
+    const { at, status, error, attempt } = w.lastAttempt;
+    results.push(
+      `last ${outcome(status, error)} at ${at} (attempt ${attempt})`,
+    );
+  }
+  if (w.failedStreak) results.push(`${w.failedStreak} failed in a row`);
+  return results.length === 0 ? base : `${base} | ${results.join(", ")}`;
+};
+
+const deliveryLine = (d: ApiDelivery) => {
+  const last =
+    d.lastStatus === null && d.lastError === null
+      ? ""
+      : ` last ${outcome(d.lastStatus, d.lastErrorKind)}`;
+  const error =
+    d.lastError !== null && d.lastStatus === null ? ` (${d.lastError})` : "";
+  return `${d.createdAt} ${d.status} ${d.eventType} ${d.runId} attempts ${d.attempts}${last}${error}`;
+};
 
 const split = (list: string) =>
   list
@@ -86,9 +107,69 @@ export const webhook: AgentCommand = {
     format: { type: "string" },
     secret: { type: "string" },
     env: { type: "string" },
+    limit: { type: "string" },
+    cursor: { type: "string" },
   },
   prepare(positionals, values) {
     const [sub, ...rest] = positionals;
+    if (
+      sub !== "deliveries" &&
+      (values.limit !== undefined || values.cursor !== undefined)
+    ) {
+      throw new UsageError(
+        "--limit and --cursor only go with webhook deliveries",
+        true,
+      );
+    }
+    if (sub === "deliveries") {
+      const [id, ...extra] = rest;
+      if (id === undefined || extra.length > 0) {
+        throw new UsageError(
+          "webhook deliveries takes <id> [--limit=<n>] [--cursor=<cursor>]",
+          true,
+        );
+      }
+      if (values.events || values.format || values.env || values.secret) {
+        throw new UsageError(
+          "webhook deliveries takes only --limit and --cursor",
+          true,
+        );
+      }
+      const query = new URLSearchParams();
+      if (values.limit !== undefined) {
+        const n = Number(values.limit);
+        if (
+          !/^\d+$/.test(values.limit) ||
+          n < 1 ||
+          n > DELIVERY_LIST_MAX_LIMIT
+        ) {
+          throw new UsageError(
+            `--limit takes a whole number from 1 to ${DELIVERY_LIST_MAX_LIMIT}, not '${values.limit}'`,
+            true,
+          );
+        }
+        query.set("limit", String(n));
+      }
+      if (values.cursor !== undefined) {
+        if (values.cursor === "")
+          throw new UsageError("--cursor is empty", true);
+        query.set("cursor", values.cursor);
+      }
+      return async (api, _io, out) => {
+        const page = await api.listWebhookDeliveries(id, query);
+        if (out.json || page.data.length > 0) {
+          out.result(page.raw, page.data.map(deliveryLine).join("\n"));
+        } else {
+          out.progress(`no deliveries yet for ${id}`);
+        }
+        if (page.nextCursor !== undefined) {
+          out.progress(
+            `older deliveries exist; for the next page pass --cursor=${page.nextCursor}`,
+          );
+        }
+        return 0;
+      };
+    }
     if (sub !== "add" && (values.events || values.format || values.env)) {
       throw new UsageError(
         "--events, --format and --env only go with webhook add",
@@ -193,7 +274,7 @@ export const webhook: AgentCommand = {
     }
     throw new UsageError(
       sub === undefined
-        ? "webhook needs a subcommand: add, list or delete"
+        ? "webhook needs a subcommand: add, list, deliveries or delete"
         : `unknown webhook subcommand '${sub}'`,
       true,
     );

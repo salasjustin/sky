@@ -10,6 +10,7 @@ import {
 } from "@sky/db";
 import type {
   AgentId,
+  DeliveryErrorKind,
   EnvironmentId,
   Event,
   EventType,
@@ -18,7 +19,7 @@ import type {
 import { and, asc, eq, isNull, lt, lte, ne } from "drizzle-orm";
 import { open, type Sealed, webhookSecretAad } from "./crypto.js";
 import { presentEvent } from "./run-events.js";
-import type { Tx } from "./runs.js";
+import { recordEvent, type Tx } from "./runs.js";
 import {
   BlockedAddressError,
   guardedAgent,
@@ -165,6 +166,23 @@ const refusalKind = (err: unknown): RefusalKind | null => {
     : null;
 };
 
+/**
+ * Why a fetch failed, from its cause. Node's connect to a host with several addresses, when none
+ * connects, fails with an `AggregateError` whose message is empty: its per-address errors and its
+ * `code` say why instead.
+ */
+const causeText = (cause: Error): string => {
+  if (cause.message) return cause.message;
+  const each =
+    cause instanceof AggregateError
+      ? cause.errors
+          .filter((e): e is Error => e instanceof Error && e.message !== "")
+          .map((e) => e.message)
+      : [];
+  if (each.length > 0) return each.join(", ");
+  return "code" in cause && typeof cause.code === "string" ? cause.code : "";
+};
+
 /** The text stored as `last_error` for a failed attempt, with addresses and `host:port` pairs scrubbed out. */
 export const describeError = (err: unknown): string => {
   const refusal = refusalKind(err);
@@ -174,18 +192,37 @@ export const describeError = (err: unknown): string => {
   }
   // fetch's own message is a bare "fetch failed"; the cause says why
   const cause = err instanceof Error ? err.cause : undefined;
-  const text = cause instanceof Error ? `${err}: ${cause.message}` : `${err}`;
+  const text =
+    cause instanceof Error ? `${err}: ${causeText(cause)}` : `${err}`;
   return scrubAddresses(text).slice(0, MAX_ERROR_LENGTH);
 };
+
+const errorKinds: [RegExp, DeliveryErrorKind][] = [
+  // a refusal's whole stored text is its kind
+  [/^blocked_address$/, "blocked_address"],
+  [/^url_not_allowed$/, "url_not_allowed"],
+  [/timed out|timeout|ETIMEDOUT/i, "timeout"],
+  [/ECONNREFUSED/, "connection_refused"],
+  [/ECONNRESET|EPIPE|socket hang up|other side closed/i, "connection_reset"],
+  [/ENOTFOUND|EAI_AGAIN|EAI_NODATA|getaddrinfo/, "dns"],
+  [/certificate|\bSSL\b|\bTLS\b|self[- ]signed|ERR_TLS/i, "tls"],
+];
+
+/** The kind of a stored `last_error`, read from the text `describeError` wrote; null for no error. */
+export function errorKind(error: string | null): DeliveryErrorKind | null {
+  if (error === null) return null;
+  return errorKinds.find(([pattern]) => pattern.test(error))?.[1] ?? "other";
+}
 
 export type Dispatcher = ReturnType<typeof createDispatcher>;
 
 /**
  * Sends due webhook deliveries from the DB, one drain at a time: a 2xx delivers, anything else (a
- * redirect included, never followed) retries with backoff until the 30th attempt fails it. A 429
- * retries after its `Retry-After` when it parses (capped at 1 h), and holds every other pending
- * delivery of that webhook until then without spending their attempts. Each failed attempt logs
- * one line; the one that gives up is prefixed `warn:`.
+ * redirect included, never followed) retries with backoff until the 30th attempt fails it. A refused
+ * URL or address (`blocked_address`, `url_not_allowed`) fails on the attempt it is refused instead,
+ * with no retry. A 429 retries after its `Retry-After` when it parses (capped at 1 h), and holds
+ * every other pending delivery of that webhook until then without spending their attempts. Each
+ * failed attempt logs one line; the one that gives up is prefixed `warn:`.
  */
 export function createDispatcher({
   db,
@@ -298,6 +335,37 @@ export function createDispatcher({
     }
   }
 
+  /**
+   * Flags the webhook as failing and, when this give-up is the one that flips it to failing, tells the
+   * run the delivery was for (a delivery can't outlive its run: the event row references it). Later
+   * give-ups while it stays failing post nothing, until a delivered attempt clears the flag. The warning
+   * names the webhook and what the receiver answered, never its URL or secret, and is skipped for a
+   * `runner.warning` delivery: a webhook subscribed to those would otherwise warn about its own warnings.
+   */
+  function markFailing(
+    tx: Tx,
+    row: Due,
+    status: number | null,
+    error: string | null,
+    at: string,
+    attempts: number,
+  ) {
+    const flipped =
+      tx
+        .update(webhooks)
+        .set({ failingSince: at })
+        .where(
+          and(eq(webhooks.id, row.webhookId), isNull(webhooks.failingSince)),
+        )
+        .run().changes > 0;
+    if (!flipped || row.event.type === "runner.warning") return;
+    const last =
+      status === null ? (errorKind(error) ?? "error") : `status ${status}`;
+    recordEvent(tx, row.event.runId, "runner.warning", {
+      message: `webhook ${row.webhookId} gave up delivering evt_${row.event.id} after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}; last result: ${last}`,
+    });
+  }
+
   async function attempt(row: Due): Promise<void> {
     const { event } = row;
     const id = `evt_${event.id}` as const;
@@ -344,6 +412,7 @@ export function createDispatcher({
             now().getTime() + (retryAfter ?? retryDelayMs(attempts, random())),
           ).toISOString();
     const holdUntil = status === 429 ? nextAttemptAt : undefined;
+    const at = now().toISOString();
     db.transaction((tx) => {
       tx.update(webhookDeliveries)
         .set({
@@ -351,10 +420,18 @@ export function createDispatcher({
           attempts,
           lastStatus: status,
           lastError: error,
+          lastAttemptAt: at,
           ...(nextAttemptAt ? { nextAttemptAt } : {}),
         })
         .where(eq(webhookDeliveries.id, row.id))
         .run();
+      if (delivered) {
+        tx.update(webhooks)
+          .set({ failingSince: null })
+          .where(eq(webhooks.id, row.webhookId))
+          .run();
+      }
+      if (failed) markFailing(tx, row, status, error, at, attempts);
       if (!holdUntil) return;
       tx.update(webhookDeliveries)
         .set({ nextAttemptAt: holdUntil })

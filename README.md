@@ -137,7 +137,8 @@ sky env delete web --yes        # the same without asking; required off a termin
 sky webhook add https://example.com/hook --events=run.waiting,run.finished   # a Sky-format webhook
 sky webhook add https://example.com/hook --events=run.waiting --format=standard --secret=@secret.txt --env=web
 sky webhook add https://example.com/hook --events=run.waiting --format=openbot --secret=@secret.txt --env=web
-sky webhook list                # id, format, url, event types and environments; secrets are never printed
+sky webhook list                # id, format, url, event types and environments, then the last attempt and a FAILING flag; secrets are never printed
+sky webhook deliveries whk_…    # newest deliveries first (--limit=<1-100>, --cursor=<from the last page>)
 sky webhook delete whk_…
 sky key create <name> --role=runs --env=web,api   # admin only: a key limited to those environments; prints the secret once
 sky key list
@@ -463,6 +464,7 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | `POST /v1/agents/:id/stop` · `…/archive`                                | stop the current run; archive the agent                |
 | `POST`, `GET`, `DELETE /v1/agents/:id/preview`                          | start, read and stop the agent's [preview](#previews)  |
 | `POST`, `GET /v1/webhooks` · `GET`, `DELETE /v1/webhooks/:id`           | subscribe an https URL to events; list, read, remove   |
+| `GET /v1/webhooks/:id/deliveries`                                       | a webhook's recent deliveries and their results        |
 | `POST`, `GET /v1/keys` · `DELETE /v1/keys/:id`                          | admin only: mint, list and revoke `runs` keys          |
 | `GET /v1/claude-credentials`                                            | admin only: the Claude credentials, by name            |
 
@@ -601,11 +603,20 @@ Three ways to receive them:
 
 - **MCP:** `wait_for_events`, above.
 - **Stream:** `GET /v1/stream`, one SSE connection across every agent. Filter with `?types=claude.PostToolUse,run.waiting` and `?agentId=`. After a drop, reconnect with `Last-Event-ID` to receive what you missed. A `: ping` arrives every 15 seconds. When the server restarts, the stream ends with an `event: server.shutdown` frame whose `id` is your resume point and whose `retry: 2000` asks you to reconnect in 2 seconds; `EventSource` does this on its own. `GET /v1/events?after=&wait=` is the same feed as a long poll.
-- **Webhooks:** `POST /v1/webhooks` (or `sky webhook add`) with an `https` URL and the `eventTypes` you want. A failed delivery is retried with backoff, up to 30 attempts, and a `429` holds the webhook until its `Retry-After`. Two optional fields:
+- **Webhooks:** `POST /v1/webhooks` (or `sky webhook add`) with an `https` URL and the `eventTypes` you want. A failed delivery is retried with backoff, up to 30 attempts (a refused one, below, is not retried), and a `429` holds the webhook until its `Retry-After`. Two optional fields:
   - `format`: `"sky"` (the default), `"standard"` or `"openbot"`, below.
   - `environmentIds`: a non-empty array of environment ids. The webhook then receives only events from agents in those environments; an id that doesn't exist is `400 invalid_body`. Left out, it receives every environment's events. An environment a webhook filters on can't be deleted until that webhook is (`409 webhooks_filter`).
 
-  `GET /v1/webhooks` returns each webhook's `format` and `environmentIds` when set. A secret is never returned.
+  `GET /v1/webhooks` returns each webhook's `format` and `environmentIds` when set. A secret is never returned. Once a webhook has had a delivery attempt it also carries, so a receiver that answers 401 on every try shows up here and not only in the server logs:
+  - `lastAttempt`: `at` (when it ran), `status` (the HTTP status, or `null` when the receiver never answered), `error` (why there was no response: `timeout`, `connection_refused`, `connection_reset`, `dns`, `tls`, `blocked_address` or `url_not_allowed` (a refused URL or private address, which fails at once without retries), or `other`; `null` when there was one) and `attempt` (the attempt number within its delivery, from 1).
+  - `failedStreak`: how many deliveries in a row, since the last delivered one, ended failed or are still retrying after a failed attempt.
+  - `failing`: `true` once a delivery gave up, after its 30th attempt or at once when refused, until the webhook's next delivered one clears it. Absent otherwise.
+
+  `lastAttempt` and `failedStreak` are absent until the webhook has an attempt on record, and `failing` is absent unless set; all three are optional, so older clients ignore them. `sky webhook list` prints them after the webhook, such as `| FAILING, last 401 at 2026-11-21T09:30:00.000Z (attempt 30), 13 failed in a row`.
+
+  `GET /v1/webhooks/:id/deliveries` (or `sky webhook deliveries <id>`) lists the webhook's deliveries, newest first, 20 by default and at most 100 (`?limit=`, or `--limit`). When older ones remain the page carries a `nextCursor`; pass it back as `?cursor=` (or `--cursor`). Each delivery has `id`, `eventType`, `runId`, `status` (`pending`, `delivered` or `failed`), `attempts`, `lastStatus`, `lastError` (redacted) with its `lastErrorKind`, and `createdAt`, `lastAttemptAt` and `nextAttemptAt` (only while pending). The request body, headers, signature and secret are never included. A `runs` key reads the deliveries of its own webhooks only; another's is `404 not_found`.
+
+  When a delivery's give-up makes the webhook `failing`, the run it was for also gets a `runner.warning` event naming the webhook id, the event and the last status or error kind, never its URL or secret. That is once per stretch of failing: later give-ups post nothing until a delivered attempt clears `failing`, and the next give-up after that warns again. A webhook subscribed to `runner.warning` whose own warning delivery gives up is flagged but not warned about again.
 
   **Refused URLs.** A webhook URL must be `https` on the default port (443), must not carry a username or password, and must name a public host. `POST /v1/webhooks` answers `400 url_not_allowed` for `localhost` and names under it, names ending in `.internal`, `.flycast`, `.local` or `.home.arpa`, single-label names, and addresses in private, loopback, link-local, unique-local (including Fly's private `fdaa::/16`), shared, multicast and reserved ranges. The IPv6 forms refused are IPv4-mapped (`::ffff:0:0/96`) and IPv4-compatible (`::/96`) addresses, 6to4 (`2002::/16`), Teredo (`2001::/32`), discard (`100::/64`), benchmarking (`2001:2::/48`), documentation (`2001:db8::/32`) and local-use NAT64 (`64:ff9b:1::/48`) addresses, and NAT64 `64:ff9b::/96` addresses whose embedded IPv4 address is in a refused range. A URL whose host carries a zone id (`https://[fe80::1%25eth0]/hook`) does not parse, so `POST /v1/webhooks` answers `400 invalid_body` for it. Sky also resolves the host when it connects and refuses the delivery if any resolved address is in one of those ranges or carries a zone id, so a public name that points at a private address is refused too. A refused delivery is marked `failed` at once and is not retried. Its error is `blocked_address` when the host or its address is refused, and `url_not_allowed` when a stored URL fails for its scheme, port or credentials. Addresses and ports never appear in a delivery's error text; they are replaced with `<addr>`.
 
