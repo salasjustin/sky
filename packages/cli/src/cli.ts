@@ -28,6 +28,7 @@ export interface Io {
     prompt(prompt: string): Promise<string>;
   };
   sleep(ms: number): Promise<void>;
+  /** Wall-clock epoch ms: `admin drain --wait` compares it to the API's deadline. */
   now(): number;
   /** From return until the returned disarm runs, SIGINT or SIGTERM writes `stdout` (when given) to stdout and `sky: <note>` to stderr before the process dies by that signal; arm before printing anything that invites a Ctrl-C. */
   onInterrupt(note: string, stdout?: string): () => void;
@@ -124,9 +125,13 @@ const help = (io: Io) => `Usage:
       API starts them too. Prints "<draining|idle> deadline=<time|->
       active=<n> held=<n> ready=<yes|no>" and, while runs are active, a
       line "active <run ids>". --wait polls until nothing is starting or
-      running and exits 0; at the deadline it exits 4 with the run ids
-      still active, leaving the drain on. --status only reports. Needs the
-      admin key.
+      running while the drain is still on and exits 0. It stops polling
+      just before the deadline the API gives and exits 4 with the run ids
+      still active; it exits 4 too as soon as it finds the drain ended
+      early (a --cancel, a restart). Either way the drain is over and its
+      held launches start. It exits 1 when the drain can't be started or
+      its status read (the API unreachable, an error answer). --status
+      only reports. Needs the admin key.
   sky key create <name> --env=<id|name>,... [--role=runs] [options]
       Issue an API key that can run agents only in those environments.
       --env repeats or takes a comma list. Names are resolved to ids when
@@ -260,7 +265,8 @@ Exit status: 0 done; 1 failed (API error, including a key not allowed the
   inbox, wait and status exit with the newest run's state:
   0 finished; 3 waiting (needs input); 4 queued, starting or running
   (wait: timed out); 5 failed; 6 stopped
-  admin drain --wait exits 4 when runs were still active at the deadline
+  admin drain --wait exits 4 when the drain ended, at its deadline or
+  earlier, before it saw the runs finish
 `;
 
 const commonOptions = {

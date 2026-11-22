@@ -7,10 +7,16 @@ import { type Api, ApiError } from "./api.js";
 import type { Io } from "./cli.js";
 import { type Output, UsageError } from "./output.js";
 
-/** Exit status of `drain --wait` when runs were still active at the deadline; 1 is for an API it couldn't reach. */
+/**
+ * Exit status of `drain --wait` when the drain ended before the wait saw its runs finish: at its
+ * deadline, or earlier by a --cancel or an API restart. 1 is a drain that couldn't be started or whose status
+ * couldn't be read (an API it couldn't reach, an error answer); a rejected key is 2.
+ */
 export const DRAIN_TIMED_OUT = 4;
 
 const pollIntervalMs = 5_000;
+/** The last poll lands this long before the API's deadline: at it, the drain has ended and its held launches are starting. */
+const lastPollMarginMs = 1_000;
 
 export type DrainValues = {
   timeout?: string;
@@ -93,10 +99,15 @@ export function prepareAdmin(
 
 const isTransient = (err: ApiError) => err.status === 0 || err.status >= 500;
 
+const stillActive = (d: DrainStatus) =>
+  `${d.active.length} run${d.active.length === 1 ? "" : "s"} still active`;
+
 /**
- * Polls until nothing is starting or running: 0, with the final status. At the deadline it prints
- * the runs still active and exits `DRAIN_TIMED_OUT`. An API that stops answering is retried until
- * the deadline, then reported as unreachable (exit 1), since it says nothing of the runs.
+ * Polls until nothing is starting or running while the drain is still on: 0, with the final status.
+ * Polling stops just before the deadline `first` gives, the API's own; then it prints the runs still
+ * active and exits `DRAIN_TIMED_OUT`, as it does at once for a status showing the drain already
+ * ended. An API that stops answering is retried until that deadline, then reported as an error
+ * (exit 1), since it says nothing of the runs.
  */
 async function waitUntilReady(
   api: Api,
@@ -105,12 +116,22 @@ async function waitUntilReady(
   io: Io,
   out: Output,
 ): Promise<number> {
-  const deadline = io.now() + timeoutS * 1000;
+  const deadline =
+    first.deadline === null
+      ? io.now()
+      : Date.parse(first.deadline) - lastPollMarginMs;
   let latest = first;
   let lastError: ApiError | undefined;
   let announced = -1;
   for (;;) {
     if (lastError === undefined) {
+      if (!latest.draining) {
+        io.stderr(
+          `sky: the drain ended before the runs finished${latest.active.length > 0 ? `; ${stillActive(latest)}: ${latest.active.join(" ")}` : ""}\n`,
+        );
+        out.result(latest, statusLine(latest));
+        return DRAIN_TIMED_OUT;
+      }
       if (latest.ready) {
         out.result(latest, statusLine(latest));
         return 0;
@@ -135,7 +156,7 @@ async function waitUntilReady(
   }
   if (lastError !== undefined) throw lastError;
   io.stderr(
-    `sky: ${latest.active.length} run${latest.active.length === 1 ? "" : "s"} still active after ${timeoutS}s: ${latest.active.join(" ")}\n`,
+    `sky: ${stillActive(latest)} after ${timeoutS}s: ${latest.active.join(" ")}\n`,
   );
   out.result(latest, statusLine(latest));
   return DRAIN_TIMED_OUT;

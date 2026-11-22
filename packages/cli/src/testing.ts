@@ -24,11 +24,13 @@ export async function runCli(
     env?: Record<string, string | undefined>;
     stdin?: Partial<Io["stdin"]>;
     stderrIsTTY?: boolean;
+    /** Epoch ms the fake clock starts at, for code that compares it to a server timestamp. */
+    clockStart?: number;
   } = {},
 ): Promise<Captured> {
   let stdout = "";
   let stderr = "";
-  let clock = 0;
+  let clock = opts.clockStart ?? 0;
   const sleeps: number[] = [];
   const armed = new Set<string>();
   const interruptNotes = new Set<string>();
