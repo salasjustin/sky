@@ -13,8 +13,9 @@ permissions:
   contents: read
 
 concurrency:
-  # the group binds before the job's `if:`, so a skipped branch run would still displace a pending main deploy
-  group: ${{ github.ref == 'refs/heads/main' && 'deploy-sky' || github.run_id }}
+  # repeats the job's `if:`: the group binds before it, and under workflow_run github.ref is always main, so a
+  # failed, cancelled or pull-request CI run would otherwise join deploy-sky and cancel the deploy pending there
+  group: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && 'deploy-sky' || github.run_id }}
   cancel-in-progress: false
 
 jobs:
