@@ -605,27 +605,31 @@ test("cancelling a drain, or starting a new one, clears the re-armed deadline ti
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const realNow = Date.now();
   const clock = vi.spyOn(Date, "now").mockReturnValue(realNow);
-  expect(vi.getTimerCount()).toBe(0);
+  try {
+    expect(vi.getTimerCount()).toBe(0);
 
-  // an early fire leaves the timer set again for the 5 ms that are left
-  await startDrain({ timeoutSeconds: 60 });
-  clock.mockReturnValue(realNow + 59_995);
-  await vi.advanceTimersByTimeAsync(60_000);
-  expect(vi.getTimerCount()).toBe(1);
+    // an early fire leaves the timer set again for the 5 ms that are left
+    await startDrain({ timeoutSeconds: 60 });
+    clock.mockReturnValue(realNow + 59_995);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(vi.getTimerCount()).toBe(1);
 
-  // cancelling leaves none to fire a release afterwards
-  expect((await call("DELETE", "/v1/admin/drain")).status).toBe(200);
-  expect(vi.getTimerCount()).toBe(0);
+    // cancelling leaves no timer behind
+    expect((await call("DELETE", "/v1/admin/drain")).status).toBe(200);
+    expect(vi.getTimerCount()).toBe(0);
 
-  // and a new drain replaces the re-armed timer of the one before it instead of adding to it
-  clock.mockReturnValue(realNow);
-  await startDrain({ timeoutSeconds: 60 });
-  clock.mockReturnValue(realNow + 59_995);
-  await vi.advanceTimersByTimeAsync(60_000);
-  expect(vi.getTimerCount()).toBe(1);
-  await startDrain({ timeoutSeconds: 120 });
-  expect(vi.getTimerCount()).toBe(1);
-  clock.mockRestore();
+    // and a new drain replaces the re-armed timer of the one before it instead of adding to it
+    clock.mockReturnValue(realNow);
+    await startDrain({ timeoutSeconds: 60 });
+    clock.mockReturnValue(realNow + 59_995);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(vi.getTimerCount()).toBe(1);
+    await startDrain({ timeoutSeconds: 120 });
+    expect(vi.getTimerCount()).toBe(1);
+  } finally {
+    // a red run must not leave a frozen Date.now for the tests after it
+    clock.mockRestore();
+  }
 });
 
 test("held launches are released oldest first by createdAt, not by insertion order", async () => {
