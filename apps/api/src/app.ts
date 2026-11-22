@@ -5,6 +5,7 @@ import { createMcpHandler } from "@sky/mcp";
 import { HTTPException } from "hono/http-exception";
 import { logger } from "hono/logger";
 import { accountEventRoutes } from "./account-events.js";
+import { adminRoutes } from "./admin.js";
 import { agentRoutes } from "./agents.js";
 import { apiKeyGuard } from "./auth.js";
 import { createBranchChecker } from "./branch-check.js";
@@ -118,6 +119,10 @@ export function createApp({
     runnerExitBackoffMs,
     wake: (runId, spriteName) => wakeLaunch(spriteOps, runId, spriteName, log),
   });
+  // a drain lives in one process, so launches a previous one held are released as this one comes up
+  const released = launcher.releaseQueued();
+  if (released > 0)
+    log(`released ${released} launches held before the restart`);
   const checkBranch = createBranchChecker({
     db,
     secretEncryptionKey: config.secretEncryptionKey,
@@ -162,6 +167,7 @@ export function createApp({
         previews,
       ),
     )
+    .route("/admin", adminRoutes(launcher))
     .route("/webhooks", webhookRoutes())
     .route("/keys", keyRoutes())
     .route("/claude-credentials", claudeCredentialRoutes())

@@ -271,7 +271,7 @@ export const runs = sqliteTable(
     index("runs_agent_id_created_at").on(t.agentId, t.createdAt),
     check(
       "runs_status",
-      sql`${c(t.status)} in ('starting', 'running', 'waiting', 'finished', 'failed', 'stopped')`,
+      sql`${c(t.status)} in ('queued', 'starting', 'running', 'waiting', 'finished', 'failed', 'stopped')`,
     ),
     check(
       "runs_usage",

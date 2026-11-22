@@ -917,7 +917,7 @@ test("--help documents the run-state exit codes", async () => {
     const r = await runCli(argv);
     expect(r.code, argv.join(" ")).toBe(0);
     expect(r.stdout).toMatch(
-      /0 finished; 3 waiting \(needs input\); 4 starting or running \(wait: timed\s+out\); 5 failed; 6 stopped/,
+      /0 finished; 3 waiting \(needs input\); 4 queued, starting or running\s+\(wait: timed out\); 5 failed; 6 stopped/,
     );
   }
 });

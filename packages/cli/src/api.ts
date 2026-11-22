@@ -3,6 +3,7 @@ import {
   ApiKey,
   ClaudeCredentialSummary,
   CreatedApiKey,
+  DrainStatus,
   Environment,
   type KeyInput,
   PluginRefresh,
@@ -520,6 +521,25 @@ export function createApi(config: Config) {
         `/v1/keys/${encodeURIComponent(id)}`,
       );
       return parseKey(ApiKey, status, json, "a revoked key");
+    },
+    /** Admin only: starts holding new launches, or moves the deadline of a drain already on. */
+    async startDrain(timeoutSeconds?: number): Promise<DrainStatus> {
+      const { status, json } = await request(
+        "POST",
+        "/v1/admin/drain",
+        timeoutSeconds === undefined ? {} : { timeoutSeconds },
+      );
+      return parseKey(DrainStatus, status, json, "a drain");
+    },
+    /** Admin only. */
+    async getDrain(): Promise<DrainStatus> {
+      const { status, json } = await request("GET", "/v1/admin/drain");
+      return parseKey(DrainStatus, status, json, "a drain");
+    },
+    /** Admin only: ends the drain and releases what it held; succeeds when none is on. */
+    async cancelDrain(): Promise<DrainStatus> {
+      const { status, json } = await request("DELETE", "/v1/admin/drain");
+      return parseKey(DrainStatus, status, json, "a drain");
     },
     /** Admin only. Names, kinds, assignments, limits and counts; the API has no value to send. */
     async listClaudeCredentials(): Promise<ClaudeCredentialSummary[]> {

@@ -4,6 +4,7 @@ import {
   API_KEY_CREDENTIAL,
   type AutoApprove,
   type BaseProfile,
+  type DrainStatus,
   EnvironmentId,
   POOL_CREDENTIAL,
   REPO_LOCK_FILE,
@@ -11,7 +12,18 @@ import {
   RunId,
   spriteTaskNameFor,
 } from "@sky/shared";
-import { and, eq, gte, isNotNull, lt, ne } from "drizzle-orm";
+import {
+  and,
+  asc,
+  count,
+  eq,
+  gte,
+  inArray,
+  isNotNull,
+  lt,
+  ne,
+  sql,
+} from "drizzle-orm";
 import { z } from "zod";
 import { mintAgentToken } from "./agent-token.js";
 import { runEnv } from "./base-profile.js";
@@ -60,6 +72,7 @@ import {
   type Tx,
 } from "./runs.js";
 import {
+  extendRunEnvVars,
   hasConnectorSecret,
   isReservedName,
   openEnvSecrets,
@@ -1185,7 +1198,7 @@ export function createLauncher({
           .values({
             id: retryId,
             agentId: found.id,
-            status: "starting",
+            status: api.entryStatus(),
             // set by the launch once it settles on one: `target` may be refused there
             claudeCredential: null,
             retryOf: failedId,
@@ -1260,87 +1273,248 @@ export function createLauncher({
         skipRetry(failedId, "not retried: its agent was stopped");
       }
     },
+    /**
+     * Launches the run, or, when its row says `queued` (see `entryStatus`), holds its launch until
+     * the drain ends.
+     */
     start(launch: Launch): void {
-      const now = Date.now();
-      for (const [id, held] of launches) {
-        if (now - held.at > REMEMBER_LAUNCH_MS) launches.delete(id);
+      if (!isQueued(launch.runId)) {
+        begin(launch);
+        return;
       }
-      launches.set(launch.runId, { launch, at: now });
-      // what a retry needs survives a restart; rows past the bound drop theirs. A write that fails
-      // only loses that: the run's row is already committed, and a throw here would leave it in
-      // `starting` with no runner
-      try {
-        storeLaunch(db, config.secretEncryptionKey, launch.runId, {
-          launch,
-          at: now,
-        });
-        db.update(runs)
-          .set(NO_LAUNCH)
-          .where(
-            and(
-              isNotNull(runs.launchCiphertext),
-              lt(
-                runs.createdAt,
-                new Date(now - REMEMBER_LAUNCH_MS).toISOString(),
-              ),
-            ),
-          )
-          .run();
-      } catch (err) {
-        log(
-          `keeping the launch of ${launch.runId} for a retry failed; a restart before it ends loses the retry: ${err}`,
-        );
-      }
-      const agentToken = mintAgentToken(config.apiKey, launch.runId);
-      run(launch, agentToken)
-        .catch(async (err: unknown) => {
-          // no sprite to blame: the launch never reached one
-          if (err instanceof ClaudeCredentialError) throw err;
-          await failEnvIfSpriteGone(launch).catch((checkErr: unknown) => {
-            log(
-              `checking whether the sprite of environment ${launch.envId} exists failed: ${checkErr}`,
-            );
-          });
-          // rethrown: the next catch still fails the run
-          throw err;
-        })
-        .catch((err: unknown) => {
-          const message = err instanceof Error ? err.message : String(err);
-          // the SDK's socket errors quote the session URL, which carries the env, and a sprite's
-          // stderr can echo any live run's token. This run's own is listed too: it may have ended
-          const known = [
-            ...secrets.values(),
-            agentToken,
-            ...liveAgentTokens(db, config.apiKey),
-          ];
-          const stored = eventText(message, known);
-          log(`launching ${launch.runId} failed: ${stored}`);
-          const ended = db.transaction(
-            (tx) => {
-              return failRun(
-                tx,
-                launch.runId,
-                // already worded as a run error, with its own code
-                err instanceof LowMemoryError ||
-                  err instanceof ClaudeCredentialError
-                  ? stored
-                  : `launch_failed: ${stored}`,
-              );
-            },
-            { behavior: "immediate" },
-          );
-          nudgeDeliveries();
-          // best effort, not awaited: a sprite that can't be reached is logged by `signalRunner`.
-          // A run something else already ended had its runner signalled there; a second SIGTERM kills it
-          if (maybeStarted.delete(launch.runId) && ended) {
-            void signalRunner(sprites, launch.spriteName, launch.runId, log);
-          }
-        })
-        .catch((err: unknown) => {
-          log(`launching ${launch.runId} could not record its outcome: ${err}`);
-        });
+      hold(launch);
+      // a drain cancelled between the run's insert and here has nobody left to release it
+      if (!draining()) releaseQueued();
     },
+    /** The status a run is inserted with: `queued` while the API drains, else `starting`. */
+    entryStatus: (): "queued" | "starting" =>
+      draining() ? "queued" : "starting",
+    /**
+     * Starts holding new launches, for `timeoutMs`; a drain already on keeps its start and takes the
+     * new deadline.
+     */
+    startDrain(timeoutMs: number): DrainStatus {
+      const now = Date.now();
+      drainState = {
+        since: drainState?.since ?? now,
+        deadline: now + timeoutMs,
+      };
+      if (drainTimer) clearTimeout(drainTimer);
+      drainTimer = setTimeout(() => void draining(), timeoutMs);
+      drainTimer.unref();
+      log(`draining: new launches are held until ${iso(drainState.deadline)}`);
+      return drainStatus();
+    },
+    /** Ends the drain and releases the held launches; false when none was on. */
+    endDrain(): boolean {
+      const was = draining();
+      if (was) finishDrain("cancelled");
+      return was;
+    },
+    drainStatus,
+    /** Starts every held launch, oldest first; the boot calls this for the launches a previous process held. */
+    releaseQueued,
   };
+
+  const iso = (ms: number) => new Date(ms).toISOString();
+  // in memory only: a restart ends the drain, and the boot releases what it held
+  let drainState: { since: number; deadline: number } | undefined;
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Whether a drain is on, ending one whose deadline has passed. */
+  function draining(): boolean {
+    if (drainState && Date.now() >= drainState.deadline) {
+      finishDrain("reached its deadline");
+    }
+    return drainState !== undefined;
+  }
+
+  function finishDrain(why: string): void {
+    drainState = undefined;
+    if (drainTimer) clearTimeout(drainTimer);
+    drainTimer = undefined;
+    const released = releaseQueued();
+    log(`drain ${why}: released ${released} held launches`);
+  }
+
+  function drainStatus(): DrainStatus {
+    const on = draining() ? drainState : undefined;
+    const active = db
+      .select({ id: runs.id })
+      .from(runs)
+      .where(inArray(runs.status, ["starting", "running"]))
+      .orderBy(asc(runs.createdAt))
+      .all()
+      .map((r) => r.id);
+    const held = db
+      .select({ n: count() })
+      .from(runs)
+      .where(eq(runs.status, "queued"))
+      .get();
+    return {
+      draining: on !== undefined,
+      since: on ? iso(on.since) : null,
+      deadline: on ? iso(on.deadline) : null,
+      active,
+      held: held?.n ?? 0,
+      ready: active.length === 0,
+    };
+  }
+
+  const isQueued = (runId: RunId) =>
+    db
+      .select({ id: runs.id })
+      .from(runs)
+      .where(and(eq(runs.id, runId), eq(runs.status, "queued")))
+      .get() !== undefined;
+
+  /** Keeps a queued run's launch, in memory and sealed on its row so a restart still has it. */
+  function hold(launch: Launch): void {
+    const now = Date.now();
+    launches.set(launch.runId, { launch, at: now });
+    try {
+      storeLaunch(db, config.secretEncryptionKey, launch.runId, {
+        launch,
+        at: now,
+      });
+    } catch (err) {
+      log(
+        `keeping the held launch of ${launch.runId} failed; a restart before its release fails it: ${err}`,
+      );
+    }
+    log(`holding ${launch.runId}: the API is draining`);
+  }
+
+  /**
+   * Moves every queued run to `starting`, oldest first, and launches it as a fresh launch would be.
+   * Its clock restarts, so the launch deadline counts from the release, not from the hold. A run
+   * whose launch can't be read fails, rather than sit queued. Returns how many it released.
+   */
+  function releaseQueued(): number {
+    const queued = db
+      .select({ id: runs.id })
+      .from(runs)
+      .where(eq(runs.status, "queued"))
+      .orderBy(asc(runs.createdAt), sql`${runs}.rowid`)
+      .all();
+    let released = 0;
+    for (const { id } of queued) {
+      const claimed = db.transaction(
+        (tx) => {
+          const moved = tx
+            .update(runs)
+            .set({ status: "starting", createdAt: new Date().toISOString() })
+            .where(and(eq(runs.id, id), eq(runs.status, "queued")))
+            .run();
+          if (moved.changes === 0) return false;
+          extendRunEnvVars(tx, id, RETRY_ENV_VARS_TTL_S);
+          return true;
+        },
+        { behavior: "immediate" },
+      );
+      if (!claimed) continue;
+      released++;
+      const held =
+        launches.get(id) ?? readLaunch(db, config.secretEncryptionKey, id);
+      if (!held) {
+        db.transaction(
+          (tx) =>
+            failRun(
+              tx,
+              id,
+              "launch_failed: the launch held while the API drained could not be read after it",
+            ),
+          { behavior: "immediate" },
+        );
+        nudgeDeliveries();
+        continue;
+      }
+      begin(held.launch);
+    }
+    return released;
+  }
+
+  /** Launches the run in the background; the rest of what `start` does once it is not held. */
+  function begin(launch: Launch): void {
+    const now = Date.now();
+    for (const [id, held] of launches) {
+      if (now - held.at > REMEMBER_LAUNCH_MS) launches.delete(id);
+    }
+    launches.set(launch.runId, { launch, at: now });
+    // what a retry needs survives a restart; rows past the bound drop theirs. A write that fails
+    // only loses that: the run's row is already committed, and a throw here would leave it in
+    // `starting` with no runner
+    try {
+      storeLaunch(db, config.secretEncryptionKey, launch.runId, {
+        launch,
+        at: now,
+      });
+      db.update(runs)
+        .set(NO_LAUNCH)
+        .where(
+          and(
+            isNotNull(runs.launchCiphertext),
+            lt(
+              runs.createdAt,
+              new Date(now - REMEMBER_LAUNCH_MS).toISOString(),
+            ),
+          ),
+        )
+        .run();
+    } catch (err) {
+      log(
+        `keeping the launch of ${launch.runId} for a retry failed; a restart before it ends loses the retry: ${err}`,
+      );
+    }
+    const agentToken = mintAgentToken(config.apiKey, launch.runId);
+    run(launch, agentToken)
+      .catch(async (err: unknown) => {
+        // no sprite to blame: the launch never reached one
+        if (err instanceof ClaudeCredentialError) throw err;
+        await failEnvIfSpriteGone(launch).catch((checkErr: unknown) => {
+          log(
+            `checking whether the sprite of environment ${launch.envId} exists failed: ${checkErr}`,
+          );
+        });
+        // rethrown: the next catch still fails the run
+        throw err;
+      })
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        // the SDK's socket errors quote the session URL, which carries the env, and a sprite's
+        // stderr can echo any live run's token. This run's own is listed too: it may have ended
+        const known = [
+          ...secrets.values(),
+          agentToken,
+          ...liveAgentTokens(db, config.apiKey),
+        ];
+        const stored = eventText(message, known);
+        log(`launching ${launch.runId} failed: ${stored}`);
+        const ended = db.transaction(
+          (tx) => {
+            return failRun(
+              tx,
+              launch.runId,
+              // already worded as a run error, with its own code
+              err instanceof LowMemoryError ||
+                err instanceof ClaudeCredentialError
+                ? stored
+                : `launch_failed: ${stored}`,
+            );
+          },
+          { behavior: "immediate" },
+        );
+        nudgeDeliveries();
+        // best effort, not awaited: a sprite that can't be reached is logged by `signalRunner`.
+        // A run something else already ended had its runner signalled there; a second SIGTERM kills it
+        if (maybeStarted.delete(launch.runId) && ended) {
+          void signalRunner(sprites, launch.spriteName, launch.runId, log);
+        }
+      })
+      .catch((err: unknown) => {
+        log(`launching ${launch.runId} could not record its outcome: ${err}`);
+      });
+  }
   return api;
 }
 

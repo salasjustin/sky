@@ -1438,8 +1438,10 @@ test("the refusal names the pending migrations, the sizes in MB and the fix, on 
   seedRun();
   insertEvents(200);
   const events = bytesOf("events");
-  const growth = Math.max(0, 2 * events - freePageBytes());
-  const needed = neededFor(2 * events);
+  // events is rebuilt by 0017 and 0018, runs by 0024
+  const copied = 2 * events + bytesOf("runs");
+  const growth = Math.max(0, copied - freePageBytes());
+  const needed = neededFor(copied);
   const free = needed - 1;
 
   let message = "";
@@ -1449,7 +1451,7 @@ test("the refusal names the pending migrations, the sizes in MB and the fix, on 
     message = err instanceof Error ? err.message : String(err);
   }
   expect(message).toBe(
-    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine, 0021_magical_klaw, 0022_aberrant_wolverine, 0023_tiny_madame_hydra needs ${mb(needed)} (${mb(2 * events)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
+    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine, 0021_magical_klaw, 0022_aberrant_wolverine, 0023_tiny_madame_hydra, 0024_condemned_wild_pack needs ${mb(needed)} (${mb(copied)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
   );
 });
 
@@ -1457,7 +1459,7 @@ test("two pending rebuilds of one table are charged twice, since drizzle runs th
   migrateThrough("0016_silly_jetstream");
   seedRun();
   insertEvents(200);
-  const needed = neededFor(2 * bytesOf("events"));
+  const needed = neededFor(2 * bytesOf("events") + bytesOf("runs"));
 
   expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
     /not enough free disk space/,
@@ -1475,8 +1477,9 @@ test("migrate counts free pages as room already in the file, so they shrink what
   // part of the copy, not all of it, fits in the free pages
   expect(freePageBytes()).toBeGreaterThan(0);
   expect(freePageBytes()).toBeLessThan(events);
-  const needed = neededFor(events);
-  expect(needed).toBeLessThan(2 * events + MIGRATION_MARGIN_BYTES);
+  const copied = events + bytesOf("runs");
+  const needed = neededFor(copied);
+  expect(needed).toBeLessThan(2 * copied + MIGRATION_MARGIN_BYTES);
 
   expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
     /not enough free disk space/,
@@ -1489,7 +1492,7 @@ test("live data in tables no pending migration rebuilds isn't charged", () => {
   filler(2000);
   const events = bytesOf("events");
   expect(bytesOf("filler")).toBeGreaterThan(10 * events);
-  const needed = neededFor(events);
+  const needed = neededFor(events + bytesOf("runs"));
 
   expect(() => migrate(db, { freeBytes: () => needed })).not.toThrow();
   expect(count("filler")).toBe(2000);

@@ -169,6 +169,13 @@
       "when": 1795255582803,
       "tag": "0023_tiny_madame_hydra",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1795322237579,
+      "tag": "0024_condemned_wild_pack",
+      "breakpoints": true
     }
   ]
 }

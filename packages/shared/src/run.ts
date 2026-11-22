@@ -2,6 +2,7 @@ import { z } from "zod";
 import { AgentId, RunId } from "./ids.js";
 
 export const RunStatus = z.enum([
+  "queued",
   "starting",
   "running",
   "waiting",
@@ -11,8 +12,12 @@ export const RunStatus = z.enum([
 ]);
 export type RunStatus = z.infer<typeof RunStatus>;
 
-/** Every legal run status change; `finished`, `failed` and `stopped` are terminal. */
+/**
+ * Every legal run status change; `finished`, `failed` and `stopped` are terminal. A `queued` run is a
+ * launch held while the API drains: it becomes `starting` when released.
+ */
 export const runTransitions = {
+  queued: ["starting", "failed", "stopped"],
   starting: ["running", "failed", "stopped"],
   running: ["waiting", "finished", "failed", "stopped"],
   waiting: ["running", "failed", "stopped"],

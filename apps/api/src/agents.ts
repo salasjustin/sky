@@ -486,7 +486,7 @@ export function agentRoutes(
             .get();
           const run = tx
             .insert(runs)
-            .values({ id: runId, agentId, status: "starting" })
+            .values({ id: runId, agentId, status: launcher.entryStatus() })
             .returning()
             .get();
           storeRunEnvVars(
@@ -592,7 +592,7 @@ export function agentRoutes(
           }
           const run = tx
             .insert(runs)
-            .values({ id: runId, agentId: id, status: "starting" })
+            .values({ id: runId, agentId: id, status: launcher.entryStatus() })
             .returning()
             .get();
           storeRunEnvVars(

@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import { prepareAdmin } from "./admin.js";
 import { type AgentCommand, agentCommands } from "./agent.js";
 import { type Api, ApiError, createApi } from "./api.js";
 import { apply } from "./apply.js";
@@ -112,6 +113,20 @@ const help = (io: Io) => `Usage:
       its own webhooks' deliveries.
   sky webhook delete <id> [options]
       Remove a webhook.
+  sky admin drain [--timeout=<seconds>] [--wait] [options]
+  sky admin drain --status [options]
+  sky admin drain --cancel [options]
+      Hold new launches (agent start, follow-up, a retry) as queued runs
+      while the runs already starting or running carry on; a run waiting
+      on an approval or an answer doesn't count. --timeout is how long the
+      drain lasts (1800 without it, at most 7200): at its end, or at
+      --cancel, the held launches start, oldest first. A restart of the
+      API starts them too. Prints "<draining|idle> deadline=<time|->
+      active=<n> held=<n> ready=<yes|no>" and, while runs are active, a
+      line "active <run ids>". --wait polls until nothing is starting or
+      running and exits 0; at the deadline it exits 4 with the run ids
+      still active, leaving the drain on. --status only reports. Needs the
+      admin key.
   sky key create <name> --env=<id|name>,... [--role=runs] [options]
       Issue an API key that can run agents only in those environments.
       --env repeats or takes a comma list. Names are resolved to ids when
@@ -145,7 +160,8 @@ const help = (io: Io) => `Usage:
       started without one), then the env name, last since it may contain
       spaces. An agent with no run yet shows - in their place.
       --env and --status repeat or take a comma list. States: starting,
-      running, waiting_approval, waiting_answer, finished, failed, stopped.
+      running, waiting_approval, waiting_answer, finished, failed, stopped
+      (queued is a launch held while the API drains).
       --archived lists archived agents too, not only live ones. --limit is
       at most 200 (50 without it); when more agents match, a note on stderr
       gives the --cursor for the next page, to pass with the same filters.
@@ -242,8 +258,9 @@ Exit status: 0 done; 1 failed (API error, including a key not allowed the
   command; provisioning failed); 2 usage or config error, a rejected API
   key included
   inbox, wait and status exit with the newest run's state:
-  0 finished; 3 waiting (needs input); 4 starting or running (wait: timed
-  out); 5 failed; 6 stopped
+  0 finished; 3 waiting (needs input); 4 queued, starting or running
+  (wait: timed out); 5 failed; 6 stopped
+  admin drain --wait exits 4 when runs were still active at the deadline
 `;
 
 const commonOptions = {
@@ -275,6 +292,8 @@ export async function run(io: Io): Promise<number> {
         return await runApply(rest, io);
       case "secret":
         return await runSecret(rest, io);
+      case "admin":
+        return await runAdmin(rest, io);
       default:
         if (Object.hasOwn(commands, command)) {
           return await runCommand(command, rest, io);
@@ -396,6 +415,28 @@ async function runSecret(args: string[], io: Io): Promise<number> {
   return await withApi(values, io, (api, out) =>
     secretSet(envRef, name, values.connector, api, io, out),
   );
+}
+
+// its own parse: --status here is a flag, where agent list's takes states
+async function runAdmin(args: string[], io: Io): Promise<number> {
+  const { values, positionals } = parse(args, {
+    ...commonOptions,
+    timeout: { type: "string" },
+    wait: { type: "boolean" },
+    status: { type: "boolean" },
+    cancel: { type: "boolean" },
+  });
+  if (values.help) {
+    io.stdout(help(io));
+    return 0;
+  }
+  const action = prepareAdmin(positionals, {
+    timeout: values.timeout,
+    wait: values.wait === true,
+    status: values.status === true,
+    cancel: values.cancel === true,
+  });
+  return await withApi(values, io, (api, out) => action(api, io, out));
 }
 
 const commands: Record<string, AgentCommand> = {

@@ -10,6 +10,7 @@ export type AgentStatus = z.infer<typeof AgentStatus>;
  * `waiting_answer`).
  */
 export const AgentState = z.enum([
+  "queued",
   "starting",
   "running",
   "waiting_approval",

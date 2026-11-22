@@ -48,6 +48,41 @@ jobs:
             -t "registry.fly.io/sky-justin:sha-${SHORT_SHA}" .
           docker push registry.fly.io/sky-justin:main
           docker push "registry.fly.io/sky-justin:sha-${SHORT_SHA}"
+      # holds new launches and waits for the runs in flight, so the restart doesn't cut one off; the
+      # held launches start on the new API's boot. Only a drain that times out stops the deploy: an API
+      # that can't be reached (the first deploy, or one that is down) is no reason to hold back a fix
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Drain the live API
+        timeout-minutes: 70
+        run: |
+          if [ -z "$SKY_API_KEY" ]; then
+            echo "SKY_ADMIN_KEY is not set; deploying without a drain"
+            exit 0
+          fi
+          if ! curl -fsS --max-time 30 -o "$RUNNER_TEMP/sky.mjs" "$SKY_URL/cli/sky.mjs"; then
+            echo "could not fetch the CLI from $SKY_URL; deploying without a drain"
+            exit 0
+          fi
+          status=0
+          node "$RUNNER_TEMP/sky.mjs" admin drain --wait --timeout=3600 || status=$?
+          case "$status" in
+            0)
+              echo "the live API is drained"
+              ;;
+            4)
+              echo "::error::runs were still active when the drain timed out; not deploying"
+              node "$RUNNER_TEMP/sky.mjs" admin drain --cancel || true
+              exit 1
+              ;;
+            *)
+              echo "the drain could not be started or watched (exit $status); deploying anyway"
+              ;;
+          esac
+        env:
+          SKY_URL: https://sky-justin.fly.dev
+          SKY_API_KEY: ${{ secrets.SKY_ADMIN_KEY }}
       - name: Deploy to Fly
         run: flyctl deploy -a sky-justin --image "registry.fly.io/sky-justin:sha-${DEPLOY_SHA::7}" --ha=false
         env:
