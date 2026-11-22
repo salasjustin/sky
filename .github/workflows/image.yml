@@ -1,12 +1,12 @@
 name: Image
 
 on:
-  # deploys a main commit only after CI has passed on it
+  # deploys a main commit only after CI has passed on it, and never over a newer commit already running
   workflow_run:
     workflows: [CI]
     types: [completed]
     branches: [main]
-  # a manual run redeploys main's tip as it stands, without checking its CI
+  # a manual run redeploys main's tip, and refuses it unless CI passed on that commit
   workflow_dispatch:
 
 permissions:
@@ -14,33 +14,77 @@ permissions:
 
 concurrency:
   # repeats the job's `if:`: the group binds before it, and under workflow_run github.ref is always main, so a
-  # failed, cancelled or pull-request CI run would otherwise join deploy-sky and cancel the deploy pending there
-  group: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && 'deploy-sky' || github.run_id }}
+  # failed, cancelled, pull-request or fork CI run would otherwise join deploy-sky and cancel the deploy pending there
+  group: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && 'deploy-sky' || github.run_id }}
+  # queued deploys run one after another, each re-reading what is running before it builds
   cancel-in-progress: false
 
 jobs:
   image:
-    # deploys prod and pushes the hardcoded :main tag, so a pull request's CI run, a failed CI run and a
-    # manual run from another branch must not get this far
+    # deploys prod and pushes the hardcoded :main tag, so a pull request's CI run, a failed CI run, a run of a
+    # fork's or another branch's commit and a manual run from another branch must not get this far
     if: >-
       (github.event_name == 'workflow_run'
         && github.event.workflow_run.event == 'push'
-        && github.event.workflow_run.conclusion == 'success')
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.head_branch == 'main'
+        && github.event.workflow_run.head_repository.full_name == github.repository)
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      # lets a manual run list CI's runs for the commit
+      actions: read
     env:
       # the commit CI checked, not whatever main points at when this run starts
       DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
+      - name: Require a passing CI run for this commit
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          passed="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow CI --event push --branch main \
+            --commit "$DEPLOY_SHA" --json conclusion --jq 'any(.[]; .conclusion == "success")')"
+          if [[ "$passed" != "true" ]]; then
+            echo "::error::CI has not passed on ${DEPLOY_SHA::7}, the tip of main; nothing deployed. Wait for CI or fix it, then run again."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.DEPLOY_SHA }}
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+          # the guard below asks git whether the running commit descends from DEPLOY_SHA
+          fetch-depth: 0
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
+      # An older passing CI run can be re-run after newer commits deployed. Skip when the app already runs
+      # DEPLOY_SHA or a descendant of it. A running tag that isn't a sha- tag, or names a commit this
+      # repository doesn't have, can't be shown to be newer, so it deploys; a failed read fails the job
+      # rather than guess, and a re-run settles it.
+      - name: Skip if the app already runs this commit or a newer one
+        id: guard
+        run: |
+          tag="$(flyctl image show -a sky-justin --json | jq -r '.[0].Tag // ""')"
+          deploy=true
+          if [[ ! "$tag" =~ ^sha-[0-9a-f]{7,40}$ ]]; then
+            echo "The app runs tag '${tag}', not a sha- tag, so its age can't be told: deploying ${DEPLOY_SHA::7}."
+          elif ! running="$(git rev-parse --verify --quiet "${tag#sha-}^{commit}")"; then
+            echo "The app runs ${tag}, a commit this repository doesn't have, so its age can't be told: deploying ${DEPLOY_SHA::7}."
+          elif git merge-base --is-ancestor "$DEPLOY_SHA" "$running"; then
+            echo "The app runs ${running::7}, which is ${DEPLOY_SHA::7} or newer: nothing deployed."
+            deploy=false
+          else
+            echo "The app runs ${running::7}, which doesn't include ${DEPLOY_SHA::7}: deploying."
+          fi
+          echo "deploy=${deploy}" >> "$GITHUB_OUTPUT"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - name: Log in to Fly registry
+        if: steps.guard.outputs.deploy == 'true'
         run: echo "$FLY_API_TOKEN" | docker login registry.fly.io -u x --password-stdin
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - name: Build and push
+        if: steps.guard.outputs.deploy == 'true'
         run: |
           SHORT_SHA="${DEPLOY_SHA::7}"
           docker build --platform linux/amd64 \
@@ -49,6 +93,7 @@ jobs:
           docker push registry.fly.io/sky-justin:main
           docker push "registry.fly.io/sky-justin:sha-${SHORT_SHA}"
       - name: Deploy to Fly
+        if: steps.guard.outputs.deploy == 'true'
         run: flyctl deploy -a sky-justin --image "registry.fly.io/sky-justin:sha-${DEPLOY_SHA::7}" --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
