@@ -1,25 +1,40 @@
 name: Image
 
 on:
-  push:
+  # deploys a main commit only after CI has passed on it
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
+  # a manual run redeploys main's tip as it stands, without checking its CI
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # the group binds before the job's `if:`, so a skipped branch run would still displace a pending main deploy
-  group: ${{ github.ref == 'refs/heads/main' && 'deploy-sky' || github.run_id }}
+  # repeats the job's `if:`: the group binds before it, and under workflow_run github.ref is always main, so a
+  # failed, cancelled or pull-request CI run would otherwise join deploy-sky and cancel the deploy pending there
+  group: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && 'deploy-sky' || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   image:
-    # deploys prod and pushes the hardcoded :main tag, so a manual run from another branch must not get this far
-    if: github.ref == 'refs/heads/main'
+    # deploys prod and pushes the hardcoded :main tag, so a pull request's CI run, a failed CI run and a
+    # manual run from another branch must not get this far
+    if: >-
+      (github.event_name == 'workflow_run'
+        && github.event.workflow_run.event == 'push'
+        && github.event.workflow_run.conclusion == 'success')
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      # the commit CI checked, not whatever main points at when this run starts
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Log in to Fly registry
         run: echo "$FLY_API_TOKEN" | docker login registry.fly.io -u x --password-stdin
@@ -27,13 +42,13 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - name: Build and push
         run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
+          SHORT_SHA="${DEPLOY_SHA::7}"
           docker build --platform linux/amd64 \
             -t registry.fly.io/sky-justin:main \
             -t "registry.fly.io/sky-justin:sha-${SHORT_SHA}" .
           docker push registry.fly.io/sky-justin:main
           docker push "registry.fly.io/sky-justin:sha-${SHORT_SHA}"
       - name: Deploy to Fly
-        run: flyctl deploy -a sky-justin --image "registry.fly.io/sky-justin:sha-${GITHUB_SHA::7}" --ha=false
+        run: flyctl deploy -a sky-justin --image "registry.fly.io/sky-justin:sha-${DEPLOY_SHA::7}" --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

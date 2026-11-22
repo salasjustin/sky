@@ -29,6 +29,8 @@ node packages/cli/dist/bundle/sky.mjs --help
 
 Sky runs as one Fly machine with a volume for its SQLite database. [`fly.toml`](fly.toml) names every secret and how to generate it; set your app name and region there, then `fly volumes create sky_data`, `fly secrets set …`, and `fly deploy`. Take volume snapshots: the database is a single copy.
 
+After that, the [Image workflow](.github/workflows/image.yml) deploys `main`. A push to `main` deploys only after its CI run passes, and it deploys the commit CI checked. A manual run of Image deploys the tip of `main` as it stands, without waiting on or checking CI.
+
 Repo access goes through a Sprites connector, never a raw GitHub token in the sprite. An agent publishes with `node /opt/sky/runner.mjs publish` ([`packages/runner/src/publish.ts`](packages/runner/src/publish.ts)), which recreates its commits through GitHub's REST API at the Sprites gateway, since the gateway carries no git push. It reads the connection id from `GITHUB_CONNECTOR`, and the gateway from `GITHUB_GATEWAY_URL` (default `https://api.sprites.dev/v1/gateway/github`).
 
 ### Store sync
