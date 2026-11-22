@@ -42,6 +42,8 @@ fail_with_log() {
   exit 1
 }
 
+# set before docker run: a run that fails to start the entrypoint still leaves a Created container behind
+STARTED=1
 # DATA_DIR and NODE_ENV come from the image's ENV, as in production; the dummy secrets match boot-check.sh
 docker run -d --name "$NAME" -p "127.0.0.1:$HOST_PORT:$APP_PORT" \
   -e SKY_API_KEY="boot-check-api-key-boot-check-api-key" \
@@ -51,7 +53,6 @@ docker run -d --name "$NAME" -p "127.0.0.1:$HOST_PORT:$APP_PORT" \
   -e WEBHOOK_SIGNING_KEY="boot-check-webhook-key-boot-check-webhook" \
   -e SECRET_ENCRYPTION_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" \
   "$IMAGE" >/dev/null
-STARTED=1
 
 deadline=$((SECONDS + BOOT_SECONDS))
 while [ "$SECONDS" -lt "$deadline" ]; do
