@@ -50,11 +50,14 @@ jobs:
           docker push "registry.fly.io/sky-justin:sha-${SHORT_SHA}"
       # holds new launches and waits for the runs in flight, so the restart doesn't cut one off; the
       # held launches start on the new API's boot. Only a drain that times out stops the deploy: an API
-      # that can't be reached (the first deploy, or one that is down) is no reason to hold back a fix
+      # that can't be reached (the first deploy, or one that is down) is no reason to hold back a fix.
+      # Once drained, a fresh 15-minute deadline covers the deploy; a failed or cancelled run ends the drain
       - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Drain the live API
+        id: drain
+        # the hour-long wait, plus up to 30 s each for the CLI fetch, an in-flight poll and the refresh or cancel
         timeout-minutes: 70
         run: |
           if [ -z "$SKY_API_KEY" ]; then
@@ -70,6 +73,11 @@ jobs:
           case "$status" in
             0)
               echo "the live API is drained"
+              # the wait and the drain share one deadline, so what is left of it may not cover the
+              # deploy; a drain ending mid-deploy releases every held launch just before the restart
+              if ! node "$RUNNER_TEMP/sky.mjs" admin drain --timeout=900; then
+                echo "::warning::could not extend the drain to cover the deploy; deploying anyway"
+              fi
               ;;
             4)
               echo "::error::runs were still active when the drain timed out; not deploying"
@@ -87,3 +95,17 @@ jobs:
         run: flyctl deploy -a sky-justin --image "registry.fly.io/sky-justin:sha-${DEPLOY_SHA::7}" --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      # a successful deploy needs no cancel: the new API releases held launches on boot
+      - name: End the drain
+        if: (failure() || cancelled()) && steps.drain.outcome != 'skipped'
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          if [ ! -f "$RUNNER_TEMP/sky.mjs" ]; then
+            exit 0
+          fi
+          node "$RUNNER_TEMP/sky.mjs" admin drain --cancel \
+            || echo "::warning::could not end the drain; new launches stay held until its deadline"
+        env:
+          SKY_URL: https://sky-justin.fly.dev
+          SKY_API_KEY: ${{ secrets.SKY_ADMIN_KEY }}

@@ -33,11 +33,11 @@ After that, the [Image workflow](.github/workflows/image.yml) deploys `main`. A 
 
 Before `flyctl deploy`, the workflow drains the live API (`sky admin drain --wait --timeout=3600`, using the CLI the live API serves at `/cli/sky.mjs`), so a restart doesn't cut off a run that is starting or running. New launches are held while it waits, and the new API starts them when it boots. It needs the GitHub secret `SKY_ADMIN_KEY`, the API's admin key (`SKY_API_KEY`); the workflow never prints it. What the step does:
 
-- Nothing is starting or running: the drain succeeds at once and the deploy goes on.
+- Nothing is starting or running: the drain succeeds at once, the step gives the drain a fresh 15-minute deadline so it can't end mid-deploy, and the deploy goes on.
 - The secret is unset, the CLI can't be fetched, or the API can't be reached or answers an error (the first deploy, an API that is down, one from before the drain existed): the step logs it and the deploy goes on, so a fix is never held back by a broken API.
 - Runs are still active when the hour is up: the step cancels the drain, which starts the held launches, and fails, so nothing deploys. Re-run Image once they are done, or stop them.
 
-A drain also ends by itself at its deadline, so one left behind after a failed deploy never blocks launches for long. To drain by hand, see "Draining before a restart" in the README.
+If the run fails or is cancelled after the drain started (a failed `flyctl deploy`, say), a last step cancels the drain so held launches start on the old API. A drain also ends by itself at its deadline, so one left behind after a failed deploy never blocks launches for long. To drain by hand, see "Draining before a restart" in the README.
 
 Repo access goes through a Sprites connector, never a raw GitHub token in the sprite. An agent publishes with `node /opt/sky/runner.mjs publish` ([`packages/runner/src/publish.ts`](packages/runner/src/publish.ts)), which recreates its commits through GitHub's REST API at the Sprites gateway, since the gateway carries no git push. It reads the connection id from `GITHUB_CONNECTOR`, and the gateway from `GITHUB_GATEWAY_URL` (default `https://api.sprites.dev/v1/gateway/github`).
 
