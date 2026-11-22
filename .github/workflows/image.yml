@@ -20,9 +20,8 @@ concurrency:
 
 jobs:
   image:
-    # a CI run on a push to main that passed, or a manual run on main; a pull request's CI run, a failed
-    # CI run and a manual run from another branch never get this far, since this deploys prod and pushes
-    # the hardcoded :main tag
+    # deploys prod and pushes the hardcoded :main tag, so a pull request's CI run, a failed CI run and a
+    # manual run from another branch must not get this far
     if: >-
       (github.event_name == 'workflow_run'
         && github.event.workflow_run.event == 'push'
