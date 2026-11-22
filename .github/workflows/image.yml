@@ -49,8 +49,8 @@ jobs:
           docker push registry.fly.io/sky-justin:main
           docker push "registry.fly.io/sky-justin:sha-${SHORT_SHA}"
       # holds new launches and waits for the runs in flight, so the restart doesn't cut one off; the
-      # held launches start on the new API's boot. Only a drain that times out stops the deploy: an API
-      # that can't be reached (the first deploy, or one that is down) is no reason to hold back a fix.
+      # held launches start on the new API's boot. An API that can't be reached or errors when the drain
+      # starts doesn't stop the deploy; one lost after it started does, as its runs may still be active.
       # Once drained, a fresh 15-minute deadline covers the deploy; a failed or cancelled run ends the drain
       - uses: actions/setup-node@v7
         with:
@@ -85,7 +85,7 @@ jobs:
               fi
               ;;
             4)
-              echo "::error::runs were still active when the drain timed out; not deploying"
+              echo "::error::runs were still active, or the API stopped answering, when the drain's hour ran out; not deploying"
               node "$RUNNER_TEMP/sky.mjs" admin drain --cancel || true
               exit 1
               ;;
