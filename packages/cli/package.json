@@ -11,7 +11,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=dist/bundle/sky.mjs"
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --banner:js=\"import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);\" --outfile=dist/bundle/sky.mjs"
   },
   "dependencies": {
     "@sky/shared": "workspace:*",
