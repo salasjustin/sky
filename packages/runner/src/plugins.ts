@@ -423,7 +423,8 @@ function sameDir(a: string, b: string): boolean {
  * budget ran out), how long it took and how long each command did (`steps`). Each marketplace the
  * installed plugins come from, `skills-dir` aside, is updated by name, and every command has a cap
  * of its own besides the overall budget: an
- * update is cut at `stepTimeoutMs`, a listing at `listTimeoutMs`. A marketplace update that fails, cut
+ * update is cut at `stepTimeoutMs`, the first listing at `firstListTimeoutMs` and a later one at
+ * `listTimeoutMs`. A marketplace update that fails, cut
  * or not, is a failed update named for that marketplace, and the plugin updates after it still run from
  * the cached marketplace while the budget lasts. The first listing, which on a sprite that has just woken
  * can take up to about 30 s, is cut at `firstListTimeoutMs` and not retried: a cut one means nothing is
