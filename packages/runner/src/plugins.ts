@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -12,31 +12,144 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { promisify } from "node:util";
 import type {
   PluginRefresh,
   PluginRefreshStep,
   PluginVersion,
 } from "@sky/shared";
 
-const exec = promisify(execFile);
-
 /** Overall budget for the refresh; a slow or unreachable marketplace costs a session this at most. */
 export const PLUGIN_REFRESH_TIMEOUT_MS = 30_000;
 
 /**
- * What the marketplace update and each plugin update may take; `list before` and `list after` run
- * under the overall budget only. An update that stalls on the network (measured on a sprite: a marketplace update
- * 2.8 s, any other command 0.6 s) is cut here and counted as a failed update, so the updates after it
- * still run inside the overall budget instead of being starved.
+ * What one marketplace update or one plugin update may take. An update that stalls on the network
+ * (measured on a sprite: a marketplace update 2.8 s, any other command 0.6 s) is cut here and counted
+ * as a failed update, so the updates after it still run inside the overall budget instead of being starved.
  */
 export const PLUGIN_STEP_TIMEOUT_MS = 10_000;
 
-type Exec = (
+/**
+ * What one `claude plugin list` may take. It reads local files only (measured on a sprite: 0.4 s warm,
+ * 0.9 s cold, 0.8 s with six at once, the same with the network unreachable), so this is over ten times
+ * a normal listing: one that stalls is cut and tried once more, not left to spend the overall budget.
+ */
+export const PLUGIN_LIST_TIMEOUT_MS = 5_000;
+
+/** How long a cut command's process group gets to exit on SIGTERM before it is sent SIGKILL. */
+export const KILL_GRACE_MS = 2_000;
+
+/** How long after SIGKILL a command is waited on to close before it is given up on. */
+const KILL_WAIT_MS = 1_000;
+
+/**
+ * Runs `file` as the leader of its own process group, so a cut reaches what it started too (a git
+ * child of `claude` keeps writing otherwise). Settles only once the command has closed: aborting
+ * `signal` sends the group SIGTERM, then SIGKILL after `graceMs`, and rejects with the abort's reason
+ * once the group is gone, or `KILL_WAIT_MS` after the SIGKILL when something still holds on.
+ */
+export function runInGroup(
   file: string,
   args: string[],
   options: { env: NodeJS.ProcessEnv; signal: AbortSignal; cwd?: string },
-) => Promise<{ stdout: string }>;
+  graceMs: number = KILL_GRACE_MS,
+): Promise<{ stdout: string }> {
+  const { signal } = options;
+  return new Promise((settle, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const child = spawn(file, args, {
+      env: options.env,
+      ...(options.cwd !== undefined && { cwd: options.cwd }),
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const pid = child.pid;
+    if (pid === undefined) {
+      child.once("error", reject);
+      return;
+    }
+    liveGroups.add(pid);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    let cut = false;
+    const timers: NodeJS.Timeout[] = [];
+    const done = (finish: () => void) => {
+      signal.removeEventListener("abort", onAbort);
+      for (const timer of timers) clearTimeout(timer);
+      liveGroups.delete(pid);
+      finish();
+    };
+    const onAbort = () => {
+      cut = true;
+      killGroup(pid, "SIGTERM");
+      timers.push(
+        setTimeout(() => killGroup(pid, "SIGKILL"), graceMs),
+        setTimeout(
+          () => done(() => reject(signal.reason)),
+          graceMs + KILL_WAIT_MS,
+        ),
+      );
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    child.once("error", (error) => done(() => reject(error)));
+    child.once("close", (code, by) =>
+      done(() => {
+        if (cut) reject(signal.reason);
+        else if (code === 0) settle({ stdout });
+        else
+          reject(
+            Object.assign(
+              new Error(
+                `Command failed: ${file} ${args.join(" ")}${by ? ` (${by})` : ""}`,
+              ),
+              { code, stderr },
+            ),
+          );
+      }),
+    );
+    // the abort may have landed between the check above and the listener
+    if (signal.aborted) onAbort();
+  });
+}
+
+type Exec = typeof runInGroup;
+
+/** The process groups of commands still running, so the runner's end can take them along. */
+const liveGroups = new Set<number>();
+
+const killGroup = (pid: number, by: NodeJS.Signals) => {
+  try {
+    process.kill(-pid, by);
+  } catch {
+    // the group is already gone
+  }
+};
+
+/**
+ * SIGKILLs every command a refresh still has running, each with what it started. Synchronous, for the
+ * runner's own end: a signal's death skips `exit` handlers, and a command in its own group would
+ * outlive the runner.
+ */
+export function killRefreshCommands(): void {
+  for (const pid of liveGroups) killGroup(pid, "SIGKILL");
+  liveGroups.clear();
+}
+process.on("exit", killRefreshCommands);
+
+/** A command cut by its own cap (not the refresh's end or the run's stop): which timer fired is the type. */
+class CapExceeded extends Error {
+  constructor(capMs: number) {
+    super(`timed out after ${seconds(capMs)}s`);
+  }
+}
 
 /**
  * The `claude` that provisioning installed plugins with: `SKY_CLAUDE` when set, else the binary the
@@ -140,9 +253,6 @@ export async function withRefreshLock(
 /** What a refresh did, as the run's `run.started` carries it; the session adds what it loaded. */
 export type PluginRefreshRecord = Omit<PluginRefresh, "loaded">;
 
-/** Bounds the `claude plugin list` that reads the plugins back after a refresh that ended early. */
-const LIST_TIMEOUT_MS = 5_000;
-
 /** `PluginRefresh`'s bounds in `@sky/shared`: a record past them is dropped from the `run.started` post. */
 const REASON_MAX = 300;
 const PLUGINS_MAX = 100;
@@ -230,18 +340,23 @@ function sameDir(a: string, b: string): boolean {
  * Resolves to the record of what it did: the user-scope plugins before and after (null for a list
  * it never read; a waiting run with nothing to update has its one listing as both), the outcome
  * code (`refreshed`, `timed_out`, `failed` or `skipped`), the reason for a `failed` or `skipped`
- * one, how long it took and how long each command did (`steps`). An update is also cut at
- * `stepTimeoutMs`: a marketplace update cut there is a failed update, and the plugin updates after it
- * still run from the cached marketplace. Never throws.
+ * one, how long it took and how long each command did (`steps`). Each marketplace the installed plugins
+ * come from is updated by name, and every command has a cap of its own besides the overall budget: an
+ * update is cut at `stepTimeoutMs`, a listing at `listTimeoutMs`. A marketplace update that fails, cut
+ * or not, is a failed update named for that marketplace, and the plugin updates after it still run from
+ * the cached marketplace. A listing that is cut is tried once more; if the first one is cut twice
+ * nothing is updated and the outcome is `failed`, and if the last one is, `after` stays null. A cut
+ * command's whole process group is killed, and waited on, before the next command or the lock's release.
+ * Never throws.
  */
 export async function refreshPlugins(options: {
   env: NodeJS.ProcessEnv;
   warn: (line: string) => void;
   signal?: AbortSignal;
   timeoutMs?: number;
-  /** How long the marketplace update or one plugin update may take; `PLUGIN_STEP_TIMEOUT_MS` when absent. */
+  /** How long one marketplace update or one plugin update may take; `PLUGIN_STEP_TIMEOUT_MS` when absent. */
   stepTimeoutMs?: number;
-  /** How long the read-back after a refresh that ended early may take; `LIST_TIMEOUT_MS` when absent. */
+  /** How long one `claude plugin list` may take; `PLUGIN_LIST_TIMEOUT_MS` when absent. */
   listTimeoutMs?: number;
   claude?: string;
   /** The agent's worktree, whose project-scope plugin records are updated too; none are when absent. */
@@ -296,7 +411,7 @@ export async function refreshPlugins(options: {
     warn("runner: plugin refresh skipped (stopped)");
     return record("skipped", "stopped");
   }
-  const run = options.run ?? exec;
+  const run = options.run ?? runInGroup;
   const claude = options.claude ?? claudeBinary(env);
   const timeout = AbortSignal.timeout(
     options.timeoutMs ?? PLUGIN_REFRESH_TIMEOUT_MS,
@@ -305,38 +420,63 @@ export async function refreshPlugins(options: {
   const lockFile =
     options.lockFile ?? join(tmpdir(), "sky-plugin-refresh.lock");
   const stepMs = options.stepTimeoutMs ?? PLUGIN_STEP_TIMEOUT_MS;
-  const list = async (name: string, within: AbortSignal) =>
-    readListing(
-      (
-        await timed(name, () =>
-          run(claude, ["plugin", "list", "--json"], { env, signal: within }),
-        )
-      ).stdout,
-      options.projectDir,
-    );
-  /** One command, cut at `stepMs` as well as at the refresh's end; the cut is an error that says so. */
-  const claudeRun = async (name: string, args: string[], cwd?: string) => {
-    const own = AbortSignal.timeout(stepMs);
+  const listMs = options.listTimeoutMs ?? PLUGIN_LIST_TIMEOUT_MS;
+  /** One command, cut at `capMs` as well as when `within` ends; a cut by its own cap alone is a `CapExceeded`. */
+  const capped = async (
+    name: string,
+    capMs: number,
+    within: AbortSignal,
+    args: string[],
+    cwd?: string,
+  ) => {
+    const own = AbortSignal.timeout(capMs);
     try {
-      await timed(name, () =>
+      return await timed(name, () =>
         run(claude, args, {
           env,
-          signal: AbortSignal.any([signal, own]),
+          signal: AbortSignal.any([within, own]),
           ...(cwd !== undefined && { cwd }),
         }),
       );
     } catch (error) {
-      if (!signal.aborted && own.aborted)
-        throw new Error(`timed out after ${seconds(stepMs)}s`);
+      if (!within.aborted && own.aborted) throw new CapExceeded(capMs);
       throw error;
     }
   };
-  let failedUpdates = "";
+  const claudeRun = async (name: string, args: string[], cwd?: string) => {
+    await capped(name, stepMs, signal, args, cwd);
+  };
+  const list = async (name: string, within: AbortSignal) =>
+    readListing(
+      (await capped(name, listMs, within, ["plugin", "list", "--json"])).stdout,
+      options.projectDir,
+    );
+  /** A listing whose own cap cuts it is run once more; a second cut is the caller's. */
+  const listWithRetry = async (name: string, within: AbortSignal) => {
+    try {
+      return await list(name, within);
+    } catch (error) {
+      if (!(error instanceof CapExceeded)) throw error;
+      return await list(`${name} (retry)`, within);
+    }
+  };
+  let failedReason = "";
   // set by a waiting run whose own pass found no record of its worktree to update
   let nothingPinnedHere = false;
   /** One pass under the lock: the whole refresh, or, after another run's, this worktree's records only. */
   const pass = (whole: boolean) => async () => {
-    const read = await list("list before", signal);
+    let read: Listing;
+    try {
+      read = await listWithRetry("list before", signal);
+    } catch (error) {
+      if (!(error instanceof CapExceeded)) throw error;
+      // what is installed is unknown, so nothing can be updated: said in the record, not left silent
+      failedReason = `list before ${error.message} twice; no plugin was updated`;
+      warn(
+        `runner: plugin refresh failed (${failedReason}); continuing with the installed versions`,
+      );
+      return;
+    }
     before = read.plugins;
     if (!whole && read.pinnedHere.length === 0) {
       // no command ran since the listing, so it is the state either side
@@ -346,23 +486,30 @@ export async function refreshPlugins(options: {
     }
     const updated: string[] = [];
     const failed: string[] = [];
+    let unreadAfter = "";
     if (before.length === 0) {
       // nothing installed, so nothing for the refresh to change
       after = [];
     } else {
       try {
         if (whole) {
-          try {
-            await claudeRun("marketplace update", [
-              "plugin",
-              "marketplace",
-              "update",
-            ]);
-          } catch (error) {
-            // a stalled marketplace is not the whole refresh: the updates after it still run, from what is cached
-            if (signal.aborted || !/^timed out/.test(firstLine(error)))
-              throw error;
-            failed.push(`marketplace (${firstLine(error)})`);
+          // each by name, so a failure says which one; only the marketplaces the installed plugins come from
+          const marketplaces = new Set<string>();
+          for (const { marketplace } of before)
+            if (marketplace !== null) marketplaces.add(marketplace);
+          for (const name of marketplaces) {
+            try {
+              await claudeRun(`update marketplace ${name}`, [
+                "plugin",
+                "marketplace",
+                "update",
+                name,
+              ]);
+            } catch (error) {
+              // a marketplace that stalled or failed fast is not the whole refresh: the updates after it still run, from what is cached
+              if (signal.aborted) throw error;
+              failed.push(`marketplace ${name} (${firstLine(error)})`);
+            }
           }
           for (const plugin of before.map(idOf)) {
             try {
@@ -394,19 +541,22 @@ export async function refreshPlugins(options: {
             failed.push(`${plugin} project scope (${firstLine(error)})`);
           }
         }
-        after = (await list("list after", signal)).plugins;
+        try {
+          after = (await listWithRetry("list after", signal)).plugins;
+        } catch (error) {
+          if (!(error instanceof CapExceeded)) throw error;
+          // the updates ran; only the read-back is missing, and `after` stays null
+          unreadAfter = `list after ${error.message} twice`;
+        }
       } catch (error) {
         // still under the lock, read back what is installed now: an update that landed before the cut may have changed it
         if (!stop?.aborted) {
-          // its own timeout, since the refresh's is spent by now, but still ended by a stop
-          const listTimeout = AbortSignal.timeout(
-            options.listTimeoutMs ?? LIST_TIMEOUT_MS,
-          );
           try {
+            // the refresh's budget is spent by now, so this runs under its own cap, ended only by a stop
             after = (
               await list(
                 "list after (cut short)",
-                stop ? AbortSignal.any([stop, listTimeout]) : listTimeout,
+                stop ?? new AbortController().signal,
               )
             ).plugins;
           } catch {}
@@ -414,9 +564,13 @@ export async function refreshPlugins(options: {
         throw error;
       }
     }
-    failedUpdates =
-      failed.length > 0 ? `update failed for ${failed.join(", ")}` : "";
-    const failures = failedUpdates === "" ? "" : `; ${failedUpdates}`;
+    failedReason = [
+      failed.length > 0 ? `update failed for ${failed.join(", ")}` : "",
+      unreadAfter,
+    ]
+      .filter((part) => part !== "")
+      .join("; ");
+    const failures = failedReason === "" ? "" : `; ${failedReason}`;
     const took = seconds(now() - started);
     const what =
       updated.join(", ") ||
@@ -449,9 +603,9 @@ export async function refreshPlugins(options: {
     // ended while another run held the lock
     if (outcome === "aborted")
       throw new Error("waiting for another run's refresh");
-    return failedUpdates === ""
+    return failedReason === ""
       ? record("refreshed")
-      : record("failed", failedUpdates);
+      : record("failed", failedReason);
   } catch (error) {
     if (stop?.aborted) {
       warn(`runner: plugin refresh stopped after ${seconds(now() - started)}s`);

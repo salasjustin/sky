@@ -11,7 +11,11 @@ import { type Config, ConfigError, loadConfig } from "./config.js";
 import { removeSkyLogin } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
 import { holdSprite, spriteApiFrom } from "./keepalive.js";
-import { type PluginRefreshRecord, refreshPlugins } from "./plugins.js";
+import {
+  killRefreshCommands,
+  type PluginRefreshRecord,
+  refreshPlugins,
+} from "./plugins.js";
 import { previewProxyMain } from "./preview-proxy.js";
 import { publishMain } from "./publish.js";
 import { endSessionProcesses } from "./reap.js";
@@ -131,6 +135,8 @@ async function main(): Promise<void> {
     removeCredentialFilesNow();
     removeScratchNow();
     removeSealedCopiesNow();
+    // a plugin command runs in its own process group, which the runner's signal death wouldn't reach
+    killRefreshCommands();
     process.kill(process.pid, signal);
   };
   let dying = false;
