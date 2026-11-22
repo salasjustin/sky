@@ -39,7 +39,7 @@ import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
 import { redact } from "./redact.js";
 import { body, jsonBody } from "./validation.js";
-import { isAllowedWebhookUrl } from "./webhook-url.js";
+import { isAllowedWebhookUrl, scrubAddresses } from "./webhook-url.js";
 
 // any https URL here, so an internal host is refused as url_not_allowed before the shared schema's domain-only rule
 const WebhookInput = z.strictObject({
@@ -333,7 +333,12 @@ export function webhookRoutes() {
           {
             data: page.map(({ nextAttemptAt, lastError, ...row }) => ({
               ...row,
-              lastError: lastError === null ? null : redact(lastError, known),
+              // a row stored before addresses were scrubbed on write still holds them; redact first,
+              // so a scrub can't split a secret out of its match
+              lastError:
+                lastError === null
+                  ? null
+                  : scrubAddresses(redact(lastError, known)),
               lastErrorKind: errorKind(lastError),
               nextAttemptAt: row.status === "pending" ? nextAttemptAt : null,
             })),

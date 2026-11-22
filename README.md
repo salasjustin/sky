@@ -603,14 +603,14 @@ Three ways to receive them:
 
 - **MCP:** `wait_for_events`, above.
 - **Stream:** `GET /v1/stream`, one SSE connection across every agent. Filter with `?types=claude.PostToolUse,run.waiting` and `?agentId=`. After a drop, reconnect with `Last-Event-ID` to receive what you missed. A `: ping` arrives every 15 seconds. When the server restarts, the stream ends with an `event: server.shutdown` frame whose `id` is your resume point and whose `retry: 2000` asks you to reconnect in 2 seconds; `EventSource` does this on its own. `GET /v1/events?after=&wait=` is the same feed as a long poll.
-- **Webhooks:** `POST /v1/webhooks` (or `sky webhook add`) with an `https` URL and the `eventTypes` you want. A failed delivery is retried with backoff, up to 30 attempts, and a `429` holds the webhook until its `Retry-After`. Two optional fields:
+- **Webhooks:** `POST /v1/webhooks` (or `sky webhook add`) with an `https` URL and the `eventTypes` you want. A failed delivery is retried with backoff, up to 30 attempts (a refused one, below, is not retried), and a `429` holds the webhook until its `Retry-After`. Two optional fields:
   - `format`: `"sky"` (the default), `"standard"` or `"openbot"`, below.
   - `environmentIds`: a non-empty array of environment ids. The webhook then receives only events from agents in those environments; an id that doesn't exist is `400 invalid_body`. Left out, it receives every environment's events. An environment a webhook filters on can't be deleted until that webhook is (`409 webhooks_filter`).
 
   `GET /v1/webhooks` returns each webhook's `format` and `environmentIds` when set. A secret is never returned. Once a webhook has had a delivery attempt it also carries, so a receiver that answers 401 on every try shows up here and not only in the server logs:
   - `lastAttempt`: `at` (when it ran), `status` (the HTTP status, or `null` when the receiver never answered), `error` (why there was no response: `timeout`, `connection_refused`, `connection_reset`, `dns`, `tls`, `blocked_address` or `url_not_allowed` (a refused URL or private address, which fails at once without retries), or `other`; `null` when there was one) and `attempt` (the attempt number within its delivery, from 1).
   - `failedStreak`: how many deliveries in a row, since the last delivered one, ended failed or are still retrying after a failed attempt.
-  - `failing`: `true` once a delivery gave up after its 30th attempt, until the webhook's next delivered one clears it. Absent otherwise.
+  - `failing`: `true` once a delivery gave up, after its 30th attempt or at once when refused, until the webhook's next delivered one clears it. Absent otherwise.
 
   `lastAttempt` and `failedStreak` are absent until the webhook has an attempt on record, and `failing` is absent unless set; all three are optional, so older clients ignore them. `sky webhook list` prints them after the webhook, such as `| FAILING, last 401 at 2026-11-21T09:30:00.000Z (attempt 30), 13 failed in a row`.
 

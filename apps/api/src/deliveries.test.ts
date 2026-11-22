@@ -1904,6 +1904,28 @@ test("a delivery's last error is redacted", async () => {
   expect(text).toContain("[redacted]");
 });
 
+test("a last error stored with addresses shows none of them, and keeps its kind", async () => {
+  const id = await subscribe(["run.finished"]);
+  seedDeliveries(id, 1);
+  // as stored before addresses were scrubbed on write
+  db.update(webhookDeliveries)
+    .set({
+      status: "failed",
+      attempts: 1,
+      lastError:
+        "TypeError: fetch failed: connect ECONNREFUSED 10.1.2.3:5432, connect ECONNREFUSED [fdaa:0:1::3]:443, connect ECONNREFUSED fdaa:0:1::2:5432, attempted addresses: db.internal:5432",
+    })
+    .run();
+  const { data } = (await (await getDeliveries(id)).json()) as Page;
+  expect(data).toEqual([
+    expect.objectContaining({
+      lastError:
+        "TypeError: fetch failed: connect ECONNREFUSED <addr>, connect ECONNREFUSED <addr>, connect ECONNREFUSED <addr>, attempted addresses: <addr>",
+      lastErrorKind: "connection_refused",
+    }),
+  ]);
+});
+
 async function runsKey(name: string, envId: EnvironmentId) {
   const created = await app.request("/v1/keys", {
     method: "POST",
