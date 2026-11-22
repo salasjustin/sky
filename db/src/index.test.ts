@@ -1368,6 +1368,71 @@ test("migrating a populated 0017 file keeps every event, id, index and remaining
   expect(insertEvent("run.brand_new")).toBe(tail + 1);
 });
 
+test("migrating a populated 0023 file keeps every run column and every child row through the runs rebuild, keeps the agent index, and takes queued", () => {
+  migrateThrough("0023_tiny_madame_hydra");
+  seedRun();
+  run(
+    `update runs set summary = 's', input_tokens = 100, output_tokens = 50, cost_usd = 0.25, turns = 3, duration_ms = 4200,
+      rollup = '{"a":1}', secret_names = '["K"]', claude_credential = 'sub-a', retry_of = 'run_0',
+      launch_ciphertext = ?, launch_nonce = ?, launch_key_version = 3, created_at = '2026-10-29T11:00:00.000Z'
+      where id = 'run_1'`,
+    Buffer.from([1, 2, 3]),
+    Buffer.from([4, 5]),
+  );
+  for (const name of ["A", "B"]) {
+    run(
+      "insert into run_env_vars (run_id, name, ciphertext, nonce, key_version, expires_at, created_at) values ('run_1', ?, x'0a', x'0b', 1, '2026-10-29T13:00:00.000Z', '2026-10-29T11:00:00.000Z')",
+      name,
+    );
+  }
+  run(
+    "insert into run_requests (id, run_id, kind, request) values ('req_1', 'run_1', 'question', '{\"kind\":\"question\",\"requestId\":\"req_1\"}')",
+  );
+  insertEvent();
+  insertEvent("run.failed");
+  const insertQueued = () =>
+    run(
+      "insert into runs (id, agent_id, status) values ('run_2', 'agt_1', 'queued')",
+    );
+  expect(insertQueued).toThrow(/CHECK constraint failed: runs_status/);
+  const runBefore = db.$client.prepare("select * from runs").all();
+  const envVarsBefore = db.$client
+    .prepare("select * from run_env_vars order by name")
+    .all();
+  // every column is set, so the comparison below can't pass on a column the rebuild dropped
+  expect(Object.values(runBefore[0] as object)).not.toContain(null);
+
+  migrate(db);
+
+  expect(db.$client.prepare("select * from runs").all()).toEqual(runBefore);
+  expect(
+    db.$client.prepare("select * from run_env_vars order by name").all(),
+  ).toEqual(envVarsBefore);
+  const children = [
+    count("run_env_vars"),
+    count("run_requests"),
+    count("events"),
+  ];
+  expect(children).toEqual([2, 1, 2]);
+  expect(db.$client.pragma("foreign_key_check")).toEqual([]);
+  expect(
+    db.$client
+      .prepare(
+        "select name from sqlite_schema where type = 'index' and tbl_name = 'runs' and sql is not null",
+      )
+      .pluck()
+      .all(),
+  ).toEqual(["runs_agent_id_created_at"]);
+
+  // the rebuilt table takes queued, and the envVars' cascade still follows its runs
+  insertQueued();
+  run(
+    "insert into run_env_vars (run_id, name, ciphertext, nonce, key_version, expires_at) values ('run_2', 'C', x'0a', x'0b', 1, '2026-10-29T13:00:00.000Z')",
+  );
+  run("delete from runs where id = 'run_2'");
+  expect(count("run_env_vars")).toBe(2);
+});
+
 // a populated file as the previous release left it, ready to migrate
 const staleFile = () => {
   migrateThrough("0017_plain_ultimatum");
@@ -1424,7 +1489,8 @@ const journalTags = () =>
 test("migrate refuses when the volume can't hold the rebuild, and leaves the file untouched", () => {
   staleFile();
   const before = tables();
-  const needed = neededFor(bytesOf("events"));
+  // 0018 rebuilds events and 0024 runs
+  const needed = neededFor(bytesOf("events") + bytesOf("runs"));
 
   expect(() => migrate(db, { freeBytes: () => needed - 1 })).toThrow(
     /not enough free disk space/,

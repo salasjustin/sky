@@ -6,17 +6,21 @@ import {
   agents,
   type Db,
   environments,
+  events,
   migrate,
   openDb,
   runEnvVars,
   runs,
 } from "@sky/db";
 import type { AgentId, EnvironmentId, RunId, RunStatus } from "@sky/shared";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { open, runLaunchAad } from "./crypto.js";
+import { KnownSecrets } from "./redact.js";
+import { failUnlaunchedRuns } from "./runs.js";
+import { purgeExpiredEnvVars, storeRunEnvVars } from "./secrets.js";
 import { spriteNameFor } from "./sprites.js";
 import { fiveHourLimit } from "./testing/limits.js";
 import {
@@ -93,7 +97,7 @@ const startDrain = async (body: unknown = {}) => {
   return (await res.json()) as Drain;
 };
 
-function readyEnv(): EnvironmentId {
+function readyEnv(concurrency = 10): EnvironmentId {
   const id = `env_${Math.random().toString(36).slice(2)}` as EnvironmentId;
   db.insert(environments)
     .values({
@@ -105,7 +109,7 @@ function readyEnv(): EnvironmentId {
       spriteName: spriteNameFor(id),
       checkpointId: "v1",
       claudeCredential: "default",
-      concurrency: 10,
+      concurrency,
     })
     .run();
   wire.sprites.add(spriteNameFor(id));
@@ -437,4 +441,177 @@ test("timeoutSeconds is bounded and defaults to 1800", async () => {
   const span =
     Date.parse(state.deadline as string) - Date.parse(state.since as string);
   expect(span).toBe(1_800_000);
+});
+
+test("a released launch's clock restarts: createdAt moves to the release and the launch-deadline sweep spares it", async () => {
+  const envId = readyEnv();
+  await startDrain();
+  const held = await launch(envId);
+  // held longer than the launch deadline, as a long drain would
+  const stale = new Date(
+    Date.now() - 2 * config.launchDeadlineMs,
+  ).toISOString();
+  db.update(runs)
+    .set({ createdAt: stale })
+    .where(eq(runs.id, held.run.id as RunId))
+    .run();
+
+  expect((await call("DELETE", "/v1/admin/drain")).status).toBe(200);
+
+  const row = db
+    .select({ createdAt: runs.createdAt })
+    .from(runs)
+    .where(eq(runs.id, held.run.id as RunId))
+    .get();
+  expect(
+    Math.abs(Date.parse(row?.createdAt as string) - Date.now()),
+  ).toBeLessThan(5_000);
+  expect(statusOf(held.run.id)).toBe("starting");
+  expect(failUnlaunchedRuns(db, config.launchDeadlineMs)).toEqual([]);
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(1));
+});
+
+test("a launch held at an environment's concurrency cap counts against it", async () => {
+  const envId = readyEnv(1);
+  await startDrain();
+  const held = await launch(envId);
+  const over = await call("POST", "/v1/agents", { envId, prompt: "one more" });
+  expect(over.status).toBe(409);
+  expect(await over.json()).toMatchObject({
+    error: { code: "concurrency_cap", limit: 1 },
+  });
+  expect(await drainState()).toMatchObject({ held: 1 });
+
+  // the slot frees once the held run ends
+  expect(
+    (await call("POST", `/v1/agents/${held.agent.id}/stop`)).status,
+  ).toBe(200);
+  expect((await launch(envId)).run.status).toBe("queued");
+});
+
+test("a follow-up to an agent whose run is queued is refused as busy", async () => {
+  const envId = readyEnv();
+  await startDrain();
+  const held = await launch(envId);
+  const again = await call("POST", `/v1/agents/${held.agent.id}/runs`, {
+    prompt: "again",
+  });
+  expect(again.status).toBe(409);
+  expect(await again.json()).toMatchObject({ error: { code: "agent_busy" } });
+  expect(await drainState()).toMatchObject({ held: 1 });
+});
+
+test("an expired envVar of a queued run survives the purge, while an expired one of a running run does not", async () => {
+  const envId = readyEnv();
+  await startDrain();
+  const res = await call("POST", "/v1/agents", {
+    envId,
+    prompt: "deploy the fix",
+    envVars: { DEPLOY_TOKEN: "held-deploy-token" },
+  });
+  expect(res.status).toBe(202);
+  const { run: held } = (await res.json()) as { run: { id: RunId } };
+  const running = seedRun(envId, "running");
+  db.transaction((tx) =>
+    storeRunEnvVars(tx, config.secretEncryptionKey, running, { OLD: "x" }, 60),
+  );
+  const lapsed = new Date(Date.now() - 60_000).toISOString();
+  db.update(runEnvVars).set({ expiresAt: lapsed }).run();
+
+  purgeExpiredEnvVars(db, KnownSecrets.fromConfig(config), new Date());
+
+  const namesOf = (runId: RunId) =>
+    db
+      .select({ name: runEnvVars.name })
+      .from(runEnvVars)
+      .where(eq(runEnvVars.runId, runId))
+      .all()
+      .map((r) => r.name);
+  expect(namesOf(held.id)).toEqual(["DEPLOY_TOKEN"]);
+  expect(namesOf(running)).toEqual([]);
+});
+
+test("a held launch that can't be read after a restart fails with launch_failed instead of sitting queued", async () => {
+  const envId = readyEnv();
+  await startDrain();
+  const held = await launch(envId);
+  db.update(runs)
+    .set({ launchCiphertext: Buffer.from("not a sealed launch") })
+    .where(eq(runs.id, held.run.id as RunId))
+    .run();
+
+  buildApp();
+
+  expect(statusOf(held.run.id)).toBe("failed");
+  const failed = db
+    .select({ payload: events.payload })
+    .from(events)
+    .where(
+      and(
+        eq(events.runId, held.run.id as RunId),
+        eq(events.type, "run.failed"),
+      ),
+    )
+    .all()
+    .map((e) => (e.payload as { error: string }).error);
+  expect(failed).toEqual([expect.stringContaining("launch_failed")]);
+  await settle();
+  expect(wire.sessions).toHaveLength(0);
+});
+
+test("the deadline timer alone releases the held launches, with no request to notice it", async () => {
+  const envId = readyEnv();
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout"] });
+  await startDrain({ timeoutSeconds: 60 });
+  const held = await launch(envId);
+  expect(statusOf(held.run.id)).toBe("queued");
+
+  await vi.advanceTimersByTimeAsync(60_000);
+
+  // read from the row: a GET would release it through the lazy deadline check instead
+  expect(statusOf(held.run.id)).toBe("starting");
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(1));
+});
+
+test("held launches are released oldest first by createdAt, not by insertion order", async () => {
+  const envId = readyEnv();
+  await startDrain();
+  const inserted = await launch(envId, "inserted first");
+  const older = await launch(envId, "inserted second");
+  db.update(runs)
+    .set({ createdAt: new Date(Date.now() - 60_000).toISOString() })
+    .where(eq(runs.id, older.run.id as RunId))
+    .run();
+
+  expect((await call("DELETE", "/v1/admin/drain")).status).toBe(200);
+
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(2));
+  expect(wire.sessions.map((s) => s.env.RUN_ID)).toEqual([
+    older.run.id,
+    inserted.run.id,
+  ]);
+});
+
+const ms = (iso: string | null) => Date.parse(iso as string);
+
+test("timeoutSeconds accepts 1 and 7200 and rejects a non-integer", async () => {
+  expect(
+    (await call("POST", "/v1/admin/drain", { timeoutSeconds: 1.5 })).status,
+  ).toBe(400);
+  for (const seconds of [1, 7200]) {
+    const state = await startDrain({ timeoutSeconds: seconds });
+    expect(ms(state.deadline) - ms(state.since)).toBe(seconds * 1000);
+    expect((await call("DELETE", "/v1/admin/drain")).status).toBe(200);
+  }
+});
+
+test("starting a drain that is already on keeps its start and moves its deadline", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const first = await startDrain({ timeoutSeconds: 60 });
+  vi.setSystemTime(Date.now() + 10_000);
+  const second = await startDrain({ timeoutSeconds: 120 });
+
+  expect(second.since).toBe(first.since);
+  expect(ms(second.deadline) - ms(first.deadline)).toBe(70_000);
+  expect(ms(second.deadline) - ms(second.since)).toBe(130_000);
 });

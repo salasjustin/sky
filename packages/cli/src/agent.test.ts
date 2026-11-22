@@ -546,6 +546,7 @@ test("status exits with every run state's code", async () => {
   for (const [state, code] of [
     ["finished", 0],
     ["waiting", 3],
+    ["queued", 4],
     ["starting", 4],
     ["running", 4],
     ["failed", 5],
@@ -591,6 +592,20 @@ test("wait polls until the run waits, then prints what inbox prints", async () =
     "interrupted; agt_1 keeps running on the server. Run sky wait agt_1 to keep waiting",
   ]);
   expect(r.armedAtExit).toBe(0);
+});
+
+test("wait keeps polling a queued run, held while the API drains, until it ends", async () => {
+  server.use(
+    runsSequence(
+      [run({ status: "queued" })],
+      [run({ status: "queued" })],
+      [run({ status: "running" })],
+      [run({ status: "finished" })],
+    ),
+  );
+  const r = await runCli(["wait", agentId]);
+  expect(r.code).toBe(0);
+  expect(r.sleeps).toEqual([3000, 3000, 3000]);
 });
 
 test("wait returns at once on an ended run", async () => {

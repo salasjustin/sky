@@ -162,10 +162,49 @@ test("--wait exits 1 when the API stops answering until the deadline", async () 
   expect(r.code).toBe(1);
 });
 
-test("--wait exits 1 for a key that isn't the admin key", async () => {
+test("--wait carries on past a 5xx mid-poll and exits 0 once the drain is ready", async () => {
+  let gets = 0;
   server.use(
     http.post(`${apiUrl}/v1/admin/drain`, () =>
-      HttpResponse.json(
+      HttpResponse.json(busy("run_a")),
+    ),
+    http.get(`${apiUrl}/v1/admin/drain`, () => {
+      gets++;
+      return gets === 1
+        ? new HttpResponse(null, { status: 502 })
+        : HttpResponse.json(drain());
+    }),
+  );
+  const r = await cli(["admin", "drain", "--wait"]);
+  expect(r.code).toBe(0);
+  expect(gets).toBe(2);
+  expect(r.stdout).toContain("ready=yes");
+});
+
+test("--wait ends at once on a 4xx mid-poll instead of retrying it until the deadline", async () => {
+  let gets = 0;
+  server.use(
+    http.post(`${apiUrl}/v1/admin/drain`, () =>
+      HttpResponse.json(busy("run_a")),
+    ),
+    http.get(`${apiUrl}/v1/admin/drain`, () => {
+      gets++;
+      return HttpResponse.json(
+        { error: { code: "forbidden", message: "only the admin key" } },
+        { status: 403 },
+      );
+    }),
+  );
+  const r = await cli(["admin", "drain", "--wait"]);
+  expect(r.code).toBe(1);
+  expect(gets).toBe(1);
+});
+
+test("--wait exits 1 for a key that isn't the admin key, without retrying", async () => {
+  server.use(
+    http.post(`${apiUrl}/v1/admin/drain`, () => {
+      requests.push("POST");
+      return HttpResponse.json(
         {
           error: {
             code: "forbidden",
@@ -173,12 +212,17 @@ test("--wait exits 1 for a key that isn't the admin key", async () => {
           },
         },
         { status: 403 },
-      ),
-    ),
+      );
+    }),
+    http.get(`${apiUrl}/v1/admin/drain`, () => {
+      requests.push("GET");
+      return HttpResponse.json(drain());
+    }),
   );
   const r = await cli(["admin", "drain", "--wait"]);
   expect(r.code).toBe(1);
   expect(r.stderr).toContain("only the admin key");
+  expect(requests).toEqual(["POST"]);
 });
 
 test("--status reads and --cancel deletes", async () => {
