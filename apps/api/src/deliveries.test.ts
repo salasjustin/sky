@@ -9,7 +9,7 @@ import {
   webhookDeliveries,
 } from "@sky/db";
 import type { AgentId, EnvironmentId, RunId, WebhookId } from "@sky/shared";
-import { eq } from "drizzle-orm";
+import { eq, isNull } from "drizzle-orm";
 import { HttpResponse, http, passthrough } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -1630,6 +1630,54 @@ test("a refused delivery fails at once, shows its kind, flags the webhook and wa
   expect(message).toContain("blocked_address");
   expect(message).not.toContain("10.0.0.5");
 });
+
+const webhookIdOf = () =>
+  db.$client.prepare("select id from webhooks").pluck().get() as string;
+
+test.each([
+  [
+    "a non-default port",
+    "https://hooks.example.com:4280/hook",
+    "url_not_allowed",
+  ],
+  ["a literal private IP", "https://10.0.0.5/hook", "blocked_address"],
+])(
+  "a delivery refused for %s shows its kind in the webhook list and apart from its text in the deliveries",
+  async (_, url, kind) => {
+    await failedBlocked(() => {}, url);
+    const id = webhookIdOf();
+
+    const listed = await app.request("/v1/webhooks", { headers: auth });
+    const { data: hooks } = (await listed.json()) as { data: Summary[] };
+    expect(hooks.find((w) => w.id === id)?.lastAttempt).toMatchObject({
+      status: null,
+      error: kind,
+    });
+
+    // a refused row's text is its kind, so a second row whose text differs from its kind is what
+    // tells `lastError` and `lastErrorKind` apart
+    seedDeliveries(id, 1);
+    db.update(webhookDeliveries)
+      .set({
+        status: "failed",
+        attempts: 1,
+        lastError: "TypeError: fetch failed: read ECONNRESET",
+      })
+      .where(isNull(webhookDeliveries.lastError))
+      .run();
+    const { data } = (await (await getDeliveries(id)).json()) as Page;
+    expect(data).toHaveLength(2);
+    expect(data).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ lastError: kind, lastErrorKind: kind }),
+        expect.objectContaining({
+          lastError: "TypeError: fetch failed: read ECONNRESET",
+          lastErrorKind: "connection_reset",
+        }),
+      ]),
+    );
+  },
+);
 
 /** Fails one event's delivery through all 30 attempts. */
 async function giveUp() {
