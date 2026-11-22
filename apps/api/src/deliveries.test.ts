@@ -544,6 +544,35 @@ test("describeError says why when no address of a many-address host connects", (
   expect(errorKind(bare)).toBe("timeout");
 });
 
+test("a connect failure naming an address is stored and served without it", async () => {
+  server.use(http.post(subscriberUrl, () => passthrough()));
+  await failedBlocked(
+    () => {},
+    subscriberUrl,
+    (_host, _options, callback) => {
+      callback(
+        Object.assign(
+          new Error(
+            "getaddrinfo ENOTFOUND hooks.example.com via 203.0.113.9:53",
+          ),
+          { code: "ENOTFOUND" },
+        ),
+        "",
+      );
+    },
+  );
+  const stored = deliveries()[0];
+  expect(stored).toMatchObject({ status: "pending", attempts: 1 });
+  expect(stored?.lastError).toContain("<addr>");
+  expect(stored?.lastError).not.toMatch(/203\.0\.113\.9|:53\b/);
+  expect(logs.join("\n")).not.toMatch(/203\.0\.113\.9|:53\b/);
+
+  const { data } = (await (await getDeliveries(webhookIdOf())).json()) as Page;
+  expect(data[0]?.lastError).toBe(stored?.lastError);
+  expect(data[0]?.lastErrorKind).toBe("dns");
+  expect(JSON.stringify(data)).not.toMatch(/203\.0\.113\.9|:53\b/);
+});
+
 test("a redirect is a failed attempt, never followed", async () => {
   await subscribe(["run.finished"]);
   server.use(
