@@ -32,7 +32,8 @@ jobs:
         && github.event.workflow_run.head_repository.full_name == github.repository)
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # the deploy secrets live in this environment, which allows only main, so no other branch's workflow reads them
+    # the deploy secrets live in this environment, whose rule admits a run by its ref (main only) and which admins
+    # can bypass or change. Under workflow_run that ref is always main, so the `if:` decides which CI runs get here
     environment:
       name: production
       # a deployment record would name main's tip, which may not be DEPLOY_SHA, and count a skipped deploy as one
