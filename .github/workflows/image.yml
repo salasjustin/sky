@@ -97,12 +97,12 @@ jobs:
             -t "registry.fly.io/sky-justin:sha-${SHORT_SHA}" .
           docker push registry.fly.io/sky-justin:main
           docker push "registry.fly.io/sky-justin:sha-${SHORT_SHA}"
-      # holds new launches and waits for the runs in flight, so the restart doesn't cut one off; the
-      # held launches start on the new API's boot. Only runs that outlast the wait stop the deploy: an API
-      # that can't be reached or errors at the start, or that never answers a check once the drain is on
-      # (nothing is known of its runs, and a broken API is what a fix is for), doesn't. Once drained, a
-      # fresh 15-minute deadline covers the deploy; a failed or cancelled run ends the drain. Like the
-      # deploy, these steps run only when the guard above lets the deploy go ahead
+      # holds new launches for the new API's boot and waits for the runs in flight, so the restart doesn't
+      # cut one off. Of the CLI's exits only 4 stops the deploy: runs outlasted the wait (by the last status
+      # answered, if the API was then lost) or the drain ended early. A failed start, no successful check
+      # (nothing newer than the start's runs is known) or a refused or unreadable one doesn't: a broken
+      # API is what a fix is for. Once drained, it asks for a fresh 15-minute deadline; a failed or cancelled
+      # run tries to end the drain. Like the deploy, these steps run only when the guard above allows it
       - uses: actions/setup-node@v7
         if: steps.guard.outputs.deploy == 'true'
         with:
@@ -117,8 +117,8 @@ jobs:
             echo "SKY_ADMIN_KEY is not set; deploying without a drain"
             exit 0
           fi
-          # the CLI of the commit being deployed, from the image just built: nothing downloaded runs
-          # beside the admin key, and the API isn't built twice
+          # the CLI of the commit being deployed, from the image just built: it isn't downloaded from
+          # the live API, and the API isn't built twice
           cid=$(docker create --platform linux/amd64 "registry.fly.io/sky-justin:sha-${DEPLOY_SHA::7}") || cid=
           if [ -z "$cid" ] || ! docker cp "$cid:/app/bundle/sky.mjs" "$RUNNER_TEMP/sky.mjs"; then
             [ -z "$cid" ] || docker rm "$cid" > /dev/null || true
@@ -139,12 +139,12 @@ jobs:
               fi
               ;;
             4)
-              echo "::error::runs were still active when the drain's hour ran out; not deploying"
+              echo "::error::the drain ended, or its hour ran out, before the runs were seen to finish (the CLI's line above says which); not deploying"
               node "$RUNNER_TEMP/sky.mjs" admin drain --cancel || true
               exit 1
               ;;
             *)
-              echo "the drain could not be started, or the API stopped answering during it (exit $status); deploying anyway"
+              echo "the drain didn't complete (exit $status, see the line above); deploying anyway"
               ;;
           esac
         env:
@@ -165,7 +165,7 @@ jobs:
             exit 0
           fi
           node "$RUNNER_TEMP/sky.mjs" admin drain --cancel \
-            || echo "::warning::could not end the drain; new launches stay held until its deadline"
+            || echo "::warning::could not end the drain; if one is on, new launches stay held until its deadline or the API's restart"
         env:
           SKY_URL: https://sky-justin.fly.dev
           SKY_API_KEY: ${{ secrets.SKY_ADMIN_KEY }}
