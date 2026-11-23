@@ -955,8 +955,8 @@ test.each([
   ["node /opt/sky/runner.mjs store-sync pull", false],
   ["\tnode /opt/sky/runner.mjs sync", true],
   ["\vnode /opt/sky/runner.mjs sync", false],
-  [" node /opt/sky/runner.mjs sync", false],
-  ["node x /opt/sky/runner.mjs sync", false],
+  ["\u00a0node /opt/sky/runner.mjs sync", false],
+  ["node\u00a0x /opt/sky/runner.mjs sync", false],
   ['"node" /opt/sky/runner.mjs sync', false],
 ])("bare node: %s is the agent's own call: %s", (command, expected) => {
   expect(isBrokerCall(command, RUNNER)).toBe(expected);
