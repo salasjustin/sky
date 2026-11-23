@@ -23,7 +23,7 @@ import { endSessionProcesses } from "./reap.js";
 import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
 import { claimRunLog, processAlive } from "./runlog.js";
-import { createSeal, removeSealedCopiesNow } from "./seal.js";
+import { createSeal, hideRunner, removeSealedCopiesNow } from "./seal.js";
 import { removeScratchNow, runSession } from "./session.js";
 import { storeSyncMain, syncStoreQuietly } from "./store.js";
 import { branchCheckMain } from "./sync.js";
@@ -250,13 +250,30 @@ const commands: Record<
 const command = Object.hasOwn(commands, process.argv[2] ?? "")
   ? commands[process.argv[2] as string]
   : undefined;
-// the API's own subcommands keep the connector in the env they are handed, and out of the process's
-// own, which the git commands they start inherit
+/**
+ * Runs a subcommand. The API's own subcommands keep the connector in the env they are handed, and
+ * out of the process's own, which the git commands they start inherit.
+ */
+async function runCommand(
+  run: (argv: string[], env: NodeJS.ProcessEnv) => Promise<number>,
+): Promise<number> {
+  const connector = takeConnector(process.env);
+  if (Object.keys(connector).length > 0) {
+    // taking it out of process.env leaves it in /proc/<pid>/environ, which every process of this user
+    // reads, the hooks of the git this command runs included, until the kernel hides this process. The
+    // connector is readable there from exec until this step runs
+    const exposed = hideRunner();
+    if (exposed) {
+      io.stderr(
+        `runner: ${process.argv[2]} can't keep the GitHub connector from this user's other processes: ${exposed}\n`,
+      );
+    }
+  }
+  return run(process.argv.slice(3), { ...process.env, ...connector });
+}
+
 const entry = command
-  ? command(process.argv.slice(3), {
-      ...process.env,
-      ...takeConnector(process.env),
-    }).then((code) => {
+  ? runCommand(command).then((code) => {
       process.exitCode = code;
     })
   : main();

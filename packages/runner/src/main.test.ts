@@ -177,6 +177,39 @@ test("branch-check is its own command, not a run: with no branch it exits 2 with
   });
 });
 
+describe("a subcommand started with the GitHub connector", () => {
+  const USAGE = "usage: branch-check <branch>\n";
+  const withConnector = {
+    GITHUB_CONNECTOR: "conn_subcommand",
+    GITHUB_GATEWAY_URL: "https://gateway.test",
+  };
+
+  test("hides itself from the user's other processes, and says nothing when the kernel did", async () => {
+    const result = await runBundle(withConnector, ["branch-check"], "capable");
+    expect(result).toEqual({ code: 2, stdout: "", stderr: USAGE });
+  });
+
+  test("on a host where it can't hide, says why in one line on stderr and still runs the command", async () => {
+    const { code, stdout, stderr } = await runBundle(
+      withConnector,
+      ["branch-check"],
+      "unprivileged",
+    );
+    expect({ code, stdout }).toEqual({ code: 2, stdout: "" });
+    const [line, ...rest] = stderr.split("\n");
+    expect(line).toMatch(
+      /^runner: branch-check can't keep the GitHub connector from this user's other processes: .*can't change its effective user \(EPERM\)/,
+    );
+    expect(rest.join("\n")).toBe(USAGE);
+    expect(stderr).not.toContain("conn_subcommand");
+  });
+
+  test("without a connector it tries nothing, so a host that can't hide prints no line", async () => {
+    const result = await runBundle({}, ["branch-check"], "unprivileged");
+    expect(result).toEqual({ code: 2, stdout: "", stderr: USAGE });
+  });
+});
+
 test.each(["constructor", "toString", "__proto__"])(
   "%s is not a command: the runner starts a run, which wants its env",
   async (name) => {
