@@ -46,6 +46,7 @@ import {
   type Tx,
 } from "./runs.js";
 import {
+  CONNECTOR_NAMES,
   EnvVarName,
   isReservedName,
   registerRunEnvVars,
@@ -75,8 +76,12 @@ const LaunchInput = z.strictObject({
 });
 const FollowUpInput = z.strictObject({ prompt: Prompt, ...RunEnv });
 
+// a run's connector names would override the env's, and the runner sends the connector id to the
+// gateway URL it is given
 const reservedIn = (envVars: Record<string, string>) =>
-  Object.keys(envVars).find(isReservedName);
+  Object.keys(envVars).find(
+    (name) => isReservedName(name) || CONNECTOR_NAMES.has(name),
+  );
 const AnswerInput = z.strictObject({
   requestId: RequestId,
   answer: z.string().min(1),

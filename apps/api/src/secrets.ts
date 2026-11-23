@@ -51,6 +51,15 @@ const reservedNames = new Set<string>([
 
 export const isReservedName = (name: string) => reservedNames.has(name);
 
+/**
+ * The variables that let a process call GitHub through the gateway as the environment's connector:
+ * the env's own secrets set them, and nothing else may. Not reserved, so `sky secret set` takes them.
+ */
+export const CONNECTOR_NAMES: ReadonlySet<string> = new Set([
+  "GITHUB_CONNECTOR",
+  "GITHUB_GATEWAY_URL",
+]);
+
 export const reservedName = (c: Context, name: string) =>
   apiError(c, 400, "reserved_name", `${name} is reserved by sky`);
 

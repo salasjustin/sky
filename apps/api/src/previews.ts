@@ -29,6 +29,7 @@ import {
 import { cut, redact } from "./redact.js";
 import type { BundleInstaller } from "./runner-bundle.js";
 import {
+  CONNECTOR_NAMES,
   hasConnectorSecret,
   isReservedName,
   openEnvSecrets,
@@ -41,9 +42,6 @@ import {
   spriteCall,
   writeSpriteFile,
 } from "./sprites.js";
-
-// the variables that let a process call GitHub through the gateway as the environment's connector
-const CONNECTOR_NAMES = new Set(["GITHUB_CONNECTOR", "GITHUB_GATEWAY_URL"]);
 
 // how long a created service is watched for an immediate exit; one that dies in this window fails the start,
 // with its last output

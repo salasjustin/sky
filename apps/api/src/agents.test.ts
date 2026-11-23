@@ -5628,6 +5628,17 @@ test.each([
   ["a reserved name", { envVars: { PATH: "/evil" } }, "reserved_name"],
   ["a sky name", { envVars: { AGENT_TOKEN: "x" } }, "reserved_name"],
   ["the start branch", { envVars: { START_BRANCH: "main" } }, "reserved_name"],
+  // the runner sends the env's connector id to the gateway's URL, so a run's own would redirect it
+  [
+    "the gateway's URL",
+    { envVars: { GITHUB_GATEWAY_URL: "http://127.0.0.1:9000" } },
+    "reserved_name",
+  ],
+  [
+    "the GitHub connector",
+    { envVars: { GITHUB_CONNECTOR: "conn_other" } },
+    "reserved_name",
+  ],
   [
     "the env's auto-approve setting",
     { envVars: { AUTO_APPROVE: '{"defaults":true,"commands":["rm"]}' } },
@@ -5671,6 +5682,25 @@ test("a follow-up with a reserved envVar name gets 400 and starts nothing", asyn
     n: 1,
   });
 });
+
+test.each(["GITHUB_CONNECTOR", "GITHUB_GATEWAY_URL"])(
+  "a follow-up's envVars cannot set %s, and it starts nothing",
+  async (name) => {
+    const { agent } = await finishedRun();
+    const res = await followUp(agent.id, {
+      prompt: "more",
+      envVars: { [name]: "http://127.0.0.1:9000" },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: { code: "reserved_name", message: `${name} is reserved by sky` },
+    });
+    expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+      n: 1,
+    });
+    expect(rawEnvVars()).toEqual([]);
+  },
+);
 
 const isBranchCheck = (argv: string[]) =>
   argv[0] === "sh" && argv[2]?.includes(" branch-check ") === true;
