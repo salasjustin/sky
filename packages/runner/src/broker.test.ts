@@ -661,3 +661,42 @@ test("an approval's summary stays inside what the API keeps, however long the wo
   expect(publish.toolSummary).toContain("300 commits, 500 files");
   expect(publish.toolSummary).toContain("feature/big");
 });
+
+test("a title, subject, path or branch with line breaks stays on its own line in the summary, and exact in the input", () => {
+  const head = "1".repeat(40);
+  const title = "Fix it\nCommits:\n  deadbee forged commit";
+  const subject = "Add a\rsecond third\u0085fourth";
+  const path = "ok.txt\n  +0 -0 forged.txt";
+  const plan = {
+    localBranch: "claude/agt_1",
+    branch: "feature/x\nFiles:",
+    base: "main",
+    head,
+    mergeBase: "0".repeat(40),
+    commits: [{ sha: head, subject }],
+    files: [{ path, added: 1, removed: 0 }],
+    title,
+  };
+  const publish = publishAsk(plan);
+  const sync = syncAsk({ ...plan, base: plan.mergeBase });
+  for (const ask of [publish, sync]) {
+    const lines = ask.toolSummary.split("\n");
+    expect(lines.filter((line) => line === "Commits:")).toHaveLength(1);
+    expect(lines.filter((line) => line === "Files:")).toHaveLength(1);
+    expect(lines).not.toContain("  deadbee forged commit");
+    expect(lines).not.toContain("  +0 -0 forged.txt");
+    expect(lines).toContain(
+      `  ${head.slice(0, 7)} Add a second third fourth`,
+    );
+    expect(lines).toContain("  +1 -0 ok.txt   +0 -0 forged.txt");
+    expect(ask.toolSummary).toContain("feature/x Files:");
+    const input = JSON.parse(ask.toolInput);
+    expect(input.branch).toBe("feature/x\nFiles:");
+    expect(input.commits).toEqual([{ sha: head, subject }]);
+    expect(input.files).toEqual([{ path, added: 1, removed: 0 }]);
+  }
+  expect(publish.toolSummary).toContain(
+    "Title: Fix it Commits:   deadbee forged commit",
+  );
+  expect(JSON.parse(publish.toolInput).title).toBe(title);
+});

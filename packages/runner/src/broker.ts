@@ -96,6 +96,10 @@ const BODY_MAX = 4_000;
 const cut = (text: string, max: number) =>
   text.length > max ? `${text.slice(0, max - 1)}…` : text;
 const short = (sha: string) => sha.slice(0, 7);
+// a title, subject, path or branch from config can hold a line break, which would add a line of its
+// own to the summary; the C1 controls and U+2028/U+2029 are line breaks to some renderers too
+const oneLine = (text: string) =>
+  text.replace(/[\p{Cc}\u2028\u2029]/gu, " ");
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 type Listed = {
@@ -116,7 +120,7 @@ const stat = ({ commits, files }: Listed) => ({
  * under it. The full lists are in the request's input.
  */
 function summaryOf(lead: string[], { commits, files }: Listed): string {
-  const head = lead.join("\n");
+  const head = lead.map(oneLine).join("\n");
   let room = SUMMARY_MAX - head.length;
   const section = (title: string, items: string[], share: number): string[] => {
     const budget = Math.max(0, Math.floor(room * share));
@@ -138,12 +142,14 @@ function summaryOf(lead: string[], { commits, files }: Listed): string {
     head,
     ...section(
       "Commits:",
-      commits.map((c) => `  ${short(c.sha)} ${cut(c.subject, 80)}`),
+      commits.map((c) => `  ${short(c.sha)} ${cut(oneLine(c.subject), 80)}`),
       0.4,
     ),
     ...section(
       "Files:",
-      files.map((f) => `  +${f.added} -${f.removed} ${cut(f.path, 90)}`),
+      files.map(
+        (f) => `  +${f.added} -${f.removed} ${cut(oneLine(f.path), 90)}`,
+      ),
       1,
     ),
   ].join("\n");
