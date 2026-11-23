@@ -331,7 +331,7 @@ export async function planSync(
 
 export type BrokerDeps = {
   socketPath: string;
-  /** The agent's worktree, from the runner's own state: no request names a path. */
+  /** The agent's worktree, from the runner's own state: no request names it, and a `--body` file is read only inside it or the scratch directory. */
   cwd: string;
   /** What the runner's own code runs with: the session's env and the connector. Never a command's. */
   env: NodeJS.ProcessEnv;
@@ -359,7 +359,7 @@ export type Broker = {
   release: (toolUseId: string) => void;
 };
 
-// paths the runner never reads a body from: the kernel's, which hold other processes' environments
+// paths the runner never reads a body from: the kernel's, where a read reaches the runner's own environment or another process's
 const KERNEL_DIRS = ["/proc", "/sys", "/dev"];
 
 const under = (root: string, path: string) =>
@@ -454,7 +454,7 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
     { toolUseId: string; op: "publish" | "sync"; used: boolean; live: boolean }
   >();
   const refused = (op: BrokerRequest["op"]) =>
-    `sky ${op}: refused: the runner serves a request only for the agent's own plain ${op} call while it runs, and this is not one; nothing was sent\n`;
+    `sky ${op}: refused: the runner serves a request only for the agent's own plain ${op} call while it runs, and this request doesn't carry that call's unused token; nothing was sent\n`;
 
   const serve = async (
     request: BrokerRequest,
