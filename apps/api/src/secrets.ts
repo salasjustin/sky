@@ -196,9 +196,10 @@ export function postponeRunEnvVars(tx: Tx, runId: RunId, byMs: number): void {
 
 /**
  * The redaction key of a connector secret's connection id. The gateway serves a request on the id
- * alone, so it is scrubbed from events and requests like any other secret value, and like one it is
- * keyed by what it holds: an id replaced or deleted stays scrubbed until a restart, because a run
- * started with it still holds it, and deleting the secret doesn't revoke the connector.
+ * alone, so it is scrubbed from events and requests like any other secret value. Like a value's
+ * nonce, the key names the id it holds: an id replaced or deleted stays scrubbed until a restart,
+ * because a run started with it still holds it, and deleting the secret doesn't revoke the
+ * connector.
  */
 const connectorKey = (envId: string, name: string, connector: string) =>
   `${envSecretAad(envId, name)}:connector:${connector}`;

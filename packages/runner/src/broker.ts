@@ -365,7 +365,7 @@ const KERNEL_DIRS = ["/proc", "/sys", "/dev"];
 const under = (root: string, path: string) =>
   path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
 
-// the most a body file may hold, as much as a whole request may carry
+// the most bytes a body file may hold: the same 4 MiB a whole request may carry in characters
 const BODY_FILE_MAX = REQUEST_MAX;
 
 /**
