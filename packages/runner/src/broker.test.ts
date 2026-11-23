@@ -953,6 +953,11 @@ test.each([
   ["/tmp/node /opt/sky/runner.mjs sync", false],
   ["node /tmp/evil.mjs publish --title T", false],
   ["node /opt/sky/runner.mjs store-sync pull", false],
+  ["\tnode /opt/sky/runner.mjs sync", true],
+  ["\vnode /opt/sky/runner.mjs sync", false],
+  [" node /opt/sky/runner.mjs sync", false],
+  ["node x /opt/sky/runner.mjs sync", false],
+  ['"node" /opt/sky/runner.mjs sync', false],
 ])("bare node: %s is the agent's own call: %s", (command, expected) => {
   expect(isBrokerCall(command, RUNNER)).toBe(expected);
 });
@@ -970,6 +975,9 @@ test("a call on bare node is rewritten to the runner's own node, and nothing els
     `/usr/bin/node ${rest}`,
   );
   expect(onRunnerNode("git status", "/usr/bin/node")).toBe("git status");
+  expect(onRunnerNode(`\vnode ${rest}`, "/usr/bin/node")).toBe(
+    `\vnode ${rest}`,
+  );
   // a path the shell would split or expand is quoted, and `$&` in it is not a replacement pattern
   expect(onRunnerNode("node x sync", "/opt/my node/$&/bin/node")).toBe(
     "'/opt/my node/$&/bin/node' x sync",

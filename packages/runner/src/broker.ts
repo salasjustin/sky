@@ -78,14 +78,18 @@ export function brokerCallOp(
   if (!words) return undefined;
   const [program, script, op] = words;
   if (script !== runner.script) return undefined;
-  if (program !== runner.execPath && !startsWithBareNode(command))
+  if (
+    program !== runner.execPath &&
+    !(program === "node" && startsWithBareNode(command))
+  )
     return undefined;
   return op === "publish" || op === "sync" ? op : undefined;
 }
 
-// the bare word `node`, unquoted, as the command's first word; a quoted spelling parses to the same
-// word but isn't the form the instructions give, so it isn't taken for the agent's own call
-const BARE_NODE = /^(\s*)node(?=\s)/;
+// the bare word `node`, unquoted, as the command's first word, with only space or tab around it: the
+// shell splits words on those alone, so `\v` or a no-break space would make a word of its own; a quoted
+// spelling parses to the same word but isn't the form the instructions give, so it isn't taken either
+const BARE_NODE = /^([ \t]*)node(?=[ \t])/;
 const startsWithBareNode = (command: string) => BARE_NODE.test(command);
 
 /**
