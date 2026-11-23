@@ -17,12 +17,17 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(home, { recursive: true, force: true }));
 
-test("the store's setup script runs with no GitHub connector and no env secret in its environment", () => {
+test("the store's setup script runs with no GitHub connector and no env secret in its environment or on disk", () => {
   const store = join(home, ".sky-store");
   mkdirSync(store);
   const seen = join(home, "seen.txt");
-  writeFileSync(join(store, "setup.sh"), `env > ${JSON.stringify(seen)}\n`);
+  const onDisk = join(home, "on-disk.txt");
   const file = join(home, "store.env");
+  // the env file sits at a fixed path the script could read the secrets back from
+  writeFileSync(
+    join(store, "setup.sh"),
+    `env > ${JSON.stringify(seen)}\nif [ -e ${JSON.stringify(file)} ]; then echo present; else echo gone; fi > ${JSON.stringify(onDisk)}\n`,
+  );
   // what the provisioner writes for the step: the env's secrets, the connector among them
   writeFileSync(
     file,
@@ -47,4 +52,5 @@ test("the store's setup script runs with no GitHub connector and no env secret i
   expect(names).not.toContain("GITHUB_CONNECTOR");
   expect(names).not.toContain("GITHUB_GATEWAY_URL");
   expect(names).not.toContain("PROJECT_SECRET");
+  expect(readFileSync(onDisk, "utf8").trim()).toBe("gone");
 });

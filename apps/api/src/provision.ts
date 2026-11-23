@@ -259,9 +259,10 @@ const REPO_ENV_FILE = "/tmp/sky-repo.env";
 const PULL_REPO = `. "$1" && exec node ${RUNNER} repo-pull "$2" "$3"`;
 const PULL_STORE = `. "$1" && exec node ${RUNNER} store-sync pull`;
 // the store's own setup script, when it has one, in the checkout the profile's layout names. Only
-// the root resolution sees the env file, sourced in a subshell: the script is repo code, and gets
-// neither the env's secrets nor the GitHub connector in its environment
-export const RUN_STORE_SETUP = `home=$(. "$1" || exit 1; printf %s "$HOME/\${SKY_STORE_HOME:-.sky-store}") || exit 1; if [ -f "$home/setup.sh" ]; then bash "$home/setup.sh"; fi`;
+// the root resolution sees the env file, sourced in a subshell, and the file is removed before the
+// script starts: the script is repo code, and gets neither the env's secrets nor the GitHub
+// connector, in its environment or on disk
+export const RUN_STORE_SETUP = `home=$(. "$1" || exit 1; printf %s "$HOME/\${SKY_STORE_HOME:-.sky-store}") || exit 1; rm -f "$1" || exit 1; if [ -f "$home/setup.sh" ]; then bash "$home/setup.sh"; fi`;
 // the sprite's node ships corepack but no pnpm or yarn; corepack's shims go under $HOME, so need no
 // root, and resolve the repo's `packageManager` version when run
 const PACKAGE_MANAGERS_DIR = "$HOME/.local/bin";
