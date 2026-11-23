@@ -24,6 +24,7 @@ import {
   type ApprovalAsk,
   type BrokerDeps,
   isBrokerCall,
+  onRunnerNode,
   publishAsk,
   readBodyFile,
   startBroker,
@@ -652,6 +653,9 @@ test("a request that isn't the agent's own running call is refused at once, with
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("refused");
     expect(result.stderr).toContain("agent's own plain publish call");
+    expect(result.stderr).toContain(
+      "Run the command exactly as the session instructions give it, as one plain command with no pipe, redirect or 2>&1",
+    );
   }
   expect(wrongOp).toContain("refused");
   expect(afterEnd).toContain("refused");
@@ -922,6 +926,54 @@ test.each([
   ["/tmp/node /opt/sky/runner.mjs publish --title T", false],
 ])("%s is the agent's own call: %s", (command, expected) => {
   expect(isBrokerCall(command, RUNNER)).toBe(expected);
+});
+
+test.each([
+  ["node /opt/sky/runner.mjs publish --title 'Add widgets'", true],
+  [
+    `node /opt/sky/runner.mjs publish --title "Add widgets" --body @/tmp/b.md`,
+    true,
+  ],
+  [
+    `node /opt/sky/runner.mjs publish --title 'Add "x" & more' --body @/tmp/b.md`,
+    true,
+  ],
+  ["node /opt/sky/runner.mjs sync", true],
+  ["node /opt/sky/runner.mjs sync --branch feature/x", true],
+  ["node /opt/sky/runner.mjs publish --title T && echo done", false],
+  ["node /opt/sky/runner.mjs publish --title T | cat", false],
+  ["node /opt/sky/runner.mjs sync 2>&1", false],
+  ["node /opt/sky/runner.mjs sync > out.txt", false],
+  ["node /opt/sky/runner.mjs publish --title T; rm -rf x", false],
+  ['node /opt/sky/runner.mjs publish --title "$(date)"', false],
+  ["env node /opt/sky/runner.mjs publish --title T", false],
+  ["command node /opt/sky/runner.mjs sync", false],
+  ["sh -c 'node /opt/sky/runner.mjs sync'", false],
+  ["./node /opt/sky/runner.mjs sync", false],
+  ["/tmp/node /opt/sky/runner.mjs sync", false],
+  ["node /tmp/evil.mjs publish --title T", false],
+  ["node /opt/sky/runner.mjs store-sync pull", false],
+])("bare node: %s is the agent's own call: %s", (command, expected) => {
+  expect(isBrokerCall(command, RUNNER)).toBe(expected);
+});
+
+test("a call on bare node is rewritten to the runner's own node, and nothing else changes", () => {
+  const rest = `/opt/sky/runner.mjs publish --title 'Add "x" & $y' --body @/tmp/b.md`;
+  expect(onRunnerNode(`node ${rest}`, "/usr/bin/node")).toBe(
+    `/usr/bin/node ${rest}`,
+  );
+  expect(onRunnerNode(`  node  ${rest}`, "/usr/bin/node")).toBe(
+    `  /usr/bin/node  ${rest}`,
+  );
+  // the full-path form and any other command are returned as they came
+  expect(onRunnerNode(`/usr/bin/node ${rest}`, "/usr/bin/node")).toBe(
+    `/usr/bin/node ${rest}`,
+  );
+  expect(onRunnerNode("git status", "/usr/bin/node")).toBe("git status");
+  // a path the shell would split or expand is quoted, and `$&` in it is not a replacement pattern
+  expect(onRunnerNode("node x sync", "/opt/my node/$&/bin/node")).toBe(
+    "'/opt/my node/$&/bin/node' x sync",
+  );
 });
 
 test("a runner with no script path of its own lets no call through as its own", () => {

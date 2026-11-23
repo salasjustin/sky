@@ -77,8 +77,27 @@ export function brokerCallOp(
   }
   if (!words) return undefined;
   const [program, script, op] = words;
-  if (program !== runner.execPath || script !== runner.script) return undefined;
+  if (script !== runner.script) return undefined;
+  if (program !== runner.execPath && !startsWithBareNode(command))
+    return undefined;
   return op === "publish" || op === "sync" ? op : undefined;
+}
+
+// the bare word `node`, unquoted, as the command's first word; a quoted spelling parses to the same
+// word but isn't the form the instructions give, so it isn't taken for the agent's own call
+const BARE_NODE = /^(\s*)node(?=\s)/;
+const startsWithBareNode = (command: string) => BARE_NODE.test(command);
+
+/**
+ * `command` run on the runner's own node: a call that began with the bare word `node` has only that
+ * word replaced by `execPath`, so it doesn't run on whatever `node` resolves to on PATH. The arguments
+ * stay as written. Any other command comes back as it was.
+ */
+export function onRunnerNode(command: string, execPath: string): string {
+  const program = /^[\w@%+=:,./-]+$/.test(execPath)
+    ? execPath
+    : `'${execPath.replaceAll("'", `'\\''`)}'`;
+  return command.replace(BARE_NODE, (_, lead: string) => `${lead}${program}`);
 }
 
 /** Whether `command` is the agent's own `publish` or `sync` call; see `brokerCallOp`. */
@@ -454,7 +473,7 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
     { toolUseId: string; op: "publish" | "sync"; used: boolean; live: boolean }
   >();
   const refused = (op: BrokerRequest["op"]) =>
-    `sky ${op}: refused: the runner serves a request only for the agent's own plain ${op} call while it runs, and this request doesn't carry that call's unused token; nothing was sent\n`;
+    `sky ${op}: refused: the runner serves a request only for the agent's own plain ${op} call while it runs, and this request doesn't carry that call's unused token; nothing was sent. Run the command exactly as the session instructions give it, as one plain command with no pipe, redirect or 2>&1\n`;
 
   const serve = async (
     request: BrokerRequest,

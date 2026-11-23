@@ -1119,7 +1119,7 @@ export async function publish(options: {
     // a continued branch is someone's pull request: its head is theirs even when it sits in this
     // branch's reflog, as the head the worktree was made from always does
     if (at === -1 && continued && remoteBranch === continued) {
-      const syncIt = `run \`node /opt/sky/runner.mjs sync\` to bring what was pushed to ${remoteBranch} into this worktree (your unpublished commits are rebased onto it), then publish again`;
+      const syncIt = `run \`${process.execPath} ${process.argv[1]} sync\` to bring what was pushed to ${remoteBranch} into this worktree (your unpublished commits are rebased onto it), then publish again`;
       // a commit git doesn't know can only have been pushed since the last fetch
       const known = await git(cwd, "cat-file", "-e", `${remote}^{commit}`).then(
         () => true,
