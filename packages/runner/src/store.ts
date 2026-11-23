@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { BaseProfileStoreLayout } from "@sky/shared";
+import { connectorOf } from "./connector.js";
 import {
   CONNECTOR_ENV,
   DEFAULT_GATEWAY_URL,
@@ -606,6 +607,8 @@ export function underLock(
   io: { stdout: (s: string) => void; stderr: (s: string) => void },
   self: [string, ...string[]] = [process.execPath, process.argv[1] as string],
   waitS = LOCK_WAIT_S,
+  /** Where the connector comes from: the runner holds it outside its own env, and the locked child is handed it. */
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<number> {
   return new Promise((resolve) => {
     const child = spawn(
@@ -622,7 +625,10 @@ export function underLock(
         mode,
         "--locked",
       ],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, ...connectorOf(env) },
+      },
     );
     child.stdout.on("data", (d: Buffer) => io.stdout(d.toString()));
     child.stderr.on("data", (d: Buffer) => io.stderr(d.toString()));
@@ -692,7 +698,7 @@ export async function storeSyncMain(
   const home = resolveStoreHome(env, layout);
   if (!locked) {
     await mkdir(home, { recursive: true });
-    return underLock(home, mode, io);
+    return underLock(home, mode, io, undefined, undefined, env);
   }
   const options: StoreOptions = {
     home,

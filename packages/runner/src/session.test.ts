@@ -19,6 +19,7 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { setImmediate } from "node:timers/promises";
@@ -65,7 +66,10 @@ import {
   PINNED_SETTINGS,
   settingsRedirects,
 } from "./settings-guard.js";
-import { hermeticRunSession as runSession } from "./testing/hermetic-run.js";
+import {
+  hermeticRunSession as runSession,
+  TEST_SEAL,
+} from "./testing/hermetic-run.js";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -856,6 +860,50 @@ test("runs the session in the agent worktree, resuming the stored session, witho
   }
 });
 
+test("no command of the session gets the GitHub connector, whoever set it; the runner's broker socket is there in its place", async () => {
+  vi.stubEnv("GITHUB_CONNECTOR", "conn_runner_env");
+  vi.stubEnv("GITHUB_GATEWAY_URL", "https://runner-env.test");
+  try {
+    const query = scripted([init, success]);
+    await runSession(
+      {
+        ...config,
+        sessionEnv: {
+          GITHUB_CONNECTOR: "conn_profile",
+          GITHUB_GATEWAY_URL: "https://profile.test",
+        },
+      },
+      {
+        query,
+        post: recorder().post,
+        signal: new AbortController().signal,
+        awaitDecision: noDecision,
+        connector: {
+          GITHUB_CONNECTOR: "conn_held",
+          GITHUB_GATEWAY_URL: "https://held.test",
+        },
+      },
+    );
+    const env = query.calls[0]?.options.env ?? {};
+    // names only: this env is the machine's, which a failure must not print
+    expect(
+      ["GITHUB_CONNECTOR", "GITHUB_GATEWAY_URL"].filter((name) => name in env),
+    ).toEqual([]);
+    expect(
+      Object.entries(env)
+        .filter(([, value]) =>
+          /conn_(runner_env|profile|held)|(runner-env|profile|held)\.test/.test(
+            String(value),
+          ),
+        )
+        .map(([name]) => name),
+    ).toEqual([]);
+    expect(env.SKY_BROKER_SOCKET).toMatch(/broker\.sock$/);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
 const HOST_GIT_IDENTITY = [
   "GIT_AUTHOR_NAME",
   "GIT_AUTHOR_EMAIL",
@@ -1111,26 +1159,28 @@ test("the Claude session has kru's lead-contract hook off, whatever the runner's
   expect(query.calls[0]?.options.env?.KRU_NO_LEAD_GATE).toBe("1");
 });
 
-test("with a GitHub connector in its env, the session is told to publish through the runner instead of git push or gh", async () => {
-  const start = () => {
+test("with a GitHub connector held by the runner, the session is told to publish through the runner, after one approval, instead of git push or gh", async () => {
+  const start = (connector?: NodeJS.ProcessEnv) => {
     const query = scripted([init, success]);
     return runSession(config, {
       query,
       post: recorder().post,
       signal: new AbortController().signal,
       awaitDecision: noDecision,
+      ...(connector && { connector }),
     }).then(() => query.calls[0]?.options.systemPrompt);
   };
   try {
     vi.stubEnv("GITHUB_CONNECTOR", undefined);
     const bare = (await start()) as { append?: string };
     expect(bare.append).not.toContain("publish --title");
-    vi.stubEnv("GITHUB_CONNECTOR", "conn_123");
-    const prompt = await start();
+    const prompt = await start({ GITHUB_CONNECTOR: "conn_123" });
     expect(prompt).toMatchObject({ type: "preset", preset: "claude_code" });
     const append = (prompt as { append?: string }).append ?? "";
     expect(append).toContain(" publish --title <title>");
-    expect(append).toContain(`--body "$(cat <<'EOF'`);
+    expect(append).toContain("opens one approval for the person");
+    expect(append).toContain("`--body @<path>`");
+    expect(append).not.toContain("<<'EOF'");
     expect(append).toContain("instead of `git push` or `gh pr create`");
     expect(append).toContain(
       "This sandbox has no git transport and no GitHub credential: `git fetch`, `git pull` and `git push` fail here, and so does `gh`.",
@@ -1149,6 +1199,7 @@ test("with a GitHub connector in its env, the session is told to publish through
 const appendOf = async (
   checks: string[],
   credentialEnv: NodeJS.ProcessEnv = {},
+  connector?: NodeJS.ProcessEnv,
 ) => {
   const query = scripted([init, success]);
   await runSession(
@@ -1159,6 +1210,7 @@ const appendOf = async (
       signal: new AbortController().signal,
       awaitDecision: noDecision,
       credentialEnv,
+      ...(connector && { connector }),
     },
   );
   return (
@@ -1186,9 +1238,14 @@ test("with checks in the profile, the session is told to run them in order befor
 });
 
 test("with a connector and checks, the publish instructions come first, then the checks, as separate paragraphs", async () => {
-  vi.stubEnv("GITHUB_CONNECTOR", "conn_123");
   try {
-    const append = await appendOf(["update the changelog"]);
+    const append = await appendOf(
+      ["update the changelog"],
+      {},
+      {
+        GITHUB_CONNECTOR: "conn_123",
+      },
+    );
     // the connector makes the run try to refresh from GitHub, which this test's origin fails, and
     // that failure is a note of its own
     const paragraphs = append
@@ -3595,7 +3652,7 @@ async function bareBashRun(
       ? [e.payload.request.toolSummary]
       : [],
   );
-  return { code, held, warned };
+  return { code, held, warned, sent };
 }
 
 test("a relative path that leaves the worktree still asks under a bare Bash policy", async () => {
@@ -3740,6 +3797,178 @@ test("an auto-approved call is logged by its tool use id; held and unheld calls 
   expect(warned).toEqual([
     "runner: auto-approved Bash call t1 without an approval request",
   ]);
+});
+
+test("an auto-approved Bash call's claude.PreToolUse says it was auto-approved and why; a held call's carries no note", async () => {
+  const { sent } = await bareBashRun(() => [
+    { command: "git status" },
+    { command: "git push origin main" },
+  ]);
+  const pre = sent.flatMap((event) =>
+    event.type === "claude.PreToolUse" ? [event.payload] : [],
+  );
+  expect(pre.map((p) => p.toolUseId)).toEqual(["t1", "t2"]);
+  expect(pre[0]?.autoApproved).toEqual({
+    verdict: "approved",
+    reason: "the command is on the default auto-approve list",
+  });
+  expect(pre[1]).not.toHaveProperty("autoApproved");
+  // an event the API's schema takes, which an older client reads as its other PreToolUse events
+  for (const event of sent) RunnerEventPost.parse({ ...event, runId: "run_1" });
+});
+
+test("a policy that doesn't hold Bash lets every call run and notes none of them", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      await fire(options, "PreToolUse", {
+        tool_name: "Bash",
+        tool_input: { command: "git status" },
+        tool_use_id: "t1",
+      });
+    },
+    success,
+  ]);
+  await runSession({ ...config, approvalPolicy: [] }, { ...deps, query });
+  const pre = sent.flatMap((event) =>
+    event.type === "claude.PreToolUse" ? [event.payload] : [],
+  );
+  expect(pre).toHaveLength(1);
+  expect(pre[0]).not.toHaveProperty("autoApproved");
+});
+
+const PUBLISH_CALL = `${process.execPath} ${process.argv[1]} publish --title T`;
+
+const waitingSummaries = (sent: RunnerEventPost[]) =>
+  sent.flatMap((e) =>
+    e.type === "run.waiting" && e.payload.request.kind === "approval"
+      ? [e.payload.request.toolSummary]
+      : [],
+  );
+const preToolUse = (sent: RunnerEventPost[]) =>
+  sent.flatMap((e) => (e.type === "claude.PreToolUse" ? [e.payload] : []));
+
+test("the agent's plain publish call asks nothing as a Bash call, because the runner opens its own approval; the same words chained still ask", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      for (const [i, command] of [
+        PUBLISH_CALL,
+        `${PUBLISH_CALL} && echo done`,
+        `${PUBLISH_CALL.replace(" publish ", " sync ")}`,
+      ].entries())
+        await fire(options, "PreToolUse", {
+          tool_name: "Bash",
+          tool_input: { command },
+          tool_use_id: `t${i + 1}`,
+        });
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query, connector: { GITHUB_CONNECTOR: "conn_123" } },
+  );
+  expect(waitingSummaries(sent)).toEqual([`${PUBLISH_CALL} && echo done`]);
+  const pre = preToolUse(sent);
+  expect(pre.map((p) => p.autoApproved?.verdict)).toEqual([
+    "broker",
+    undefined,
+    "broker",
+  ]);
+  expect(pre[0]?.autoApproved?.reason).toContain("opens its own approval");
+});
+
+test("with no connector there is no broker, and the same call asks like any command", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      await fire(options, "PreToolUse", {
+        tool_name: "Bash",
+        tool_input: { command: PUBLISH_CALL },
+        tool_use_id: "t1",
+      });
+    },
+    success,
+  ]);
+  await runSession({ ...config, approvalPolicy: ["Bash"] }, { ...deps, query });
+  expect(waitingSummaries(sent)).toEqual([PUBLISH_CALL]);
+  expect(preToolUse(sent)[0]).not.toHaveProperty("autoApproved");
+});
+
+/** What the runner's broker answers one request, over the socket the session's commands are given. */
+const askBroker = (options: Options, request: object) =>
+  new Promise<string>((resolve, reject) => {
+    const socket = net.createConnection(String(options.env?.SKY_BROKER_SOCKET));
+    let received = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+    });
+    socket.on("error", reject);
+    socket.on("close", () => resolve(received));
+  });
+
+test("a sync asked of the session's broker opens exactly one approval, a Sync request the inbox reads like a held call", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  let reply = "";
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      reply = await askBroker(options, { op: "sync" });
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: [] },
+    { ...deps, query, connector: { GITHUB_CONNECTOR: "conn_123" } },
+  );
+  const requests = sent.flatMap((e) =>
+    e.type === "run.waiting" ? [e.payload.request] : [],
+  );
+  expect(requests).toHaveLength(1);
+  expect(requests[0]).toMatchObject({ kind: "approval", toolName: "Sync" });
+  // approved, so the runner went on to sync, which this test's origin can't do
+  expect(reply).toContain('"t":"exit"');
+  expect(reply).toContain("origin is not a GitHub repo");
+});
+
+test("a runner that can't confirm its seal refuses a publish asked of its broker, and posts a runner.warning", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  let reply = "";
+  // the check at the session's start passes; the one the request makes does not
+  const check = vi
+    .fn<() => string | undefined>()
+    .mockReturnValueOnce(undefined)
+    .mockReturnValue(
+      "the kernel lets the repo's commands read Claude's environment",
+    );
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      reply = await askBroker(options, { op: "publish", title: "T" });
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: [] },
+    {
+      ...deps,
+      query,
+      connector: { GITHUB_CONNECTOR: "conn_123" },
+      seal: { ...TEST_SEAL, check },
+    },
+  );
+  expect(reply).toContain("sky publish refused");
+  expect(waitingSummaries(sent)).toEqual([]);
+  const warnings = sent.flatMap((e) =>
+    e.type === "runner.warning" ? [e.payload.message] : [],
+  );
+  expect(warnings.some((m) => m.startsWith("sky publish refused"))).toBe(true);
 });
 
 test("an auto-approve check that throws holds the call for approval", async () => {

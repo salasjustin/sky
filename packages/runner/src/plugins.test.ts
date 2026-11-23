@@ -1234,6 +1234,36 @@ describe("refresh lock", () => {
     expect(existsSync(lockFile)).toBe(false);
   });
 
+  test("no command of the refresh gets the GitHub connector, even from an env that holds it", async () => {
+    const lockFile = join(dir, "lock");
+    const seen: NodeJS.ProcessEnv[] = [];
+    const run = async (
+      _f: string,
+      args: string[],
+      options: { env: NodeJS.ProcessEnv },
+    ) => {
+      seen.push(options.env);
+      return { stdout: args[1] === "list" ? listing : "" };
+    };
+    await refreshPlugins({
+      env: {
+        PATH: "/usr/bin",
+        GITHUB_CONNECTOR: "conn_secret",
+        GITHUB_GATEWAY_URL: "https://gateway.test",
+      },
+      warn: vi.fn(),
+      claude: "c",
+      lockFile,
+      run,
+    });
+    expect(seen.length).toBeGreaterThan(0);
+    for (const env of seen) {
+      expect(env).not.toHaveProperty("GITHUB_CONNECTOR");
+      expect(env).not.toHaveProperty("GITHUB_GATEWAY_URL");
+      expect(env.PATH).toBe("/usr/bin");
+    }
+  });
+
   test("a run that waited on a live holder skips its refresh once the holder releases", async () => {
     const lockFile = join(dir, "lock");
     writeFileSync(lockFile, String(process.pid));

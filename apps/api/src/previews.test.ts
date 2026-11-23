@@ -449,6 +449,22 @@ test("the app's env is the environment's secrets and profile, with no Claude cre
   seedSecret("AGENT_TOKEN", "stored-agent-token-value");
   seedSecret("SKY_CLAUDE_API_KEY", "stored-claude-key-value");
   seedSecret("PATH", "/evil/bin");
+  // the GitHub connector, which the gateway honors on its id alone: the app's build and server run the
+  // agent's branch, and never get it, whatever the secret is named, nor the gateway's URL
+  seedSecret("GITHUB_GATEWAY_URL", "https://gateway.test/v1/gateway/github");
+  for (const name of ["GITHUB_CONNECTOR", "OTHER_CONNECTOR"]) {
+    db.insert(secrets)
+      .values({
+        envId,
+        name,
+        kind: "connector",
+        connector: `conn_${name.toLowerCase()}`,
+        ciphertext: null,
+        nonce: null,
+        keyVersion: null,
+      })
+      .run();
+  }
   await started(agentId, { build: "none", start: "pnpm dev", port: 3000 });
 
   const env = servicesOf(envId).get(PREVIEW_APP_SERVICE)?.env ?? {};

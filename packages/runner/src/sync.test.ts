@@ -874,9 +874,7 @@ async function runOnce(
   extra: { startBranch?: string } = {},
   sessionEnv: Record<string, string> = {},
 ) {
-  vi.stubEnv("GITHUB_CONNECTOR", CONNECTOR);
   vi.stubEnv("SKY_ANON_GIT", "0");
-  vi.stubEnv("GITHUB_GATEWAY_URL", GATEWAY);
   const posted: RunnerEventPost[] = [];
   let options: Options | undefined;
   const query: QueryFn = (params) => {
@@ -926,6 +924,11 @@ async function runOnce(
       },
       signal: new AbortController().signal,
       warn: (line) => warnings.push(line),
+      // what `main` takes out of the runner's own env and hands only to the runner's code
+      connector: {
+        GITHUB_CONNECTOR: CONNECTOR,
+        GITHUB_GATEWAY_URL: GATEWAY,
+      },
     },
   );
   const append = (options?.systemPrompt as { append?: string } | undefined)

@@ -17,6 +17,7 @@ import type {
   PluginRefreshStep,
   PluginVersion,
 } from "@sky/shared";
+import { withoutConnector } from "./connector.js";
 
 /**
  * Overall budget for the refresh, the wait on another run's refresh included. It is sized so the updates
@@ -454,7 +455,9 @@ export async function refreshPlugins(options: {
   /** The clock the commands' durations are read from, in ms; `performance.now` when absent. */
   stepNow?: () => number;
 }): Promise<PluginRefreshRecord> {
-  const { env, warn, signal: stop } = options;
+  const { warn, signal: stop } = options;
+  // the plugins' own commands run repo and marketplace code: they never get the GitHub connector
+  const env = withoutConnector(options.env);
   const now = options.now ?? Date.now;
   const started = now();
   // null until the list is read: a read that found no plugins is `[]`
