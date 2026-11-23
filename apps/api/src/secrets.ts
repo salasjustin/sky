@@ -195,12 +195,13 @@ export function postponeRunEnvVars(tx: Tx, runId: RunId, byMs: number): void {
 }
 
 /**
- * The redaction key of a connector secret's connection id: one per secret, replaced when it is set
- * again. The gateway serves a request on the id alone, so it is scrubbed from events and requests
- * like any other secret value.
+ * The redaction key of a connector secret's connection id. The gateway serves a request on the id
+ * alone, so it is scrubbed from events and requests like any other secret value, and like one it is
+ * keyed by what it holds: an id replaced or deleted stays scrubbed until a restart, because a run
+ * started with it still holds it, and deleting the secret doesn't revoke the connector.
  */
-const connectorKey = (envId: string, name: string) =>
-  `${envSecretAad(envId, name)}:connector`;
+const connectorKey = (envId: string, name: string, connector: string) =>
+  `${envSecretAad(envId, name)}:connector:${connector}`;
 
 /** Registers a run's envVars with redaction, until `purgeExpiredEnvVars` drops them. */
 export function registerRunEnvVars(
@@ -241,7 +242,7 @@ export function purgeExpiredEnvVars(
   for (const { runId, name } of purged) known.remove(runEnvVarAad(runId, name));
 }
 
-/** Registers every stored env value secret and every held run envVar with redaction. */
+/** Registers every stored env value secret, connector secret's id and held run envVar with redaction. */
 export function registerStoredValues(
   db: Db,
   key: Buffer,
@@ -265,7 +266,7 @@ export function registerStoredValues(
     .where(isNotNull(secrets.connector))
     .all()) {
     if (row.connector !== null) {
-      known.add(connectorKey(row.envId, row.name), row.connector);
+      known.add(connectorKey(row.envId, row.name, row.connector), row.connector);
     }
   }
   for (const row of db.select().from(runEnvVars).all()) {
@@ -353,10 +354,7 @@ export function secretRoutes() {
         c.var.secrets.add(envSecretKey(id, name, sealed.nonce), input.value);
       }
       if ("connector" in input) {
-        c.var.secrets.add(connectorKey(id, name), input.connector);
-      } else {
-        // replaced by a value: the old id is no longer this secret's
-        c.var.secrets.remove(connectorKey(id, name));
+        c.var.secrets.add(connectorKey(id, name, input.connector), input.connector);
       }
       return c.json(present(row), 200);
     })
@@ -370,7 +368,6 @@ export function secretRoutes() {
         .returning({ name: secrets.name })
         .get();
       if (!deleted) return apiError(c, 404, "not_found", "no such secret");
-      c.var.secrets.remove(connectorKey(id, c.req.param("name")));
       return c.body(null, 204);
     });
 }

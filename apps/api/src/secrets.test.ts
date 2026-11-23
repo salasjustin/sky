@@ -72,7 +72,7 @@ const rawSecrets = () =>
 
 const plaintext = "ghp_plaintext-secret-value-0001";
 
-test("a connector secret's connection id is redacted like any secret value: when set, after a restart, and not once replaced or deleted", async () => {
+test("a connector secret's connection id is redacted like any secret value: when set, after a restart, and still once replaced or deleted", async () => {
   const known = KnownSecrets.fromConfig(config);
   const appWith = (secrets: KnownSecrets) =>
     createApp({
@@ -105,17 +105,31 @@ test("a connector secret's connection id is redacted like any secret value: when
     "gateway/github/[redacted]/repos/acme/widgets",
   );
 
-  // set again to another id: the old one is no longer held
+  // set again to another id, then to a value, then deleted: a run started with an earlier id still
+  // holds it, and the connector still serves it, so every id stays scrubbed until a restart
   const other = "conn_fedcba9876543210";
   await set("GITHUB_CONNECTOR", { connector: other });
   expect(known.values()).toContain(other);
-  expect(known.values()).not.toContain(id);
+  expect(known.values()).toContain(id);
+  expect((await set("GITHUB_CONNECTOR", { value: plaintext })).status).toBe(
+    200,
+  );
+  expect(
+    (
+      await live.request(
+        `/v1/environments/${envId}/secrets/GITHUB_CONNECTOR`,
+        { method: "DELETE", headers: auth },
+      )
+    ).status,
+  ).toBe(204);
+  expect(known.values()).toEqual(expect.arrayContaining([id, other]));
+  expect(scrubbed(known)).toBe("gateway/github/[redacted]/repos/acme/widgets");
 
-  await live.request(`/v1/environments/${envId}/secrets/GITHUB_CONNECTOR`, {
-    method: "DELETE",
-    headers: auth,
-  });
-  expect(known.values()).not.toContain(other);
+  // a restart forgets the ids no longer stored, as it does replaced values
+  const afterDelete = KnownSecrets.fromConfig(config);
+  appWith(afterDelete);
+  expect(afterDelete.values()).not.toContain(id);
+  expect(afterDelete.values()).not.toContain(other);
 });
 
 test("PUT of a value answers its name and kind, never the value, and stores no plaintext", async () => {
