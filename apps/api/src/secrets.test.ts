@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
 import { runEnvVarAad, seal } from "./crypto.js";
+import { KnownSecrets, redact } from "./redact.js";
 import { spriteNameFor } from "./sprites.js";
 import { spritesToken, stubSprites, testConfig } from "./testing/sprites.js";
 
@@ -70,6 +71,52 @@ const rawSecrets = () =>
   >[];
 
 const plaintext = "ghp_plaintext-secret-value-0001";
+
+test("a connector secret's connection id is redacted like any secret value: when set, after a restart, and not once replaced or deleted", async () => {
+  const known = KnownSecrets.fromConfig(config);
+  const appWith = (secrets: KnownSecrets) =>
+    createApp({
+      db,
+      config,
+      sprites: new SpritesClient(spritesToken),
+      log: () => {},
+      nudgeDeliveries: () => {},
+      secrets,
+    });
+  const live = appWith(known);
+  const envId = env();
+  const id = "conn_0123456789abcdef";
+  const set = (name: string, body: unknown) =>
+    live.request(`/v1/environments/${envId}/secrets/${name}`, {
+      method: "PUT",
+      headers: json,
+      body: JSON.stringify(body),
+    });
+  const scrubbed = (secrets: KnownSecrets) =>
+    redact(`gateway/github/${id}/repos/acme/widgets`, secrets.values());
+
+  expect((await set("GITHUB_CONNECTOR", { connector: id })).status).toBe(200);
+  expect(scrubbed(known)).toBe("gateway/github/[redacted]/repos/acme/widgets");
+
+  // a restarted API learns it from the stored row
+  const restarted = KnownSecrets.fromConfig(config);
+  appWith(restarted);
+  expect(scrubbed(restarted)).toBe(
+    "gateway/github/[redacted]/repos/acme/widgets",
+  );
+
+  // set again to another id: the old one is no longer held
+  const other = "conn_fedcba9876543210";
+  await set("GITHUB_CONNECTOR", { connector: other });
+  expect(known.values()).toContain(other);
+  expect(known.values()).not.toContain(id);
+
+  await live.request(`/v1/environments/${envId}/secrets/GITHUB_CONNECTOR`, {
+    method: "DELETE",
+    headers: auth,
+  });
+  expect(known.values()).not.toContain(other);
+});
 
 test("PUT of a value answers its name and kind, never the value, and stores no plaintext", async () => {
   const envId = env();

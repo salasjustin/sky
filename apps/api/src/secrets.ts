@@ -194,6 +194,14 @@ export function postponeRunEnvVars(tx: Tx, runId: RunId, byMs: number): void {
   }
 }
 
+/**
+ * The redaction key of a connector secret's connection id: one per secret, replaced when it is set
+ * again. The gateway serves a request on the id alone, so it is scrubbed from events and requests
+ * like any other secret value.
+ */
+const connectorKey = (envId: string, name: string) =>
+  `${envSecretAad(envId, name)}:connector`;
+
 /** Registers a run's envVars with redaction, until `purgeExpiredEnvVars` drops them. */
 export function registerRunEnvVars(
   known: KnownSecrets,
@@ -250,6 +258,15 @@ export function registerStoredValues(
       envSecretKey(row.envId, row.name, sealed.nonce),
       open(key, sealed, envSecretAad(row.envId, row.name)),
     );
+  }
+  for (const row of db
+    .select()
+    .from(secrets)
+    .where(isNotNull(secrets.connector))
+    .all()) {
+    if (row.connector !== null) {
+      known.add(connectorKey(row.envId, row.name), row.connector);
+    }
   }
   for (const row of db.select().from(runEnvVars).all()) {
     const aad = runEnvVarAad(row.runId, row.name);
@@ -335,6 +352,12 @@ export function secretRoutes() {
       if (sealed && "value" in input) {
         c.var.secrets.add(envSecretKey(id, name, sealed.nonce), input.value);
       }
+      if ("connector" in input) {
+        c.var.secrets.add(connectorKey(id, name), input.connector);
+      } else {
+        // replaced by a value: the old id is no longer this secret's
+        c.var.secrets.remove(connectorKey(id, name));
+      }
       return c.json(present(row), 200);
     })
     .delete("/:id/secrets/:name", envParam, (c) => {
@@ -347,6 +370,7 @@ export function secretRoutes() {
         .returning({ name: secrets.name })
         .get();
       if (!deleted) return apiError(c, 404, "not_found", "no such secret");
+      c.var.secrets.remove(connectorKey(id, c.req.param("name")));
       return c.body(null, 204);
     });
 }
