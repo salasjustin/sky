@@ -372,8 +372,24 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
           `${plan.localBranch} moved from ${plan.head} to ${now} while the sync waited for approval; nothing was changed, sync again to ask for the new head`,
         );
       }
+      // a switch to another branch at the same commit keeps the head, and would sync that branch
+      const checkedOut = await git(
+        deps.cwd,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+      ).catch(() => "");
+      if (checkedOut !== plan.localBranch) {
+        throw new PublishError(
+          `the worktree switched from ${plan.localBranch} to ${checkedOut || "a detached HEAD"} while the sync waited for approval; nothing was changed, sync again to ask for the branch it is on`,
+        );
+      }
+      // the GitHub branch the person approved, never one sync would work out again from config the
+      // worktree can change while they decided. Past choosing it, sync treats a `--branch` exactly as
+      // the branch it would choose itself
       const code = await (deps.syncRun ?? syncMain)(
-        request.branch ? ["--branch", request.branch] : [],
+        ["--branch", plan.branch],
         deps.env,
         io,
       );

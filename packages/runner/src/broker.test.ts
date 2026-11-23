@@ -497,6 +497,50 @@ test("a sync's approval shows the commits as stored, whatever a replacement says
   expect(input.files).toEqual([{ path: "a.txt", added: 1, removed: 0 }]);
 });
 
+test("a sync acts on the GitHub branch it showed, even when the branch's config changed while the person decided", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const asks: ApprovalAsk[] = [];
+  const syncRun = vi.fn<typeof syncMain>(async () => 0);
+  const { socketPath } = await broker(
+    async (ask) => {
+      asks.push(ask);
+      git(work, "config", "branch.claude/agt_1.sky-remote-branch", "elsewhere");
+      return approved;
+    },
+    { syncRun },
+  );
+
+  const { status } = await client(brokerSyncMain, [], socketPath);
+
+  expect(status).toBe(0);
+  expect(JSON.parse(asks[0]?.toolInput ?? "{}").branch).toBe("claude/agt_1");
+  expect(syncRun).toHaveBeenCalledOnce();
+  expect(syncRun.mock.calls[0]?.[0]).toEqual(["--branch", "claude/agt_1"]);
+});
+
+test("a sync whose worktree switched branch at the same commit while the person decided runs nothing", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const syncRun = vi.fn<typeof syncMain>(async () => 0);
+  const { socketPath } = await broker(
+    async () => {
+      git(work, "switch", "-q", "-c", "other");
+      return approved;
+    },
+    { syncRun },
+  );
+
+  const { status, stderr } = await client(brokerSyncMain, [], socketPath);
+
+  expect(status).toBe(1);
+  expect(stderr).toContain(
+    "switched from claude/agt_1 to other while the sync waited for approval",
+  );
+  expect(stderr).toContain("nothing was changed");
+  expect(syncRun).not.toHaveBeenCalled();
+});
+
 test("the worktree and the connector are the runner's own: a request that names a path or a connector changes neither", async () => {
   const gh = github();
   writeFileSync(join(work, "a.txt"), "first\n");
