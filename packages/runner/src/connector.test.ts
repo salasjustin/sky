@@ -33,10 +33,12 @@ test("after takeConnector on the process's own env, a child process sees no conn
       process.execPath,
       [
         "-e",
-        "process.stdout.write(JSON.stringify(Object.keys(process.env).filter((k) => k.startsWith('GITHUB_'))))",
+        // only the connector's two names: a CI runner sets many other GITHUB_ variables of its own
+        "process.stdout.write(JSON.stringify(['GITHUB_CONNECTOR', 'GITHUB_GATEWAY_URL'].filter((k) => k in process.env)))",
       ],
       { encoding: "utf8" },
     );
+    // names only, never values
     expect(JSON.parse(seen)).toEqual([]);
   } finally {
     process.env = before;
