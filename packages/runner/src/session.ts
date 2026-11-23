@@ -19,6 +19,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AskUserQuestionInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools";
 import {
+  type AutoApproved,
   type AutoApproveScope,
   BACKGROUND_TASKS_MAX,
   type Decision,
@@ -31,6 +32,16 @@ import {
   type Usage,
   type WithdrawalReason,
 } from "@sky/shared";
+import {
+  type ApprovalAnswer,
+  type ApprovalAsk,
+  BROKER_SOCKET_ENV,
+  type Broker,
+  brokerCallOp,
+  brokerSocketIn,
+  startBroker,
+  withBrokerToken,
+} from "./broker.js";
 import {
   type CommandEnv,
   claudeProcessEnv,
@@ -47,6 +58,7 @@ import {
   runnerDirs,
 } from "./claude-auth.js";
 import type { Config } from "./config.js";
+import { withoutConnector } from "./connector.js";
 import { ATTEMPT_TIMEOUT_MS, type PostEvent, RunEndedError } from "./events.js";
 import { createHeartbeat } from "./heartbeat.js";
 import {
@@ -188,9 +200,13 @@ function withGitConfig(
  */
 function sessionEnvOf(config: Config): NodeJS.ProcessEnv {
   const { AGENT_TOKEN: _, ...env } = process.env;
-  return withGitConfig(
-    { ...env, ...sessionGitIdentity(env), ...config.sessionEnv },
-    SESSION_GIT_CONFIG,
+  // never the GitHub connector, whoever set it: a command that held it could publish or push with no
+  // one asked. The agent's `publish` and `sync` ask the runner, which holds it.
+  return withoutConnector(
+    withGitConfig(
+      { ...env, ...sessionGitIdentity(env), ...config.sessionEnv },
+      SESSION_GIT_CONFIG,
+    ),
   );
 }
 
@@ -244,6 +260,8 @@ export function sessionOptions(
   scratchDir?: string,
   /** The default branch's tip the run's refresh reached; see `prepareWorktree`. */
   refreshed?: Refreshed,
+  /** Whether the runner holds a GitHub connector, so `publish` and `sync` work. */
+  publishing = false,
 ): Options {
   return {
     cwd,
@@ -257,7 +275,18 @@ export function sessionOptions(
     // secrets to the session's commands. The Claude process itself gets exactly the run's credential,
     // sent to the Anthropic API: `claudeProcessEnv` drops the project's API key, auth token, base URL
     // and provider switches, and the commands get those from `commandEnvHooks` instead
-    env: claudeProcessEnv(sessionEnvOf(config), config.claudeAuth, runnerEnv),
+    env: claudeProcessEnv(
+      {
+        ...sessionEnvOf(config),
+        // where the agent's `publish` and `sync` find the runner's broker
+        ...(publishing &&
+          scratchDir && {
+            [BROKER_SOCKET_ENV]: brokerSocketIn(scratchDir),
+          }),
+      },
+      config.claudeAuth,
+      runnerEnv,
+    ),
     ...(spawn && { spawnClaudeCodeProcess: spawn }),
     // Claude Code's own commit trailer and pull request footer are off, for hosting that rejects them;
     // the credential helpers, kru's lead-gate switch and HOME are pinned above the user, project and
@@ -273,7 +302,7 @@ export function sessionOptions(
       preset: "claude_code",
       append: [
         UNANSWERED_NOTE,
-        ...(process.env[CONNECTOR_ENV] ? [publishInstructions(refreshed)] : []),
+        ...(publishing ? [publishInstructions(refreshed)] : []),
         ...(config.checks.length > 0
           ? [checkInstructions(config.checks, nestedLogin, scratchDir)]
           : []),
@@ -321,7 +350,8 @@ const publishInstructions = (refreshed?: Refreshed) =>
     "instead of `git push` or `gh pr create`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and prints its URL. Run it again after more commits to update the same pull request.",
     "`--branch <name>` publishes to a GitHub branch of that name instead of your worktree's branch, and the pull request's head is that branch; pass the same name each time. Stay on your worktree's branch rather than switching to another local branch; `--branch` is how you choose the GitHub branch. Commits go out under the git author configured for this environment, with every `Co-authored-by` trailer removed.",
     "Once commits are published, add new commits rather than amending or rebasing them: a rewritten branch can't be published again.",
-    "Pass a multi-line body from a quoted heredoc, `--body \"$(cat <<'EOF'` … `EOF` `)\"`, so the shell leaves its backticks and `$` alone. A large branch can take minutes to send, so give the Bash call a 10-minute timeout.",
+    "`publish` and `sync` don't touch GitHub themselves: they ask this run's runner, the only process that holds the GitHub credential, which does the work. For each, the runner opens one approval for the person watching the run and waits for it: for `publish`, the branch it goes to and the commits, files and diff stat that go out; for `sync`, the branch and the commits it may rebase. `publish` first refreshes the base from GitHub, which can rebase your branch, and then sends nothing until it is approved; `sync` fetches and changes nothing until it is approved. Nothing in the environment skips the approval, so expect the call to last as long as the person takes, and give the Bash call a 10-minute timeout. A denied approval sends nothing, and a head that moved after the approval, or a `sync` whose worktree switched branch, is refused: commit what you need first, then run it again, and never commit or switch branches while it waits.",
+    "Run each as one plain command, nothing chained, piped, redirected or wrapped around it, so the call itself asks nothing and the runner's approval is the only one; written any other way, it is also held as a Bash call. Write a multi-line body to a file with the Write tool and pass `--body @<path>`, rather than a heredoc or `$(…)` in the command: the runner reads that file itself, only from your worktree or the run's scratch directory, and shows the person the body's size and first 500 characters. The runner serves a request only while that plain call runs, in the foreground, and only on that call's one-time token. Your commands are not given the GitHub connector: don't look for a GitHub credential or call GitHub's API any other way.",
   ].join("\n");
 
 /**
@@ -440,6 +470,8 @@ function sessionHooks(
       input: PreToolUseHookInput,
       signal: AbortSignal,
     ) => Promise<SyncHookJSONOutput>;
+    /** Why a Bash call will run unasked under a policy that holds Bash, for its `claude.PreToolUse`; undefined for any other call. */
+    autoApproved?: (input: PreToolUseHookInput) => AutoApproved | undefined;
     /** A tool call is running: it passed `gate`. */
     toolStarted: (toolUseId: string, toolName: string) => void;
     toolEnded: (toolUseId: string) => void;
@@ -489,7 +521,11 @@ function sessionHooks(
   });
   return {
     PreToolUse: matcher<"PreToolUse">(async (input, signal) => {
-      on.event({ type: "claude.PreToolUse", payload: tool(input) });
+      const autoApproved = on.autoApproved?.(input);
+      on.event({
+        type: "claude.PreToolUse",
+        payload: { ...tool(input), ...(autoApproved && { autoApproved }) },
+      });
       const output = await on.gate(input, signal);
       // a call the gate denied or stopped never runs, so there is nothing to beat for; nor for
       // Claude's question, which the SDK holds in canUseTool for a person's answer: a wait, not a
@@ -657,6 +693,12 @@ export async function runSession(
     seal: Seal;
     /** What the start-of-run plugin refresh did; `run.started` carries it with the plugins the session loaded. */
     pluginRefresh?: PluginRefreshRecord;
+    /**
+     * The GitHub connector variables `main` took out of the runner's own env. The runner's code
+     * alone uses them: no command the session starts is given them, and `publish` and `sync` reach
+     * GitHub only through the broker, after an approval.
+     */
+    connector?: NodeJS.ProcessEnv;
   },
 ): Promise<0 | 1> {
   const { runId } = config;
@@ -705,7 +747,7 @@ export async function runSession(
   try {
     ({ cwd, notes, refreshed } = await prepareWorktree(config, {
       // what the session's own `publish` reads, so the sync looks where it publishes
-      env: { ...process.env, ...config.sessionEnv },
+      env: { ...process.env, ...deps.connector, ...config.sessionEnv },
       warn,
       lockWaitS: repoLockWaitS(config.launchDeadlineMs, launchElapsedMs()),
       // a stop while queued behind another run's setup must not go on to make the worktree
@@ -1075,6 +1117,88 @@ export async function runSession(
     };
   };
 
+  /** The broker's one approval: the run's own approval request, read in the inbox like a held tool call. */
+  const approveBrokered = async (
+    ask: ApprovalAsk,
+    signal: AbortSignal,
+  ): Promise<ApprovalAnswer> => {
+    const decision = await decide(
+      {
+        kind: "approval",
+        toolName: ask.toolName,
+        toolSummary: bound(ask.toolSummary),
+        toolInput: ask.toolInput.slice(0, TOOL_INPUT_POST_MAX),
+      },
+      signal,
+    );
+    if (decision?.decision === "approve") return { approved: true };
+    if (decision === undefined || decision.decision === "unanswered") {
+      return {
+        approved: false,
+        reason: abortController.signal.aborted
+          ? endingReason()
+          : "no one answered in time",
+      };
+    }
+    return { approved: false, reason: visibleReason(decision) };
+  };
+  // set once the broker listens: the agent's `publish` and `sync` ask nothing as Bash calls, since
+  // the broker opens their one approval
+  let brokerListening = false;
+  const brokerRunner = { execPath: process.execPath, script: process.argv[1] };
+  const autoApproveReason = () =>
+    config.autoApprove.defaults
+      ? config.autoApprove.commands.length > 0
+        ? "the command is on the default auto-approve list or the environment's own additions to it"
+        : "the command is on the default auto-approve list"
+      : "the command is on the environment's own auto-approve list";
+  /**
+   * What the policy does with one call, and for a Bash call it lets through unasked under a policy
+   * that holds Bash, why: that note is posted with the call's `claude.PreToolUse`. The agent's own
+   * `publish` or `sync`, as one plain command, is let through whatever the policy names: the
+   * broker's approval is the one asked, and nothing in the environment skips it.
+   */
+  const classify = (
+    input: PreToolUseHookInput,
+  ): {
+    outcome: ReturnType<typeof policyOutcome>;
+    note?: AutoApproved;
+    /** Set for the agent's own `publish` or `sync` call, which the runner gives a one-time token. */
+    brokerOp?: "publish" | "sync";
+  } => {
+    const outcome = policyOutcome(
+      config.approvalPolicy,
+      config.autoApprove,
+      commandScope(input.cwd),
+      input.tool_name,
+      input.tool_input,
+    );
+    if (input.tool_name !== "Bash") return { outcome };
+    const command = (input.tool_input as { command?: unknown } | null)?.command;
+    const brokerOp =
+      brokerListening && typeof command === "string"
+        ? brokerCallOp(command, brokerRunner)
+        : undefined;
+    if (outcome === "run") return { outcome, ...(brokerOp && { brokerOp }) };
+    if (brokerOp) {
+      return {
+        outcome: "auto-approved",
+        brokerOp,
+        note: {
+          verdict: "broker",
+          reason:
+            "the agent's publish or sync: the runner opens its own approval for it, with the branch, commits, files and diff stat",
+        },
+      };
+    }
+    return outcome === "auto-approved"
+      ? {
+          outcome,
+          note: { verdict: "approved", reason: autoApproveReason() },
+        }
+      : { outcome };
+  };
+
   const gate = async (
     input: PreToolUseHookInput,
     signal: AbortSignal,
@@ -1088,17 +1212,32 @@ export async function runSession(
       claudeHome,
     );
     if (read) return gateOutsideRead(input, read, signal);
-    const outcome = policyOutcome(
-      config.approvalPolicy,
-      config.autoApprove,
-      commandScope(input.cwd),
-      input.tool_name,
-      input.tool_input,
-    );
-    if (outcome === "auto-approved")
+    const { outcome, note, brokerOp } = classify(input);
+    if (note)
       warn(
-        `runner: auto-approved ${input.tool_name} call ${input.tool_use_id} without an approval request`,
+        note.verdict === "broker"
+          ? `runner: let ${input.tool_name} call ${input.tool_use_id} through: the runner opens its own approval for it`
+          : `runner: auto-approved ${input.tool_name} call ${input.tool_use_id} without an approval request`,
       );
+    // the agent's own call: the broker serves a request only while it runs, on the one-time token
+    // put in front of its command
+    if (brokerOp && broker) {
+      const token = broker.issue(input.tool_use_id, brokerOp);
+      const command = (input.tool_input as { command: string }).command;
+      return {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: {
+            ...(input.tool_input as object),
+            command: withBrokerToken(command, token),
+            // run in the background, the call would end, and void its token, before it asked
+            run_in_background: false,
+          },
+        },
+      };
+    }
     if (outcome !== "hold") return { continue: true };
     const inputJson = JSON.stringify(input.tool_input);
     const decision = await decide(
@@ -1229,6 +1368,7 @@ export async function runSession(
       const toolName = letThrough.get(toolUseId);
       if (toolName === undefined) continue;
       letThrough.delete(toolUseId);
+      broker?.release(toolUseId);
       if (wasNotRefused(text)) continue;
       const message = bound(
         `Claude Code turned down ${toolName} call ${toolUseId} after the runner let it through: ${text}`,
@@ -1246,12 +1386,25 @@ export async function runSession(
       stopMessage = lastMessage || stopMessage;
     },
     gate,
+    autoApproved: (input) =>
+      // a read outside the worktree is the gate's own to judge, and carries no note
+      outsideRead(
+        input.tool_name,
+        input.tool_input,
+        scratch ? [cwd, scratch] : [cwd],
+        input.cwd,
+        claudeHome,
+      )
+        ? undefined
+        : classify(input).note,
     toolStarted: (toolUseId, toolName) => {
       letThrough.set(toolUseId, toolName);
       heartbeat.started(toolUseId, toolName);
     },
     toolEnded: (toolUseId) => {
       letThrough.delete(toolUseId);
+      // the agent's own publish or sync call is over: its token serves nothing more
+      broker?.release(toolUseId);
       heartbeat.ended(toolUseId);
     },
     subagent: (agentId, running) => {
@@ -1321,6 +1474,9 @@ export async function runSession(
   };
   let commandEnv: CommandEnv | undefined;
   let nestedLogin: NestedLogin | undefined;
+  let broker: Broker | undefined;
+  // the runner holds a connector: `publish` and `sync` work, through the broker
+  const publishing = Boolean(deps.connector?.[CONNECTOR_ENV]);
   try {
     // inside the try: an API-key run that can't hide Sky's key from its commands must not start
     commandEnv = await prepareCommandEnv(
@@ -1328,6 +1484,25 @@ export async function runSession(
       sessionEnvOf(config),
     );
     scratch = scratchDirOf(runId);
+    // `publish` and `sync` ask this socket, which opens one approval each and does the sending with
+    // the connector: a run with no connector has no socket, and the commands say so
+    if (publishing) {
+      broker = await startBroker({
+        socketPath: brokerSocketIn(scratch),
+        cwd,
+        env: { ...sessionEnvOf(config), ...deps.connector },
+        sealProblem: () => deps.seal.problem ?? deps.seal.check(),
+        approve: approveBrokered,
+        warn: (message) => {
+          warn(`runner: ${message}`);
+          void post({
+            type: "runner.warning",
+            payload: { message: bound(message) },
+          }).catch(() => {});
+        },
+      });
+      brokerListening = true;
+    }
     // Claude Code applies the repo's `permissions.allow` only once the repo is trusted: an untrusted
     // nested session runs with just the built-in read-only allowances, so tests and builds are denied.
     // Trust is permanent and covers every Claude session in the repo on the sprite, this one included.
@@ -1386,6 +1561,7 @@ export async function runSession(
         nestedLogin?.prefix,
         scratch,
         refreshed,
+        publishing,
       ),
     });
     for await (const message of stream) {
@@ -1555,6 +1731,8 @@ export async function runSession(
     endHold();
     closeInput();
     heartbeat.stop();
+    brokerListening = false;
+    await broker?.close().catch(() => {});
     await commandEnv?.remove().catch(() => {});
     await nestedLogin?.remove().catch(() => {});
     if (scratch) {

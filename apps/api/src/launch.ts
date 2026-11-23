@@ -73,6 +73,7 @@ import {
   type Tx,
 } from "./runs.js";
 import {
+  CONNECTOR_NAMES,
   hasConnectorSecret,
   isReservedName,
   openEnvSecrets,
@@ -794,6 +795,14 @@ export function createLauncher({
       "secret",
     );
     const envVars = unreserved(openRunEnvVars(db, key, launch.runId), "envVar");
+    // a launch or retry stored before the API refused these names: a run's envVars override the env's
+    // secrets, and would point the runner's gateway calls, the connection id in them included, anywhere
+    for (const name of CONNECTOR_NAMES) {
+      if (!envVars.delete(name)) continue;
+      log(
+        `envVar ${name} on ${launch.envId} is the GitHub connector's; not passed to ${launch.runId}`,
+      );
+    }
     db.update(runs)
       .set({
         secretNames: [

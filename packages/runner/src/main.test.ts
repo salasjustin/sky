@@ -141,10 +141,13 @@ async function runBundle(
 ) {
   const child = spawn(
     process.execPath,
-    ["--import", preload(host), bundle, ...(args ?? [env.RUN_ID ?? ""])],
+    [bundle, ...(args ?? [env.RUN_ID ?? ""])],
     {
       env: {
         PATH: process.env.PATH ?? "",
+        // through the env, not the argv, so the runner's own subcommands (the store sync's locked
+        // child) stand in for the same host: a child that took the real one would depend on the machine
+        NODE_OPTIONS: `--import=${preload(host)}`,
         CLAUDE_CONFIG_DIR,
         SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
         ...env,
@@ -174,6 +177,39 @@ test("branch-check is its own command, not a run: with no branch it exits 2 with
     code: 2,
     stdout: "",
     stderr: "usage: branch-check <branch>\n",
+  });
+});
+
+describe("a subcommand started with the GitHub connector", () => {
+  const USAGE = "usage: branch-check <branch>\n";
+  const withConnector = {
+    GITHUB_CONNECTOR: "conn_subcommand",
+    GITHUB_GATEWAY_URL: "https://gateway.test",
+  };
+
+  test("hides itself from the user's other processes, and says nothing when the kernel did", async () => {
+    const result = await runBundle(withConnector, ["branch-check"], "capable");
+    expect(result).toEqual({ code: 2, stdout: "", stderr: USAGE });
+  });
+
+  test("on a host where it can't hide, says why in one line on stderr and still runs the command", async () => {
+    const { code, stdout, stderr } = await runBundle(
+      withConnector,
+      ["branch-check"],
+      "unprivileged",
+    );
+    expect({ code, stdout }).toEqual({ code: 2, stdout: "" });
+    const [line, ...rest] = stderr.split("\n");
+    expect(line).toMatch(
+      /^runner: branch-check can't keep the GitHub connector from this user's other processes: .*can't change its effective user \(EPERM\)/,
+    );
+    expect(rest.join("\n")).toBe(USAGE);
+    expect(stderr).not.toContain("conn_subcommand");
+  });
+
+  test("without a connector it tries nothing, so a host that can't hide prints no line", async () => {
+    const result = await runBundle({}, ["branch-check"], "unprivileged");
+    expect(result).toEqual({ code: 2, stdout: "", stderr: USAGE });
   });
 });
 
@@ -550,6 +586,36 @@ test("the store is pulled before the run and pushed after it, a failed run inclu
     expect(code).toBe(1);
     expect(stderr).toMatch(/runner: .*pull/);
     expect(stderr).toMatch(/runner: .*push/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("on a host that can't hide the store sync, each line of its output is logged under one runner: prefix, and the pull and push still run", async () => {
+  const { seen, base } = await apiAndGateway();
+  const home = mkdtempSync(join(tmpdir(), "runner-main-store-"));
+  try {
+    const { stderr } = await runBundle(
+      storeRunEnv(base, home),
+      undefined,
+      "unprivileged",
+    );
+    // the sync warns that it can't hide itself, and goes on: its pull and push are tried all the same
+    expect(seen.filter((s) => s === "store")).toHaveLength(2);
+    const lines = stderr.split("\n").filter(Boolean);
+    expect(stderr).not.toContain("runner: runner:");
+    expect(
+      lines.filter((l) =>
+        /^\S+ runner: store-sync can't keep the GitHub connector/.test(l),
+      ),
+    ).toHaveLength(2);
+    expect(
+      lines.filter((l) => /runner: store sync: pull failed/.test(l)),
+    ).toHaveLength(1);
+    expect(
+      lines.filter((l) => /runner: store sync: push failed/.test(l)),
+    ).toHaveLength(1);
+    expect(stderr).not.toContain("conn_1");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

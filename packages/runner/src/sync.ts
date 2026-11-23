@@ -19,7 +19,7 @@ import {
 } from "./publish.js";
 import { editShallow, fetchCommit, shallowCommits } from "./repo.js";
 import { RepoLockBusyError, withRepoLock } from "./repo-lock.js";
-import { git, messageOf } from "./store.js";
+import { git, messageOf, STORED_OBJECTS_ENV } from "./store.js";
 import { adoptAgentBranch, ensureWorktree } from "./worktree.js";
 
 type Call = ReturnType<typeof gateway>;
@@ -358,6 +358,7 @@ const run = promisify(execFile);
 async function inTree(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await run("git", args, {
     cwd,
+    env: { ...process.env, ...STORED_OBJECTS_ENV },
     maxBuffer: 64 * 1024 * 1024,
   });
   return stdout.trim();
@@ -1132,6 +1133,15 @@ export async function branchCheckMain(
 
 export const SYNC_USAGE = "sync [--branch <name>]";
 
+/** What `sync --help` prints under the usage line. */
+export const SYNC_HELP = [
+  "Brings GitHub's default branch, and the GitHub branch `publish` sends to, into this worktree.",
+  "The run's runner does it, with credentials this command never holds: it opens one approval",
+  "for the person watching the run, naming the branch and showing the commits and files in the",
+  "worktree it would rebase. Nothing is fetched or moved until that is approved, and a branch head",
+  "that moved after the approval is refused. Environment settings can't skip the approval.",
+].join("\n");
+
 /** Seconds `sync` waits for the repo lock: short, so the agent hears "busy" before its shell times out. */
 export const SYNC_LOCK_WAIT_S = 30;
 
@@ -1175,7 +1185,7 @@ async function describeDefault(
 }
 
 /** The GitHub branch flag of `sync`, `--branch <name>` or `--branch=<name>`; undefined for a bad argv. */
-function syncArgs(argv: string[]): { branch?: string } | undefined {
+export function syncArgs(argv: string[]): { branch?: string } | undefined {
   if (argv.length === 0) return {};
   const [first = "", second, ...rest] = argv;
   if (first.startsWith("--branch=") && second === undefined) {

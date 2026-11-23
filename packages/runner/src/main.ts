@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { brokerPublishMain, brokerSyncMain } from "./broker-client.js";
 import {
   removeCredentialFilesNow,
   removeCredentialFilesOnExit,
@@ -8,6 +9,7 @@ import {
   withdrawCredential,
 } from "./claude-auth.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
+import { takeConnector } from "./connector.js";
 import { removeSkyLogin } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
 import { holdSprite, spriteApiFrom } from "./keepalive.js";
@@ -17,15 +19,14 @@ import {
   refreshPlugins,
 } from "./plugins.js";
 import { previewProxyMain } from "./preview-proxy.js";
-import { publishMain } from "./publish.js";
 import { endSessionProcesses } from "./reap.js";
 import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
 import { claimRunLog, processAlive } from "./runlog.js";
-import { createSeal, removeSealedCopiesNow } from "./seal.js";
+import { createSeal, hideRunner, removeSealedCopiesNow } from "./seal.js";
 import { removeScratchNow, runSession } from "./session.js";
 import { storeSyncMain, syncStoreQuietly } from "./store.js";
-import { branchCheckMain, syncMain } from "./sync.js";
+import { branchCheckMain } from "./sync.js";
 
 // the runner's stderr is the exec session's terminal, gone once the API detaches, so every line also
 // lands in a log file beside the run's prompt: what a stuck launch was doing is readable on the sprite.
@@ -61,6 +62,9 @@ async function step<T>(name: string, task: () => Promise<T>): Promise<T> {
 }
 
 async function main(): Promise<void> {
+  // first of all: the connector is the runner's alone, so no git, `claude` or hook it starts, and no
+  // command of the session, inherits it. The runner's own code reads it from `connector`.
+  const connector = takeConnector(process.env);
   let config: Config;
   try {
     config = loadConfig(process.env);
@@ -172,6 +176,7 @@ async function main(): Promise<void> {
     : await setUpSession(
         controller.signal,
         join(config.worktreesDir, config.agentId),
+        connector,
       );
   warn("runner: session starting");
   try {
@@ -184,11 +189,12 @@ async function main(): Promise<void> {
       credentialEnv,
       seal,
       pluginRefresh,
+      connector,
     });
   } finally {
     // the run is over, whatever way: nothing it started may keep its memory on a sprite other runs share
     await endSessionProcesses({ runId: config.runId, warn });
-    await syncStoreQuietly("push", process.env, warn);
+    await syncStoreQuietly("push", { ...process.env, ...connector }, warn);
     await hold.release();
   }
   // a second signal's own reap ends in `dieBy`
@@ -200,9 +206,12 @@ async function main(): Promise<void> {
 async function setUpSession(
   signal: AbortSignal,
   worktree: string,
+  connector: NodeJS.ProcessEnv,
 ): Promise<PluginRefreshRecord> {
   // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
-  await step("store sync", () => syncStoreQuietly("pull", process.env, warn));
+  await step("store sync", () =>
+    syncStoreQuietly("pull", { ...process.env, ...connector }, warn),
+  );
   // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails
   // the run. The marketplaces need no Claude login, and these `claude` processes are neither sealed nor
   // pinned, so they get the env with the credential taken out. What it did rides the run's `run.started`.
@@ -228,8 +237,10 @@ const commands: Record<
   string,
   (argv: string[], env: NodeJS.ProcessEnv) => Promise<number>
 > = {
-  publish: (argv, env) => publishMain(argv, env, { cwd: process.cwd(), ...io }),
-  sync: (argv, env) => syncMain(argv, env, { cwd: process.cwd(), ...io }),
+  // thin clients of the run's runner, which holds the connector and asks the person before it sends
+  publish: (argv, env) =>
+    brokerPublishMain(argv, env, { cwd: process.cwd(), ...io }),
+  sync: (argv, env) => brokerSyncMain(argv, env, { cwd: process.cwd(), ...io }),
   "store-sync": (argv, env) => storeSyncMain(argv, env, io),
   "repo-pull": (argv, env) => repoPullMain(argv, env, io),
   "branch-check": (argv, env) => branchCheckMain(argv, env, io),
@@ -239,8 +250,30 @@ const commands: Record<
 const command = Object.hasOwn(commands, process.argv[2] ?? "")
   ? commands[process.argv[2] as string]
   : undefined;
+/**
+ * Runs a subcommand. The API's own subcommands keep the connector in the env they are handed, and
+ * out of the process's own, which the git commands they start inherit.
+ */
+async function runCommand(
+  run: (argv: string[], env: NodeJS.ProcessEnv) => Promise<number>,
+): Promise<number> {
+  const connector = takeConnector(process.env);
+  if (Object.keys(connector).length > 0) {
+    // taking it out of process.env leaves it in /proc/<pid>/environ, which every process of this user
+    // reads, the hooks of the git this command runs included, until the kernel hides this process. The
+    // connector is readable there from exec until this step runs
+    const exposed = hideRunner();
+    if (exposed) {
+      io.stderr(
+        `runner: ${process.argv[2]} can't keep the GitHub connector from this user's other processes: ${exposed}\n`,
+      );
+    }
+  }
+  return run(process.argv.slice(3), { ...process.env, ...connector });
+}
+
 const entry = command
-  ? command(process.argv.slice(3), process.env).then((code) => {
+  ? runCommand(command).then((code) => {
       process.exitCode = code;
     })
   : main();

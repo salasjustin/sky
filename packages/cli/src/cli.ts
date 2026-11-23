@@ -162,7 +162,10 @@ const help = (io: Io) => `Usage:
       GITHUB_CONNECTOR secret. Sandboxes have no git transport, so the
       agent can't fetch or push itself: Sky fetches the branch through the
       connector when each run starts, and the agent runs runner.mjs only
-      for publish.
+      for publish and sync. The connector stays with the run's runner, which
+      opens one approval for you before each (in sky inbox: "approval
+      <requestId> Publish" or "Sync", then the branch, commits, files and
+      diff stat), whatever the environment's approval policy says.
   sky agent list [--env=<id|name>,...] [--status=<state>,...] [--archived]
       [--limit=N] [--cursor=<c>] [options]
       Print "<agent> <state> <run> <last event> <open requests> <branch>
@@ -185,7 +188,8 @@ const help = (io: Io) => `Usage:
       Preview the agent's branch as a production build: build the app once
       in the agent's worktree on its environment's sandbox, then serve it
       (--start, listening on --port; both get $PORT, NODE_ENV=production
-      and the environment's secrets). --build and --start default from the
+      and the environment's secrets, less the GitHub connector). --build
+      and --start default from the
       worktree's lockfile (pnpm build and pnpm start, yarn build and yarn
       start, bun run build and bun run start, or npm run build and npm
       start); with no lockfile, pass both. --build=none skips the build.

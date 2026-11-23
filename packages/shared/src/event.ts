@@ -110,6 +110,19 @@ export const EventType = z.enum([
 ]);
 export type EventType = z.infer<typeof EventType>;
 
+/**
+ * Why a Bash call ran with no approval request although the environment's policy holds Bash,
+ * carried by that call's `claude.PreToolUse`: `approved` is the auto-approve list's own verdict
+ * (the command is on the list), `broker` the agent's `publish` or `sync`, which the runner's own
+ * approval stands for. Absent on every other call, and from an older runner; a client that doesn't
+ * know it ignores it.
+ */
+export const AutoApproved = z.object({
+  verdict: z.enum(["approved", "broker"]),
+  reason: z.string().min(1).max(300),
+});
+export type AutoApproved = z.infer<typeof AutoApproved>;
+
 /** SHA-1 or SHA-256 object name. */
 const GitSha = z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/);
 
@@ -269,7 +282,11 @@ const claudePayloads = (textMax: number) => {
   };
   const durationMs = z.number().nonnegative().optional();
   return {
-    "claude.PreToolUse": z.object(tool),
+    "claude.PreToolUse": z.object({
+      ...tool,
+      /** set when the call ran unasked under a policy that holds Bash */
+      autoApproved: AutoApproved.optional(),
+    }),
     "claude.PostToolUse": z.object({ ...tool, output: text, durationMs }),
     "claude.PostToolUseFailure": z.object({
       ...tool,

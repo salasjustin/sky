@@ -3,17 +3,17 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
+import { CONNECTOR_ENV, GATEWAY_URL_ENV } from "./connector.js";
 import { fetchCommit } from "./repo.js";
-import { git as repoGit } from "./store.js";
+import { git as repoGit, STORED_OBJECTS_ENV } from "./store.js";
 
 const run = promisify(execFile);
 
 /** Where a sprite reaches GitHub's REST API through a Sprites connector; the gateway adds the credential. */
 export const DEFAULT_GATEWAY_URL = "https://api.sprites.dev/v1/gateway/github";
-/** The env var holding the connector's connection id: a connector secret of this name sets it. */
-export const CONNECTOR_ENV = "GITHUB_CONNECTOR";
-/** Overrides `DEFAULT_GATEWAY_URL`. */
-export const GATEWAY_URL_ENV = "GITHUB_GATEWAY_URL";
+// the connector's env var names live in connector.ts, which imports nothing, so the runner's modules
+// can all take them without a cycle
+export { CONNECTOR_ENV, GATEWAY_URL_ENV };
 
 /** GitHub, through the gateway, answered something other than success. */
 export class GatewayError extends Error {
@@ -44,12 +44,76 @@ export type PublishResult = {
   pullRequest: { number: number; url: string };
 };
 
+/** What a publish is about to send, as `publish`'s `review` is told it. */
+export type PublishPlan = {
+  /** The worktree's own branch. */
+  localBranch: string;
+  /** The GitHub branch the commits go to. */
+  branch: string;
+  base: string;
+  /** The worktree's head when the plan was made; the last of `commits`. */
+  head: string;
+  mergeBase: string;
+  /** Oldest first: every commit past the base that is sent. */
+  commits: { sha: string; subject: string }[];
+  /** What the commits change against the base. */
+  files: { path: string; added: number; removed: number }[];
+  title?: string;
+  body?: string;
+  /** The open pull request for the branch, when there is one. */
+  pullRequest?: { number: number; url: string };
+};
+
+/** Each commit's subject, in the order given. */
+export async function subjectsOf(cwd: string, shas: string[]) {
+  const subjects = new Map<string, string>();
+  if (shas.length > 0) {
+    const out = await git(
+      cwd,
+      "log",
+      "--no-walk=unsorted",
+      "--format=%H%x09%s",
+      ...shas,
+    );
+    for (const line of lines(out)) {
+      const tab = line.indexOf("\t");
+      subjects.set(line.slice(0, tab), line.slice(tab + 1));
+    }
+  }
+  return shas.map((sha) => ({ sha, subject: subjects.get(sha) ?? "" }));
+}
+
+/** The files `to` changes against `from`, with lines added and removed; a binary file counts 0 and 0. */
+export async function filesBetween(cwd: string, from: string, to: string) {
+  const out = await git(
+    cwd,
+    "diff",
+    "--numstat",
+    "-z",
+    "--no-renames",
+    from,
+    to,
+  );
+  const files: PublishPlan["files"] = [];
+  // -z: "<added>\t<removed>\t<path>\0", repeated
+  for (const entry of out.split("\0").filter(Boolean)) {
+    const [added = "", removed = "", ...path] = entry.split("\t");
+    files.push({
+      path: path.join("\t"),
+      added: Number(added) || 0,
+      removed: Number(removed) || 0,
+    });
+  }
+  return files;
+}
+
 /** The directory GitHub refuses a tree change under without the `workflow` scope. */
 export const WORKFLOWS_DIR = ".github/workflows";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await run("git", args, {
     cwd,
+    env: { ...process.env, ...STORED_OBJECTS_ENV },
     maxBuffer: 64 * 1024 * 1024,
   });
   return stdout;
@@ -58,6 +122,7 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 async function gitBytes(cwd: string, ...args: string[]): Promise<Buffer> {
   const { stdout } = await run("git", args, {
     cwd,
+    env: { ...process.env, ...STORED_OBJECTS_ENV },
     encoding: "buffer",
     maxBuffer: 256 * 1024 * 1024,
   });
@@ -797,6 +862,13 @@ export async function publish(options: {
   progress?: (line: string) => void;
   /** The gateway's rate-limit policy, whose `sleep` also paces retries; a test sets its own. */
   rateLimit?: Partial<RateLimitPolicy>;
+  /**
+   * Told what is about to go out, once the branch is checked and refreshed onto GitHub's base and
+   * before anything is written to GitHub. It resolves to send, and throws to send nothing. The
+   * worktree's head is read again after it settles: a head that moved while it waited fails the
+   * publish, so what is sent is the plan's commits and no others.
+   */
+  review?: (plan: PublishPlan) => Promise<void>;
 }): Promise<PublishResult> {
   // `ls-files` takes its implicit pathspec relative to the directory it runs in, while
   // `<rev>:<path>` is from the top, so every call runs from the top
@@ -948,6 +1020,31 @@ export async function publish(options: {
     throw new PublishError(
       `the changes on ${localBranch} are already on ${base} on GitHub, so there is nothing left to publish`,
     );
+  }
+  if (options.review) {
+    const head = (await git(cwd, "rev-parse", "HEAD")).trim();
+    await options.review({
+      localBranch,
+      branch: remoteBranch,
+      base,
+      head,
+      mergeBase,
+      commits: await subjectsOf(cwd, commits),
+      files: await filesBetween(cwd, mergeBase, head),
+      ...(options.title && { title: options.title }),
+      ...(options.body !== undefined && { body: options.body }),
+      ...(existing && {
+        pullRequest: { number: existing.number, url: existing.html_url },
+      }),
+    });
+    // the approval can take hours; the commits above are objects that can't change, but a new commit,
+    // an amend or a checkout since then is a head nobody was shown
+    const now = (await git(cwd, "rev-parse", "HEAD")).trim();
+    if (now !== head) {
+      throw new PublishError(
+        `${localBranch} moved from ${head} to ${now} while the publish waited for approval; nothing was sent, publish again to ask for the new head`,
+      );
+    }
   }
   const refPath = `heads/${remoteBranch.split("/").map(encodeURIComponent).join("/")}`;
   const notFastForward = `${remoteBranch} on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten`;
@@ -1330,22 +1427,33 @@ export function configuredIdentity(env: NodeJS.ProcessEnv) {
   };
 }
 
+/** What `publish --help` prints under the usage line. */
+export const PUBLISH_HELP = [
+  "Sends the worktree's commits to GitHub and opens a pull request into the base branch.",
+  "The run's runner does the sending, with credentials this command never holds: it opens one",
+  "approval for the person watching the run, naming the branch and showing the commits, the",
+  "files and the diff stat. Nothing is sent until that is approved, and a branch head that",
+  "moved after the approval is refused. Environment settings can't skip the approval.",
+].join("\n");
+
+export type PublishValues = {
+  title?: string;
+  body?: string;
+  base?: string;
+  branch?: string;
+};
+
 /**
- * `runner.mjs publish …`, run by the agent from its worktree: prints the pull request's URL on
- * stdout, and returns the exit status, 2 for a usage or config error.
+ * `publish`'s arguments, with a `--body @file` read from `cwd`; `code` is the exit status when
+ * there is nothing to publish (a usage error, or `--help`, printed on `io`).
  */
-export async function publishMain(
+export async function readPublishArgs(
   argv: string[],
-  env: NodeJS.ProcessEnv,
   io: { cwd: string; stdout: (s: string) => void; stderr: (s: string) => void },
-): Promise<number> {
-  let values: {
-    title?: string;
-    body?: string;
-    base?: string;
-    branch?: string;
-    help?: boolean;
-  };
+  /** `deferBodyFile`: return a `--body @file` as its absolute path, for the runner to read under its own rules. */
+  options: { deferBodyFile?: boolean } = {},
+): Promise<{ values: PublishValues; bodyFile?: string } | { code: number }> {
+  let values: PublishValues & { help?: boolean };
   try {
     ({ values } = parseArgs({
       args: argv,
@@ -1361,14 +1469,21 @@ export async function publishMain(
     io.stderr(
       `sky publish: ${(error as Error).message}\nusage: ${PUBLISH_USAGE}\n`,
     );
-    return 2;
+    return { code: 2 };
   }
   if (values.help) {
-    io.stdout(`usage: ${PUBLISH_USAGE}\n`);
-    return 0;
+    io.stdout(`usage: ${PUBLISH_USAGE}\n${PUBLISH_HELP}\n`);
+    return { code: 0 };
   }
   // `--body @path` reads the body from a file, like the CLI's `--prompt=@file`; a relative path is
   // from the working directory
+  if (values.body?.startsWith("@") && options.deferBodyFile) {
+    const { help: _, body, ...rest } = values;
+    return {
+      values: rest,
+      bodyFile: resolve(io.cwd, (body as string).slice(1)),
+    };
+  }
   if (values.body?.startsWith("@")) {
     const file = resolve(io.cwd, values.body.slice(1));
     try {
@@ -1378,9 +1493,24 @@ export async function publishMain(
       io.stderr(
         `sky publish: cannot read the --body file ${file}${code ? ` (${code})` : ""}\nusage: ${PUBLISH_USAGE}\n`,
       );
-      return 2;
+      return { code: 2 };
     }
   }
+  const { help: _, ...rest } = values;
+  return { values: rest };
+}
+
+/**
+ * Publishes the worktree at `io.cwd` as the runner's own code: it holds the connector in `env`.
+ * Prints the pull request's URL on stdout, and returns the exit status, 2 for a config error.
+ * `review` is `publish`'s: the broker's approval hangs on it.
+ */
+export async function publishWith(
+  values: PublishValues,
+  env: NodeJS.ProcessEnv,
+  io: { cwd: string; stdout: (s: string) => void; stderr: (s: string) => void },
+  deps: { review?: (plan: PublishPlan) => Promise<void> } = {},
+): Promise<number> {
   const connectorId = env[CONNECTOR_ENV];
   if (!connectorId) {
     io.stderr(
@@ -1394,10 +1524,10 @@ export async function publishMain(
       gatewayUrl: env[GATEWAY_URL_ENV] || DEFAULT_GATEWAY_URL,
       connectorId,
       ...values,
-      ...(values.branch !== undefined && { branch: values.branch }),
       defaultBranch: env[BRANCH_ENV] || undefined,
       identity: configuredIdentity(env),
       progress: (line) => io.stderr(`${line}\n`),
+      ...(deps.review && { review: deps.review }),
     });
     io.stderr(
       result.created
@@ -1412,4 +1542,20 @@ export async function publishMain(
     );
     return 1;
   }
+}
+
+/**
+ * `publish …` with the connector in `env`, from the worktree at `io.cwd`: reads the arguments and
+ * publishes. The runner runs this for the agent's request; the agent's own command is
+ * `brokerPublishMain`, which holds no connector.
+ */
+export async function publishMain(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  io: { cwd: string; stdout: (s: string) => void; stderr: (s: string) => void },
+  deps: { review?: (plan: PublishPlan) => Promise<void> } = {},
+): Promise<number> {
+  const args = await readPublishArgs(argv, io);
+  if ("code" in args) return args.code;
+  return publishWith(args.values, env, io, deps);
 }

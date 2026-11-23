@@ -51,6 +51,15 @@ const reservedNames = new Set<string>([
 
 export const isReservedName = (name: string) => reservedNames.has(name);
 
+/**
+ * The variables that let a process call GitHub through the gateway as the environment's connector:
+ * the env's own secrets set them, and nothing else may. Not reserved, so `sky secret set` takes them.
+ */
+export const CONNECTOR_NAMES: ReadonlySet<string> = new Set([
+  "GITHUB_CONNECTOR",
+  "GITHUB_GATEWAY_URL",
+]);
+
 export const reservedName = (c: Context, name: string) =>
   apiError(c, 400, "reserved_name", `${name} is reserved by sky`);
 
@@ -185,6 +194,16 @@ export function postponeRunEnvVars(tx: Tx, runId: RunId, byMs: number): void {
   }
 }
 
+/**
+ * The redaction key of a connector secret's connection id. The gateway serves a request on the id
+ * alone, so it is scrubbed from events and requests like any other secret value. Like a value's
+ * nonce, the key names the id it holds: an id replaced or deleted stays scrubbed until a restart,
+ * because a run started with it still holds it, and deleting the secret doesn't revoke the
+ * connector.
+ */
+const connectorKey = (envId: string, name: string, connector: string) =>
+  `${envSecretAad(envId, name)}:connector:${connector}`;
+
 /** Registers a run's envVars with redaction, until `purgeExpiredEnvVars` drops them. */
 export function registerRunEnvVars(
   known: KnownSecrets,
@@ -224,7 +243,7 @@ export function purgeExpiredEnvVars(
   for (const { runId, name } of purged) known.remove(runEnvVarAad(runId, name));
 }
 
-/** Registers every stored env value secret and every held run envVar with redaction. */
+/** Registers every stored env value secret, connector secret's id and held run envVar with redaction. */
 export function registerStoredValues(
   db: Db,
   key: Buffer,
@@ -241,6 +260,18 @@ export function registerStoredValues(
       envSecretKey(row.envId, row.name, sealed.nonce),
       open(key, sealed, envSecretAad(row.envId, row.name)),
     );
+  }
+  for (const row of db
+    .select()
+    .from(secrets)
+    .where(isNotNull(secrets.connector))
+    .all()) {
+    if (row.connector !== null) {
+      known.add(
+        connectorKey(row.envId, row.name, row.connector),
+        row.connector,
+      );
+    }
   }
   for (const row of db.select().from(runEnvVars).all()) {
     const aad = runEnvVarAad(row.runId, row.name);
@@ -325,6 +356,12 @@ export function secretRoutes() {
         .get();
       if (sealed && "value" in input) {
         c.var.secrets.add(envSecretKey(id, name, sealed.nonce), input.value);
+      }
+      if ("connector" in input) {
+        c.var.secrets.add(
+          connectorKey(id, name, input.connector),
+          input.connector,
+        );
       }
       return c.json(present(row), 200);
     })

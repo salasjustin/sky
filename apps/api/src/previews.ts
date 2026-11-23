@@ -28,7 +28,12 @@ import {
 } from "./provision.js";
 import { cut, redact } from "./redact.js";
 import type { BundleInstaller } from "./runner-bundle.js";
-import { isReservedName, openEnvSecrets } from "./secrets.js";
+import {
+  CONNECTOR_NAMES,
+  hasConnectorSecret,
+  isReservedName,
+  openEnvSecrets,
+} from "./secrets.js";
 import {
   execInSprite,
   execLogged,
@@ -391,8 +396,16 @@ export function createPreviews({
       openEnvSecrets(db, config.secretEncryptionKey, envId),
     );
     // reserved names are the runner's own (the Claude credential, the agent token, PATH…): never passed on
+    // and neither is the GitHub connector, which the gateway honors on its id alone: the build and the
+    // server run the agent's branch, which may be code no one has reviewed
     for (const name of [...secrets.keys()]) {
-      if (isReservedName(name)) secrets.delete(name);
+      if (
+        isReservedName(name) ||
+        CONNECTOR_NAMES.has(name) ||
+        hasConnectorSecret(db, envId, name)
+      ) {
+        secrets.delete(name);
+      }
     }
     return {
       env: {
