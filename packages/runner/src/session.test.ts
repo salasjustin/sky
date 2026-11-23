@@ -3913,13 +3913,106 @@ const askBroker = (options: Options, request: object) =>
     socket.on("close", () => resolve(received));
   });
 
+const SYNC_CALL = PUBLISH_CALL.replace(" publish ", " sync ");
+
+/** The one-time token the gate put in front of an agent's own call: the answer's rewritten command starts with it. */
+const tokenOf = (answer: unknown) => {
+  const updated = (
+    answer as {
+      hookSpecificOutput?: { updatedInput?: { command?: string } };
+    }
+  ).hookSpecificOutput?.updatedInput?.command;
+  return /^SKY_BROKER_TOKEN=([0-9a-f]{32}) /.exec(updated ?? "")?.[1];
+};
+
+/** Fires the PreToolUse of `command` as the agent's call `toolUseId`, and returns the token the gate handed it. */
+const callWithToken = async (
+  options: Options,
+  command: string,
+  toolUseId: string,
+) => {
+  const [answer] = await fire(options, "PreToolUse", {
+    tool_name: "Bash",
+    tool_input: { command },
+    tool_use_id: toolUseId,
+  });
+  return tokenOf(answer);
+};
+
+test("the gate puts a one-time token in front of the agent's own plain publish or sync call, whatever the policy holds, and in front of no other command", async () => {
+  for (const approvalPolicy of [[], ["Bash"]]) {
+    const { deps } = api(decided({ decision: "approve" }));
+    const tokens: (string | undefined)[] = [];
+    const query = scripted([
+      init,
+      async (options: Options) => {
+        for (const [i, command] of [
+          PUBLISH_CALL,
+          SYNC_CALL,
+          PUBLISH_CALL,
+          `${PUBLISH_CALL} && echo done`,
+          `env X=1 ${PUBLISH_CALL}`,
+          "git status",
+        ].entries())
+          tokens.push(await callWithToken(options, command, `t${i + 1}`));
+      },
+      success,
+    ]);
+    await runSession(
+      { ...config, approvalPolicy },
+      { ...deps, query, connector: { GITHUB_CONNECTOR: "conn_123" } },
+    );
+    expect(
+      tokens.slice(0, 3).every((t) => /^[0-9a-f]{32}$/.test(t ?? "")),
+    ).toBe(true);
+    // each call has a token of its own
+    expect(new Set(tokens.slice(0, 3)).size).toBe(3);
+    expect(tokens.slice(3)).toEqual([undefined, undefined, undefined]);
+  }
+});
+
+test("a request with no token, or whose call has ended, is refused at once by the session's broker: no approval, no event for a person", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const replies: string[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      replies.push(await askBroker(options, { op: "sync" }));
+      replies.push(
+        await askBroker(options, { op: "sync", token: "0".repeat(32) }),
+      );
+      const token = await callWithToken(options, SYNC_CALL, "t1");
+      // the call ends; its token serves nothing more
+      await fire(options, "PostToolUse", {
+        tool_name: "Bash",
+        tool_input: { command: SYNC_CALL },
+        tool_response: "",
+        tool_use_id: "t1",
+      });
+      replies.push(await askBroker(options, { op: "sync", token }));
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: [] },
+    { ...deps, query, connector: { GITHUB_CONNECTOR: "conn_123" } },
+  );
+  expect(replies).toHaveLength(3);
+  for (const reply of replies) expect(reply).toContain("refused");
+  expect(waitingSummaries(sent)).toEqual([]);
+  expect(
+    sent.filter((e) => e.type === "run.waiting" || e.type === "runner.warning"),
+  ).toEqual([]);
+});
+
 test("a sync asked of the session's broker opens exactly one approval, a Sync request the inbox reads like a held call", async () => {
   const { sent, deps } = api(decided({ decision: "approve" }));
   let reply = "";
   const query = scripted([
     init,
     async (options: Options) => {
-      reply = await askBroker(options, { op: "sync" });
+      const token = await callWithToken(options, SYNC_CALL, "t1");
+      reply = await askBroker(options, { op: "sync", token });
     },
     success,
   ]);
@@ -3950,7 +4043,8 @@ test("a runner that can't confirm its seal refuses a publish asked of its broker
   const query = scripted([
     init,
     async (options: Options) => {
-      reply = await askBroker(options, { op: "publish", title: "T" });
+      const token = await callWithToken(options, PUBLISH_CALL, "t1");
+      reply = await askBroker(options, { op: "publish", title: "T", token });
     },
     success,
   ]);

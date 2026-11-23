@@ -37,9 +37,10 @@ import {
   type ApprovalAsk,
   BROKER_SOCKET_ENV,
   type Broker,
+  brokerCallOp,
   brokerSocketIn,
-  isBrokerCall,
   startBroker,
+  withBrokerToken,
 } from "./broker.js";
 import {
   type CommandEnv,
@@ -350,7 +351,7 @@ const publishInstructions = (refreshed?: Refreshed) =>
     "`--branch <name>` publishes to a GitHub branch of that name instead of your worktree's branch, and the pull request's head is that branch; pass the same name each time. Stay on your worktree's branch rather than switching to another local branch; `--branch` is how you choose the GitHub branch. Commits go out under the git author configured for this environment, with every `Co-authored-by` trailer removed.",
     "Once commits are published, add new commits rather than amending or rebasing them: a rewritten branch can't be published again.",
     "`publish` and `sync` don't touch GitHub themselves: they ask this run's runner, the only process that holds the GitHub credential, which does the work. For each, the runner opens one approval for the person watching the run and waits for it: for `publish`, the branch it goes to and the commits, files and diff stat that go out; for `sync`, the branch and the commits it may rebase. `publish` first refreshes the base from GitHub, which can rebase your branch, and then sends nothing until it is approved; `sync` fetches and changes nothing until it is approved. Nothing in the environment skips the approval, so expect the call to last as long as the person takes, and give the Bash call a 10-minute timeout. A denied approval sends nothing, and a head that moved after the approval, or a `sync` whose worktree switched branch, is refused: commit what you need first, then run it again, and never commit or switch branches while it waits.",
-    "Run each as one plain command, nothing chained, piped, redirected or wrapped around it, so the call itself asks nothing and the runner's approval is the only one; written any other way, it is also held as a Bash call. Write a multi-line body to a file with the Write tool and pass `--body @<path>`, rather than a heredoc or `$(…)` in the command. Your commands are not given the GitHub connector: don't look for a GitHub credential or call GitHub's API any other way.",
+    "Run each as one plain command, nothing chained, piped, redirected or wrapped around it, so the call itself asks nothing and the runner's approval is the only one; written any other way, it is also held as a Bash call. Write a multi-line body to a file with the Write tool and pass `--body @<path>`, rather than a heredoc or `$(…)` in the command: the runner reads that file itself, only from your worktree or the run's scratch directory, and shows the person the body's size and first 500 characters. The runner serves a request only while that plain call runs, so no other command can ask it for anything. Your commands are not given the GitHub connector: don't look for a GitHub credential or call GitHub's API any other way.",
   ].join("\n");
 
 /**
@@ -1162,6 +1163,8 @@ export async function runSession(
   ): {
     outcome: ReturnType<typeof policyOutcome>;
     note?: AutoApproved;
+    /** Set for the agent's own `publish` or `sync` call, which the runner gives a one-time token. */
+    brokerOp?: "publish" | "sync";
   } => {
     const outcome = policyOutcome(
       config.approvalPolicy,
@@ -1170,15 +1173,17 @@ export async function runSession(
       input.tool_name,
       input.tool_input,
     );
-    if (outcome === "run" || input.tool_name !== "Bash") return { outcome };
+    if (input.tool_name !== "Bash") return { outcome };
     const command = (input.tool_input as { command?: unknown } | null)?.command;
-    if (
-      brokerListening &&
-      typeof command === "string" &&
-      isBrokerCall(command, brokerRunner)
-    ) {
+    const brokerOp =
+      brokerListening && typeof command === "string"
+        ? brokerCallOp(command, brokerRunner)
+        : undefined;
+    if (outcome === "run") return { outcome, ...(brokerOp && { brokerOp }) };
+    if (brokerOp) {
       return {
         outcome: "auto-approved",
+        brokerOp,
         note: {
           verdict: "broker",
           reason:
@@ -1207,13 +1212,30 @@ export async function runSession(
       claudeHome,
     );
     if (read) return gateOutsideRead(input, read, signal);
-    const { outcome, note } = classify(input);
+    const { outcome, note, brokerOp } = classify(input);
     if (note)
       warn(
         note.verdict === "broker"
           ? `runner: let ${input.tool_name} call ${input.tool_use_id} through: the runner opens its own approval for it`
           : `runner: auto-approved ${input.tool_name} call ${input.tool_use_id} without an approval request`,
       );
+    // the agent's own call: the broker serves a request only while it runs, on the one-time token
+    // put in front of its command
+    if (brokerOp && broker) {
+      const token = broker.issue(input.tool_use_id, brokerOp);
+      const command = (input.tool_input as { command: string }).command;
+      return {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: {
+            ...(input.tool_input as object),
+            command: withBrokerToken(command, token),
+          },
+        },
+      };
+    }
     if (outcome !== "hold") return { continue: true };
     const inputJson = JSON.stringify(input.tool_input);
     const decision = await decide(
@@ -1344,6 +1366,7 @@ export async function runSession(
       const toolName = letThrough.get(toolUseId);
       if (toolName === undefined) continue;
       letThrough.delete(toolUseId);
+      broker?.release(toolUseId);
       if (wasNotRefused(text)) continue;
       const message = bound(
         `Claude Code turned down ${toolName} call ${toolUseId} after the runner let it through: ${text}`,
@@ -1378,6 +1401,8 @@ export async function runSession(
     },
     toolEnded: (toolUseId) => {
       letThrough.delete(toolUseId);
+      // the agent's own publish or sync call is over: its token serves nothing more
+      broker?.release(toolUseId);
       heartbeat.ended(toolUseId);
     },
     subagent: (agentId, running) => {

@@ -1,8 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { HttpResponse, http } from "msw";
 import {
   afterEach,
@@ -19,6 +25,7 @@ import {
   type BrokerDeps,
   isBrokerCall,
   publishAsk,
+  readBodyFile,
   startBroker,
   syncAsk,
 } from "./broker.js";
@@ -92,12 +99,18 @@ afterEach(() => {
 function github() {
   const state = {
     gets: 0,
+    /** Every gateway request's URL, whichever handler answers it. */
+    urls: [] as string[],
     writes: [] as { method: string; path: string; body: unknown }[],
     commits: [] as { message: string }[],
   };
   const write = (method: string, path: string, body: unknown) =>
     state.writes.push({ method, path, body });
   server.use(
+    // answers nothing: only notes the request, which the handlers below then answer
+    http.all(/\/gateway\/github\//, ({ request }) => {
+      state.urls.push(request.url);
+    }),
     http.get(REPO, () => {
       state.gets++;
       return HttpResponse.json({ full_name: "acme/widgets" });
@@ -166,20 +179,39 @@ async function broker(
     ...extra,
   });
   onTestFinished(() => started.close());
-  return { socketPath, warnings };
+  running = started;
+  return { socketPath, warnings, started };
 }
 
-/** The agent's command, with only what a command of the session has: the socket's path and no connector. */
+let running: Awaited<ReturnType<typeof startBroker>> | undefined;
+let calls = 0;
+
+/**
+ * The agent's command, with only what a command of the session has: the socket's path, the one-time
+ * token the runner puts in front of the agent's own call, and no connector. `token` is that call's
+ * own by default; a string stands in for another, `false` for none.
+ */
 async function client(
   command: typeof brokerPublishMain,
   args: string[],
   socketPath: string | undefined,
+  token?: string | false,
 ) {
   let stdout = "";
   let stderr = "";
+  const given =
+    token === undefined
+      ? running?.issue(
+          `call_${++calls}`,
+          command === brokerPublishMain ? "publish" : "sync",
+        )
+      : token || undefined;
   const status = await command(
     args,
-    { ...(socketPath && { SKY_BROKER_SOCKET: socketPath }) },
+    {
+      ...(socketPath && { SKY_BROKER_SOCKET: socketPath }),
+      ...(given && { SKY_BROKER_TOKEN: given }),
+    },
     {
       cwd: work,
       stdout: (s) => {
@@ -545,31 +577,274 @@ test("the worktree and the connector are the runner's own: a request that names 
   const gh = github();
   writeFileSync(join(work, "a.txt"), "first\n");
   commit("Add a");
-  const { socketPath } = await broker(async () => approved);
+  const { socketPath, started } = await broker(async () => approved);
 
-  const reply = await new Promise<string>((resolve) => {
+  const reply = await raw(socketPath, {
+    op: "publish",
+    token: started.issue("call_raw", "publish"),
+    title: "T",
+    cwd: "/somewhere/else",
+    GITHUB_CONNECTOR: "conn_attacker",
+    GITHUB_GATEWAY_URL: "https://attacker.test/v1/gateway/github",
+    connectorId: "conn_attacker",
+    gatewayUrl: "https://attacker.test/v1/gateway/github",
+  });
+
+  expect(reply).toContain('"exit","code":0');
+  expect(gh.writes.some((w) => w.path === "/pulls")).toBe(true);
+  // every call went through the runner's own connector and gateway, whatever the request named
+  expect(gh.urls.length).toBeGreaterThan(0);
+  for (const url of gh.urls) {
+    expect(url.startsWith(`${GATEWAY}/${CONNECTOR}/repos/acme/widgets`)).toBe(
+      true,
+    );
+  }
+  expect(gh.urls.some((url) => url.includes("attacker"))).toBe(false);
+});
+
+/** One raw request to the broker, as any process of the run's user could send it; what it answers. */
+const raw = (socketPath: string, request: object) =>
+  new Promise<string>((resolve) => {
     const socket = net.createConnection(socketPath);
     let received = "";
     socket.setEncoding("utf8");
-    socket.on("connect", () =>
-      socket.write(
-        `${JSON.stringify({
-          op: "publish",
-          title: "T",
-          cwd: "/somewhere/else",
-          GITHUB_CONNECTOR: "conn_attacker",
-          connectorId: "conn_attacker",
-        })}\n`,
-      ),
-    );
+    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
     socket.on("data", (chunk: string) => {
       received += chunk;
     });
     socket.on("close", () => resolve(received));
   });
 
-  expect(reply).toContain('"exit","code":0');
-  expect(gh.writes.some((w) => w.path === "/pulls")).toBe(true);
+test("a request that isn't the agent's own running call is refused at once, with no approval opened and nothing read", async () => {
+  const gh = github();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const asked = vi.fn(async (): Promise<ApprovalAnswer> => approved);
+  const syncRun = vi.fn<typeof syncMain>(async () => 0);
+  const { socketPath, started } = await broker(asked, { syncRun });
+
+  const none = await client(
+    brokerPublishMain,
+    ["--title", "T"],
+    socketPath,
+    false,
+  );
+  const forged = await client(
+    brokerPublishMain,
+    ["--title", "T"],
+    socketPath,
+    "0".repeat(32),
+  );
+  // a token issued for a publish call can't make a sync, and the other way round
+  const wrongOp = await raw(socketPath, {
+    op: "sync",
+    token: started.issue("call_a", "publish"),
+  });
+  const ended = started.issue("call_b", "publish");
+  started.release("call_b");
+  const afterEnd = await raw(socketPath, {
+    op: "publish",
+    title: "T",
+    token: ended,
+  });
+
+  for (const result of [none, forged]) {
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("refused");
+    expect(result.stderr).toContain("agent's own plain publish call");
+  }
+  expect(wrongOp).toContain("refused");
+  expect(afterEnd).toContain("refused");
+  expect(asked).not.toHaveBeenCalled();
+  expect(syncRun).not.toHaveBeenCalled();
+  expect(gh.gets).toBe(0);
+  expect(gh.writes).toEqual([]);
+});
+
+test("a publish's body is in the person's summary: its size, and its first 500 characters with line breaks as spaces", async () => {
+  github();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const asks: ApprovalAsk[] = [];
+  const { socketPath } = await broker(async (ask) => {
+    asks.push(ask);
+    return approved;
+  });
+  const body = `## Summary\nline two\r\nline three\n${"x".repeat(700)}`;
+
+  await client(brokerPublishMain, ["--title", "T", "--body", body], socketPath);
+
+  const summary = asks[0]?.toolSummary ?? "";
+  const shown = body.replace(/[\r\n]/g, " ").slice(0, 500);
+  expect(summary).toContain(`Body (${body.length} characters): ${shown}…`);
+  expect(summary).not.toContain(`${shown}x`);
+  expect(
+    summary.split("\n").filter((line) => line.startsWith("Body")),
+  ).toHaveLength(1);
+  expect(summary.length).toBeLessThanOrEqual(2000);
+});
+
+test("a publish approval's summary carries the body's size and first 500 characters, as text a person reads", () => {
+  const plan = {
+    localBranch: "claude/agt_1",
+    branch: "claude/agt_1",
+    base: "main",
+    head: "a".repeat(40),
+    mergeBase: "b".repeat(40),
+    commits: [{ sha: "a".repeat(40), subject: "Add a" }],
+    files: [{ path: "a.txt", added: 1, removed: 0 }],
+  };
+  const body = `one\ntwo\n${"y".repeat(600)}`;
+
+  const long = publishAsk({ ...plan, body }).toolSummary;
+  const none = publishAsk(plan).toolSummary;
+
+  expect(long).toContain(`Body (${body.length} characters): one two yyyy`);
+  expect(long).toContain(`${"y".repeat(490)}…`);
+  expect(long).not.toContain("\ntwo");
+  expect(none).not.toContain("Body (");
+});
+
+test("readBodyFile reads from the worktree and the scratch directory, and refuses the kernel's directories and anywhere else", async () => {
+  const worktree = join(root, "wt");
+  const scratch = join(root, "sc");
+  mkdirSync(worktree);
+  mkdirSync(scratch);
+  writeFileSync(join(worktree, "b.md"), "in the worktree");
+  writeFileSync(join(scratch, "b.md"), "in the scratch");
+  const roots = { worktree, scratch };
+
+  expect(await readBodyFile(join(worktree, "b.md"), roots)).toBe(
+    "in the worktree",
+  );
+  expect(await readBodyFile(join(scratch, "b.md"), roots)).toBe(
+    "in the scratch",
+  );
+  for (const path of [
+    "/proc/self/environ",
+    "/sys/kernel/hostname",
+    "/dev/null",
+    "/etc/hostname",
+    "relative/b.md",
+    join(worktree, "missing.md"),
+  ]) {
+    await expect(readBodyFile(path, roots)).rejects.toThrow("--body file");
+  }
+});
+
+test("a publish with no body shows none, and a short body shows whole", async () => {
+  github();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const asks: ApprovalAsk[] = [];
+  const { socketPath } = await broker(async (ask) => {
+    asks.push(ask);
+    return approved;
+  });
+
+  await client(brokerPublishMain, ["--title", "T"], socketPath);
+  await client(
+    brokerPublishMain,
+    ["--title", "T", "--body", "Fixes it."],
+    socketPath,
+  );
+
+  expect(asks[0]?.toolSummary).not.toContain("Body (");
+  expect(asks[1]?.toolSummary).toContain("Body (9 characters): Fixes it.");
+});
+
+test("--body @path is read by the runner, from the worktree or the run's scratch directory only", async () => {
+  const gh = github();
+  mkdirSync(join(work, "docs"));
+  writeFileSync(join(work, "docs", "body.md"), "From the worktree.\n");
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const asks: ApprovalAsk[] = [];
+  const { socketPath } = await broker(async (ask) => {
+    asks.push(ask);
+    return approved;
+  });
+  // the scratch directory is the socket's: `root` here
+  writeFileSync(join(root, "scratch-body.md"), "From the scratch directory.\n");
+
+  const inWorktree = await client(
+    brokerPublishMain,
+    ["--title", "T", "--body", "@docs/body.md"],
+    socketPath,
+  );
+  const inScratch = await client(
+    brokerPublishMain,
+    ["--title", "T", "--body", `@${join(root, "scratch-body.md")}`],
+    socketPath,
+  );
+
+  expect(inWorktree.status).toBe(0);
+  expect(inScratch.status).toBe(0);
+  expect(asks[0]?.toolSummary).toContain("From the worktree.");
+  expect(asks[1]?.toolSummary).toContain("From the scratch directory.");
+  expect(gh.writes.filter((w) => w.path === "/pulls")).toHaveLength(2);
+});
+
+test("--body @path outside the worktree and the scratch directory, or under /proc, /sys or /dev, is refused with nothing asked or sent", async () => {
+  const gh = github();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const asked = vi.fn(async (): Promise<ApprovalAnswer> => approved);
+  const { socketPath } = await broker(asked);
+  // a file the run's user can read, in neither place
+  const elsewhere = mkdtempSync(join(tmpdir(), "runner-elsewhere-"));
+  onTestFinished(() => rmSync(elsewhere, { recursive: true, force: true }));
+  writeFileSync(join(elsewhere, "secret.txt"), "not for a pull request\n");
+  // a link in the scratch directory that leads out of it, and one that leads into /proc
+  symlinkSync(join(elsewhere, "secret.txt"), join(root, "out-link"));
+  symlinkSync("/proc/self/environ", join(root, "proc-link"));
+
+  for (const path of [
+    join(elsewhere, "secret.txt"),
+    join(root, "out-link"),
+    join(root, "proc-link"),
+    "/proc/self/environ",
+    "/proc/self/../self/environ",
+    "/sys/kernel/hostname",
+    "/dev/null",
+    "/etc/hostname",
+  ]) {
+    const { status, stderr, stdout } = await client(
+      brokerPublishMain,
+      ["--title", "T", "--body", `@${path}`],
+      socketPath,
+    );
+    expect({ path, status }).toEqual({ path, status: 1 });
+    // the command sends the path made absolute, `..` folded
+    expect(stderr).toContain(`the --body file ${resolve(path)}`);
+    expect(stderr).toContain("nothing was sent");
+    expect(`${stdout}${stderr}`).not.toContain("not for a pull request");
+  }
+  expect(asked).not.toHaveBeenCalled();
+  expect(gh.writes).toEqual([]);
+});
+
+test("a token serves one request, and a refused request doesn't hold up the agent's real call", async () => {
+  const gh = github();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  const asks: ApprovalAsk[] = [];
+  const { socketPath, started } = await broker(async (ask) => {
+    asks.push(ask);
+    return approved;
+  });
+  const token = started.issue("call_real", "publish");
+
+  // someone with no token goes first, and the real call is served right after
+  const forged = raw(socketPath, { op: "publish", title: "X", token: "nope" });
+  const real = raw(socketPath, { op: "publish", title: "T", token });
+  const again = raw(socketPath, { op: "publish", title: "T", token });
+
+  expect(await forged).toContain("refused");
+  expect(await real).toContain('"exit","code":0');
+  expect(await again).toContain("refused");
+  expect(asks).toHaveLength(1);
+  expect(gh.writes.filter((w) => w.path === "/pulls")).toHaveLength(1);
 });
 
 test("the commands say so plainly when there is no broker to ask", async () => {
@@ -685,9 +960,7 @@ test("a title, subject, path or branch with line breaks stays on its own line in
     expect(lines.filter((line) => line === "Files:")).toHaveLength(1);
     expect(lines).not.toContain("  deadbee forged commit");
     expect(lines).not.toContain("  +0 -0 forged.txt");
-    expect(lines).toContain(
-      `  ${head.slice(0, 7)} Add a second third fourth`,
-    );
+    expect(lines).toContain(`  ${head.slice(0, 7)} Add a second third fourth`);
     expect(lines).toContain("  +1 -0 ok.txt   +0 -0 forged.txt");
     expect(ask.toolSummary).toContain("feature/x Files:");
     const input = JSON.parse(ask.toolInput);

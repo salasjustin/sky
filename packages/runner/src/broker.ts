@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { chmodSync, rmSync } from "node:fs";
+import { readFile, realpath } from "node:fs/promises";
 import net from "node:net";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { parseCommandEntry } from "@sky/shared";
 import { z } from "zod";
@@ -29,15 +31,24 @@ export const brokerSocketIn = (dir: string) => join(dir, SOCKET_NAME);
 // a request carries a pull request's title and body and nothing else
 const REQUEST_MAX = 4 * 1024 * 1024;
 
+// `token` is the one the runner put in front of the agent's own call: a request without a live one
+// is refused before anything is read. `bodyFile` is an absolute path the runner reads itself, so what
+// it may read is the runner's to decide.
 const BrokerRequest = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("publish"),
+    token: z.string().optional(),
     title: z.string().optional(),
     body: z.string().optional(),
+    bodyFile: z.string().optional(),
     base: z.string().optional(),
     branch: z.string().optional(),
   }),
-  z.object({ op: z.literal("sync"), branch: z.string().optional() }),
+  z.object({
+    op: z.literal("sync"),
+    token: z.string().optional(),
+    branch: z.string().optional(),
+  }),
 ]);
 export type BrokerRequest = z.infer<typeof BrokerRequest>;
 
@@ -53,25 +64,35 @@ export type BrokerReply =
  * ask nothing as Bash calls, because the broker opens the approval for them; any other form of the
  * same words is judged by the approval policy like any command.
  */
-export function isBrokerCall(
+export function brokerCallOp(
   command: string,
   runner: { execPath: string; script: string | undefined },
-): boolean {
-  if (runner.script === undefined) return false;
+): "publish" | "sync" | undefined {
+  if (runner.script === undefined) return undefined;
   let words: string[] | undefined;
   try {
     words = parseCommandEntry(command);
   } catch {
-    return false;
+    return undefined;
   }
-  if (!words) return false;
+  if (!words) return undefined;
   const [program, script, op] = words;
-  return (
-    program === runner.execPath &&
-    script === runner.script &&
-    (op === "publish" || op === "sync")
-  );
+  if (program !== runner.execPath || script !== runner.script) return undefined;
+  return op === "publish" || op === "sync" ? op : undefined;
 }
+
+/** Whether `command` is the agent's own `publish` or `sync` call; see `brokerCallOp`. */
+export const isBrokerCall = (
+  command: string,
+  runner: { execPath: string; script: string | undefined },
+): boolean => brokerCallOp(command, runner) !== undefined;
+
+/** The env var the runner puts in front of the agent's own call, which the call sends with its request. */
+export const BROKER_TOKEN_ENV = "SKY_BROKER_TOKEN";
+
+/** `command` with this call's one-time token set in front of it, for the shell to put in the command's env. */
+export const withBrokerToken = (command: string, token: string) =>
+  `${BROKER_TOKEN_ENV}=${token} ${command}`;
 
 /** What the person is asked: shown as the approval request's tool name, summary and input. */
 export type ApprovalAsk = {
@@ -92,14 +113,15 @@ const FILES_MAX = 200;
 const SUBJECT_MAX = 200;
 const PATH_MAX = 200;
 const BODY_MAX = 4_000;
+// how much of a publish's body the person's summary shows, line breaks as spaces
+const BODY_SUMMARY_MAX = 500;
 
 const cut = (text: string, max: number) =>
   text.length > max ? `${text.slice(0, max - 1)}…` : text;
 const short = (sha: string) => sha.slice(0, 7);
 // a title, subject, path or branch from config can hold a line break, which would add a line of its
 // own to the summary; the C1 controls and U+2028/U+2029 are line breaks to some renderers too
-const oneLine = (text: string) =>
-  text.replace(/[\p{Cc}\u2028\u2029]/gu, " ");
+const oneLine = (text: string) => text.replace(/[\p{Cc}\u2028\u2029]/gu, " ");
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 type Listed = {
@@ -165,6 +187,13 @@ export function publishAsk(plan: PublishPlan): ApprovalAsk {
     `Publish ${plan.localBranch} to GitHub branch ${plan.branch}, which ${target}.`,
     `${plural(total.commits, "commit")}, ${plural(total.files, "file")}, +${total.added} -${total.removed}; head ${short(plan.head)}.`,
     ...(plan.title ? [`Title: ${cut(plan.title, 200)}`] : []),
+    // the body is the agent's to write, and where a file's text or a secret could be sent: its size
+    // and start are what the person reads
+    ...(plan.body !== undefined
+      ? [
+          `Body (${plural(plan.body.length, "character")}): ${cut(oneLine(plan.body), BODY_SUMMARY_MAX + 1)}`,
+        ]
+      : []),
   ];
   const input = {
     action: "publish",
@@ -318,7 +347,54 @@ export type BrokerDeps = {
   publishRun?: typeof publishWith;
 };
 
-export type Broker = { close: () => Promise<void> };
+export type Broker = {
+  close: () => Promise<void>;
+  /**
+   * Lets one request through for the agent's own `op` call `toolUseId`, and returns the token that
+   * call carries: the runner puts it in front of the command, so the client sends it. Used once,
+   * and void when the call ends (`release`).
+   */
+  issue: (toolUseId: string, op: "publish" | "sync") => string;
+  /** The call ended: its token, used or not, serves nothing more. */
+  release: (toolUseId: string) => void;
+};
+
+// paths the runner never reads a body from: the kernel's, which hold other processes' environments
+const KERNEL_DIRS = ["/proc", "/sys", "/dev"];
+
+const under = (root: string, path: string) =>
+  path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
+
+/**
+ * The text of `--body @<path>`: the file must be in the worktree or the run's scratch directory (links
+ * followed) and no path of it, as written or as resolved, under `/proc`, `/sys` or `/dev`, where a
+ * read would put the session's environment in a pull request. Throws, naming why, for any other.
+ */
+export async function readBodyFile(
+  path: string,
+  roots: { worktree: string; scratch: string },
+): Promise<string> {
+  const refuse = (why: string) =>
+    new PublishError(`the --body file ${path} ${why}; nothing was sent`);
+  if (!isAbsolute(path)) throw refuse("is not an absolute path");
+  const real = await realpath(path).catch(() => {
+    throw refuse("can't be read");
+  });
+  for (const candidate of [path, real]) {
+    if (KERNEL_DIRS.some((dir) => under(dir, resolve(candidate)))) {
+      throw refuse("is under /proc, /sys or /dev");
+    }
+  }
+  const allowed = await Promise.all(
+    [roots.worktree, roots.scratch].map((dir) =>
+      realpath(dir).catch(() => dir),
+    ),
+  );
+  if (!allowed.some((dir) => under(dir, real))) {
+    throw refuse("is outside the worktree and the run's scratch directory");
+  }
+  return readFile(real, "utf8");
+}
 
 /**
  * The runner's socket for the agent's `publish` and `sync`. The commands are thin clients: they
@@ -330,6 +406,13 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
   rmSync(deps.socketPath, { force: true });
   let turn: Promise<void> = Promise.resolve();
   const sockets = new Set<net.Socket>();
+  // the one-time tokens of the agent's own calls that are running: a request is served only on one
+  const grants = new Map<
+    string,
+    { toolUseId: string; op: "publish" | "sync"; used: boolean; live: boolean }
+  >();
+  const refused = (op: BrokerRequest["op"]) =>
+    `sky ${op}: refused: the runner serves a request only for the agent's own plain ${op} call while it runs, and this is not one; nothing was sent\n`;
 
   const serve = async (
     request: BrokerRequest,
@@ -360,7 +443,13 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
     };
     try {
       if (request.op === "publish") {
-        const { op: _, ...values } = request;
+        const { op: _, token: __, bodyFile, ...values } = request;
+        if (bodyFile !== undefined) {
+          values.body = await readBodyFile(bodyFile, {
+            worktree: deps.cwd,
+            scratch: dirname(deps.socketPath),
+          });
+        }
         const code = await (deps.publishRun ?? publishWith)(
           values,
           deps.env,
@@ -441,9 +530,22 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
         socket.end();
         return;
       }
+      // at once, before it can wait behind anyone: a request that isn't the running call's asks no
+      // one, and holds up nobody's real call
+      const grant =
+        request.token === undefined ? undefined : grants.get(request.token);
+      if (!grant || grant.used || !grant.live || grant.op !== request.op) {
+        send({ t: "err", s: refused(request.op) });
+        send({ t: "exit", code: 1 });
+        socket.end();
+        return;
+      }
+      grant.used = true;
       turn = turn.then(async () => {
-        // a client that left while it waited its turn is never served
-        if (!gone.signal.aborted) await serve(request, send, gone.signal);
+        // a client that left while it waited its turn, or whose call ended, is never served
+        if (!gone.signal.aborted && grant.live) {
+          await serve(request, send, gone.signal);
+        }
         socket.end();
       });
     });
@@ -456,8 +558,20 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
   return {
     close: async () => {
       for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await new Promise<void>((done) => server.close(() => done()));
       rmSync(deps.socketPath, { force: true });
+    },
+    issue: (toolUseId, op) => {
+      const token = randomBytes(16).toString("hex");
+      grants.set(token, { toolUseId, op, used: false, live: true });
+      return token;
+    },
+    release: (toolUseId) => {
+      for (const [token, grant] of grants) {
+        if (grant.toolUseId !== toolUseId) continue;
+        grant.live = false;
+        grants.delete(token);
+      }
     },
   };
 }

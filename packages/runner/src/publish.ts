@@ -1450,7 +1450,9 @@ export type PublishValues = {
 export async function readPublishArgs(
   argv: string[],
   io: { cwd: string; stdout: (s: string) => void; stderr: (s: string) => void },
-): Promise<{ values: PublishValues } | { code: number }> {
+  /** `deferBodyFile`: return a `--body @file` as its absolute path, for the runner to read under its own rules. */
+  options: { deferBodyFile?: boolean } = {},
+): Promise<{ values: PublishValues; bodyFile?: string } | { code: number }> {
   let values: PublishValues & { help?: boolean };
   try {
     ({ values } = parseArgs({
@@ -1475,6 +1477,13 @@ export async function readPublishArgs(
   }
   // `--body @path` reads the body from a file, like the CLI's `--prompt=@file`; a relative path is
   // from the working directory
+  if (values.body?.startsWith("@") && options.deferBodyFile) {
+    const { help: _, body, ...rest } = values;
+    return {
+      values: rest,
+      bodyFile: resolve(io.cwd, (body as string).slice(1)),
+    };
+  }
   if (values.body?.startsWith("@")) {
     const file = resolve(io.cwd, values.body.slice(1));
     try {

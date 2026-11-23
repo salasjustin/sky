@@ -1,5 +1,9 @@
 import net from "node:net";
-import { BROKER_SOCKET_ENV, type BrokerReply } from "./broker.js";
+import {
+  BROKER_SOCKET_ENV,
+  BROKER_TOKEN_ENV,
+  type BrokerReply,
+} from "./broker.js";
 import { readPublishArgs } from "./publish.js";
 import { SYNC_HELP, SYNC_USAGE, syncArgs } from "./sync.js";
 
@@ -43,7 +47,13 @@ async function ask(
       else if (reply.t === "err") io.stderr(reply.s);
       else if (reply.t === "exit") exit = reply.code;
     };
-    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+    // the token the runner put in front of this call; without it the runner refuses the request
+    const token = env[BROKER_TOKEN_ENV];
+    socket.on("connect", () =>
+      socket.write(
+        `${JSON.stringify({ ...request, ...(token && { token }) })}\n`,
+      ),
+    );
     socket.on("data", (chunk: string) => {
       received += chunk;
       for (
@@ -82,9 +92,19 @@ export async function brokerPublishMain(
   env: NodeJS.ProcessEnv,
   io: Io,
 ): Promise<number> {
-  const args = await readPublishArgs(argv, io);
+  // a `--body @file` goes as its path: the runner reads it, and only from where it allows
+  const args = await readPublishArgs(argv, io, { deferBodyFile: true });
   if ("code" in args) return args.code;
-  return ask("sky publish", { op: "publish", ...args.values }, env, io);
+  return ask(
+    "sky publish",
+    {
+      op: "publish",
+      ...args.values,
+      ...(args.bodyFile !== undefined && { bodyFile: args.bodyFile }),
+    },
+    env,
+    io,
+  );
 }
 
 /** `runner.mjs sync …`, the agent's own command: asks the run's runner to sync the worktree, after one approval. */
