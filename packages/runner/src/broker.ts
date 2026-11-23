@@ -60,7 +60,8 @@ export type BrokerReply =
 
 /**
  * Whether `command` is exactly the agent's own `publish` or `sync` call: the runner's script run by
- * the runner's node as one plain command, nothing chained, substituted, redirected or wrapped. Those
+ * the runner's node, named by its full path or by the bare word `node` (see `onRunnerNode`), as one
+ * plain command, nothing chained, substituted, redirected or wrapped. Those
  * ask nothing as Bash calls, because the broker opens the approval for them; any other form of the
  * same words is judged by the approval policy like any command.
  */
@@ -87,8 +88,8 @@ export function brokerCallOp(
 }
 
 // the bare word `node`, unquoted, as the command's first word, with only space or tab around it: the
-// shell splits words on those alone, so `\v` or a no-break space would make a word of its own; a quoted
-// spelling parses to the same word but isn't the form the instructions give, so it isn't taken either
+// shell splits words on those alone, so `\v` or a no-break space stays part of the word beside it; a
+// quoted spelling parses to the same word but isn't the form the instructions give, so it isn't taken
 const BARE_NODE = /^([ \t]*)node(?=[ \t])/;
 const startsWithBareNode = (command: string) => BARE_NODE.test(command);
 
