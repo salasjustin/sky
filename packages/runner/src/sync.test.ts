@@ -848,7 +848,7 @@ test("publish never force-updates a continued branch, even one the agent rewrote
   await expect(
     publish({ cwd, gatewayUrl: GATEWAY, connectorId: CONNECTOR, title: "t" }),
   ).rejects.toThrow(
-    `feature/login on GitHub is at ${tip}, which this branch doesn't build on (as after a push there, or an amend or rebase here); a branch this agent continues is only ever fast-forwarded, so nothing was sent. If someone pushed there, run \`node /opt/sky/runner.mjs sync\` to bring what was pushed to feature/login into this worktree (your unpublished commits are rebased onto it), then publish again. If you amended or rebased commits that were already published, put your work back on top of it instead: \`git reset --soft ${tip}\` and \`git commit\` keep your files as they are in a new commit on it, then publish again`,
+    `feature/login on GitHub is at ${tip}, which this branch doesn't build on (as after a push there, or an amend or rebase here); a branch this agent continues is only ever fast-forwarded, so nothing was sent. If someone pushed there, run \`${process.execPath} ${process.argv[1]} sync\` to bring what was pushed to feature/login into this worktree (your unpublished commits are rebased onto it), then publish again. If you amended or rebased commits that were already published, put your work back on top of it instead: \`git reset --soft ${tip}\` and \`git commit\` keep your files as they are in a new commit on it, then publish again`,
   );
   expect(sent.commits).toEqual([]);
   expect(sent.refs).toEqual([]);
@@ -865,7 +865,7 @@ test("publish refusing a push git has never seen points to sync alone, not to a 
   await expect(
     publish({ cwd, gatewayUrl: GATEWAY, connectorId: CONNECTOR, title: "t" }),
   ).rejects.toThrow(
-    `feature/login on GitHub is at ${pushed}, which this branch doesn't build on (as after a push there, or an amend or rebase here); a branch this agent continues is only ever fast-forwarded, so nothing was sent. Someone pushed there since this worktree last fetched: run \`node /opt/sky/runner.mjs sync\` to bring what was pushed to feature/login into this worktree (your unpublished commits are rebased onto it), then publish again`,
+    `feature/login on GitHub is at ${pushed}, which this branch doesn't build on (as after a push there, or an amend or rebase here); a branch this agent continues is only ever fast-forwarded, so nothing was sent. Someone pushed there since this worktree last fetched: run \`${process.execPath} ${process.argv[1]} sync\` to bring what was pushed to feature/login into this worktree (your unpublished commits are rebased onto it), then publish again`,
   );
 });
 

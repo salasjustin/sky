@@ -60,7 +60,8 @@ export type BrokerReply =
 
 /**
  * Whether `command` is exactly the agent's own `publish` or `sync` call: the runner's script run by
- * the runner's node as one plain command, nothing chained, substituted, redirected or wrapped. Those
+ * the runner's node, named by its full path or by the bare word `node` (see `onRunnerNode`), as one
+ * plain command, nothing chained, substituted, redirected or wrapped. Those
  * ask nothing as Bash calls, because the broker opens the approval for them; any other form of the
  * same words is judged by the approval policy like any command.
  */
@@ -77,8 +78,31 @@ export function brokerCallOp(
   }
   if (!words) return undefined;
   const [program, script, op] = words;
-  if (program !== runner.execPath || script !== runner.script) return undefined;
+  if (script !== runner.script) return undefined;
+  if (
+    program !== runner.execPath &&
+    !(program === "node" && startsWithBareNode(command))
+  )
+    return undefined;
   return op === "publish" || op === "sync" ? op : undefined;
+}
+
+// the bare word `node`, unquoted, as the command's first word, with only space or tab around it: the
+// shell splits words on those alone, so `\v` or a no-break space stays part of the word beside it; a
+// quoted spelling parses to the same word but isn't the form the instructions give, so it isn't taken
+const BARE_NODE = /^([ \t]*)node(?=[ \t])/;
+const startsWithBareNode = (command: string) => BARE_NODE.test(command);
+
+/**
+ * `command` run on the runner's own node: a call that began with the bare word `node` has only that
+ * word replaced by `execPath`, so it doesn't run on whatever `node` resolves to on PATH. The arguments
+ * stay as written. Any other command comes back as it was.
+ */
+export function onRunnerNode(command: string, execPath: string): string {
+  const program = /^[\w@%+=:,./-]+$/.test(execPath)
+    ? execPath
+    : `'${execPath.replaceAll("'", `'\\''`)}'`;
+  return command.replace(BARE_NODE, (_, lead: string) => `${lead}${program}`);
 }
 
 /** Whether `command` is the agent's own `publish` or `sync` call; see `brokerCallOp`. */
@@ -454,7 +478,7 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
     { toolUseId: string; op: "publish" | "sync"; used: boolean; live: boolean }
   >();
   const refused = (op: BrokerRequest["op"]) =>
-    `sky ${op}: refused: the runner serves a request only for the agent's own plain ${op} call while it runs, and this request doesn't carry that call's unused token; nothing was sent\n`;
+    `sky ${op}: refused: the runner serves a request only for the agent's own plain ${op} call while it runs, and this request doesn't carry that call's unused token; nothing was sent. Run the command exactly as the session instructions give it, as one plain command: nothing chained, piped, redirected or wrapped\n`;
 
   const serve = async (
     request: BrokerRequest,

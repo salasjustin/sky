@@ -4067,6 +4067,82 @@ test("a sync asked of the session's broker opens exactly one approval, a Sync re
   expect(reply).toContain("origin is not a GitHub repo");
 });
 
+const BARE_REST = `${process.argv[1]} publish --title 'Add "widgets" & more' --body @/tmp/b.md`;
+
+test("a call that begins with the bare word node gets a token and runs on the runner's own node, its arguments untouched", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const commands: (string | undefined)[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      for (const [i, command] of [
+        `node ${BARE_REST}`,
+        `node ${process.argv[1]} sync`,
+        `node ${BARE_REST} | cat`,
+        `env node ${BARE_REST}`,
+        `./node ${BARE_REST}`,
+        `/tmp/node ${BARE_REST}`,
+      ].entries()) {
+        const [answer] = await fire(options, "PreToolUse", {
+          tool_name: "Bash",
+          tool_input: { command },
+          tool_use_id: `t${i + 1}`,
+        });
+        commands.push(
+          (
+            answer as {
+              hookSpecificOutput?: { updatedInput?: { command?: string } };
+            }
+          ).hookSpecificOutput?.updatedInput?.command,
+        );
+      }
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query, connector: { GITHUB_CONNECTOR: "conn_123" } },
+  );
+  const token = /^SKY_BROKER_TOKEN=[0-9a-f]{32} /;
+  expect(commands[0]).toMatch(token);
+  expect(commands[1]).toMatch(token);
+  const rest = (c: string | undefined) => c?.replace(token, "");
+  expect(rest(commands[0])).toBe(`${process.execPath} ${BARE_REST}`);
+  expect(rest(commands[1])).toBe(`${process.execPath} ${process.argv[1]} sync`);
+  expect(commands.slice(2)).toEqual([
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+  ]);
+  // the four that are not the agent's own call ask like any command
+  expect(waitingSummaries(sent)).toHaveLength(4);
+});
+
+test("a bare node call's token serves one request, like the full-path form's", async () => {
+  const { deps } = api(decided({ decision: "approve" }));
+  const replies: string[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      const token = await callWithToken(
+        options,
+        `node ${process.argv[1]} sync`,
+        "t1",
+      );
+      replies.push(await askBroker(options, { op: "sync", token }));
+      replies.push(await askBroker(options, { op: "sync", token }));
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: [] },
+    { ...deps, query, connector: { GITHUB_CONNECTOR: "conn_123" } },
+  );
+  expect(replies[0]).toContain("origin is not a GitHub repo");
+  expect(replies[1]).toContain("refused");
+});
+
 test("a runner that can't confirm its seal refuses a publish asked of its broker, and posts a runner.warning", async () => {
   const { sent, deps } = api(decided({ decision: "approve" }));
   let reply = "";

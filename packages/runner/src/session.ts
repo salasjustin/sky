@@ -39,6 +39,7 @@ import {
   type Broker,
   brokerCallOp,
   brokerSocketIn,
+  onRunnerNode,
   startBroker,
   withBrokerToken,
 } from "./broker.js";
@@ -1231,7 +1232,10 @@ export async function runSession(
           permissionDecision: "allow",
           updatedInput: {
             ...(input.tool_input as object),
-            command: withBrokerToken(command, token),
+            command: withBrokerToken(
+              onRunnerNode(command, process.execPath),
+              token,
+            ),
             // run in the background, the call would end, and void its token, before it asked
             run_in_background: false,
           },
