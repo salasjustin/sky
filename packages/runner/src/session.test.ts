@@ -3971,6 +3971,45 @@ test("the gate puts a one-time token in front of the agent's own plain publish o
   }
 });
 
+test("the agent's own call keeps its other input, and runs in the foreground, where its token lasts until it asks", async () => {
+  const { deps } = api(decided({ decision: "approve" }));
+  let updated: Record<string, unknown> | undefined;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      const [answer] = await fire(options, "PreToolUse", {
+        tool_name: "Bash",
+        tool_input: {
+          command: PUBLISH_CALL,
+          timeout: 600_000,
+          description: "Publish",
+          run_in_background: true,
+        },
+        tool_use_id: "t1",
+      });
+      updated = (
+        answer as {
+          hookSpecificOutput?: { updatedInput?: Record<string, unknown> };
+        }
+      ).hookSpecificOutput?.updatedInput;
+    },
+    success,
+  ]);
+  await runSession(config, {
+    ...deps,
+    query,
+    connector: { GITHUB_CONNECTOR: "conn_123" },
+  });
+  expect(updated).toMatchObject({
+    timeout: 600_000,
+    description: "Publish",
+    run_in_background: false,
+  });
+  expect(String(updated?.command)).toMatch(
+    /^SKY_BROKER_TOKEN=[0-9a-f]{32} /,
+  );
+});
+
 test("a request with no token, or whose call has ended, is refused at once by the session's broker: no approval, no event for a person", async () => {
   const { sent, deps } = api(decided({ decision: "approve" }));
   const replies: string[] = [];

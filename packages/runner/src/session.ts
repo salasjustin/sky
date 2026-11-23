@@ -351,7 +351,7 @@ const publishInstructions = (refreshed?: Refreshed) =>
     "`--branch <name>` publishes to a GitHub branch of that name instead of your worktree's branch, and the pull request's head is that branch; pass the same name each time. Stay on your worktree's branch rather than switching to another local branch; `--branch` is how you choose the GitHub branch. Commits go out under the git author configured for this environment, with every `Co-authored-by` trailer removed.",
     "Once commits are published, add new commits rather than amending or rebasing them: a rewritten branch can't be published again.",
     "`publish` and `sync` don't touch GitHub themselves: they ask this run's runner, the only process that holds the GitHub credential, which does the work. For each, the runner opens one approval for the person watching the run and waits for it: for `publish`, the branch it goes to and the commits, files and diff stat that go out; for `sync`, the branch and the commits it may rebase. `publish` first refreshes the base from GitHub, which can rebase your branch, and then sends nothing until it is approved; `sync` fetches and changes nothing until it is approved. Nothing in the environment skips the approval, so expect the call to last as long as the person takes, and give the Bash call a 10-minute timeout. A denied approval sends nothing, and a head that moved after the approval, or a `sync` whose worktree switched branch, is refused: commit what you need first, then run it again, and never commit or switch branches while it waits.",
-    "Run each as one plain command, nothing chained, piped, redirected or wrapped around it, so the call itself asks nothing and the runner's approval is the only one; written any other way, it is also held as a Bash call. Write a multi-line body to a file with the Write tool and pass `--body @<path>`, rather than a heredoc or `$(…)` in the command: the runner reads that file itself, only from your worktree or the run's scratch directory, and shows the person the body's size and first 500 characters. The runner serves a request only while that plain call runs, so no other command can ask it for anything. Your commands are not given the GitHub connector: don't look for a GitHub credential or call GitHub's API any other way.",
+    "Run each as one plain command, nothing chained, piped, redirected or wrapped around it, so the call itself asks nothing and the runner's approval is the only one; written any other way, it is also held as a Bash call. Write a multi-line body to a file with the Write tool and pass `--body @<path>`, rather than a heredoc or `$(…)` in the command: the runner reads that file itself, only from your worktree or the run's scratch directory, and shows the person the body's size and first 500 characters. The runner serves a request only while that plain call runs, in the foreground, and only for that call. Run nothing else while it waits. Your commands are not given the GitHub connector: don't look for a GitHub credential or call GitHub's API any other way.",
   ].join("\n");
 
 /**
@@ -1232,6 +1232,8 @@ export async function runSession(
           updatedInput: {
             ...(input.tool_input as object),
             command: withBrokerToken(command, token),
+            // run in the background, the call would end, and void its token, before it asked
+            run_in_background: false,
           },
         },
       };
