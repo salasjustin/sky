@@ -4005,9 +4005,7 @@ test("the agent's own call keeps its other input, and runs in the foreground, wh
     description: "Publish",
     run_in_background: false,
   });
-  expect(String(updated?.command)).toMatch(
-    /^SKY_BROKER_TOKEN=[0-9a-f]{32} /,
-  );
+  expect(String(updated?.command)).toMatch(/^SKY_BROKER_TOKEN=[0-9a-f]{32} /);
 });
 
 test("a request with no token, or whose call has ended, is refused at once by the session's broker: no approval, no event for a person", async () => {

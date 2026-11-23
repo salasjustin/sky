@@ -116,10 +116,10 @@ test("a connector secret's connection id is redacted like any secret value: when
   );
   expect(
     (
-      await live.request(
-        `/v1/environments/${envId}/secrets/GITHUB_CONNECTOR`,
-        { method: "DELETE", headers: auth },
-      )
+      await live.request(`/v1/environments/${envId}/secrets/GITHUB_CONNECTOR`, {
+        method: "DELETE",
+        headers: auth,
+      })
     ).status,
   ).toBe(204);
   expect(known.values()).toEqual(expect.arrayContaining([id, other]));

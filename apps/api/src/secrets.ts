@@ -266,7 +266,10 @@ export function registerStoredValues(
     .where(isNotNull(secrets.connector))
     .all()) {
     if (row.connector !== null) {
-      known.add(connectorKey(row.envId, row.name, row.connector), row.connector);
+      known.add(
+        connectorKey(row.envId, row.name, row.connector),
+        row.connector,
+      );
     }
   }
   for (const row of db.select().from(runEnvVars).all()) {
@@ -354,7 +357,10 @@ export function secretRoutes() {
         c.var.secrets.add(envSecretKey(id, name, sealed.nonce), input.value);
       }
       if ("connector" in input) {
-        c.var.secrets.add(connectorKey(id, name, input.connector), input.connector);
+        c.var.secrets.add(
+          connectorKey(id, name, input.connector),
+          input.connector,
+        );
       }
       return c.json(present(row), 200);
     })
