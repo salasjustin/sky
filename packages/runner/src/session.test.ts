@@ -4103,8 +4103,10 @@ test("a call that begins with the bare word node gets a token and runs on the ru
     { ...config, approvalPolicy: ["Bash"] },
     { ...deps, query, connector: { GITHUB_CONNECTOR: "conn_123" } },
   );
-  const rest = (c: string | undefined) =>
-    c?.replace(/^SKY_BROKER_TOKEN=[0-9a-f]{32} /, "");
+  const token = /^SKY_BROKER_TOKEN=[0-9a-f]{32} /;
+  expect(commands[0]).toMatch(token);
+  expect(commands[1]).toMatch(token);
+  const rest = (c: string | undefined) => c?.replace(token, "");
   expect(rest(commands[0])).toBe(`${process.execPath} ${BARE_REST}`);
   expect(rest(commands[1])).toBe(`${process.execPath} ${process.argv[1]} sync`);
   expect(commands.slice(2)).toEqual([
