@@ -732,6 +732,36 @@ test("readBodyFile reads from the worktree and the scratch directory, and refuse
   }
 });
 
+test("readBodyFile refuses a link out of the worktree, a named pipe and an oversized file, and never waits on one", async () => {
+  const worktree = join(root, "wt2");
+  const scratch = join(root, "sc2");
+  mkdirSync(worktree);
+  mkdirSync(scratch);
+  const roots = { worktree, scratch };
+  symlinkSync("/proc/self/environ", join(worktree, "environ.md"));
+  symlinkSync(join(root, "outside.md"), join(worktree, "outside.md"));
+  writeFileSync(join(root, "outside.md"), "outside");
+  execFileSync("mkfifo", [join(worktree, "pipe.md")]);
+  writeFileSync(join(worktree, "big.md"), "x".repeat(4 * 1024 * 1024 + 1));
+  writeFileSync(join(worktree, "edge.md"), "x".repeat(4 * 1024 * 1024));
+
+  await expect(
+    readBodyFile(join(worktree, "environ.md"), roots),
+  ).rejects.toThrow("under /proc, /sys or /dev");
+  await expect(
+    readBodyFile(join(worktree, "outside.md"), roots),
+  ).rejects.toThrow("outside the worktree");
+  await expect(readBodyFile(join(worktree, "pipe.md"), roots)).rejects.toThrow(
+    "not a regular file",
+  );
+  await expect(readBodyFile(join(worktree, "big.md"), roots)).rejects.toThrow(
+    "over 4194304 bytes",
+  );
+  expect(await readBodyFile(join(worktree, "edge.md"), roots)).toHaveLength(
+    4 * 1024 * 1024,
+  );
+});
+
 test("a publish with no body shows none, and a short body shows whole", async () => {
   github();
   writeFileSync(join(work, "a.txt"), "first\n");

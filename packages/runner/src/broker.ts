@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, rmSync } from "node:fs";
-import { readFile, realpath } from "node:fs/promises";
+import { chmodSync, constants, rmSync } from "node:fs";
+import { open, readlink, realpath } from "node:fs/promises";
 import net from "node:net";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -191,7 +191,7 @@ export function publishAsk(plan: PublishPlan): ApprovalAsk {
     // and start are what the person reads
     ...(plan.body !== undefined
       ? [
-          `Body (${plural(plan.body.length, "character")}): ${cut(oneLine(plan.body), BODY_SUMMARY_MAX + 1)}`,
+          `Body (${plural(plan.body.length, "character")}): ${oneLine(plan.body.slice(0, BODY_SUMMARY_MAX))}${plan.body.length > BODY_SUMMARY_MAX ? "…" : ""}`,
         ]
       : []),
   ];
@@ -365,9 +365,12 @@ const KERNEL_DIRS = ["/proc", "/sys", "/dev"];
 const under = (root: string, path: string) =>
   path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
 
+// the most a body file may hold, as much as a whole request may carry
+const BODY_FILE_MAX = REQUEST_MAX;
+
 /**
- * The text of `--body @<path>`: the file must be in the worktree or the run's scratch directory (links
- * followed) and no path of it, as written or as resolved, under `/proc`, `/sys` or `/dev`, where a
+ * The text of `--body @<path>`: a regular file in the worktree or the run's scratch directory (links
+ * followed), with no path of it, as written or as resolved, under `/proc`, `/sys` or `/dev`, where a
  * read would put the session's environment in a pull request. Throws, naming why, for any other.
  */
 export async function readBodyFile(
@@ -376,24 +379,63 @@ export async function readBodyFile(
 ): Promise<string> {
   const refuse = (why: string) =>
     new PublishError(`the --body file ${path} ${why}; nothing was sent`);
+  const kernel = (candidate: string) =>
+    KERNEL_DIRS.some((dir) => under(dir, resolve(candidate)));
   if (!isAbsolute(path)) throw refuse("is not an absolute path");
-  const real = await realpath(path).catch(() => {
-    throw refuse("can't be read");
-  });
-  for (const candidate of [path, real]) {
-    if (KERNEL_DIRS.some((dir) => under(dir, resolve(candidate)))) {
-      throw refuse("is under /proc, /sys or /dev");
-    }
-  }
   const allowed = await Promise.all(
     [roots.worktree, roots.scratch].map((dir) =>
       realpath(dir).catch(() => dir),
     ),
   );
-  if (!allowed.some((dir) => under(dir, real))) {
-    throw refuse("is outside the worktree and the run's scratch directory");
+  const check = (real: string) => {
+    if (kernel(path) || kernel(real)) {
+      throw refuse("is under /proc, /sys or /dev");
+    }
+    if (!allowed.some((dir) => under(dir, real))) {
+      throw refuse("is outside the worktree and the run's scratch directory");
+    }
+  };
+  // refused before it is opened, so no device or kernel file is opened for a path that resolves there now
+  check(
+    await realpath(path).catch(() => {
+      throw refuse("can't be read");
+    }),
+  );
+  // then opened once, and checked again and read through that one handle: the agent can swap a link
+  // in the path between a check and a second open. Non-blocking, so a named pipe can't hold the runner
+  const file = await open(
+    path,
+    constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOCTTY,
+  ).catch(() => {
+    throw refuse("can't be read");
+  });
+  try {
+    // where the open file is, as the kernel has it
+    check(
+      await readlink(`/proc/self/fd/${file.fd}`).catch(() => {
+        throw refuse("can't be read");
+      }),
+    );
+    if (!(await file.stat()).isFile()) throw refuse("is not a regular file");
+    const buffer = Buffer.alloc(BODY_FILE_MAX + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const { bytesRead } = await file.read(
+        buffer,
+        length,
+        buffer.length - length,
+        length,
+      );
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+    if (length > BODY_FILE_MAX) {
+      throw refuse(`is over ${BODY_FILE_MAX} bytes`);
+    }
+    return buffer.subarray(0, length).toString("utf8");
+  } finally {
+    await file.close();
   }
-  return readFile(real, "utf8");
 }
 
 /**
@@ -530,8 +572,9 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
         socket.end();
         return;
       }
-      // at once, before it can wait behind anyone: a request that isn't the running call's asks no
-      // one, and holds up nobody's real call
+      // at once, before it can wait behind anyone: a request without the running call's token asks no
+      // one, and holds up nobody's real call. One that read the token and sent it first is served in
+      // place of the real call, which is then refused
       const grant =
         request.token === undefined ? undefined : grants.get(request.token);
       if (!grant || grant.used || !grant.live || grant.op !== request.op) {
