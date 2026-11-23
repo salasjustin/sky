@@ -757,8 +757,19 @@ export async function syncStoreQuietly(
         stderr += s;
       },
     });
-    if (code !== 0)
-      warn(`runner: ${stderr.trim() || `store ${mode} exited ${code}`}`);
+    if (code !== 0) {
+      // the locked child's output arrives as lines of its own, some already `runner: `-prefixed (its
+      // warning about hiding itself): each is logged under one prefix, never two, never none
+      const lines = stderr
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      for (const line of lines.length > 0
+        ? lines
+        : [`store ${mode} exited ${code}`]) {
+        warn(line.startsWith("runner: ") ? line : `runner: ${line}`);
+      }
+    }
   } catch (error) {
     warn(`runner: store ${mode} failed: ${messageOf(error)}`);
   }

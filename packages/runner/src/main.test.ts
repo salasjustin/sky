@@ -141,10 +141,13 @@ async function runBundle(
 ) {
   const child = spawn(
     process.execPath,
-    ["--import", preload(host), bundle, ...(args ?? [env.RUN_ID ?? ""])],
+    [bundle, ...(args ?? [env.RUN_ID ?? ""])],
     {
       env: {
         PATH: process.env.PATH ?? "",
+        // through the env, not the argv, so the runner's own subcommands (the store sync's locked
+        // child) stand in for the same host: a child that took the real one would depend on the machine
+        NODE_OPTIONS: `--import=${preload(host)}`,
         CLAUDE_CONFIG_DIR,
         SKY_SPRITE_API_SOCKET: NO_SPRITE_SOCKET,
         ...env,
@@ -583,6 +586,36 @@ test("the store is pulled before the run and pushed after it, a failed run inclu
     expect(code).toBe(1);
     expect(stderr).toMatch(/runner: .*pull/);
     expect(stderr).toMatch(/runner: .*push/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("on a host that can't hide the store sync, each line of its output is logged under one runner: prefix, and the pull and push still run", async () => {
+  const { seen, base } = await apiAndGateway();
+  const home = mkdtempSync(join(tmpdir(), "runner-main-store-"));
+  try {
+    const { stderr } = await runBundle(
+      storeRunEnv(base, home),
+      undefined,
+      "unprivileged",
+    );
+    // the sync warns that it can't hide itself, and goes on: its pull and push are tried all the same
+    expect(seen.filter((s) => s === "store")).toHaveLength(2);
+    const lines = stderr.split("\n").filter(Boolean);
+    expect(stderr).not.toContain("runner: runner:");
+    expect(
+      lines.filter((l) =>
+        /^\S+ runner: store-sync can't keep the GitHub connector/.test(l),
+      ),
+    ).toHaveLength(2);
+    expect(
+      lines.filter((l) => /runner: store sync: pull failed/.test(l)),
+    ).toHaveLength(1);
+    expect(
+      lines.filter((l) => /runner: store sync: push failed/.test(l)),
+    ).toHaveLength(1);
+    expect(stderr).not.toContain("conn_1");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
