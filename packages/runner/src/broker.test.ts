@@ -654,7 +654,7 @@ test("a request that isn't the agent's own running call is refused at once, with
     expect(result.stderr).toContain("refused");
     expect(result.stderr).toContain("agent's own plain publish call");
     expect(result.stderr).toContain(
-      "Run the command exactly as the session instructions give it, as one plain command with no pipe, redirect or 2>&1",
+      "Run the command exactly as the session instructions give it, as one plain command: nothing chained, piped, redirected or wrapped",
     );
   }
   expect(wrongOp).toContain("refused");

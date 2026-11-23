@@ -477,7 +477,7 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
     { toolUseId: string; op: "publish" | "sync"; used: boolean; live: boolean }
   >();
   const refused = (op: BrokerRequest["op"]) =>
-    `sky ${op}: refused: the runner serves a request only for the agent's own plain ${op} call while it runs, and this request doesn't carry that call's unused token; nothing was sent. Run the command exactly as the session instructions give it, as one plain command with no pipe, redirect or 2>&1\n`;
+    `sky ${op}: refused: the runner serves a request only for the agent's own plain ${op} call while it runs, and this request doesn't carry that call's unused token; nothing was sent. Run the command exactly as the session instructions give it, as one plain command: nothing chained, piped, redirected or wrapped\n`;
 
   const serve = async (
     request: BrokerRequest,
