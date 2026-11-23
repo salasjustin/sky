@@ -11,6 +11,7 @@ import {
   openDb,
   runEnvVars,
   runs,
+  secrets,
 } from "@sky/db";
 import type { AgentId, EnvironmentId, RunId, RunStatus } from "@sky/shared";
 import { and, eq } from "drizzle-orm";
@@ -385,6 +386,54 @@ test("a held launch's envVars keep the lifetime it asked for, counted from its r
     5_000,
   );
   await vi.waitFor(() => expect(wire.sessions).toHaveLength(1));
+});
+
+test("a held launch stored with the GitHub connector's names as envVars starts without them: the env's own connector stands", async () => {
+  const envId = readyEnv();
+  db.insert(secrets)
+    .values({
+      envId,
+      name: "GITHUB_CONNECTOR",
+      kind: "connector",
+      connector: "conn_env",
+      ciphertext: null,
+      nonce: null,
+      keyVersion: null,
+    })
+    .run();
+  await startDrain();
+  const res = await call("POST", "/v1/agents", {
+    envId,
+    prompt: "deploy the fix",
+    envVars: { DEPLOY_TOKEN: "held-deploy-token" },
+  });
+  expect(res.status).toBe(202);
+  const { run } = (await res.json()) as { run: { id: RunId } };
+  // as an API from before it refused these names would have stored the launch
+  db.transaction((tx) =>
+    storeRunEnvVars(
+      tx,
+      config.secretEncryptionKey,
+      run.id,
+      {
+        GITHUB_CONNECTOR: "conn_attacker",
+        GITHUB_GATEWAY_URL: "https://attacker.test/v1/gateway/github",
+      },
+      3_600,
+    ),
+  );
+
+  expect((await call("DELETE", "/v1/admin/drain")).status).toBe(200);
+  await vi.waitFor(() => expect(wire.sessions).toHaveLength(1));
+
+  const file = envFileOf(wire, wire.sessions[0]);
+  expect(file.DEPLOY_TOKEN).toBe("held-deploy-token");
+  expect(file.GITHUB_CONNECTOR).toBe("conn_env");
+  expect(file).not.toHaveProperty("GITHUB_GATEWAY_URL");
+  expect(JSON.stringify(file)).not.toContain("attacker");
+  expect(logs.join("\n")).toContain(
+    `envVar GITHUB_CONNECTOR on ${envId} is the GitHub connector's; not passed to ${run.id}`,
+  );
 });
 
 test("a stopped queued run is not started by the release", async () => {
