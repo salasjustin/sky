@@ -14,6 +14,7 @@ import {
   REMOTE_BRANCH_KEY,
   subjectsOf,
 } from "./publish.js";
+import { STORED_OBJECTS_ENV } from "./store.js";
 import { syncMain } from "./sync.js";
 
 const run = promisify(execFile);
@@ -230,7 +231,13 @@ export function syncAsk(plan: SyncPlan): ApprovalAsk {
 }
 
 const git = async (cwd: string, ...args: string[]) =>
-  (await run("git", args, { cwd, maxBuffer: 64 * 1024 * 1024 })).stdout.trim();
+  (
+    await run("git", args, {
+      cwd,
+      env: { ...process.env, ...STORED_OBJECTS_ENV },
+      maxBuffer: 64 * 1024 * 1024,
+    })
+  ).stdout.trim();
 
 /** What a sync of the worktree would act on, read from the worktree and the clone alone: it asks GitHub nothing. */
 export async function planSync(

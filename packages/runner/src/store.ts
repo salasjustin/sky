@@ -59,6 +59,19 @@ const GIT_CONFIG = [
   "commit.gpgsign=false",
 ];
 
+/**
+ * Env for the runner's own git: objects as they are stored, never through `refs/replace` or a graft
+ * file, which anything that can write the repo can point at other content. A publish or sync shows a
+ * person commits, then reads them again to send or rebase them; through a replacement made while the
+ * person decided, the second read would be content no one was shown. `/dev/null/grafts` can never
+ * exist, so git reads no graft file and prints none of the hint `/dev/null` gets. Never in the
+ * session's env: the agent's own git sees the repo as it is.
+ */
+export const STORED_OBJECTS_ENV: Readonly<NodeJS.ProcessEnv> = {
+  GIT_NO_REPLACE_OBJECTS: "1",
+  GIT_GRAFT_FILE: "/dev/null/grafts",
+};
+
 type GitOptions = {
   input?: string | Buffer;
   env?: NodeJS.ProcessEnv;
@@ -73,7 +86,12 @@ const gitBytes =
     new Promise((resolve, reject) => {
       const child = spawn("git", [...GIT_CONFIG, ...args], {
         cwd: home,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...options.env },
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0",
+          ...STORED_OBJECTS_ENV,
+          ...options.env,
+        },
         // its own process group, so a timeout reaches the transport helpers (`git-remote-https`,
         // `index-pack`) too: killed alone, git leaves them holding our pipes and writing the repo
         detached: Boolean(options.timeoutMs),

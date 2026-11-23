@@ -417,6 +417,86 @@ test("a denied sync, and a sync whose head moved while it waited, run nothing", 
   expect(syncRun).not.toHaveBeenCalled();
 });
 
+/** A commit holding `evil.txt` alone on `parent`, for `git replace` to put in another's place. */
+function impostor(parent: string): string {
+  const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+    cwd: work,
+    input: "evil\n",
+    encoding: "utf8",
+  }).trim();
+  const tree = execFileSync("git", ["mktree"], {
+    cwd: work,
+    input: `100644 blob ${blob}\tevil.txt\n`,
+    encoding: "utf8",
+  }).trim();
+  return git(
+    work,
+    "-c",
+    "user.name=x",
+    "-c",
+    "user.email=x@x",
+    "commit-tree",
+    tree,
+    "-p",
+    parent,
+    "-m",
+    "evil",
+  );
+}
+
+const sentBlobs = (gh: ReturnType<typeof github>) =>
+  gh.writes
+    .filter((w) => w.path === "/git/blobs")
+    .map((w) =>
+      Buffer.from((w.body as { content: string }).content, "base64").toString(
+        "utf8",
+      ),
+    );
+
+test("a replacement made for the shown commit while the person decided is not what is sent", async () => {
+  const gh = github();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const head = commit("Add a");
+  const { socketPath } = await broker(async () => {
+    git(work, "replace", head, impostor(baseSha));
+    return approved;
+  });
+
+  const { status } = await client(
+    brokerPublishMain,
+    ["--title", "T"],
+    socketPath,
+  );
+
+  expect(status).toBe(0);
+  expect(gh.commits.map((c) => c.message)).toEqual(["Add a\n"]);
+  expect(sentBlobs(gh)).toContain("first\n");
+  expect(sentBlobs(gh)).not.toContain("evil\n");
+  expect(JSON.stringify(gh.writes)).not.toContain("evil.txt");
+});
+
+test("a sync's approval shows the commits as stored, whatever a replacement says", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const head = commit("Add a");
+  git(work, "replace", head, impostor(baseSha));
+  const asks: ApprovalAsk[] = [];
+  const syncRun = vi.fn<typeof syncMain>(async () => 0);
+  const { socketPath } = await broker(
+    async (ask) => {
+      asks.push(ask);
+      return approved;
+    },
+    { syncRun },
+  );
+
+  await client(brokerSyncMain, [], socketPath);
+
+  expect(asks).toHaveLength(1);
+  const input = JSON.parse(asks[0]?.toolInput ?? "{}");
+  expect(input.commits).toEqual([{ sha: head, subject: "Add a" }]);
+  expect(input.files).toEqual([{ path: "a.txt", added: 1, removed: 0 }]);
+});
+
 test("the worktree and the connector are the runner's own: a request that names a path or a connector changes neither", async () => {
   const gh = github();
   writeFileSync(join(work, "a.txt"), "first\n");

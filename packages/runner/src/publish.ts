@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
 import { CONNECTOR_ENV, GATEWAY_URL_ENV } from "./connector.js";
 import { fetchCommit } from "./repo.js";
-import { git as repoGit } from "./store.js";
+import { git as repoGit, STORED_OBJECTS_ENV } from "./store.js";
 
 const run = promisify(execFile);
 
@@ -113,6 +113,7 @@ export const WORKFLOWS_DIR = ".github/workflows";
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await run("git", args, {
     cwd,
+    env: { ...process.env, ...STORED_OBJECTS_ENV },
     maxBuffer: 64 * 1024 * 1024,
   });
   return stdout;
@@ -121,6 +122,7 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 async function gitBytes(cwd: string, ...args: string[]): Promise<Buffer> {
   const { stdout } = await run("git", args, {
     cwd,
+    env: { ...process.env, ...STORED_OBJECTS_ENV },
     encoding: "buffer",
     maxBuffer: 256 * 1024 * 1024,
   });

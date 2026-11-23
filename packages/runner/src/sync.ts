@@ -19,7 +19,7 @@ import {
 } from "./publish.js";
 import { editShallow, fetchCommit, shallowCommits } from "./repo.js";
 import { RepoLockBusyError, withRepoLock } from "./repo-lock.js";
-import { git, messageOf } from "./store.js";
+import { git, messageOf, STORED_OBJECTS_ENV } from "./store.js";
 import { adoptAgentBranch, ensureWorktree } from "./worktree.js";
 
 type Call = ReturnType<typeof gateway>;
@@ -358,6 +358,7 @@ const run = promisify(execFile);
 async function inTree(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await run("git", args, {
     cwd,
+    env: { ...process.env, ...STORED_OBJECTS_ENV },
     maxBuffer: 64 * 1024 * 1024,
   });
   return stdout.trim();
