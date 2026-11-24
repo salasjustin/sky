@@ -58,7 +58,11 @@ describe("SKY_RUNTIME", () => {
 
   test("refuses an unknown runtime", () => {
     expect(() =>
-      loadConfig({ ...base, SKY_RUNTIME: "opencode", CLAUDE_CODE_OAUTH_TOKEN: "t" }),
+      loadConfig({
+        ...base,
+        SKY_RUNTIME: "opencode",
+        CLAUDE_CODE_OAUTH_TOKEN: "t",
+      }),
     ).toThrow(/SKY_RUNTIME/);
   });
 });
@@ -263,7 +267,9 @@ describe("runCodexSession", () => {
   let bin: string;
   let logFile: string;
   let events: RunnerEventPost[];
-  let decide: (request: { toolName?: string }) => Decision["decision"] | "deny-with-reason";
+  let decide: (request: {
+    toolName?: string;
+  }) => Decision["decision"] | "deny-with-reason";
 
   beforeEach(() => {
     vi.stubEnv("GITHUB_CONNECTOR", undefined);
@@ -276,7 +282,16 @@ describe("runCodexSession", () => {
     execFileSync("git", ["init", "-q", "-b", "main", origin]);
     writeFileSync(join(origin, "README"), "hi\n");
     git(origin, "add", ".");
-    git(origin, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init");
+    git(
+      origin,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "commit",
+      "-qm",
+      "init",
+    );
     execFileSync("git", ["clone", "-q", origin, join(root, "repo")]);
     bin = join(root, "fake-codex");
     writeFileSync(bin, FAKE_SERVER);
@@ -380,9 +395,9 @@ describe("runCodexSession", () => {
       home: join(root, "codex-home"),
       connector: null,
     });
-    expect(
-      readFileSync(join(root, "codex-home", "config.toml"), "utf8"),
-    ).toBe(codexConfigToml());
+    expect(readFileSync(join(root, "codex-home", "config.toml"), "utf8")).toBe(
+      codexConfigToml(),
+    );
 
     expect(ofType("run.started")[0]?.payload.sessionId).toBe("thr_1");
     const waiting = ofType("run.waiting").map((e) => e.payload.request);
@@ -421,9 +436,9 @@ describe("runCodexSession", () => {
     config.approvalPolicy = [];
     expect(await run()).toBe(0);
     expect(ofType("run.waiting")).toEqual([]);
-    expect(
-      sent().find((m) => m.id === 100 && m.result)?.result,
-    ).toEqual({ decision: "accept" });
+    expect(sent().find((m) => m.id === 100 && m.result)?.result).toEqual({
+      decision: "accept",
+    });
   });
 
   test("a denial declines the call and steers the turn with its reason", async () => {
@@ -482,9 +497,9 @@ describe("runCodexSession", () => {
     expect(await run()).toBe(0);
     const log = sent();
     expect(log.some((m) => m.method === "thread/start")).toBe(false);
-    expect(
-      log.find((m) => m.method === "thread/resume")?.params.threadId,
-    ).toBe("thr_1");
+    expect(log.find((m) => m.method === "thread/resume")?.params.threadId).toBe(
+      "thr_1",
+    );
   });
 
   test("a thread Codex doesn't have fails the run", async () => {
@@ -503,9 +518,7 @@ describe("runCodexSession", () => {
   test("a stop interrupts the turn and fails the run", async () => {
     const stop = new AbortController();
     const ended = run(stop.signal, "hang");
-    await vi.waitFor(() =>
-      expect(ofType("run.started")).toHaveLength(1),
-    );
+    await vi.waitFor(() => expect(ofType("run.started")).toHaveLength(1));
     await new Promise((r) => setTimeout(r, 100));
     stop.abort("SIGTERM");
     expect(await ended).toBe(1);

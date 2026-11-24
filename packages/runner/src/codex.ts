@@ -56,7 +56,11 @@ import { createHeartbeat } from "./heartbeat.js";
 import { policyOutcome } from "./policy.js";
 import type { AwaitDecision } from "./requests.js";
 import { scratchDirOf } from "./session.js";
-import { DEFAULT_MAX_COMMITS, prepareWorktree, type Refreshed } from "./sync.js";
+import {
+  DEFAULT_MAX_COMMITS,
+  prepareWorktree,
+  type Refreshed,
+} from "./sync.js";
 import { commitAll, diffRollup, headSha } from "./worktree.js";
 
 /** The Codex version Sky installs on every sprite (`provision.ts`) and was tested against. */
@@ -127,10 +131,11 @@ export function unwrapShell(command: string): string {
   } catch {
     return command;
   }
-  if (!words || words.length !== 3) return command;
+  if (words?.length !== 3) return command;
   const [shell = "", flag, script = ""] = words;
   const name = shell.slice(shell.lastIndexOf("/") + 1);
-  return ["bash", "sh", "zsh"].includes(name) && (flag === "-lc" || flag === "-c")
+  return ["bash", "sh", "zsh"].includes(name) &&
+    (flag === "-lc" || flag === "-c")
     ? script
     : command;
 }
@@ -232,7 +237,8 @@ const DYNAMIC_TOOLS = [
         },
         base: {
           type: "string",
-          description: "The branch to merge into; the default branch when absent.",
+          description:
+            "The branch to merge into; the default branch when absent.",
         },
         branch: {
           type: "string",
@@ -254,7 +260,8 @@ const DYNAMIC_TOOLS = [
       properties: {
         branch: {
           type: "string",
-          description: "The GitHub branch you publish to, if not the worktree's own.",
+          description:
+            "The GitHub branch you publish to, if not the worktree's own.",
         },
       },
       additionalProperties: false,
@@ -778,7 +785,10 @@ export async function runCodexSession(
       emitPre(itemId);
       heartbeat?.ended(itemId);
       calls.delete(itemId);
-      const duration = Math.max(0, Math.round(durationMs ?? Date.now() - call.at));
+      const duration = Math.max(
+        0,
+        Math.round(durationMs ?? Date.now() - call.at),
+      );
       void post(
         "output" in result
           ? {
@@ -878,9 +888,17 @@ export async function runCodexSession(
           track(mcp.id, `mcp__${mcp.server}__${mcp.tool}`, mcp.arguments ?? {});
           if (!done) return;
           if (mcp.status === "completed")
-            settle(mcp.id, { output: JSON.stringify(mcp.result ?? "") }, mcp.durationMs);
+            settle(
+              mcp.id,
+              { output: JSON.stringify(mcp.result ?? "") },
+              mcp.durationMs,
+            );
           else
-            settle(mcp.id, { error: JSON.stringify(mcp.error ?? mcp.status) }, mcp.durationMs);
+            settle(
+              mcp.id,
+              { error: JSON.stringify(mcp.error ?? mcp.status) },
+              mcp.durationMs,
+            );
           return;
         }
         case "dynamicToolCall": {
@@ -893,7 +911,11 @@ export async function runCodexSession(
             .map((c) => c.text ?? "")
             .join("\n");
           if (call.success === false || call.status === "failed")
-            settle(call.id, { error: text || `${call.tool} failed` }, call.durationMs);
+            settle(
+              call.id,
+              { error: text || `${call.tool} failed` },
+              call.durationMs,
+            );
           else settle(call.id, { output: text }, call.durationMs);
           return;
         }
@@ -926,7 +948,9 @@ export async function runCodexSession(
           input: [{ type: "text", text, text_elements: [] }],
         })
         .catch((error: unknown) =>
-          warn(`runner: the denial's reason didn't reach Codex: ${messageOf(error)}`),
+          warn(
+            `runner: the denial's reason didn't reach Codex: ${messageOf(error)}`,
+          ),
         );
     };
 
@@ -1120,7 +1144,10 @@ export async function runCodexSession(
               input: total.inputTokens - last.inputTokens,
               output: total.outputTokens - last.outputTokens,
             };
-            lastUsage = { input: total.inputTokens, output: total.outputTokens };
+            lastUsage = {
+              input: total.inputTokens,
+              output: total.outputTokens,
+            };
             modelCalls += 1;
             return;
           }
@@ -1134,18 +1161,22 @@ export async function runCodexSession(
           case "error": {
             const error = ErrorNote.parse(params);
             if (error.threadId && error.threadId !== thread) return;
-            if (error.willRetry) warning(`Codex is retrying: ${error.error.message}`);
+            if (error.willRetry)
+              warning(`Codex is retrying: ${error.error.message}`);
             else streamError ??= error.error.message;
             return;
           }
           case "serverRequest/resolved": {
-            const id = (params as { requestId?: unknown } | undefined)?.requestId;
+            const id = (params as { requestId?: unknown } | undefined)
+              ?.requestId;
             if (id !== undefined) pending.get(String(id))?.abort();
             return;
           }
         }
       } catch (error) {
-        warn(`runner: unreadable Codex ${method} notification: ${messageOf(error)}`);
+        warn(
+          `runner: unreadable Codex ${method} notification: ${messageOf(error)}`,
+        );
       }
     };
     app.onRequest = async (id, method, params) => {
@@ -1170,22 +1201,22 @@ export async function runCodexSession(
       }
     };
 
-    const started = z
-      .object({ turn: z.looseObject({ id: z.string() }) })
-      .parse(
-        await app.request(
-          "turn/start",
-          {
-            threadId: thread,
-            input: [{ type: "text", text: config.prompt, text_elements: [] }],
-          },
-          { timeoutMs: 120_000, signal: abortController.signal },
-        ),
-      );
+    const started = z.object({ turn: z.looseObject({ id: z.string() }) }).parse(
+      await app.request(
+        "turn/start",
+        {
+          threadId: thread,
+          input: [{ type: "text", text: config.prompt, text_elements: [] }],
+        },
+        { timeoutMs: 120_000, signal: abortController.signal },
+      ),
+    );
     turnId = started.turn.id;
     // a stop that landed while the turn was starting: interrupt it now that it has an id
     if (abortController.signal.aborted)
-      void app.request("turn/interrupt", { threadId: thread, turnId }).catch(() => {});
+      void app
+        .request("turn/interrupt", { threadId: thread, turnId })
+        .catch(() => {});
 
     const aborted = new Promise<{ status: string; error?: string }>(
       (resolveAbort) => {
@@ -1208,7 +1239,10 @@ export async function runCodexSession(
       streamError ??= outcome.error ?? "the turn failed";
     else if (outcome.status === "exited")
       streamError ??= `codex app-server exited: ${outcome.error ?? ""}`.trim();
-    else if (outcome.status === "interrupted" && !abortController.signal.aborted)
+    else if (
+      outcome.status === "interrupted" &&
+      !abortController.signal.aborted
+    )
       streamError ??= "the turn was interrupted";
     if (outcome.status === "completed") {
       const from = firstUsage ?? { input: 0, output: 0 };
@@ -1315,10 +1349,10 @@ export class AppServer {
     });
     // a line can hold a whole command's output: no length cap
     if (child.stdout)
-      createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY }).on(
-        "line",
-        (line) => this.receive(line),
-      );
+      createInterface({
+        input: child.stdout,
+        crlfDelay: Number.POSITIVE_INFINITY,
+      }).on("line", (line) => this.receive(line));
   }
 
   request(
@@ -1394,11 +1428,15 @@ export class AppServer {
     }
     if (message.method === undefined) {
       const call =
-        typeof message.id === "number" ? this.pending.get(message.id) : undefined;
+        typeof message.id === "number"
+          ? this.pending.get(message.id)
+          : undefined;
       if (!call) return;
       if (message.error)
         call.reject(
-          new Error(message.error.message ?? `error ${message.error.code ?? ""}`),
+          new Error(
+            message.error.message ?? `error ${message.error.code ?? ""}`,
+          ),
         );
       else call.resolve(message.result);
       return;
