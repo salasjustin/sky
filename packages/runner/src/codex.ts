@@ -1380,7 +1380,9 @@ export class AppServer {
           () =>
             settle(() =>
               rejectCall(
-                new Error(`Codex didn't answer ${method} within ${options.timeoutMs} ms`),
+                new Error(
+                  `Codex didn't answer ${method} within ${options.timeoutMs} ms`,
+                ),
               ),
             ),
           options.timeoutMs,
