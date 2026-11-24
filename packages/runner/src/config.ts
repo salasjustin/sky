@@ -85,7 +85,7 @@ export const CODEX_KEY_ENV = "AI_GATEWAY_API_KEY";
 export type Config = {
   /**
    * `codex` when `SKY_RUNTIME=codex`, which runs through `runCodexSession`; absent for Claude Code, so a
-   * Claude Code run's config is exactly what it was before there was a choice.
+   * Claude Code run's config holds no runtime field at all.
    */
   runtime?: "codex";
   /** The Codex session's model, from `SKY_CODEX_MODEL`; set only on a Codex run that names one. */

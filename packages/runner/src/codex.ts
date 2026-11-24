@@ -12,12 +12,15 @@
  * policy, as it does for Claude Code, and opens a request for the person when the policy holds the
  * call. Codex's own sandbox is off (`danger-full-access`): the sprite is the sandbox, as it is for
  * Claude Code. The agent's `publish` and `sync` are tools the runner serves itself
- * (`sky_publish`, `sky_sync`), through the same broker and the same one approval, so no token or
- * GitHub credential reaches the agent's commands.
+ * (`sky_publish`, `sky_sync`), through the same broker and the same one approval, so the GitHub
+ * connector never reaches the agent's commands.
  *
  * Not carried over from the Claude Code session: plugins and hooks, the base profile's MCP servers,
- * background tasks, the credential seal and the outside-read gate. Codex runs the commands it counts
- * as read-only (`cat`, `ls`, `grep` and the like) without asking, wherever they read.
+ * background tasks, the default git identity, the outside-read gate and the credential seal. Without
+ * the seal, the Codex process's own `/proc/<pid>/environ` holds the gateway key where the agent's
+ * commands can read it, and a run starts even when the kernel won't hide the runner. Codex runs the
+ * commands it counts as read-only (`cat`, `ls`, `grep` and the like) without asking, wherever they
+ * read.
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -646,7 +649,7 @@ export async function runCodexSession(
     }
     if (Object.keys(config.mcpServers).length > 0)
       warning(
-        "this Codex run doesn't load the base profile's MCP servers; only Claude Code runs do so far",
+        "this Codex run doesn't load the base profile's MCP servers; only Claude Code runs do",
       );
     const home = sessionEnv.HOME || homedir();
     const codexHome = sessionEnv.SKY_CODEX_HOME || join(home, ".sky", "codex");
@@ -785,7 +788,7 @@ export async function runCodexSession(
         at: Date.now(),
       };
       calls.set(itemId, call);
-      // a call Codex runs without asking has no approval request to wait for: it is let go now
+      // no request comes for a call Codex runs unasked: one not asked about in 250 ms is let go
       call.timer = setTimeout(() => {
         if (!call.asked) emitPre(itemId);
       }, 250);
@@ -920,7 +923,7 @@ export async function runCodexSession(
         case "dynamicToolCall": {
           const call = DynamicItem.parse(note.item);
           track(call.id, call.tool, call.arguments ?? {});
-          // the runner's own tools open their approval through the broker: they were let go here
+          // the runner's own tools open their approval through the broker, so they are let go at once
           emitPre(call.id);
           if (!done) return;
           const text = (call.contentItems ?? [])
@@ -1419,7 +1422,7 @@ export class AppServer {
     this.send({ method, ...(params !== undefined && { params }) });
   }
 
-  /** Ends the process: closes its stdin, then SIGTERM, then SIGKILL. */
+  /** Ends the process: closes its stdin, then SIGTERM, then SIGKILL 5 s later if it is still running. */
   async close(): Promise<void> {
     const child = this.child;
     if (child.exitCode !== null || child.signalCode !== null) return;
