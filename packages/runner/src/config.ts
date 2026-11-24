@@ -27,6 +27,14 @@ const Env = z.object({
     .transform((s) => s || undefined),
   API_BASE_URL: z.url(),
   AGENT_TOKEN: z.string().min(1),
+  // which agent drives the session: Claude Code through the Agent SDK, or Codex through its app server
+  // (`codex.ts`), whose model is reached through the Vercel AI Gateway rather than a Claude credential
+  SKY_RUNTIME: z.enum(["claude-code", "codex"]).default("claude-code"),
+  // the Codex session's model, as the AI Gateway names it; `DEFAULT_CODEX_MODEL` when unset
+  SKY_CODEX_MODEL: z
+    .string()
+    .optional()
+    .transform((s) => s || undefined),
   // which credential the Claude session uses, and its value, which only the Claude subprocess reads,
   // so it never enters Config: the subscription token for `oauth`, `SKY_CLAUDE_API_KEY` for `api-key`
   SKY_CLAUDE_AUTH: z.enum(["oauth", "api-key"]).default("oauth"),
@@ -60,13 +68,28 @@ const Env = z.object({
     .transform((s) => s || undefined),
 });
 
-/** The variable holding the credential the run's `SKY_CLAUDE_AUTH` names; a run without it can't start a session. */
+/**
+ * The variable holding the credential the run's session can't start without: for Claude Code, the one
+ * `SKY_CLAUDE_AUTH` names; for Codex, the AI Gateway key, which only the Codex process reads.
+ */
 const credentialVariable = (env: NodeJS.ProcessEnv) =>
-  env.SKY_CLAUDE_AUTH === "api-key"
-    ? "SKY_CLAUDE_API_KEY"
-    : "CLAUDE_CODE_OAUTH_TOKEN";
+  env.SKY_RUNTIME === "codex"
+    ? CODEX_KEY_ENV
+    : env.SKY_CLAUDE_AUTH === "api-key"
+      ? "SKY_CLAUDE_API_KEY"
+      : "CLAUDE_CODE_OAUTH_TOKEN";
+
+/** The AI Gateway key a Codex run's model calls carry; `main` takes it out of the env for the Codex process alone. */
+export const CODEX_KEY_ENV = "AI_GATEWAY_API_KEY";
 
 export type Config = {
+  /**
+   * `codex` when `SKY_RUNTIME=codex`, which runs through `runCodexSession`; absent for Claude Code, so a
+   * Claude Code run's config is exactly what it was before there was a choice.
+   */
+  runtime?: "codex";
+  /** The Codex session's model, from `SKY_CODEX_MODEL`; set only on a Codex run that names one. */
+  codexModel?: string;
   agentId: AgentId;
   runId: RunId;
   prompt: string;
@@ -119,6 +142,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
   }
   const e = parsed.data;
   return {
+    ...(e.SKY_RUNTIME === "codex" && {
+      runtime: e.SKY_RUNTIME,
+      ...(e.SKY_CODEX_MODEL && { codexModel: e.SKY_CODEX_MODEL }),
+    }),
     agentId: e.AGENT_ID,
     runId: e.RUN_ID,
     prompt: e.PROMPT,

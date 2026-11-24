@@ -16,9 +16,10 @@ type Io = {
 /**
  * Sends one request to the runner's broker and relays its answer: the runner's output on this
  * command's stdout and stderr, and the exit status it reports. The agent's commands hold no
- * connector; whatever reaches GitHub is the runner's doing, after the approval it opens.
+ * connector; whatever reaches GitHub is the runner's doing, after the approval it opens. A Codex
+ * run's runner calls it too, for the agent's `sky_publish` and `sky_sync` tools.
  */
-async function ask(
+export async function askBroker(
   name: string,
   request: object,
   env: NodeJS.ProcessEnv,
@@ -95,7 +96,7 @@ export async function brokerPublishMain(
   // a `--body @file` goes as its path: the runner reads it, and only from where it allows
   const args = await readPublishArgs(argv, io, { deferBodyFile: true });
   if ("code" in args) return args.code;
-  return ask(
+  return askBroker(
     "sky publish",
     {
       op: "publish",
@@ -124,5 +125,5 @@ export async function brokerSyncMain(
     );
     return 2;
   }
-  return ask("sky sync", { op: "sync", ...args }, env, io);
+  return askBroker("sky sync", { op: "sync", ...args }, env, io);
 }

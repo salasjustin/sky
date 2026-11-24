@@ -8,6 +8,7 @@ import {
   sweepCredentialFiles,
   withdrawCredential,
 } from "./claude-auth.js";
+import { runCodexSession, withdrawCodexKey } from "./codex.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { takeConnector } from "./connector.js";
 import { removeSkyLogin } from "./credentials.js";
@@ -84,6 +85,9 @@ async function main(): Promise<void> {
   // `claude` commands inherit, and the runner is put out of its commands' reach, so the repo's hooks and
   // config, which those run, find nothing; only the session's Claude process gets the credential back
   const credentialEnv = withdrawCredential(process.env);
+  // a Codex run's AI Gateway key leaves the env the same way, for the Codex process alone
+  const codexEnv =
+    config.runtime === "codex" ? withdrawCodexKey(process.env) : {};
   const seal = createSeal();
   const claim = process.env.PROMPT_FILE
     ? claimRunLog(process.env.PROMPT_FILE)
@@ -170,27 +174,43 @@ async function main(): Promise<void> {
     signal: controller.signal,
   });
   await step("sprite hold", () => hold.ready);
-  // a stop while the hold was landing skips setup; the session reports it as run.failed
-  const pluginRefresh = controller.signal.aborted
-    ? undefined
-    : await setUpSession(
-        controller.signal,
-        join(config.worktreesDir, config.agentId),
-        connector,
-      );
+  // a stop while the hold was landing skips setup; the session reports it as run.failed. A Codex run
+  // only pulls the store: the plugin refresh runs `claude`, whose plugins Codex doesn't load
+  const codex = config.runtime === "codex";
+  if (codex && !controller.signal.aborted)
+    await step("store sync", () =>
+      syncStoreQuietly("pull", { ...process.env, ...connector }, warn),
+    );
+  const pluginRefresh =
+    controller.signal.aborted || codex
+      ? undefined
+      : await setUpSession(
+          controller.signal,
+          join(config.worktreesDir, config.agentId),
+          connector,
+        );
   warn("runner: session starting");
   try {
-    process.exitCode = await runSession(config, {
-      query,
-      post,
-      awaitDecision: createDecisionWaiter(config),
-      signal: controller.signal,
-      warn,
-      credentialEnv,
-      seal,
-      pluginRefresh,
-      connector,
-    });
+    process.exitCode = codex
+      ? await runCodexSession(config, {
+          post,
+          awaitDecision: createDecisionWaiter(config),
+          signal: controller.signal,
+          warn,
+          codexEnv,
+          connector,
+        })
+      : await runSession(config, {
+          query,
+          post,
+          awaitDecision: createDecisionWaiter(config),
+          signal: controller.signal,
+          warn,
+          credentialEnv,
+          seal,
+          pluginRefresh,
+          connector,
+        });
   } finally {
     // the run is over, whatever way: nothing it started may keep its memory on a sprite other runs share
     await endSessionProcesses({ runId: config.runId, warn });
