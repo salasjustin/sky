@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Decision, RunnerEventPost } from "@sky/shared";
+import type { Decision, RequestId, RunnerEventPost } from "@sky/shared";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   CODEX_PROVIDER,
@@ -322,7 +322,8 @@ describe("runCodexSession", () => {
   const post: PostEvent = async (event) => {
     events.push(event);
   };
-  const awaitDecision: AwaitDecision = async (requestId) => {
+  const awaitDecision: AwaitDecision = async (id) => {
+    const requestId = id as RequestId;
     const waiting = events.find(
       (e) =>
         e.type === "run.waiting" && e.payload.request.requestId === requestId,
