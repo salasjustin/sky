@@ -86,7 +86,13 @@ const github = http.createServer((req, res) => {
     };
     const json = body ? JSON.parse(body) : {};
     if (req.method === "GET" && path === "") return send(200, {});
-    if (req.method === "GET" && path === "/pulls") return send(200, gh.pulls);
+    if (req.method === "GET" && path === "/pulls") {
+      const head = url.searchParams.get("head")?.split(":").pop();
+      return send(
+        200,
+        head ? gh.pulls.filter((pull) => pull.head === head) : gh.pulls,
+      );
+    }
     if (req.method === "GET" && path.startsWith("/git/ref/")) {
       const sha = gh.refs.get(path.slice("/git/ref/".length));
       return sha
@@ -295,9 +301,22 @@ check(
   types.includes("claude.PreToolUse") && types.includes("claude.PostToolUse"),
 );
 check("claude.Message events", types.includes("claude.Message"));
+// the values themselves, never their names: the gateway key, the connector, the event token, and any
+// 32-hex-digit string, which is what the runner's per-call broker token looks like (a `req_` id, the
+// model's `chatcmpl-tool-` call id and a git sha are not matched)
+const leaks = (text) => {
+  const found = [];
+  if (text.includes(process.env.AI_GATEWAY_API_KEY)) found.push("gateway key");
+  if (text.includes("conn1")) found.push("connector");
+  if (text.includes('"tok"')) found.push("event token");
+  if (/(?<![0-9a-f_-])[0-9a-f]{32}(?![0-9a-f])/.test(text))
+    found.push("32-hex string");
+  return found;
+};
 check(
-  "no broker token reached an event",
-  !JSON.stringify(first.events).includes("SKY_BROKER_TOKEN"),
+  "no broker token, connector, event token or gateway key reached an event",
+  leaks(JSON.stringify(first.events)).length === 0,
+  leaks(JSON.stringify(first.events)).join(", "),
 );
 const worktree = join(worktreesDir, "agt_e2e");
 check(
@@ -344,6 +363,41 @@ check(
   answer.slice(0, 120),
 );
 
+console.log("\n== run 2b: the resumed thread edits, commits and publishes ==");
+const resumed = await run(
+  "run_twob",
+  "Using apply_patch (not the shell), append the line `second turn` to README.md. Then run `git add -A` and `git commit -m 'Add second line'`. Then publish with the sky_publish tool, with the title `Second publish` and the branch `claude/agt_e2e-resume`. Report the pull request URL.",
+  started?.payload.sessionId,
+);
+print(resumed);
+const resumedWaiting = resumed.events
+  .filter((e) => e.type === "run.waiting")
+  .map((e) => e.payload.request);
+check(
+  "resumed run finished",
+  resumed.code === 0 && resumed.events.some((e) => e.type === "run.finished"),
+  `exit ${resumed.code}`,
+);
+check(
+  "resumed run is on the same thread",
+  resumed.events.find((e) => e.type === "run.started")?.payload.sessionId ===
+    started?.payload.sessionId,
+);
+check(
+  "the resumed thread asked to publish, through the broker",
+  resumedWaiting.some((r) => r.toolName === "Publish"),
+);
+check(
+  "the resumed thread's publish reached the fake GitHub",
+  gh.refs.has("heads/claude/agt_e2e-resume") && gh.pulls.length === 2,
+  gh.calls.slice(-4).join(", "),
+);
+check(
+  "no secret reached the resumed run's events",
+  leaks(JSON.stringify(resumed.events)).length === 0,
+  leaks(JSON.stringify(resumed.events)).join(", "),
+);
+
 console.log("\n== run 3: a denied approval, with a reason ==");
 decideFor = (request) =>
   request.toolName === "Edit" || request.toolName === "Write"
@@ -384,9 +438,21 @@ console.log(
 );
 const fourth = await run(
   "run_four",
-  "Run these two shell commands, one at a time, and report their output verbatim. First: `printenv AI_GATEWAY_API_KEY | wc -c`. Second: `nohup sleep 3017 >/dev/null 2>&1 &`. Then reply `done`.",
+  "Run these three shell commands, one at a time, and report their output verbatim. First: `printenv AI_GATEWAY_API_KEY | wc -c`. Second: `nohup sleep 3017 >/dev/null 2>&1 &`. Third: `for p in $(ps -eo pid,args | grep '[a]pp-server' | awk '{print $1}'); do echo \"pid $p\"; cat /proc/$p/environ 2>&1 | tr '\\0' '\\n' | grep -c '^AI_GATEWAY_API_KEY='; done`. Then reply `done`.",
 );
 print(fourth);
+// the loop's last `grep -c` finds nothing and exits 1, so the call may come back as a failure: the
+// output is in `error` then
+const environProbe = fourth.events.find(
+  (e) =>
+    (e.type === "claude.PostToolUse" ||
+      e.type === "claude.PostToolUseFailure") &&
+    e.payload.input.includes("/environ"),
+);
+const probeOutput =
+  environProbe?.payload.output ?? environProbe?.payload.error ?? "";
+const probedPids = probeOutput.match(/^pid \d+$/gm) ?? [];
+const probeCounts = probeOutput.match(/^\d+$/gm) ?? [];
 const keyProbe = fourth.events.find(
   (e) =>
     e.type === "claude.PostToolUse" && e.payload.input.includes("printenv"),
@@ -396,6 +462,14 @@ check(
   "AI_GATEWAY_API_KEY is not in the agent's shell (printenv prints nothing)",
   keyProbe?.payload.output.trim().startsWith("0"),
   keyProbe?.payload.output.trim(),
+);
+check(
+  "the agent's command found Codex's process and read nothing of its environ",
+  probedPids.length > 0 &&
+    probeCounts.length === probedPids.length &&
+    probeCounts.every((n) => n === "0") &&
+    !probeOutput.includes(process.env.AI_GATEWAY_API_KEY),
+  probeOutput.replaceAll(process.env.AI_GATEWAY_API_KEY, "<key>").trim(),
 );
 check(
   "the daemonised `sleep 3017` was reaped at run end",
@@ -431,6 +505,7 @@ check("the stopped run left no `sleep 3019`", !alive("sleep 3019"));
 for (const [n, r] of [
   ["run1", first],
   ["run2", second],
+  ["run2b", resumed],
   ["run3", third],
   ["run4", fourth],
   ["run5", fifth],

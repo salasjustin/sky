@@ -1,22 +1,27 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import type { Decision, RequestId, RunnerEventPost } from "@sky/shared";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
+  AppServer,
   CODEX_PROVIDER,
   codexConfigToml,
   codexInstructions,
   DEFAULT_CODEX_MODEL,
+  resolveCodexExecutable,
   runCodexSession,
   toolCallOf,
   unwrapShell,
@@ -25,6 +30,7 @@ import {
 import { type Config, loadConfig } from "./config.js";
 import type { PostEvent } from "./events.js";
 import type { AwaitDecision } from "./requests.js";
+import type { Seal } from "./seal.js";
 
 const base = {
   AGENT_ID: "agt_1",
@@ -275,6 +281,9 @@ describe("runCodexSession", () => {
   let bin: string;
   let logFile: string;
   let events: RunnerEventPost[];
+  // the seal a run gets: starts the process as it is asked to, and records what it was asked
+  let spawned: SpawnOptions[];
+  let seal: Seal;
   let decide: (request: {
     toolName?: string;
   }) => Decision["decision"] | "deny-with-reason";
@@ -306,6 +315,19 @@ describe("runCodexSession", () => {
     chmodSync(bin, 0o755);
     logFile = join(root, "codex.log");
     events = [];
+    spawned = [];
+    seal = {
+      problem: undefined,
+      spawn: (options) => {
+        spawned.push(options);
+        return spawn(options.command, options.args, {
+          cwd: options.cwd,
+          env: options.env,
+          stdio: ["pipe", "pipe", "pipe"],
+        }) as ReturnType<Seal["spawn"]>;
+      },
+      check: () => undefined,
+    };
     decide = () => "approve";
     config = {
       runtime: "codex",
@@ -371,6 +393,7 @@ describe("runCodexSession", () => {
       signal,
       warn: () => {},
       codexEnv: { AI_GATEWAY_API_KEY: "gw-key" },
+      seal,
       bin,
       stopGraceMs: 2_000,
     });
@@ -552,5 +575,140 @@ describe("runCodexSession", () => {
     expect(ofType("run.failed")[0]?.payload.error).toBe(
       "interrupted by SIGTERM",
     );
+  });
+
+  test("Codex starts through the seal, from its own binary, with the key in its env", async () => {
+    expect(await run()).toBe(0);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toMatchObject({
+      command: realpathSync(bin),
+      args: ["app-server"],
+      cwd: join(root, "worktrees", "agt_1"),
+    });
+    expect(spawned[0]?.env.AI_GATEWAY_API_KEY).toBe("gw-key");
+  });
+
+  test("a runner that can't be hidden fails the run before anything starts", async () => {
+    seal = { ...seal, problem: "the kernel still lets commands read it" };
+    expect(await run()).toBe(1);
+    expect(ofType("run.failed")[0]?.payload.error).toMatch(
+      /^credential_exposed: .*the kernel still lets commands read it.*did not start/,
+    );
+    expect(spawned).toEqual([]);
+    expect(existsSync(join(root, "worktrees"))).toBe(false);
+    expect(existsSync(logFile)).toBe(false);
+  });
+
+  test("a Codex process the kernel leaves readable stops the run", async () => {
+    seal = { ...seal, check: () => "the kernel lets commands read Codex" };
+    expect(await run()).toBe(1);
+    expect(ofType("run.failed")[0]?.payload.error).toMatch(
+      /^credential_exposed: the kernel lets commands read Codex/,
+    );
+    expect(ofType("run.started")).toEqual([]);
+  });
+
+  test("publish and sync check the seal each time they are asked for", async () => {
+    vi.stubEnv("GITHUB_CONNECTOR", undefined);
+    let checks = 0;
+    // sound at Codex's start, readable by the time the agent asks to publish
+    seal = { ...seal, check: () => (checks++ === 0 ? undefined : "readable") };
+    const connected = (signal: AbortSignal) =>
+      runCodexSession(config, {
+        post,
+        awaitDecision,
+        signal,
+        warn: () => {},
+        codexEnv: { AI_GATEWAY_API_KEY: "gw-key" },
+        connector: { GITHUB_CONNECTOR: "connector-secret" },
+        seal,
+        bin,
+        stopGraceMs: 2_000,
+      });
+    config.sessionEnv.FAKE_CODEX_SCENARIO = "publish";
+    expect(await connected(new AbortController().signal)).toBe(0);
+    const reply = sent().find((m) => m.id === 100)?.result;
+    expect(reply.success).toBe(false);
+    expect(reply.contentItems[0].text).toMatch(
+      /sky publish refused: the runner can't confirm.*readable.*nothing was sent/,
+    );
+  });
+});
+
+describe("resolveCodexExecutable", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "runner-codex-bin-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const install = (pkg: string, triple: string) => {
+    const modules = join(root, "node_modules");
+    mkdirSync(join(modules, "@openai", "codex", "bin"), { recursive: true });
+    writeFileSync(join(modules, "@openai", "codex", "bin", "codex.js"), "");
+    const native = join(modules, "@openai", pkg, "vendor", triple, "bin");
+    mkdirSync(native, { recursive: true });
+    writeFileSync(join(modules, "@openai", pkg, "package.json"), "{}");
+    writeFileSync(join(native, "codex"), "");
+    mkdirSync(join(modules, ".bin"));
+    symlinkSync(
+      "../@openai/codex/bin/codex.js",
+      join(modules, ".bin", "codex"),
+    );
+    return { launcher: join(modules, ".bin", "codex"), native };
+  };
+
+  test("the npm launcher resolves to the platform package's binary", () => {
+    const { launcher, native } = install(
+      "codex-linux-x64",
+      "x86_64-unknown-linux-musl",
+    );
+    expect(resolveCodexExecutable(launcher, "x64")).toBe(
+      realpathSync(join(native, "codex")),
+    );
+  });
+
+  test("arm64 picks its own package", () => {
+    const { launcher, native } = install(
+      "codex-linux-arm64",
+      "aarch64-unknown-linux-musl",
+    );
+    expect(resolveCodexExecutable(launcher, "arm64")).toBe(
+      realpathSync(join(native, "codex")),
+    );
+  });
+
+  test("a launcher with no platform package beside it is an error, not a guess", () => {
+    const { launcher } = install(
+      "codex-linux-arm64",
+      "aarch64-unknown-linux-musl",
+    );
+    expect(() => resolveCodexExecutable(launcher, "x64")).toThrow();
+    expect(() => resolveCodexExecutable(launcher, "ia32")).toThrow(
+      /no Linux build for ia32/,
+    );
+  });
+
+  test("a binary that is not the launcher is used as it is", () => {
+    const file = join(root, "codex-native");
+    writeFileSync(file, "");
+    expect(resolveCodexExecutable(file)).toBe(realpathSync(file));
+  });
+});
+
+describe("AppServer", () => {
+  test("a write that fails after Codex died ends the process's wait, not the runner", async () => {
+    const child = spawn("sleep", ["30"], { stdio: ["pipe", "pipe", "pipe"] });
+    const server = new AppServer(child, () => {});
+    try {
+      // what Node does with a write to a pipe whose reader is gone
+      child.stdin?.emit("error", new Error("write EPIPE"));
+      await expect(server.exited).resolves.toMatchObject({
+        status: "exited",
+        error: expect.stringContaining("EPIPE"),
+      });
+    } finally {
+      child.kill("SIGKILL");
+    }
   });
 });

@@ -198,6 +198,7 @@ async function main(): Promise<void> {
           signal: controller.signal,
           warn,
           codexEnv,
+          seal,
           connector,
         })
       : await runSession(config, {

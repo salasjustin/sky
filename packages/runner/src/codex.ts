@@ -15,16 +15,24 @@
  * (`sky_publish`, `sky_sync`), through the same broker and the same one approval, so the GitHub
  * connector never reaches the agent's commands.
  *
+ * The Codex process is sealed as Claude's is: started from a copy of its own binary the kernel keeps
+ * unreadable, so its `/proc/<pid>/environ`, where the gateway key lives, is closed to the agent's
+ * commands, and a run whose runner can't be hidden fails with `credential_exposed` before it starts.
+ *
  * Not carried over from the Claude Code session: plugins and hooks, the base profile's MCP servers,
- * background tasks, the default git identity, the outside-read gate and the credential seal. Without
- * the seal, the Codex process's own `/proc/<pid>/environ` holds the gateway key where the agent's
- * commands can read it, and a run starts even when the kernel won't hide the runner. Codex runs the
- * commands it counts as read-only (`cat`, `ls`, `grep` and the like) without asking, wherever they
- * read.
+ * background tasks, the default git identity and the outside-read gate. Codex runs the commands it
+ * counts as read-only (`cat`, `ls`, `grep` and the like) without asking, wherever they read.
  */
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -58,6 +66,7 @@ import { type PostEvent, RunEndedError } from "./events.js";
 import { createHeartbeat } from "./heartbeat.js";
 import { policyOutcome } from "./policy.js";
 import type { AwaitDecision } from "./requests.js";
+import type { Seal } from "./seal.js";
 import { scratchDirOf, withSessionGitConfig } from "./session.js";
 import {
   DEFAULT_MAX_COMMITS,
@@ -78,6 +87,40 @@ export const CODEX_BIN = "/opt/sky/node_modules/.bin/codex";
 
 const PUBLISH_TOOL = "sky_publish";
 const SYNC_TOOL = "sky_sync";
+
+const PLATFORM_PACKAGES: Record<string, { pkg: string; triple: string }> = {
+  x64: {
+    pkg: "@openai/codex-linux-x64",
+    triple: "x86_64-unknown-linux-musl",
+  },
+  arm64: {
+    pkg: "@openai/codex-linux-arm64",
+    triple: "aarch64-unknown-linux-musl",
+  },
+};
+
+/**
+ * The native Codex binary behind `bin`. The npm package's own launcher (`bin/codex.js`) is a Node
+ * script that execs the platform package's binary, which would leave the process the seal can't copy
+ * the unreadable binary for, so this resolves what the launcher would pick. Anything that is not
+ * that launcher is returned as it is.
+ */
+export function resolveCodexExecutable(
+  bin: string,
+  arch: string = process.arch,
+): string {
+  const real = realpathSync(bin);
+  if (!real.endsWith(".js")) return real;
+  const platform = PLATFORM_PACKAGES[arch];
+  if (!platform)
+    throw new Error(`Codex has no Linux build for ${arch} (${real})`);
+  const packageJson = createRequire(real).resolve(
+    `${platform.pkg}/package.json`,
+  );
+  return realpathSync(
+    join(packageJson, "..", "vendor", platform.triple, "bin", "codex"),
+  );
+}
 
 /** Takes the AI Gateway key out of `env`, as `withdrawCredential` does Claude's, so only the Codex process gets it. */
 export function withdrawCodexKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -418,6 +461,8 @@ export type CodexDeps = {
   env?: NodeJS.ProcessEnv;
   /** How often a tool call in flight is reported. */
   heartbeatMs?: number;
+  /** Keeps the gateway key out of the agent's commands' reach; a seal with a problem fails the run before it starts. */
+  seal: Seal;
   /** The Codex binary; `SKY_CODEX_BIN`, else `CODEX_BIN`. */
   bin?: string;
   /** How long a stopped turn gets to end before Codex is killed. */
@@ -502,6 +547,14 @@ export async function runCodexSession(
     });
     return 1 as const;
   };
+
+  // before the runner starts a single command the repo can influence, git's included
+  if (deps.seal.problem) {
+    deps.signal.removeEventListener("abort", forward);
+    return fail(
+      `credential_exposed: Sky can't keep its AI Gateway key from this repo's commands (${deps.seal.problem}); the run did not start.`,
+    );
+  }
 
   let cwd: string;
   let notes: string[];
@@ -642,7 +695,7 @@ export async function runCodexSession(
         socketPath: brokerSocketIn(scratch),
         cwd,
         env: { ...sessionEnv, ...connectorEnv },
-        sealProblem: () => undefined,
+        sealProblem: () => deps.seal.problem ?? deps.seal.check(),
         approve: approveBrokered,
         warn: warning,
       });
@@ -662,11 +715,14 @@ export async function runCodexSession(
       AGENT_TOKEN: _token,
       ...childEnv
     } = withoutConnector(withSessionGitConfig(sessionEnv));
-    child = spawn(bin, ["app-server"], {
+    // the seal's spawn ends the process with this signal; the run's own stop goes through the turn
+    child = deps.seal.spawn({
+      command: resolveCodexExecutable(bin),
+      args: ["app-server"],
       cwd,
-      stdio: ["pipe", "pipe", "pipe"],
       env: { ...childEnv, ...deps.codexEnv, CODEX_HOME: codexHome },
-    });
+      signal: new AbortController().signal,
+    }) as ChildProcess;
     server = new AppServer(child, warning);
     const app = server;
     await app.request(
@@ -677,6 +733,10 @@ export async function runCodexSession(
       },
       { timeoutMs: 60_000, signal: abortController.signal },
     );
+    // Codex is past its exec, so what the kernel does with its `/proc` entries is settled
+    const exposed = deps.seal.check();
+    if (exposed)
+      throw new Error(`credential_exposed: ${exposed}; the run was stopped.`);
     app.notify("initialized");
 
     const model = config.codexModel ?? DEFAULT_CODEX_MODEL;
@@ -1368,6 +1428,8 @@ export class AppServer {
         done(`exit ${code ?? signal ?? "unknown"}`),
       );
       child.once("error", (error) => done(error.message));
+      // a write after the process died is an EPIPE here, which would otherwise crash the runner
+      child.stdin?.on("error", (error) => done(`stdin: ${error.message}`));
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       this.stderr = (this.stderr + chunk.toString()).slice(-4_000);
