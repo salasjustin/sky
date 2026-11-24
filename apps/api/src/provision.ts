@@ -25,8 +25,11 @@ export const RUNNER_DIR = "/opt/sky";
 export const RUNNER = `${RUNNER_DIR}/runner.mjs`;
 // = the version in packages/runner/package.json; the runner bundle leaves the SDK external
 const RUNNER_SDK = "@anthropic-ai/claude-agent-sdk@0.3.312";
-// no --omit=optional: the SDK ships the Claude Code binary as a platform-specific optional dep
-const installRunnerSdk = `[ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" -g "$(id -g)" ${RUNNER_DIR}; npm install --prefix ${RUNNER_DIR} --no-audit --no-fund ${RUNNER_SDK}`;
+// = CODEX_VERSION in packages/runner/src/codex.ts: the runtime a run with SKY_RUNTIME=codex drives
+const RUNNER_CODEX = "@openai/codex@0.172.0";
+// no --omit=optional: the SDK ships the Claude Code binary as a platform-specific optional dep, and
+// Codex its own binary the same way
+const installRunnerSdk = `[ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" -g "$(id -g)" ${RUNNER_DIR}; npm install --prefix ${RUNNER_DIR} --no-audit --no-fund ${RUNNER_SDK} ${RUNNER_CODEX}`;
 // finds the SDK's bundled `claude` under the runner dir, which is the script's first argument
 const FIND_CLAUDE = `
 const sdk = process.argv[1] + "/node_modules/@anthropic-ai";

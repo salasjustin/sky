@@ -98,7 +98,7 @@ const runnerSdk = JSON.parse(
     "utf8",
   ),
 ).dependencies["@anthropic-ai/claude-agent-sdk"];
-const installRunnerSdk = `[ -w /opt/sky ] || sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/sky; npm install --prefix /opt/sky --no-audit --no-fund @anthropic-ai/claude-agent-sdk@${runnerSdk}`;
+const installRunnerSdk = `[ -w /opt/sky ] || sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/sky; npm install --prefix /opt/sky --no-audit --no-fund @anthropic-ai/claude-agent-sdk@${runnerSdk} @openai/codex@0.172.0`;
 // the setup runs as `bash -c <setup>` behind an `sh -c` wrapper; what the wrapper does, the shell-run tests pin
 const isSetup = (argv: string[]) => argv[0] === "sh" && argv[4] === "bash";
 const setupCall = (sprite: string, setup: string) =>
