@@ -183,7 +183,7 @@ const { appendFileSync, writeFileSync } = require("node:fs");
 const { createInterface } = require("node:readline");
 const { join } = require("node:path");
 const log = (entry) => appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify(entry) + "\\n");
-log({ env: { key: process.env.AI_GATEWAY_API_KEY ?? null, home: process.env.CODEX_HOME, connector: process.env.GITHUB_CONNECTOR ?? null } });
+log({ env: { key: process.env.AI_GATEWAY_API_KEY ?? null, home: process.env.CODEX_HOME, connector: process.env.GITHUB_CONNECTOR ?? null, token: process.env.AGENT_TOKEN ?? null, lastGitConfig: process.env["GIT_CONFIG_KEY_" + (process.env.GIT_CONFIG_COUNT - 1)] + "=" + process.env["GIT_CONFIG_VALUE_" + (process.env.GIT_CONFIG_COUNT - 1)] } });
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
 const waiting = new Map();
 let nextId = 100;
@@ -378,6 +378,7 @@ describe("runCodexSession", () => {
     );
 
   test("opens a thread on the gateway with Sky's approvals and reports a held command", async () => {
+    vi.stubEnv("AGENT_TOKEN", "agent-secret");
     expect(await run()).toBe(0);
     const log = sent();
     const start = log.find((m) => m.method === "thread/start");
@@ -394,6 +395,9 @@ describe("runCodexSession", () => {
       key: "gw-key",
       home: join(root, "codex-home"),
       connector: null,
+      // the event token stays with the runner, and the commands' git runs no fsmonitor
+      token: null,
+      lastGitConfig: "core.fsmonitor=false",
     });
     expect(readFileSync(join(root, "codex-home", "config.toml"), "utf8")).toBe(
       codexConfigToml(),

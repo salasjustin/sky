@@ -194,6 +194,10 @@ function withGitConfig(
   return { ...env, ...added };
 }
 
+/** `env` with the session's git config added, for a session whose env isn't built by `sessionEnvOf`. */
+export const withSessionGitConfig = (env: NodeJS.ProcessEnv) =>
+  withGitConfig(env, SESSION_GIT_CONFIG);
+
 /**
  * The session's env before `claudeProcessEnv` picks the credential: the runner's, which carries the
  * project's own secrets, less the event token, which stays with the runner; plus the profile's

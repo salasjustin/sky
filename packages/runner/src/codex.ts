@@ -55,7 +55,7 @@ import { type PostEvent, RunEndedError } from "./events.js";
 import { createHeartbeat } from "./heartbeat.js";
 import { policyOutcome } from "./policy.js";
 import type { AwaitDecision } from "./requests.js";
-import { scratchDirOf } from "./session.js";
+import { scratchDirOf, withSessionGitConfig } from "./session.js";
 import {
   DEFAULT_MAX_COMMITS,
   prepareWorktree,
@@ -89,8 +89,9 @@ export function withdrawCodexKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 /**
  * Codex's `config.toml` for Sky's runs: the AI Gateway as the model provider, keyed by
- * `AI_GATEWAY_API_KEY`, and every command given the session's whole env (the project's secrets
- * included, as Claude Code's commands get them) except that key.
+ * `AI_GATEWAY_API_KEY`, and every command given the whole env Codex starts with (the project's
+ * secrets included, as Claude Code's commands get them) except that key. The runner leaves its event
+ * token and the GitHub connector out of that env, and pins git's `core.fsmonitor` off in it.
  */
 export function codexConfigToml(): string {
   return [
@@ -642,8 +643,13 @@ export async function runCodexSession(
     const codexHome = sessionEnv.SKY_CODEX_HOME || join(home, ".sky", "codex");
     writeCodexConfig(codexHome);
     const bin = deps.bin ?? env.SKY_CODEX_BIN ?? CODEX_BIN;
-    // `withoutConnector`: the agent's commands never hold the connector; the broker does the sending
-    const { SKY_CODEX_HOME: _, ...childEnv } = withoutConnector(sessionEnv);
+    // the agent's commands, which get this env whole, never hold the connector (the broker does the
+    // sending) or the event token (the runner posts the run's events), and their git runs no fsmonitor
+    const {
+      SKY_CODEX_HOME: _home,
+      AGENT_TOKEN: _token,
+      ...childEnv
+    } = withoutConnector(withSessionGitConfig(sessionEnv));
     child = spawn(bin, ["app-server"], {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
