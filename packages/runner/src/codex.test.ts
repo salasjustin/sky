@@ -224,6 +224,14 @@ const scenarios = {
     usage(10, 1);
     finish("completed");
   },
+  async rename() {
+    const changes = [{ path: "README", kind: { type: "update", move_path: "/tmp/moved.txt" }, diff: "" }];
+    note("item/started", { threadId: thread, turnId: turn, startedAtMs: Date.now(), item: { type: "fileChange", id: "fc_3", changes, status: "inProgress" } });
+    const answer = await ask("item/fileChange/requestApproval", { threadId: thread, turnId: turn, itemId: "fc_3", startedAtMs: Date.now() });
+    note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { type: "fileChange", id: "fc_3", changes, status: answer.decision === "accept" ? "completed" : "declined" } });
+    usage(10, 1);
+    finish("completed");
+  },
   async publish() {
     const reply = await ask("item/tool/call", { threadId: thread, turnId: turn, callId: "call_1", namespace: null, tool: "sky_publish", arguments: { title: "T" } });
     note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { type: "agentMessage", id: "msg_2", text: reply.contentItems[0].text } });
@@ -484,6 +492,20 @@ describe("runCodexSession", () => {
       toolName: "Write",
       toolSummary: "/tmp/elsewhere.txt",
     });
+    expect(sent().find((m) => m.id === 100)?.result).toEqual({
+      decision: "decline",
+    });
+  });
+
+  test("a rename out of the worktree is held, with its destination shown", async () => {
+    config.approvalPolicy = [];
+    decide = () => "deny";
+    expect(await run(undefined, "rename")).toBe(0);
+    const request = ofType("run.waiting")[0]?.payload.request;
+    expect(request).toMatchObject({ toolName: "Edit" });
+    expect(
+      request && "toolInput" in request ? request.toolInput : "",
+    ).toContain('"movePath":"/tmp/moved.txt"');
     expect(sent().find((m) => m.id === 100)?.result).toEqual({
       decision: "decline",
     });

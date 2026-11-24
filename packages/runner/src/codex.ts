@@ -141,7 +141,13 @@ export function unwrapShell(command: string): string {
     : command;
 }
 
-type FileChange = { path: string; kind: string; diff: string };
+type FileChange = {
+  path: string;
+  kind: string;
+  diff: string;
+  /** Where an `update` moves the file to, as Codex wrote it. */
+  movePath?: string;
+};
 
 /**
  * The Claude-shaped tool name and input Sky's approval policy and approval requests are written in:
@@ -295,7 +301,10 @@ const FileChangeItem = z.looseObject({
   changes: z.array(
     z.looseObject({
       path: z.string(),
-      kind: z.looseObject({ type: z.string() }),
+      kind: z.looseObject({
+        type: z.string(),
+        move_path: z.string().nullish(),
+      }),
       diff: z.string().default(""),
     }),
   ),
@@ -867,6 +876,7 @@ export async function runCodexSession(
             path: c.path,
             kind: c.kind.type,
             diff: c.diff,
+            ...(c.kind.move_path && { movePath: c.kind.move_path }),
           }));
           changes.set(change.id, files);
           const { toolName, input } = toolCallOf(
@@ -990,9 +1000,14 @@ export async function runCodexSession(
         storeHome: config.storeHome,
         scratch,
       };
+      // every path a change writes: each file, and where a rename moves it
+      const targets = files.flatMap((f) => [
+        resolve(cwd, f.path),
+        ...(f.movePath ? [resolve(cwd, f.movePath)] : []),
+      ]);
       // a change to a file outside the worktree is the person's to approve, whatever the policy says
       const outsideWorktree =
-        !isCommand && files.some((f) => outside(cwd, resolve(cwd, f.path)));
+        !isCommand && targets.some((path) => outside(cwd, path));
       const outcomes = isCommand
         ? [
             policyOutcome(
@@ -1003,13 +1018,13 @@ export async function runCodexSession(
               input,
             ),
           ]
-        : files.map((f) =>
+        : targets.map((path) =>
             policyOutcome(
               config.approvalPolicy,
               config.autoApprove,
               scope,
               toolName,
-              { file_path: resolve(cwd, f.path) },
+              { file_path: path },
             ),
           );
       const outcome =
@@ -1036,6 +1051,7 @@ export async function runCodexSession(
             files: files.map((f) => ({
               path: resolve(cwd, f.path),
               kind: f.kind,
+              ...(f.movePath && { movePath: resolve(cwd, f.movePath) }),
               diff: f.diff,
             })),
           };
