@@ -101,9 +101,10 @@ const PLATFORM_PACKAGES: Record<string, { pkg: string; triple: string }> = {
 
 /**
  * The native Codex binary behind `bin`. The npm package's own launcher (`bin/codex.js`) is a Node
- * script that execs the platform package's binary, which would leave the process the seal can't copy
- * the unreadable binary for, so this resolves what the launcher would pick. Anything that is not
- * that launcher is returned as it is.
+ * script that spawns the platform package's binary, and the seal can only keep unreadable a binary it
+ * copies itself, so this resolves the platform package's binary the launcher would spawn, without its
+ * fallback to the launcher's own `vendor` folder. Anything that is not a `.js` launcher is returned as
+ * it is.
  */
 export function resolveCodexExecutable(
   bin: string,
@@ -719,6 +720,9 @@ export async function runCodexSession(
     child = deps.seal.spawn({
       command: resolveCodexExecutable(bin),
       args: ["app-server"],
+      name: "Codex",
+      // drained by the app server for the tail its exit error carries
+      stderr: "pipe",
       cwd,
       env: { ...childEnv, ...deps.codexEnv, CODEX_HOME: codexHome },
       signal: new AbortController().signal,

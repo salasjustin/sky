@@ -171,10 +171,21 @@ export function removeSealedCopiesNow(): void {
 export type Seal = {
   /** Why the boundary couldn't be set up, which fails the run before Claude starts; undefined when it is. */
   problem: string | undefined;
-  /** The Agent SDK's spawn of the Claude process: from a copy of its binary the kernel keeps unreadable. */
-  spawn: (options: SpawnOptions) => SpawnedProcess;
+  /**
+   * The Agent SDK's spawn of the Claude process, or the Codex runtime's of Codex: from a copy of its
+   * binary the kernel keeps unreadable.
+   */
+  spawn: (options: SealSpawnOptions) => SpawnedProcess;
   /** Once Claude is running: why its `/proc` entries are open to the repo's commands, or undefined. */
   check: () => string | undefined;
+};
+
+/** The Agent SDK's spawn options, plus what a caller other than the SDK sets. */
+export type SealSpawnOptions = SpawnOptions & {
+  /** The process's name in the seal's messages; Claude when absent. */
+  name?: string;
+  /** Pipes the process's stderr for the caller to drain; dropped when absent. */
+  stderr?: "pipe";
 };
 
 export type SealOptions = {
@@ -245,10 +256,12 @@ export function createSeal(
   const spawn: NonNullable<SealOptions["spawn"]> = options.spawn ?? spawnChild;
   const programs = sealPrograms(platform, options);
   let claude: ChildProcess | undefined;
+  let name = "Claude";
   return {
     problem: programs.problem,
     spawn: (spawnOptions) => {
       if (programs.problem !== undefined) throw new Error(programs.problem);
+      name = spawnOptions.name ?? "Claude";
       const copyDir = join(dir, `sky-claude-${randomUUID()}`);
       // before the copy: a signal can land while it is in flight
       copies.add(copyDir);
@@ -279,7 +292,7 @@ export function createSeal(
             cwd: spawnOptions.cwd,
             env: spawnOptions.env,
             signal: spawnOptions.signal,
-            stdio: ["pipe", "pipe", "ignore"],
+            stdio: ["pipe", "pipe", spawnOptions.stderr ?? "ignore"],
           },
         );
       } catch (error) {
@@ -291,13 +304,13 @@ export function createSeal(
       return claude as SpawnedProcess;
     },
     check: () => {
-      if (!claude?.pid) return "Claude's process was not started";
+      if (!claude?.pid) return `${name}'s process was not started`;
       // a process that has ended holds nothing to read
       if (claude.exitCode !== null || claude.signalCode !== null)
         return undefined;
       return isHidden(claude.pid)
         ? undefined
-        : "the kernel lets the repo's commands read Claude's environment";
+        : `the kernel lets the repo's commands read ${name}'s environment`;
     },
   };
 }
