@@ -185,11 +185,13 @@ export function codexConfigToml(
  * Writes `config.toml` into `codexHome` whole, so a run starting beside this one never reads half of
  * it, and removes `hooks.json` there: with plugins named, Codex runs every layer's hooks without its
  * trust prompt, so a `hooks.json` an agent's command wrote would run in the next run with Codex's env,
- * proxy token included. The environment's `plugins/` and `agents/` stay.
+ * proxy token included. A directory of that name goes too, so one can't fail every later run. The
+ * environment's `plugins/` and `agents/` stay. This narrows what the trust bypass reaches; it doesn't
+ * close it: plugin files are the sprite user's, and a run beside this one can write `hooks.json` again.
  */
 function writeCodexConfig(codexHome: string, toml: string): void {
   mkdirSync(codexHome, { recursive: true, mode: 0o700 });
-  rmSync(join(codexHome, "hooks.json"), { force: true });
+  rmSync(join(codexHome, "hooks.json"), { force: true, recursive: true });
   const file = join(codexHome, "config.toml");
   const tmp = `${file}.${process.pid}.${randomUUID()}`;
   writeFileSync(tmp, toml, { mode: 0o600 });
