@@ -685,9 +685,18 @@ describe("runCodexSession", () => {
     writeFileSync(join(home, "hooks.json"), '{"hooks":{}}');
     writeFileSync(join(home, "plugins", "cache", "kept.txt"), "plugin");
     writeFileSync(join(home, "agents", "role.toml"), "role");
+    let hooksAtSpawn: boolean | undefined;
+    const sealSpawn = seal.spawn;
+    seal = {
+      ...seal,
+      spawn: (options) => {
+        hooksAtSpawn = existsSync(join(home, "hooks.json"));
+        return sealSpawn(options);
+      },
+    };
     expect(await run()).toBe(0);
     expect(spawned).toHaveLength(1);
-    expect(existsSync(join(home, "hooks.json"))).toBe(false);
+    expect(hooksAtSpawn).toBe(false);
     expect(
       readFileSync(join(home, "plugins", "cache", "kept.txt"), "utf8"),
     ).toBe("plugin");
