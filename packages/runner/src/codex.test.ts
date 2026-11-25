@@ -62,6 +62,31 @@ describe("SKY_RUNTIME", () => {
     expect(config.codexModel).toBe("openai/gpt-5.4-mini");
   });
 
+  test("SKY_CODEX_PLUGINS names the plugins a Codex run turns on", () => {
+    const codex = { ...base, SKY_RUNTIME: "codex", AI_GATEWAY_API_KEY: "k" };
+    expect(loadConfig(codex).codexPlugins).toBeUndefined();
+    expect(
+      loadConfig({ ...codex, SKY_CODEX_PLUGINS: " kru@kru, tools@acme-1 ," })
+        .codexPlugins,
+    ).toEqual(["kru@kru", "tools@acme-1"]);
+    // a Claude Code run takes no Codex plugins
+    expect(
+      loadConfig({
+        ...base,
+        CLAUDE_CODE_OAUTH_TOKEN: "t",
+        SKY_CODEX_PLUGINS: "kru@kru",
+      }).codexPlugins,
+    ).toBeUndefined();
+  });
+
+  test("refuses a plugin id that could quote out of Codex's config", () => {
+    const codex = { ...base, SKY_RUNTIME: "codex", AI_GATEWAY_API_KEY: "k" };
+    for (const bad of ['kru@kru"]\nx = 1', "kru", "kru@", "@kru", "a b@c"])
+      expect(() => loadConfig({ ...codex, SKY_CODEX_PLUGINS: bad })).toThrow(
+        /SKY_CODEX_PLUGINS/,
+      );
+  });
+
   test("refuses an unknown runtime", () => {
     expect(() =>
       loadConfig({
@@ -142,17 +167,27 @@ describe("toolCallOf", () => {
 });
 
 describe("codexConfigToml", () => {
-  test("routes the model through the gateway and keeps its key out of commands", () => {
-    const toml = codexConfigToml();
+  test("routes the model through the run's proxy and keeps its token out of commands", () => {
+    const toml = codexConfigToml("http://127.0.0.1:4100/codex/v1");
     expect(toml).toContain(`model_provider = "${CODEX_PROVIDER}"`);
-    expect(toml).toContain(
-      'base_url = "https://ai-gateway.vercel.sh/codex/v1"',
-    );
-    expect(toml).toContain('env_key = "AI_GATEWAY_API_KEY"');
+    expect(toml).toContain('base_url = "http://127.0.0.1:4100/codex/v1"');
+    expect(toml).toContain('env_key = "SKY_CODEX_GATEWAY_TOKEN"');
     expect(toml).toContain('wire_api = "responses"');
-    expect(toml).toContain('exclude = ["AI_GATEWAY_API_KEY"]');
+    expect(toml).toContain(
+      'exclude = ["SKY_CODEX_GATEWAY_TOKEN", "AI_GATEWAY_API_KEY"]',
+    );
     // the project's own secrets reach its commands, as Claude Code's do
     expect(toml).toContain("ignore_default_excludes = true");
+    expect(toml).not.toContain("[plugins.");
+  });
+
+  test("turns on each plugin it is given", () => {
+    const toml = codexConfigToml("http://127.0.0.1:1/v1", [
+      "kru@kru",
+      "tools@acme",
+    ]);
+    expect(toml).toContain('[plugins."kru@kru"]\nenabled = true\n');
+    expect(toml).toContain('[plugins."tools@acme"]\nenabled = true\n');
   });
 });
 
@@ -189,7 +224,7 @@ const { appendFileSync, writeFileSync } = require("node:fs");
 const { createInterface } = require("node:readline");
 const { join } = require("node:path");
 const log = (entry) => appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify(entry) + "\\n");
-log({ env: { key: process.env.AI_GATEWAY_API_KEY ?? null, home: process.env.CODEX_HOME, connector: process.env.GITHUB_CONNECTOR ?? null, token: process.env.AGENT_TOKEN ?? null, lastGitConfig: process.env["GIT_CONFIG_KEY_" + (process.env.GIT_CONFIG_COUNT - 1)] + "=" + process.env["GIT_CONFIG_VALUE_" + (process.env.GIT_CONFIG_COUNT - 1)] } });
+log({ env: { key: process.env.AI_GATEWAY_API_KEY ?? null, gatewayToken: process.env.SKY_CODEX_GATEWAY_TOKEN ? "set" : null, home: process.env.CODEX_HOME, connector: process.env.GITHUB_CONNECTOR ?? null, token: process.env.AGENT_TOKEN ?? null, lastGitConfig: process.env["GIT_CONFIG_KEY_" + (process.env.GIT_CONFIG_COUNT - 1)] + "=" + process.env["GIT_CONFIG_VALUE_" + (process.env.GIT_CONFIG_COUNT - 1)] } });
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
 const waiting = new Map();
 let nextId = 100;
@@ -422,17 +457,21 @@ describe("runCodexSession", () => {
     });
     // no connector, so nothing to publish with
     expect(start.params.dynamicTools).toBeUndefined();
+    // no plugins, so Codex's hook trust stays as it is
+    expect(start.params.config).toBeUndefined();
     expect(log[0].env).toEqual({
-      key: "gw-key",
+      // the gateway key stays in the runner; Codex holds only the run's proxy token
+      key: null,
+      gatewayToken: "set",
       home: join(root, "codex-home"),
       connector: null,
       // the event token stays with the runner, and the commands' git runs no fsmonitor
       token: null,
       lastGitConfig: "core.fsmonitor=false",
     });
-    expect(readFileSync(join(root, "codex-home", "config.toml"), "utf8")).toBe(
-      codexConfigToml(),
-    );
+    const toml = readFileSync(join(root, "codex-home", "config.toml"), "utf8");
+    expect(toml).toMatch(/base_url = "http:\/\/127\.0\.0\.1:\d+\/codex\/v1"/);
+    expect(toml).not.toContain("gw-key");
 
     expect(ofType("run.started")[0]?.payload.sessionId).toBe("thr_1");
     const waiting = ofType("run.waiting").map((e) => e.payload.request);
@@ -577,7 +616,9 @@ describe("runCodexSession", () => {
     );
   });
 
-  test("Codex starts through the seal, from its own binary, with the key in its env", async () => {
+  test("Codex starts through the seal, from its own binary, with the proxy's token and not the key", async () => {
+    // a key a base profile's session env put back is dropped too
+    config.sessionEnv.AI_GATEWAY_API_KEY = "gw-key";
     expect(await run()).toBe(0);
     expect(spawned).toHaveLength(1);
     expect(spawned[0]).toMatchObject({
@@ -585,7 +626,63 @@ describe("runCodexSession", () => {
       args: ["app-server"],
       cwd: join(root, "worktrees", "agt_1"),
     });
-    expect(spawned[0]?.env.AI_GATEWAY_API_KEY).toBe("gw-key");
+    expect(spawned[0]?.env.AI_GATEWAY_API_KEY).toBeUndefined();
+    expect(spawned[0]?.env.SKY_CODEX_GATEWAY_TOKEN).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("the run's proxy gets the key, and closes when the run ends", async () => {
+    let closed = false;
+    const given: { upstream?: string; key?: string } = {};
+    const ran = await runCodexSession(config, {
+      post,
+      awaitDecision,
+      signal: new AbortController().signal,
+      warn: () => {},
+      codexEnv: { AI_GATEWAY_API_KEY: "gw-key" },
+      gatewayUrl: "https://gateway.test/codex/v1",
+      startProxy: async (options) => {
+        given.upstream = options.upstream;
+        given.key = options.key;
+        return {
+          baseUrl: "http://127.0.0.1:9/codex/v1",
+          token: "t".repeat(64),
+          close: async () => {
+            closed = true;
+          },
+        };
+      },
+      seal,
+      bin,
+      stopGraceMs: 2_000,
+    });
+    expect(ran).toBe(0);
+    expect(given).toEqual({
+      upstream: "https://gateway.test/codex/v1",
+      key: "gw-key",
+    });
+    expect(spawned[0]?.env.SKY_CODEX_GATEWAY_TOKEN).toBe("t".repeat(64));
+    expect(
+      readFileSync(join(root, "codex-home", "config.toml"), "utf8"),
+    ).toContain('base_url = "http://127.0.0.1:9/codex/v1"');
+    expect(closed).toBe(true);
+  });
+
+  test("named plugins are turned on and their hooks run without Codex's trust prompt", async () => {
+    config.codexPlugins = ["kru@kru"];
+    expect(await run()).toBe(0);
+    expect(
+      readFileSync(join(root, "codex-home", "config.toml"), "utf8"),
+    ).toContain('[plugins."kru@kru"]\nenabled = true\n');
+    const start = sent().find((m) => m.method === "thread/start");
+    expect(start.params.config).toEqual({ bypass_hook_trust: true });
+  });
+
+  test("a resumed thread keeps its plugins' hooks running", async () => {
+    config.codexPlugins = ["kru@kru"];
+    config.sessionId = "thr_1";
+    expect(await run()).toBe(0);
+    const resume = sent().find((m) => m.method === "thread/resume");
+    expect(resume.params.config).toEqual({ bypass_hook_trust: true });
   });
 
   test("a runner that can't be hidden fails the run before anything starts", async () => {

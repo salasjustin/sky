@@ -11,7 +11,13 @@
 //     node packages/runner/e2e/codex-e2e.mjs
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -177,9 +183,10 @@ const ghPort = await listen(github);
 // --- one run of the real runner ----------------------------------------------------------------------
 const home = join(root, "home");
 mkdirSync(home);
-async function run(runId, prompt, sessionId, until) {
+async function run(runId, prompt, sessionId, until, extraEnv = {}) {
   const from = events.length;
   const env = {
+    ...extraEnv,
     PATH: process.env.PATH,
     HOME: home,
     ...gitEnv,
@@ -502,6 +509,70 @@ check(
 );
 check("the stopped run left no `sleep 3019`", !alive("sleep 3019"));
 
+console.log(
+  "\n== run 6: a plugin the environment names loads, and its hook runs without the gateway key ==",
+);
+// installed as an environment's setup would install one, under the run's Codex home
+const probeRoot = join(home, ".sky/codex/plugins/cache/e2e/probe/local");
+const hookOut = join(root, "hook-fired.txt");
+mkdirSync(join(probeRoot, ".codex-plugin"), { recursive: true });
+mkdirSync(join(probeRoot, "hooks"), { recursive: true });
+writeFileSync(
+  join(probeRoot, ".codex-plugin/plugin.json"),
+  JSON.stringify({
+    name: "probe",
+    version: "0.0.1",
+    description: "Sky's e2e probe",
+    hooks: "./hooks/hooks.json",
+  }),
+);
+writeFileSync(
+  join(probeRoot, "hooks/hooks.json"),
+  JSON.stringify({
+    hooks: {
+      SessionStart: [
+        {
+          matcher: "startup|resume",
+          hooks: [
+            {
+              type: "command",
+              // the key's length (0 when absent) and whether the run's proxy token is there
+              command: `printf '%s %s\\n' "$(printenv AI_GATEWAY_API_KEY | wc -c)" "\${SKY_CODEX_GATEWAY_TOKEN:+token}" > '${hookOut}'`,
+              timeout: 10,
+            },
+          ],
+        },
+      ],
+    },
+  }),
+);
+const sixth = await run(
+  "run_six",
+  "Reply with the single word `ready`. Do nothing else.",
+  undefined,
+  undefined,
+  { SKY_CODEX_PLUGINS: "probe@e2e" },
+);
+console.log(sixth.events.map(show).join("\n"));
+check(
+  "run 6 finished",
+  sixth.code === 0 && sixth.events.some((e) => e.type === "run.finished"),
+  `exit ${sixth.code}`,
+);
+const hookLine = existsSync(hookOut) ? readFileSync(hookOut, "utf8").trim() : "";
+check("the plugin's SessionStart hook ran", hookLine !== "", hookLine);
+check(
+  "the hook's env held no gateway key",
+  hookLine.split(" ")[0] === "0" &&
+    !hookLine.includes(process.env.AI_GATEWAY_API_KEY),
+  hookLine.replaceAll(process.env.AI_GATEWAY_API_KEY, "<key>"),
+);
+check(
+  "no secret reached run 6's events",
+  leaks(JSON.stringify(sixth.events)).length === 0,
+  leaks(JSON.stringify(sixth.events)).join(", "),
+);
+
 for (const [n, r] of [
   ["run1", first],
   ["run2", second],
@@ -509,6 +580,7 @@ for (const [n, r] of [
   ["run3", third],
   ["run4", fourth],
   ["run5", fifth],
+  ["run6", sixth],
 ])
   writeFileSync(join(root, `${n}.log`), r.log);
 writeFileSync(join(root, "events.json"), JSON.stringify(events, null, 1));
