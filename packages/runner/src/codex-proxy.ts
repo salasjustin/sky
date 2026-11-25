@@ -73,6 +73,26 @@ const sameToken = (sent: string | undefined, token: string) => {
   return a.length === b.length && timingSafeEqual(a, b);
 };
 
+/**
+ * The path and query to send upstream for a request's `url`, as the gateway will read it: dot
+ * segments resolved, so `/codex/v1/../../x` is `/x`. Undefined when that path leaves `prefix`, the
+ * URL names another host, or the path holds an encoded `.`, `/` or `\` the gateway might decode.
+ */
+const gatewayPath = (url: string, upstream: URL, prefix: string) => {
+  let target: URL;
+  try {
+    target = new URL(url, upstream);
+  } catch {
+    return undefined;
+  }
+  const { pathname, search } = target;
+  if (target.origin !== upstream.origin) return undefined;
+  if (/%(2e|2f|5c)/i.test(pathname)) return undefined;
+  if (pathname !== prefix && !pathname.startsWith(`${prefix}/`))
+    return undefined;
+  return `${pathname}${search}`;
+};
+
 /** Starts the run's gateway proxy on 127.0.0.1, on a port the kernel picks. */
 export async function startGatewayProxy(
   options: GatewayProxyOptions,
@@ -95,9 +115,9 @@ export async function startGatewayProxy(
       req.resume();
       return refuse(res, 401, "this run's gateway token is missing or wrong");
     }
-    const path = req.url ?? "/";
     // only the gateway's own path, so the key goes to no other route on that host
-    if (path !== prefix && !path.startsWith(`${prefix}/`)) {
+    const path = gatewayPath(req.url ?? "/", upstream, prefix);
+    if (path === undefined) {
       req.resume();
       return refuse(res, 404, "not a gateway path");
     }
@@ -126,14 +146,19 @@ export async function startGatewayProxy(
         answer.on("error", () => res.destroy());
       },
     );
+    let hungUp = false;
     out.on("error", (error) => {
+      // Codex hanging up ends the upstream request with an error of its own; the gateway didn't fail
+      if (hungUp) return;
       warn(`the AI Gateway request failed: ${error.message}`);
       if (res.headersSent) res.destroy();
       else refuse(res, 502, "the AI Gateway could not be reached");
     });
     // Codex going away mid-answer ends the upstream request too
     res.on("close", () => {
-      if (!res.writableFinished) out.destroy();
+      if (res.writableFinished) return;
+      hungUp = true;
+      out.destroy();
     });
     req.pipe(out);
   };

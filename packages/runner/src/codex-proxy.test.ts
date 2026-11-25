@@ -149,6 +149,8 @@ describe("startGatewayProxy", () => {
     for (const authorization of [
       undefined,
       "Bearer wrong",
+      // as long as the token, so the comparison itself, not the length check, refuses it
+      `Bearer ${"0".repeat(proxy.token.length)}`,
       `Basic ${proxy.token}`,
     ]) {
       const answer = await call(
@@ -162,13 +164,48 @@ describe("startGatewayProxy", () => {
   });
 
   test("sends the key to the gateway's own path only", async () => {
-    for (const path of ["/v1/responses", "/codex/v10", "/", "/codex"]) {
+    for (const path of [
+      "/v1/responses",
+      "/codex/v10",
+      "/",
+      "/codex",
+      // under the gateway's path as written, outside it once the gateway resolves the dot segments
+      "/codex/v1/../../v1/models",
+      "/codex/v1/%2e%2e/%2e%2e/v1/models",
+      "/codex/v1/..%2f..%2fv1/models",
+      "http://elsewhere.test/codex/v1/responses",
+    ]) {
       const answer = await call(path, {
         authorization: `Bearer ${proxy.token}`,
       });
       expect(answer.status, path).toBe(404);
     }
     expect(seen).toEqual([]);
+  });
+
+  test("Codex hanging up before the answer starts is no gateway failure", async () => {
+    server.use(
+      http.all("https://gateway.test/*", async () => {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        return HttpResponse.text("late");
+      }),
+    );
+    const warnings: string[] = [];
+    const lone = await startGatewayProxy({
+      upstream: UPSTREAM,
+      key: "gw-key",
+      warn: (line) => warnings.push(line),
+    });
+    const url = new URL(lone.baseUrl);
+    const socket = connect(Number(url.port), url.hostname);
+    socket.write(
+      `POST /codex/v1/responses HTTP/1.1\r\nhost: ${url.host}\r\nauthorization: Bearer ${lone.token}\r\ncontent-length: 0\r\n\r\n`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    socket.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await lone.close();
+    expect(warnings).toEqual([]);
   });
 
   test("an unreachable gateway is a 502, not a crash", async () => {
