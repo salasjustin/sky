@@ -85,7 +85,7 @@ async function main(): Promise<void> {
   // `claude` commands inherit, and the runner is put out of its commands' reach, so the repo's hooks and
   // config, which those run, find nothing; only the session's Claude process gets the credential back
   const credentialEnv = withdrawCredential(process.env);
-  // a Codex run's AI Gateway key leaves the env the same way, for the Codex process alone
+  // a Codex run's AI Gateway key leaves the env the same way, for the run's gateway proxy alone
   const codexEnv =
     config.runtime === "codex" ? withdrawCodexKey(process.env) : {};
   const seal = createSeal();

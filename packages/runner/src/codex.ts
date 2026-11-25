@@ -135,7 +135,7 @@ export function resolveCodexExecutable(
   );
 }
 
-/** Takes the AI Gateway key out of `env`, as `withdrawCredential` does Claude's, so only the Codex process gets it. */
+/** Takes the AI Gateway key out of `env`, as `withdrawCredential` does Claude's, so only the run's gateway proxy gets it. */
 export function withdrawCodexKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const held: NodeJS.ProcessEnv = {};
   const value = env[CODEX_KEY_ENV];
@@ -800,7 +800,7 @@ export async function runCodexSession(
       sandbox: "danger-full-access",
       developerInstructions: instructions,
       // a plugin's hooks run without Codex's one-time trust prompt, which no one is there to answer;
-      // the environment chose the plugins, and no hook's env holds the gateway key
+      // the environment or the run's `envVars` chose the plugins, and no hook's env holds the gateway key
       ...(plugins.length > 0 && { config: { bypass_hook_trust: true } }),
     };
     const opened = config.sessionId

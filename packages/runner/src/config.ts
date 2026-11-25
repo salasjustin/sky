@@ -86,7 +86,7 @@ const Env = z.object({
 
 /**
  * The variable holding the credential the run's session can't start without: for Claude Code, the one
- * `SKY_CLAUDE_AUTH` names; for Codex, the AI Gateway key, which only the Codex process reads.
+ * `SKY_CLAUDE_AUTH` names; for Codex, the AI Gateway key, which only the run's gateway proxy reads.
  */
 const credentialVariable = (env: NodeJS.ProcessEnv) =>
   env.SKY_RUNTIME === "codex"
@@ -95,7 +95,7 @@ const credentialVariable = (env: NodeJS.ProcessEnv) =>
       ? "SKY_CLAUDE_API_KEY"
       : "CLAUDE_CODE_OAUTH_TOKEN";
 
-/** The AI Gateway key a Codex run's model calls carry; `main` takes it out of the env for the Codex process alone. */
+/** The AI Gateway key a Codex run's model calls carry; `main` takes it out of the env for the run's gateway proxy alone. */
 export const CODEX_KEY_ENV = "AI_GATEWAY_API_KEY";
 
 export type Config = {
