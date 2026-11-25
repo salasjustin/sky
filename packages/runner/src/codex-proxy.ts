@@ -1,9 +1,9 @@
 /**
  * The AI Gateway as Codex reaches it: a proxy on the loopback interface that the runner starts for
  * each Codex run. Codex is given the proxy's URL and a token made for the run, never the gateway key,
- * so nothing Codex starts (the agent's commands, the hooks a plugin brings, an MCP server) inherits
- * the key: each of those starts from Codex's own env. The proxy checks the token, swaps it for the
- * key and passes the request and its streamed answer through unchanged. The token is good only while
+ * so nothing Codex starts (the agent's commands, the hooks a plugin brings, an MCP server) can inherit
+ * the key: none of those gets more than Codex's own env. The proxy checks the token, swaps it for the
+ * key, sends the request on and streams the answer back as it comes. The token is good only while
  * the run's proxy is up; with it, a process can make model calls through this run, not read the key.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -164,7 +164,7 @@ export async function startGatewayProxy(
   };
 
   const server = http.createServer(handle);
-  // a WebSocket or other upgrade isn't proxied: Codex then uses plain HTTP
+  // a WebSocket or other upgrade isn't proxied, only plain HTTP
   server.on("upgrade", (_req, socket) => {
     socket.end("HTTP/1.1 501 Not Implemented\r\nconnection: close\r\n\r\n");
   });

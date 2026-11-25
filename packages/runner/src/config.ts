@@ -17,7 +17,7 @@ const json = z.string().transform((s, ctx) => {
   }
 });
 
-/** A Codex plugin id, `<plugin>@<marketplace>`: written into Codex's config as a TOML key, so nothing that could quote out of it. */
+/** A Codex plugin id, `<plugin>@<marketplace>`: written into Codex's config as a TOML key, so it holds nothing that could quote out of one. */
 const CODEX_PLUGIN_ID =
   /^[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/;
 

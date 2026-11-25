@@ -536,7 +536,7 @@ writeFileSync(
           hooks: [
             {
               type: "command",
-              // the key's length (0 when absent) and whether the run's proxy token is there
+              // 0 when the key is absent (its length plus a newline otherwise), and whether the run's proxy token is there
               command: `printf '%s %s\\n' "$(printenv AI_GATEWAY_API_KEY | wc -c)" "\${SKY_CODEX_GATEWAY_TOKEN:+token}" > '${hookOut}'`,
               timeout: 10,
             },

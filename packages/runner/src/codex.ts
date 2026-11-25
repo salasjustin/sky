@@ -744,7 +744,7 @@ export async function runCodexSession(
     const plugins = config.codexPlugins ?? [];
     writeCodexConfig(codexHome, codexConfigToml(proxy.baseUrl, plugins));
     const bin = deps.bin ?? env.SKY_CODEX_BIN ?? CODEX_BIN;
-    // Codex's env, which the agent's commands get whole and its hooks and MCP servers start from,
+    // Codex's env, which the agent's commands get whole and its hooks and MCP servers get no more than,
     // never holds the connector (the broker does the sending), the event token (the runner posts the
     // run's events) or the gateway key (the proxy holds it), and its git runs no fsmonitor
     const {
@@ -800,7 +800,7 @@ export async function runCodexSession(
       sandbox: "danger-full-access",
       developerInstructions: instructions,
       // a plugin's hooks run without Codex's one-time trust prompt, which no one is there to answer;
-      // the environment or the run's `envVars` chose the plugins, and no hook's env holds the gateway key
+      // the environment or the run's `envVars` named the plugins, and no hook's env holds the key
       ...(plugins.length > 0 && { config: { bypass_hook_trust: true } }),
     };
     const opened = config.sessionId
