@@ -17,6 +17,10 @@ const json = z.string().transform((s, ctx) => {
   }
 });
 
+/** A Codex plugin id, `<plugin>@<marketplace>`: written into Codex's config as a TOML key, so it holds nothing that could quote out of one. */
+const CODEX_PLUGIN_ID =
+  /^[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
 const Env = z.object({
   AGENT_ID: AgentId,
   RUN_ID: RunId,
@@ -35,6 +39,18 @@ const Env = z.object({
     .string()
     .optional()
     .transform((s) => s || undefined),
+  // the Codex plugins a run turns on, as `<plugin>@<marketplace>` separated by commas; the environment's
+  // setup installs them under the run's Codex home. Their hooks run without Codex's per-hook trust
+  SKY_CODEX_PLUGINS: z
+    .string()
+    .optional()
+    .transform((s) =>
+      (s ?? "")
+        .split(",")
+        .map((name) => name.trim())
+        .filter(Boolean),
+    )
+    .pipe(z.array(z.string().regex(CODEX_PLUGIN_ID))),
   // which credential the Claude session uses, and its value, which only the Claude subprocess reads,
   // so it never enters Config: the subscription token for `oauth`, `SKY_CLAUDE_API_KEY` for `api-key`
   SKY_CLAUDE_AUTH: z.enum(["oauth", "api-key"]).default("oauth"),
@@ -70,7 +86,7 @@ const Env = z.object({
 
 /**
  * The variable holding the credential the run's session can't start without: for Claude Code, the one
- * `SKY_CLAUDE_AUTH` names; for Codex, the AI Gateway key, which only the Codex process reads.
+ * `SKY_CLAUDE_AUTH` names; for Codex, the AI Gateway key, which only the run's gateway proxy reads.
  */
 const credentialVariable = (env: NodeJS.ProcessEnv) =>
   env.SKY_RUNTIME === "codex"
@@ -79,7 +95,7 @@ const credentialVariable = (env: NodeJS.ProcessEnv) =>
       ? "SKY_CLAUDE_API_KEY"
       : "CLAUDE_CODE_OAUTH_TOKEN";
 
-/** The AI Gateway key a Codex run's model calls carry; `main` takes it out of the env for the Codex process alone. */
+/** The AI Gateway key a Codex run's model calls carry; `main` takes it out of the env for the run's gateway proxy alone. */
 export const CODEX_KEY_ENV = "AI_GATEWAY_API_KEY";
 
 export type Config = {
@@ -90,6 +106,8 @@ export type Config = {
   runtime?: "codex";
   /** The Codex session's model, from `SKY_CODEX_MODEL`; set only on a Codex run that names one. */
   codexModel?: string;
+  /** The Codex plugins the run turns on, from `SKY_CODEX_PLUGINS`; set only on a Codex run that names some. */
+  codexPlugins?: string[];
   agentId: AgentId;
   runId: RunId;
   prompt: string;
@@ -145,6 +163,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     ...(e.SKY_RUNTIME === "codex" && {
       runtime: e.SKY_RUNTIME,
       ...(e.SKY_CODEX_MODEL && { codexModel: e.SKY_CODEX_MODEL }),
+      ...(e.SKY_CODEX_PLUGINS.length > 0 && {
+        codexPlugins: e.SKY_CODEX_PLUGINS,
+      }),
     }),
     agentId: e.AGENT_ID,
     runId: e.RUN_ID,

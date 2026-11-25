@@ -15,13 +15,20 @@
  * (`sky_publish`, `sky_sync`), through the same broker and the same one approval, so the GitHub
  * connector never reaches the agent's commands.
  *
- * The Codex process is sealed as Claude's is: started from a copy of its own binary the kernel keeps
- * unreadable, so its `/proc/<pid>/environ`, where the gateway key lives, is closed to the agent's
- * commands, and a run whose runner can't be hidden fails with `credential_exposed` before it starts.
+ * The gateway key stays in the runner: Codex reaches the gateway through a proxy the runner starts
+ * on the loopback interface for the run (`codex-proxy.ts`), with a token made for the run, so nothing
+ * Codex starts (commands, hooks, MCP servers) inherits the key. The Codex process is sealed as
+ * Claude's is: started from a copy of its own binary the kernel keeps unreadable, so its
+ * `/proc/<pid>/environ`, where the proxy token lives, is closed to the agent's commands, and a run
+ * whose runner can't be hidden fails with `credential_exposed` before it starts.
  *
- * Not carried over from the Claude Code session: plugins and hooks, the base profile's MCP servers,
- * background tasks, the default git identity and the outside-read gate. Codex runs the commands it
- * counts as read-only (`cat`, `ls`, `grep` and the like) without asking, wherever they read.
+ * Plugins named in `SKY_CODEX_PLUGINS` are turned on in Codex's config; the environment's setup
+ * installs them under the run's Codex home. Their hooks run without Codex's per-hook trust, and get
+ * Codex's env, proxy token included, so a hook can make model calls through the run while it lasts.
+ *
+ * Not carried over from the Claude Code session: the base profile's MCP servers, background tasks,
+ * the default git identity and the outside-read gate. Codex runs the commands it counts as read-only
+ * (`cat`, `ls`, `grep` and the like) without asking, wherever they read.
  */
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -60,6 +67,11 @@ import {
   startBroker,
 } from "./broker.js";
 import { askBroker } from "./broker-client.js";
+import {
+  type GatewayProxy,
+  type GatewayProxyOptions,
+  startGatewayProxy,
+} from "./codex-proxy.js";
 import { CODEX_KEY_ENV, type Config } from "./config.js";
 import { CONNECTOR_ENV, withoutConnector } from "./connector.js";
 import { type PostEvent, RunEndedError } from "./events.js";
@@ -81,7 +93,7 @@ export const CODEX_VERSION = "0.172.0";
 export const DEFAULT_CODEX_MODEL = "deepseek/deepseek-v4.1-flash-1017";
 /** The model provider Sky writes into Codex's config: the AI Gateway's Codex endpoint. */
 export const CODEX_PROVIDER = "sky-gateway";
-const GATEWAY_CODEX_URL = "https://ai-gateway.vercel.sh/codex/v1";
+export const GATEWAY_CODEX_URL = "https://ai-gateway.vercel.sh/codex/v1";
 /** Where `provision.ts` installs Codex; `SKY_CODEX_BIN` overrides it. */
 export const CODEX_BIN = "/opt/sky/node_modules/.bin/codex";
 
@@ -123,7 +135,7 @@ export function resolveCodexExecutable(
   );
 }
 
-/** Takes the AI Gateway key out of `env`, as `withdrawCredential` does Claude's, so only the Codex process gets it. */
+/** Takes the AI Gateway key out of `env`, as `withdrawCredential` does Claude's, so only the run's gateway proxy gets it. */
 export function withdrawCodexKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const held: NodeJS.ProcessEnv = {};
   const value = env[CODEX_KEY_ENV];
@@ -134,37 +146,56 @@ export function withdrawCodexKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return held;
 }
 
+/** Where Codex finds the run's gateway proxy token: the name its provider's `env_key` gives. */
+export const CODEX_PROXY_TOKEN_ENV = "SKY_CODEX_GATEWAY_TOKEN";
+
 /**
- * Codex's `config.toml` for Sky's runs: the AI Gateway as the model provider, keyed by
- * `AI_GATEWAY_API_KEY`, and every command given the whole env Codex starts with (the project's
- * secrets included, as Claude Code's commands get them) except that key. The runner leaves its event
- * token and the GitHub connector out of that env, and pins git's `core.fsmonitor` off in it.
+ * Codex's `config.toml` for Sky's runs: the run's gateway proxy as the model provider, keyed by the
+ * proxy's token, and every command given the whole env Codex starts with (the project's secrets
+ * included, as Claude Code's commands get them) except that token. The gateway key itself never
+ * reaches Codex (`codex-proxy.ts`). The runner leaves its event token and the GitHub connector out of
+ * that env, and pins git's `core.fsmonitor` off in it. Each plugin in `plugins` is turned on; the
+ * environment's setup installs it.
  */
-export function codexConfigToml(): string {
+export function codexConfigToml(
+  baseUrl: string,
+  plugins: readonly string[] = [],
+): string {
   return [
     "# written by Sky's runner on every Codex run; edits here are replaced",
     `model_provider = "${CODEX_PROVIDER}"`,
     "",
     `[model_providers.${CODEX_PROVIDER}]`,
     'name = "Vercel AI Gateway"',
-    `base_url = "${GATEWAY_CODEX_URL}"`,
-    `env_key = "${CODEX_KEY_ENV}"`,
+    `base_url = "${baseUrl}"`,
+    `env_key = "${CODEX_PROXY_TOKEN_ENV}"`,
     'wire_api = "responses"',
     "",
     "[shell_environment_policy]",
     'inherit = "all"',
     "ignore_default_excludes = true",
-    `exclude = ["${CODEX_KEY_ENV}"]`,
+    `exclude = ["${CODEX_PROXY_TOKEN_ENV}", "${CODEX_KEY_ENV}"]`,
     "",
+    // ids are `<plugin>@<marketplace>` of letters, digits, `.`, `_` and `-` (`config.ts`)
+    ...plugins.flatMap((id) => [`[plugins."${id}"]`, "enabled = true", ""]),
   ].join("\n");
 }
 
-/** Writes `config.toml` into `codexHome` whole, so a run starting beside this one never reads half of it. */
-function writeCodexConfig(codexHome: string): void {
+/**
+ * Writes `config.toml` into `codexHome` whole, so a run starting beside this one never reads half of
+ * it, and removes `hooks.json` there: with plugins named, Codex runs every layer's hooks without its
+ * trust prompt, so a `hooks.json` an agent's command wrote would run in the next run with Codex's env,
+ * proxy token included. A directory of that name goes too, so leaving one there no longer fails every
+ * later run; one whose contents the sprite user can't delete still does. The environment's `plugins/`
+ * and `agents/` stay. This narrows what the trust bypass reaches; it doesn't close it: plugin files
+ * are the sprite user's, and a run beside this one can write `hooks.json` again.
+ */
+function writeCodexConfig(codexHome: string, toml: string): void {
   mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+  rmSync(join(codexHome, "hooks.json"), { force: true, recursive: true });
   const file = join(codexHome, "config.toml");
   const tmp = `${file}.${process.pid}.${randomUUID()}`;
-  writeFileSync(tmp, codexConfigToml(), { mode: 0o600 });
+  writeFileSync(tmp, toml, { mode: 0o600 });
   renameSync(tmp, file);
 }
 
@@ -454,8 +485,12 @@ export type CodexDeps = {
   awaitDecision: AwaitDecision;
   signal: AbortSignal;
   warn?: (line: string) => void;
-  /** The AI Gateway key `main` took out of the runner's env. */
+  /** The AI Gateway key `main` took out of the runner's env; only the run's gateway proxy holds it. */
   codexEnv: NodeJS.ProcessEnv;
+  /** Starts the run's gateway proxy; `startGatewayProxy` when absent. */
+  startProxy?: (options: GatewayProxyOptions) => Promise<GatewayProxy>;
+  /** The gateway the proxy forwards to; `GATEWAY_CODEX_URL` when absent. */
+  gatewayUrl?: string;
   /** The GitHub connector variables `main` took out; publish and sync reach GitHub only through the broker. */
   connector?: NodeJS.ProcessEnv;
   /** The runner's env for everything but the key; `process.env` when absent. */
@@ -679,6 +714,7 @@ export async function runCodexSession(
 
   const scratch = scratchDirOf(runId);
   let broker: Broker | undefined;
+  let proxy: GatewayProxy | undefined;
   let child: ChildProcess | undefined;
   let usage: Usage | undefined;
   let lastText = "";
@@ -705,15 +741,26 @@ export async function runCodexSession(
       warning(
         "this Codex run doesn't load the base profile's MCP servers; only Claude Code runs do",
       );
+    const key = deps.codexEnv[CODEX_KEY_ENV];
+    if (!key) throw new Error(`${CODEX_KEY_ENV} is not set for this run`);
+    proxy = await (deps.startProxy ?? startGatewayProxy)({
+      upstream: deps.gatewayUrl ?? GATEWAY_CODEX_URL,
+      key,
+      warn: warning,
+    });
     const home = sessionEnv.HOME || homedir();
     const codexHome = sessionEnv.SKY_CODEX_HOME || join(home, ".sky", "codex");
-    writeCodexConfig(codexHome);
+    const plugins = config.codexPlugins ?? [];
+    writeCodexConfig(codexHome, codexConfigToml(proxy.baseUrl, plugins));
     const bin = deps.bin ?? env.SKY_CODEX_BIN ?? CODEX_BIN;
-    // the agent's commands, which get this env whole, never hold the connector (the broker does the
-    // sending) or the event token (the runner posts the run's events), and their git runs no fsmonitor
+    // Codex's env, which the agent's commands get whole and its hooks and MCP servers get no more than,
+    // never holds the connector (the broker does the sending), the event token (the runner posts the
+    // run's events) or the gateway key (the proxy holds it), and its git runs no fsmonitor
     const {
       SKY_CODEX_HOME: _home,
       AGENT_TOKEN: _token,
+      [CODEX_KEY_ENV]: _key,
+      [CODEX_PROXY_TOKEN_ENV]: _proxyToken,
       ...childEnv
     } = withoutConnector(withSessionGitConfig(sessionEnv));
     // the seal's spawn ends the process with this signal; the run's own stop goes through the turn
@@ -724,7 +771,11 @@ export async function runCodexSession(
       // drained by the app server for the tail its exit error carries
       stderr: "pipe",
       cwd,
-      env: { ...childEnv, ...deps.codexEnv, CODEX_HOME: codexHome },
+      env: {
+        ...childEnv,
+        [CODEX_PROXY_TOKEN_ENV]: proxy.token,
+        CODEX_HOME: codexHome,
+      },
       signal: new AbortController().signal,
     }) as ChildProcess;
     server = new AppServer(child, warning);
@@ -757,6 +808,9 @@ export async function runCodexSession(
       approvalPolicy: "untrusted",
       sandbox: "danger-full-access",
       developerInstructions: instructions,
+      // a plugin's hooks run without Codex's one-time trust prompt, which no one is there to answer;
+      // the environment or the run's `envVars` named the plugins, and no hook's env holds the key
+      ...(plugins.length > 0 && { config: { bypass_hook_trust: true } }),
     };
     const opened = config.sessionId
       ? await app
@@ -1354,6 +1408,8 @@ export async function runCodexSession(
     heartbeat?.stop();
     await broker?.close().catch(() => {});
     await server?.close();
+    // after Codex: its last model call may still be streaming until it exits
+    await proxy?.close().catch(() => {});
     rmSync(scratch, { recursive: true, force: true });
   }
 

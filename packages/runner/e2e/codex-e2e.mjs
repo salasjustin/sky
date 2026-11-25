@@ -11,7 +11,13 @@
 //     node packages/runner/e2e/codex-e2e.mjs
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -177,9 +183,10 @@ const ghPort = await listen(github);
 // --- one run of the real runner ----------------------------------------------------------------------
 const home = join(root, "home");
 mkdirSync(home);
-async function run(runId, prompt, sessionId, until) {
+async function run(runId, prompt, sessionId, until, extraEnv = {}) {
   const from = events.length;
   const env = {
+    ...extraEnv,
     PATH: process.env.PATH,
     HOME: home,
     ...gitEnv,
@@ -304,9 +311,17 @@ check("claude.Message events", types.includes("claude.Message"));
 // the values themselves, never their names: the gateway key, the connector, the event token, and any
 // 32-hex-digit string, which is what the runner's per-call broker token looks like (a `req_` id, the
 // model's `chatcmpl-tool-` call id and a git sha are not matched)
+// the proxy token is made per run, so it is matched by its shape: 64 hex digits
+const TOKEN_SHAPE = /(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])/g;
+// probe check notes go through this, so a key or token a probe caught is never printed
+const mask = (text) =>
+  text
+    .replaceAll(process.env.AI_GATEWAY_API_KEY, "<key>")
+    .replace(TOKEN_SHAPE, "<token>");
 const leaks = (text) => {
   const found = [];
   if (text.includes(process.env.AI_GATEWAY_API_KEY)) found.push("gateway key");
+  if (new RegExp(TOKEN_SHAPE).test(text)) found.push("proxy token");
   if (text.includes("conn1")) found.push("connector");
   if (text.includes('"tok"')) found.push("event token");
   if (/(?<![0-9a-f_-])[0-9a-f]{32}(?![0-9a-f])/.test(text))
@@ -314,7 +329,7 @@ const leaks = (text) => {
   return found;
 };
 check(
-  "no broker token, connector, event token or gateway key reached an event",
+  "no broker token, connector, event token, gateway key or proxy token reached an event",
   leaks(JSON.stringify(first.events)).length === 0,
   leaks(JSON.stringify(first.events)).join(", "),
 );
@@ -434,11 +449,11 @@ const alive = (needle) =>
     .some((l) => l.includes(needle) && !l.includes("ps -eo"));
 
 console.log(
-  "\n== run 4: the gateway key stays out of the agent's shell; a daemonised process is reaped ==",
+  "\n== run 4: the gateway key and proxy token stay out of the agent's shell; a daemonised process is reaped ==",
 );
 const fourth = await run(
   "run_four",
-  "Run these three shell commands, one at a time, and report their output verbatim. First: `printenv AI_GATEWAY_API_KEY | wc -c`. Second: `nohup sleep 3017 >/dev/null 2>&1 &`. Third: `for p in $(ps -eo pid,args | grep '[a]pp-server' | awk '{print $1}'); do echo \"pid $p\"; cat /proc/$p/environ 2>&1 | tr '\\0' '\\n' | grep -c '^AI_GATEWAY_API_KEY='; done`. Then reply `done`.",
+  "Run these three shell commands, one at a time, and report their output verbatim. First: `printenv AI_GATEWAY_API_KEY SKY_CODEX_GATEWAY_TOKEN | wc -c`. Second: `nohup sleep 3017 >/dev/null 2>&1 &`. Third: `for p in $(ps -eo pid,args | grep '[a]pp-server' | awk '{print $1}'); do echo \"pid $p\"; cat /proc/$p/environ 2>&1 | tr '\\0' '\\n' | grep -cE '^(AI_GATEWAY_API_KEY|SKY_CODEX_GATEWAY_TOKEN)='; done`. Then reply `done`.",
 );
 print(fourth);
 // the loop's last `grep -c` finds nothing and exits 1, so the call may come back as a failure: the
@@ -447,7 +462,8 @@ const environProbe = fourth.events.find(
   (e) =>
     (e.type === "claude.PostToolUse" ||
       e.type === "claude.PostToolUseFailure") &&
-    e.payload.input.includes("/environ"),
+    e.payload.input.includes("/environ") &&
+    e.payload.input.includes("SKY_CODEX_GATEWAY_TOKEN"),
 );
 const probeOutput =
   environProbe?.payload.output ?? environProbe?.payload.error ?? "";
@@ -455,21 +471,23 @@ const probedPids = probeOutput.match(/^pid \d+$/gm) ?? [];
 const probeCounts = probeOutput.match(/^\d+$/gm) ?? [];
 const keyProbe = fourth.events.find(
   (e) =>
-    e.type === "claude.PostToolUse" && e.payload.input.includes("printenv"),
+    e.type === "claude.PostToolUse" &&
+    e.payload.input.includes("printenv") &&
+    e.payload.input.includes("SKY_CODEX_GATEWAY_TOKEN"),
 );
 check("run 4 finished", fourth.code === 0, `exit ${fourth.code}`);
 check(
-  "AI_GATEWAY_API_KEY is not in the agent's shell (printenv prints nothing)",
-  keyProbe?.payload.output.trim().startsWith("0"),
-  keyProbe?.payload.output.trim(),
+  "neither the gateway key nor the proxy token is in the agent's shell (printenv prints nothing)",
+  keyProbe?.payload.output.trim() === "0",
+  mask(keyProbe?.payload.output.trim() ?? ""),
 );
 check(
-  "the agent's command found Codex's process and read nothing of its environ",
+  "the agent's command found Codex's process and read neither the key nor the token from its environ",
   probedPids.length > 0 &&
     probeCounts.length === probedPids.length &&
     probeCounts.every((n) => n === "0") &&
-    !probeOutput.includes(process.env.AI_GATEWAY_API_KEY),
-  probeOutput.replaceAll(process.env.AI_GATEWAY_API_KEY, "<key>").trim(),
+    leaks(probeOutput).length === 0,
+  mask(probeOutput.trim()),
 );
 check(
   "the daemonised `sleep 3017` was reaped at run end",
@@ -502,6 +520,105 @@ check(
 );
 check("the stopped run left no `sleep 3019`", !alive("sleep 3019"));
 
+console.log(
+  "\n== run 6: a plugin the environment names loads, and its hook runs without the gateway key ==",
+);
+// installed as an environment's setup would install one, under the run's Codex home
+const probeRoot = join(home, ".sky/codex/plugins/cache/e2e/probe/local");
+const hookOut = join(root, "hook-fired.txt");
+mkdirSync(join(probeRoot, ".codex-plugin"), { recursive: true });
+mkdirSync(join(probeRoot, "hooks"), { recursive: true });
+writeFileSync(
+  join(probeRoot, ".codex-plugin/plugin.json"),
+  JSON.stringify({
+    name: "probe",
+    version: "0.0.1",
+    description: "Sky's e2e probe",
+    hooks: "./hooks/hooks.json",
+  }),
+);
+writeFileSync(
+  join(probeRoot, "hooks/hooks.json"),
+  JSON.stringify({
+    hooks: {
+      SessionStart: [
+        {
+          matcher: "startup|resume",
+          hooks: [
+            {
+              type: "command",
+              // `wc -c` counts bytes with the trailing newline `printenv` adds: 0 when the key is absent, its length plus 1 otherwise; then `token` when the run's proxy token is there
+              command: `printf '%s %s\\n' "$(printenv AI_GATEWAY_API_KEY | wc -c)" "\${SKY_CODEX_GATEWAY_TOKEN:+token}" > '${hookOut}'`,
+              timeout: 10,
+            },
+          ],
+        },
+      ],
+    },
+  }),
+);
+// a hooks.json an agent's command left in the Codex home: the runner removes it before Codex starts,
+// so its hook never runs (the plugin's hooks run without trust, and so would this one)
+const decoyHooks = join(home, ".sky/codex/hooks.json");
+const decoyOut = join(root, "decoy-fired.txt");
+writeFileSync(
+  decoyHooks,
+  JSON.stringify({
+    hooks: {
+      SessionStart: [
+        {
+          matcher: "startup|resume",
+          hooks: [
+            {
+              type: "command",
+              command: `printf 'fired\\n' > '${decoyOut}'`,
+              timeout: 10,
+            },
+          ],
+        },
+      ],
+    },
+  }),
+);
+const sixth = await run(
+  "run_six",
+  "Reply with the single word `ready`. Do nothing else.",
+  undefined,
+  undefined,
+  { SKY_CODEX_PLUGINS: "probe@e2e" },
+);
+console.log(sixth.events.map(show).join("\n"));
+check(
+  "run 6 finished",
+  sixth.code === 0 && sixth.events.some((e) => e.type === "run.finished"),
+  `exit ${sixth.code}`,
+);
+const hookLine = existsSync(hookOut)
+  ? readFileSync(hookOut, "utf8").trim()
+  : "";
+check("the plugin's SessionStart hook ran", hookLine !== "", hookLine);
+check(
+  "the hook's env held no gateway key",
+  hookLine.split(" ")[0] === "0" &&
+    !hookLine.includes(process.env.AI_GATEWAY_API_KEY),
+  mask(hookLine),
+);
+check(
+  "the hook's env did hold a proxy token",
+  hookLine.endsWith(" token"),
+  mask(hookLine),
+);
+check(
+  "a hooks.json left in the Codex home was removed and its hook never ran",
+  !existsSync(decoyHooks) && !existsSync(decoyOut),
+  `hooks.json present: ${existsSync(decoyHooks)}, hook fired: ${existsSync(decoyOut)}`,
+);
+check(
+  "no secret reached run 6's events",
+  leaks(JSON.stringify(sixth.events)).length === 0,
+  leaks(JSON.stringify(sixth.events)).join(", "),
+);
+
 for (const [n, r] of [
   ["run1", first],
   ["run2", second],
@@ -509,6 +626,7 @@ for (const [n, r] of [
   ["run3", third],
   ["run4", fourth],
   ["run5", fifth],
+  ["run6", sixth],
 ])
   writeFileSync(join(root, `${n}.log`), r.log);
 writeFileSync(join(root, "events.json"), JSON.stringify(events, null, 1));
