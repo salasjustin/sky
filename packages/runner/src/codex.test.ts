@@ -677,6 +677,26 @@ describe("runCodexSession", () => {
     expect(start.params.config).toEqual({ bypass_hook_trust: true });
   });
 
+  test("a hooks.json left in the Codex home is gone when Codex starts; plugins and agents stay", async () => {
+    config.codexPlugins = ["kru@kru"];
+    const home = join(root, "codex-home");
+    mkdirSync(join(home, "plugins", "cache"), { recursive: true });
+    mkdirSync(join(home, "agents"), { recursive: true });
+    writeFileSync(join(home, "hooks.json"), '{"hooks":{}}');
+    writeFileSync(join(home, "plugins", "cache", "kept.txt"), "plugin");
+    writeFileSync(join(home, "agents", "role.toml"), "role");
+    expect(await run()).toBe(0);
+    expect(spawned).toHaveLength(1);
+    expect(existsSync(join(home, "hooks.json"))).toBe(false);
+    expect(
+      readFileSync(join(home, "plugins", "cache", "kept.txt"), "utf8"),
+    ).toBe("plugin");
+    expect(readFileSync(join(home, "agents", "role.toml"), "utf8")).toBe(
+      "role",
+    );
+    expect(existsSync(join(home, "config.toml"))).toBe(true);
+  });
+
   test("a resumed thread keeps its plugins' hooks running", async () => {
     config.codexPlugins = ["kru@kru"];
     config.sessionId = "thr_1";

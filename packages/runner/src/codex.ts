@@ -181,9 +181,16 @@ export function codexConfigToml(
   ].join("\n");
 }
 
-/** Writes `config.toml` into `codexHome` whole, so a run starting beside this one never reads half of it. */
+/**
+ * Writes `config.toml` into `codexHome` whole, so a run starting beside this one never reads half of
+ * it, and removes `hooks.json` there: the runner owns that folder's config, and with plugins named
+ * Codex runs every layer's hooks without its trust prompt, so a `hooks.json` an agent's command wrote
+ * would run in the next run with Codex's env, proxy token included. The environment's `plugins/` and
+ * `agents/` stay.
+ */
 function writeCodexConfig(codexHome: string, toml: string): void {
   mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+  rmSync(join(codexHome, "hooks.json"), { force: true });
   const file = join(codexHome, "config.toml");
   const tmp = `${file}.${process.pid}.${randomUUID()}`;
   writeFileSync(tmp, toml, { mode: 0o600 });
