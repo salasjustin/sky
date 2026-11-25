@@ -559,7 +559,9 @@ check(
   sixth.code === 0 && sixth.events.some((e) => e.type === "run.finished"),
   `exit ${sixth.code}`,
 );
-const hookLine = existsSync(hookOut) ? readFileSync(hookOut, "utf8").trim() : "";
+const hookLine = existsSync(hookOut)
+  ? readFileSync(hookOut, "utf8").trim()
+  : "";
 check("the plugin's SessionStart hook ran", hookLine !== "", hookLine);
 check(
   "the hook's env held no gateway key",

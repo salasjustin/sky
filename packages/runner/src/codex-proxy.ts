@@ -101,7 +101,10 @@ export async function startGatewayProxy(
       req.resume();
       return refuse(res, 404, "not a gateway path");
     }
-    const headers = forwardable(req.headers, new Set(["host", "authorization"]));
+    const headers = forwardable(
+      req.headers,
+      new Set(["host", "authorization"]),
+    );
     headers.authorization = `Bearer ${options.key}`;
     headers.host = upstream.host;
     const out = request(
