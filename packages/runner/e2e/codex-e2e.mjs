@@ -462,7 +462,8 @@ const environProbe = fourth.events.find(
   (e) =>
     (e.type === "claude.PostToolUse" ||
       e.type === "claude.PostToolUseFailure") &&
-    e.payload.input.includes("/environ"),
+    e.payload.input.includes("/environ") &&
+    e.payload.input.includes("SKY_CODEX_GATEWAY_TOKEN"),
 );
 const probeOutput =
   environProbe?.payload.output ?? environProbe?.payload.error ?? "";
@@ -470,7 +471,9 @@ const probedPids = probeOutput.match(/^pid \d+$/gm) ?? [];
 const probeCounts = probeOutput.match(/^\d+$/gm) ?? [];
 const keyProbe = fourth.events.find(
   (e) =>
-    e.type === "claude.PostToolUse" && e.payload.input.includes("printenv"),
+    e.type === "claude.PostToolUse" &&
+    e.payload.input.includes("printenv") &&
+    e.payload.input.includes("SKY_CODEX_GATEWAY_TOKEN"),
 );
 check("run 4 finished", fourth.code === 0, `exit ${fourth.code}`);
 check(
