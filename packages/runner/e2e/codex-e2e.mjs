@@ -313,7 +313,7 @@ check("claude.Message events", types.includes("claude.Message"));
 // model's `chatcmpl-tool-` call id and a git sha are not matched)
 // the proxy token is made per run, so it is matched by its shape: 64 hex digits
 const TOKEN_SHAPE = /(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])/g;
-// printed output goes through this: the key and any token-shaped string never reach the console
+// probe check notes go through this, so a key or token a probe caught is never printed
 const mask = (text) =>
   text
     .replaceAll(process.env.AI_GATEWAY_API_KEY, "<key>")
@@ -329,7 +329,7 @@ const leaks = (text) => {
   return found;
 };
 check(
-  "no broker token, connector, event token or gateway key reached an event",
+  "no broker token, connector, event token, gateway key or proxy token reached an event",
   leaks(JSON.stringify(first.events)).length === 0,
   leaks(JSON.stringify(first.events)).join(", "),
 );
@@ -449,7 +449,7 @@ const alive = (needle) =>
     .some((l) => l.includes(needle) && !l.includes("ps -eo"));
 
 console.log(
-  "\n== run 4: the gateway key stays out of the agent's shell; a daemonised process is reaped ==",
+  "\n== run 4: the gateway key and proxy token stay out of the agent's shell; a daemonised process is reaped ==",
 );
 const fourth = await run(
   "run_four",
@@ -604,7 +604,7 @@ check(
   mask(hookLine),
 );
 check(
-  "the hook's env did hold the run's proxy token",
+  "the hook's env did hold a proxy token",
   hookLine.endsWith(" token"),
   mask(hookLine),
 );
