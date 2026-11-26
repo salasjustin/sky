@@ -139,6 +139,34 @@ describe("startGatewayProxy", () => {
     expect(proxy.limitStatus?.()).toBe(429);
   });
 
+  test("a gateway success after a 429 clears the recorded status", async () => {
+    server.use(
+      http.all(
+        "https://gateway.test/*",
+        () => new HttpResponse(null, { status: 429 }),
+        { once: true },
+      ),
+    );
+    const auth = { authorization: `Bearer ${proxy.token}` };
+    expect((await call("/codex/v1/responses", auth)).status).toBe(429);
+    expect((await call("/codex/v1/responses", auth)).status).toBe(200);
+    expect(proxy.limitStatus?.()).toBeUndefined();
+  });
+
+  test("a gateway 402 after a success is recorded", async () => {
+    const auth = { authorization: `Bearer ${proxy.token}` };
+    expect((await call("/codex/v1/responses", auth)).status).toBe(200);
+    server.use(
+      http.all(
+        "https://gateway.test/*",
+        () => new HttpResponse(null, { status: 402 }),
+        { once: true },
+      ),
+    );
+    expect((await call("/codex/v1/responses", auth)).status).toBe(402);
+    expect(proxy.limitStatus?.()).toBe(402);
+  });
+
   test("swaps the run's token for the key and streams the answer through", async () => {
     const answer = await call(
       "/codex/v1/responses",

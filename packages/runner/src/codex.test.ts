@@ -277,6 +277,53 @@ describe("gatewayUnavailable", () => {
       undefined,
     ],
     [
+      "a final stream disconnect, after a retried 429 the proxy saw",
+      [
+        e("rate limited", "rateLimitExceeded"),
+        e("stream disconnected before completion", {
+          responseStreamDisconnected: { httpStatusCode: null },
+        }),
+      ],
+      429,
+      undefined,
+    ],
+    [
+      "a final variant with another status, after a retried 429 the proxy saw",
+      [
+        e("rate limited", "rateLimitExceeded"),
+        e("unexpected status 503 Service Unavailable", {
+          responseTooManyFailedAttempts: { httpStatusCode: 503 },
+        }),
+      ],
+      429,
+      undefined,
+    ],
+    [
+      "a final variant's own 429",
+      [
+        e("exceeded retry limit", {
+          responseTooManyFailedAttempts: { httpStatusCode: 429 },
+        }),
+      ],
+      undefined,
+      "rate",
+    ],
+    [
+      "a final variant's own 402",
+      [e("x", { httpConnectionFailed: { httpStatusCode: 402 } })],
+      undefined,
+      "credit",
+    ],
+    [
+      "a final other that is Codex's retry giving up on a 429",
+      [
+        e("rate limited", "rateLimitExceeded"),
+        e("exceeded retry limit, last status: 429 Too Many Requests", "other"),
+      ],
+      undefined,
+      "rate",
+    ],
+    [
       "a mention of credit that isn't the gateway's",
       [e("the build failed: credit-card form test")],
       undefined,

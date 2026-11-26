@@ -23,8 +23,9 @@ export type GatewayProxy = {
   token: string;
   close: () => Promise<void>;
   /**
-   * The last 402 (out of credit) or 429 (rate-limited) the gateway answered with, status only; undefined
-   * while it has answered neither. Absent on a proxy that doesn't track it.
+   * The gateway's latest answer when it was a 402 (out of credit) or 429 (rate-limited), status only;
+   * undefined before any answer or when the latest was anything else. Absent on a proxy that doesn't
+   * track it.
    */
   limitStatus?: () => 402 | 429 | undefined;
 };
@@ -143,8 +144,11 @@ export async function startGatewayProxy(
         headers,
       },
       (answer) => {
-        if (answer.statusCode === 402 || answer.statusCode === 429)
-          limitStatus = answer.statusCode;
+        // the latest answer only, so a 429 Codex retried past doesn't outlive the success after it
+        limitStatus =
+          answer.statusCode === 402 || answer.statusCode === 429
+            ? answer.statusCode
+            : undefined;
         res.writeHead(
           answer.statusCode ?? 502,
           answer.statusMessage,

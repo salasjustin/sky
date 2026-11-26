@@ -480,24 +480,37 @@ const statusesOf = (info: unknown): number[] =>
     : [];
 
 /**
- * Whether the turn errors Codex reported, retried ones included, or the last 402 or 429 the run's
- * gateway proxy saw, say the AI Gateway is out of credit or rate-limiting the run; out of credit wins.
+ * Whether the turn errors Codex reported say the AI Gateway is out of credit or rate-limiting the run;
+ * out of credit wins. A final error carrying its own upstream status is judged alone; otherwise the
+ * retried errors before it and the gateway proxy's latest 402 or 429 count too.
  */
 export function gatewayUnavailable(
   errors: readonly TurnError[],
   proxyStatus?: number,
 ): GatewayUnavailable | undefined {
-  const codes = errors.map((e) => e.codexErrorInfo);
+  const last = errors.at(-1);
+  const info = last?.codexErrorInfo;
   // a final error Codex named as something else (the context window, a refused key) is that, whatever
   // a retried 429 before it or the proxy saw
-  const last = codes.at(-1);
   if (
-    typeof last === "string" &&
-    last !== "other" &&
-    last !== "rateLimitExceeded" &&
-    !CREDIT_CODES.has(last)
+    typeof info === "string" &&
+    info !== "other" &&
+    info !== "rateLimitExceeded" &&
+    !CREDIT_CODES.has(info)
   )
     return undefined;
+  // a final variant names the failure itself (a dropped stream, a failed connection), so a 429 that
+  // Codex retried past earlier in the run says nothing about it
+  if (last && info !== null && typeof info === "object")
+    return limitNamedBy([last]);
+  return limitNamedBy(errors, proxyStatus);
+}
+
+function limitNamedBy(
+  errors: readonly TurnError[],
+  proxyStatus?: number,
+): GatewayUnavailable | undefined {
+  const codes = errors.map((e) => e.codexErrorInfo);
   const statuses = [
     ...codes.flatMap(statusesOf),
     ...(proxyStatus === undefined ? [] : [proxyStatus]),
