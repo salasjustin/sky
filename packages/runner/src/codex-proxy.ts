@@ -22,6 +22,11 @@ export type GatewayProxy = {
   /** The token Codex sends as its bearer; the proxy refuses any request without it. */
   token: string;
   close: () => Promise<void>;
+  /**
+   * The last 402 (out of credit) or 429 (rate-limited) the gateway answered with, status only; undefined
+   * while it has answered neither. Absent on a proxy that doesn't track it.
+   */
+  limitStatus?: () => 402 | 429 | undefined;
 };
 
 export type GatewayProxyOptions = {
@@ -104,6 +109,7 @@ export async function startGatewayProxy(
     (upstream.protocol === "http:" ? http.request : https.request);
   const token = randomBytes(32).toString("hex");
   const warn = options.warn ?? (() => {});
+  let limitStatus: 402 | 429 | undefined;
 
   const refuse = (res: ServerResponse, status: number, message: string) => {
     res.writeHead(status, { "content-type": "application/json" });
@@ -137,6 +143,8 @@ export async function startGatewayProxy(
         headers,
       },
       (answer) => {
+        if (answer.statusCode === 402 || answer.statusCode === 429)
+          limitStatus = answer.statusCode;
         res.writeHead(
           answer.statusCode ?? 502,
           answer.statusMessage,
@@ -179,6 +187,7 @@ export async function startGatewayProxy(
   return {
     baseUrl: `http://127.0.0.1:${port}${prefix}`,
     token,
+    limitStatus: () => limitStatus,
     close: () =>
       new Promise<void>((resolve) => {
         server.close(() => resolve());

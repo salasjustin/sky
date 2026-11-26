@@ -429,19 +429,105 @@ const TokenUsageNote = z.looseObject({
   threadId: z.string(),
   tokenUsage: z.looseObject({ total: Breakdown, last: Breakdown }),
 });
+// Codex's `TurnError`: `codexErrorInfo` is a code string or an object variant carrying the upstream's
+// `httpStatusCode`, kept unknown so a variant this version doesn't know never fails the parse
+const TurnError = z.looseObject({
+  message: z.string(),
+  codexErrorInfo: z.unknown().optional(),
+  additionalDetails: z.string().nullish(),
+});
+type TurnError = z.infer<typeof TurnError>;
 const TurnNote = z.looseObject({
   threadId: z.string(),
   turn: z.looseObject({
     id: z.string(),
     status: z.string(),
-    error: z.looseObject({ message: z.string() }).nullish(),
+    error: TurnError.nullish(),
   }),
 });
 const ErrorNote = z.looseObject({
   threadId: z.string().optional(),
   willRetry: z.boolean().optional(),
-  error: z.looseObject({ message: z.string() }),
+  error: TurnError,
 });
+
+/** Why a Codex run couldn't reach its model through the AI Gateway, as the run's error names it. */
+export type GatewayUnavailable = "credit" | "rate";
+
+const CREDIT_CODES = new Set([
+  "usageLimitExceeded",
+  "apiKeySpendLimitExceeded",
+  "projectSpendLimitExceeded",
+  "organizationSpendLimitExceeded",
+]);
+// the wordings Codex's own errors carry: an upstream status it didn't map ("unexpected status 402
+// Payment Required: …"), its retry giving up ("exceeded retry limit, last status: 429 …"), the body's code
+const CREDIT_TEXT =
+  /insufficient_quota|insufficient[_ ]funds|credit[_ ]balance|out of credits?|insufficient credits?|402 Payment Required|unexpected status 402/i;
+const RATE_TEXT = /429 Too Many Requests|last status: 429|rate.?limit/i;
+
+/** The upstream HTTP statuses an object `codexErrorInfo` variant carries. */
+const statusesOf = (info: unknown): number[] =>
+  info !== null && typeof info === "object"
+    ? Object.values(info).flatMap((variant) =>
+        variant !== null &&
+        typeof variant === "object" &&
+        typeof (variant as { httpStatusCode?: unknown }).httpStatusCode ===
+          "number"
+          ? [(variant as { httpStatusCode: number }).httpStatusCode]
+          : [],
+      )
+    : [];
+
+/**
+ * Whether the turn errors Codex reported, retried ones included, or the last 402 or 429 the run's
+ * gateway proxy saw, say the AI Gateway is out of credit or rate-limiting the run; out of credit wins.
+ */
+export function gatewayUnavailable(
+  errors: readonly TurnError[],
+  proxyStatus?: number,
+): GatewayUnavailable | undefined {
+  const codes = errors.map((e) => e.codexErrorInfo);
+  // a final error Codex named as something else (the context window, a refused key) is that, whatever
+  // a retried 429 before it or the proxy saw
+  const last = codes.at(-1);
+  if (
+    typeof last === "string" &&
+    last !== "other" &&
+    last !== "rateLimitExceeded" &&
+    !CREDIT_CODES.has(last)
+  )
+    return undefined;
+  const statuses = [
+    ...codes.flatMap(statusesOf),
+    ...(proxyStatus === undefined ? [] : [proxyStatus]),
+  ];
+  const text = errors
+    .map((e) => `${e.message}\n${e.additionalDetails ?? ""}`)
+    .join("\n");
+  if (
+    codes.some((c) => typeof c === "string" && CREDIT_CODES.has(c)) ||
+    statuses.includes(402) ||
+    CREDIT_TEXT.test(text)
+  )
+    return "credit";
+  if (
+    codes.includes("rateLimitExceeded") ||
+    statuses.includes(429) ||
+    RATE_TEXT.test(text)
+  )
+    return "rate";
+  return undefined;
+}
+
+const UNAVAILABLE_CAUSE: Record<GatewayUnavailable, string> = {
+  credit: "the AI Gateway is out of credit",
+  rate: "the AI Gateway rate-limited this run",
+};
+
+/** The run's error for a turn the gateway refused; the API appends how to switch the environment's runtime. */
+export const codexUnavailable = (cause: GatewayUnavailable, said: string) =>
+  `codex_unavailable: ${UNAVAILABLE_CAUSE[cause]} (Codex said: ${said.trim().slice(0, 300)})`;
 const ApprovalParams = z.looseObject({
   threadId: z.string(),
   turnId: z.string(),
@@ -721,6 +807,9 @@ export async function runCodexSession(
   const connectorEnv = deps.connector ?? {};
   const sessionEnv = { ...env, ...config.sessionEnv };
   let streamError: string | undefined;
+  // the errors Codex reported for the turn, and whether the turn failed on one rather than being stopped
+  const turnErrors: TurnError[] = [];
+  let turnFailed = false;
   let heartbeat: ReturnType<typeof createHeartbeat> | undefined;
   const startedAt = Date.now();
   const progress = { giveUp: abortController.signal };
@@ -1298,15 +1387,21 @@ export async function runCodexSession(
             const done = TurnNote.parse(params);
             if (done.threadId !== thread) return;
             if (turnId && done.turn.id !== turnId) return;
+            if (done.turn.error) turnErrors.push(done.turn.error);
             turnEnded(done.turn.status, done.turn.error?.message);
             return;
           }
           case "error": {
             const error = ErrorNote.parse(params);
             if (error.threadId && error.threadId !== thread) return;
+            // a retried error is kept too: the turn's final error may only say that it failed
+            turnErrors.push(error.error);
             if (error.willRetry)
               warning(`Codex is retrying: ${error.error.message}`);
-            else streamError ??= error.error.message;
+            else {
+              streamError ??= error.error.message;
+              turnFailed = true;
+            }
             return;
           }
           case "serverRequest/resolved": {
@@ -1378,9 +1473,10 @@ export async function runCodexSession(
     );
     const outcome = await Promise.race([turnDone, aborted, app.exited]);
     for (const call of calls.values()) clearTimeout(call.timer);
-    if (outcome.status === "failed")
+    if (outcome.status === "failed") {
       streamError ??= outcome.error ?? "the turn failed";
-    else if (outcome.status === "exited")
+      turnFailed = true;
+    } else if (outcome.status === "exited")
       streamError ??= `codex app-server exited: ${outcome.error ?? ""}`.trim();
     else if (
       outcome.status === "interrupted" &&
@@ -1400,6 +1496,7 @@ export async function runCodexSession(
       };
     }
   } catch (error) {
+    turnFailed = false;
     streamError = abortController.signal.aborted
       ? (stopReason ?? messageOf(error))
       : messageOf(error);
@@ -1420,7 +1517,12 @@ export async function runCodexSession(
     commitError = `commit failed: ${messageOf(error)}`;
   }
   const rollup = ended ? undefined : await rollupOf(cwd, runStart);
-  const failure = stopReason ?? streamError;
+  let failure = stopReason ?? streamError;
+  // only a turn that failed on its own: a stop, or Sky's own setup failing, is never the gateway's
+  if (streamError && !stopReason && turnFailed) {
+    const cause = gatewayUnavailable(turnErrors, proxy?.limitStatus?.());
+    if (cause) failure = codexUnavailable(cause, streamError);
+  }
   if (failure) return fail(failure, usage, rollup);
   if (commitError) return fail(commitError, usage, rollup);
   if (!usage) return fail("session ended without a result", undefined, rollup);

@@ -117,6 +117,28 @@ describe("startGatewayProxy", () => {
     expect(proxy.token).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  test("a gateway 429 is recorded by status and its answer still comes through unchanged", async () => {
+    expect(proxy.limitStatus?.()).toBeUndefined();
+    const body =
+      '{"error":{"message":"rate limited","type":"rate_limit_exceeded"}}';
+    server.use(
+      http.all(
+        "https://gateway.test/*",
+        () =>
+          new HttpResponse(body, {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    const answer = await call("/codex/v1/responses", {
+      authorization: `Bearer ${proxy.token}`,
+    });
+    expect(answer.status).toBe(429);
+    expect(answer.body).toBe(body);
+    expect(proxy.limitStatus?.()).toBe(429);
+  });
+
   test("swaps the run's token for the key and streams the answer through", async () => {
     const answer = await call(
       "/codex/v1/responses",

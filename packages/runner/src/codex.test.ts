@@ -21,6 +21,7 @@ import {
   codexConfigToml,
   codexInstructions,
   DEFAULT_CODEX_MODEL,
+  gatewayUnavailable,
   resolveCodexExecutable,
   runCodexSession,
   toolCallOf,
@@ -217,6 +218,75 @@ describe("codexInstructions", () => {
   });
 });
 
+describe("gatewayUnavailable", () => {
+  const e = (message: string, codexErrorInfo: unknown = null) => ({
+    message,
+    codexErrorInfo,
+  });
+  test.each([
+    [
+      "a spend limit code",
+      [e("x", "apiKeySpendLimitExceeded")],
+      undefined,
+      "credit",
+    ],
+    [
+      "Codex's unmapped 402",
+      [e("unexpected status 402 Payment Required: {}")],
+      undefined,
+      "credit",
+    ],
+    [
+      "the body's quota code",
+      [e('{"error":{"code":"insufficient_quota"}}')],
+      undefined,
+      "credit",
+    ],
+    ["the rate-limit code", [e("x", "rateLimitExceeded")], undefined, "rate"],
+    ["a proxy-seen 429", [e("the turn failed")], 429, "rate"],
+    [
+      "credit over rate",
+      [
+        e("x", "rateLimitExceeded"),
+        e("x", { httpConnectionFailed: { httpStatusCode: 402 } }),
+      ],
+      undefined,
+      "credit",
+    ],
+    [
+      "an unknown object variant",
+      [e("x", { somethingNew: { httpStatusCode: 500 } })],
+      undefined,
+      undefined,
+    ],
+    [
+      "unauthorized",
+      [e("unexpected status 401 Unauthorized", "unauthorized")],
+      undefined,
+      undefined,
+    ],
+    [
+      "a final error Codex named otherwise, after a retried 429 the proxy saw",
+      [
+        e("exceeded retry limit, last status: 429 Too Many Requests", {
+          responseTooManyFailedAttempts: { httpStatusCode: 429 },
+        }),
+        e("context window exceeded", "contextWindowExceeded"),
+      ],
+      429,
+      undefined,
+    ],
+    [
+      "a mention of credit that isn't the gateway's",
+      [e("the build failed: credit-card form test")],
+      undefined,
+      undefined,
+    ],
+  ] as const)("%s", (_, errors, proxy, expected) => {
+    expect(gatewayUnavailable(errors, proxy)).toBe(expected);
+  });
+});
+
 // a stand-in for `codex app-server`: speaks its JSON-RPC over stdio, logs every message it reads to
 // FAKE_CODEX_LOG, and plays the scenario FAKE_CODEX_SCENARIO names once a turn starts
 const FAKE_SERVER = `#!/usr/bin/env node
@@ -282,6 +352,12 @@ const scenarios = {
   async failing() {
     usage(10, 1);
     finish("failed");
+  },
+  // a turn that fails with FAKE_CODEX_TURN_ERROR as its TurnError, after a retried FAKE_CODEX_RETRY_ERROR when set
+  async failingWith() {
+    if (process.env.FAKE_CODEX_RETRY_ERROR) note("error", { threadId: thread, turnId: turn, willRetry: true, error: JSON.parse(process.env.FAKE_CODEX_RETRY_ERROR) });
+    usage(10, 1);
+    note("turn/completed", { threadId: thread, turn: { id: turn, status: "failed", error: JSON.parse(process.env.FAKE_CODEX_TURN_ERROR ?? "null"), items: [] } });
   },
   async hang() {},
 };
@@ -601,6 +677,89 @@ describe("runCodexSession", () => {
   test("a failed turn fails the run with the model's error", async () => {
     expect(await run(undefined, "failing")).toBe(1);
     expect(ofType("run.failed")[0]?.payload.error).toBe("model said no");
+  });
+
+  const turnError = (message: string, codexErrorInfo: unknown = null) =>
+    JSON.stringify({
+      message,
+      codexErrorInfo,
+      additionalDetails: null,
+      misalignment: null,
+    });
+
+  test("a turn the gateway refuses for credit fails as codex_unavailable, quoting Codex", async () => {
+    config.sessionEnv.FAKE_CODEX_TURN_ERROR = turnError(
+      "You've hit your usage limit.",
+      "usageLimitExceeded",
+    );
+    expect(await run(undefined, "failingWith")).toBe(1);
+    expect(ofType("run.failed")[0]?.payload.error).toBe(
+      "codex_unavailable: the AI Gateway is out of credit (Codex said: You've hit your usage limit.)",
+    );
+  });
+
+  test("a turn whose retries gave up on 429s fails as rate-limited", async () => {
+    config.sessionEnv.FAKE_CODEX_TURN_ERROR = turnError(
+      "exceeded retry limit, last status: 429 Too Many Requests",
+      { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+    );
+    expect(await run(undefined, "failingWith")).toBe(1);
+    expect(ofType("run.failed")[0]?.payload.error).toBe(
+      "codex_unavailable: the AI Gateway rate-limited this run (Codex said: exceeded retry limit, last status: 429 Too Many Requests)",
+    );
+  });
+
+  test("a retried 402 makes a later bare failure out of credit", async () => {
+    config.sessionEnv.FAKE_CODEX_RETRY_ERROR = turnError("stream error", {
+      responseStreamConnectionFailed: { httpStatusCode: 402 },
+    });
+    expect(await run(undefined, "failingWith")).toBe(1);
+    expect(ofType("run.failed")[0]?.payload.error).toBe(
+      "codex_unavailable: the AI Gateway is out of credit (Codex said: the turn failed)",
+    );
+  });
+
+  test("a bare failure after the proxy saw a 402 is out of credit", async () => {
+    const ran = await runCodexSession(
+      {
+        ...config,
+        sessionEnv: {
+          ...config.sessionEnv,
+          FAKE_CODEX_SCENARIO: "failingWith",
+        },
+      },
+      {
+        post,
+        awaitDecision,
+        signal: new AbortController().signal,
+        warn: () => {},
+        codexEnv: { AI_GATEWAY_API_KEY: "gw-key" },
+        startProxy: async () => ({
+          baseUrl: "http://127.0.0.1:9/codex/v1",
+          token: "t".repeat(64),
+          close: async () => {},
+          limitStatus: () => 402,
+        }),
+        seal,
+        bin,
+        stopGraceMs: 2_000,
+      },
+    );
+    expect(ran).toBe(1);
+    expect(ofType("run.failed")[0]?.payload.error).toBe(
+      "codex_unavailable: the AI Gateway is out of credit (Codex said: the turn failed)",
+    );
+  });
+
+  test("a failure the gateway didn't cause keeps Codex's own error", async () => {
+    config.sessionEnv.FAKE_CODEX_TURN_ERROR = turnError(
+      "context window exceeded",
+      "contextWindowExceeded",
+    );
+    expect(await run(undefined, "failingWith")).toBe(1);
+    expect(ofType("run.failed")[0]?.payload.error).toBe(
+      "context window exceeded",
+    );
   });
 
   test("a stop interrupts the turn and fails the run", async () => {
