@@ -809,7 +809,7 @@ export function createLauncher({
       .where(eq(agents.id, launch.agentId))
       .get();
     if (!agent) return same;
-    // a session from before runtimes were recorded ran on what the environment picks with none stored
+    // a session from before runtimes were recorded ran on what this launch picks with no runtime stored
     const from = agent.sessionRuntime ?? unrecordedRuntime;
     if (from === runtime) return same;
     const last = db
