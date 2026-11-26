@@ -276,7 +276,7 @@ sky env show web                       # shows `runtime: …`
 
 **What the switch does.** It sets the environment's `runtime` (`PUT /v1/environments/:id/runtime` with `{"runtime": "codex"}`; admin key only), which wins over a `SKY_RUNTIME` secret or envVar. An environment that has never been switched has no runtime set and follows `SKY_RUNTIME` as before. Switching to Codex is refused with `gateway_key_missing` until the environment has an `AI_GATEWAY_API_KEY` secret (`sky secret set web AI_GATEWAY_API_KEY`), and installs the pinned Codex on the sandbox when it isn't there; if that install fails the switch is refused with `codex_install_failed` and the runtime stays as it was. A run already going keeps its runtime; the switch applies from the next launch.
 
-**Agents after a switch.** An agent whose last session ran on the other runtime can't resume it. Its next run starts a fresh session on the agent's branch, which holds the earlier work's commits, and its prompt opens with a short note saying the earlier work ran on the other runtime, with the last run's summary. Follow-ups on the same runtime resume their session as before.
+**Agents after a switch.** An agent whose last session ran on the other runtime can't resume it. Its next run starts a fresh session on the agent's branch, which holds the earlier work's commits, and its prompt opens with a short note saying the earlier work ran on the other runtime, with the last run's summary. Follow-ups on the same runtime resume their session as before. An agent whose session started before Sky recorded runtimes counts as having run on what the environment picks with no runtime set: its `SKY_RUNTIME`, else Claude Code.
 
 ### Base profiles
 
