@@ -222,6 +222,57 @@ test("an API key is handed over by its name, and a credential no key matches is 
   ).toThrow(/^claude_credential_missing: /);
 });
 
+test("api-key:default is the plain key: stored as api-key and listed under it", async () => {
+  const created = await call("POST", "/v1/environments", {
+    name: "kru",
+    repo: "acme/kru",
+    setup: "true",
+    claudeCredential: "api-key:default",
+  });
+  expect(created.status).toBe(202);
+  const made = (await created.json()) as {
+    id: string;
+    claudeCredential: string;
+  };
+  expect(made.claudeCredential).toBe("api-key");
+
+  const envId = readyEnv();
+  const patched = await call("PATCH", `/v1/environments/${envId}`, {
+    claudeCredential: "api-key:default",
+  });
+  expect(patched.status).toBe(200);
+  expect(await patched.json()).toMatchObject({ claudeCredential: "api-key" });
+  expect(
+    db
+      .select({ credential: environments.claudeCredential })
+      .from(environments)
+      .where(eq(environments.id, envId))
+      .get()?.credential,
+  ).toBe("api-key");
+
+  const plain = (await credentialsOf()).find((c) => c.name === "api-key");
+  expect(
+    (plain?.environments as { id: string }[]).map((e) => e.id).sort(),
+  ).toEqual([made.id, envId].sort());
+});
+
+test("with every key out of credit the error names a clear-credit command for each key", () => {
+  const recovery =
+    "top the keys up, then clear their marks with sky claude-credentials clear-credit default, sky claude-credentials clear-credit backup and sky claude-credentials clear-credit spare (or restart the API, which a new key secret does)";
+  expect(() =>
+    apiKeyAuth(config, "the env", { outOfCredit: () => true }),
+  ).toThrow(recovery);
+  expect(() =>
+    apiKeyAuth(
+      { ...config, anthropicApiKeys: {} },
+      "the env",
+      { outOfCredit: () => true },
+    ),
+  ).toThrow(
+    "top the key up, then clear its mark with sky claude-credentials clear-credit default (or restart",
+  );
+});
+
 test("redaction knows every named API key", () => {
   const known = KnownSecrets.fromConfig(config).values();
   for (const value of [PLAIN_KEY, BACKUP_KEY, SPARE_KEY]) {

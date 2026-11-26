@@ -253,7 +253,7 @@ test("the switch command quotes an environment name a shell would split", () => 
 // --- named failures ------------------------------------------------------------------------------
 
 const RECOVERY =
-  "top the key up, then clear its mark with sky claude-credentials clear-credit <name> (or restart the API, which a new key secret does)";
+  "top the key up, then clear its mark with sky claude-credentials clear-credit default (or restart the API, which a new key secret does)";
 
 test("a run whose only API key is out of credit fails claude_unavailable with the switch command, and the next launch fails fast", async () => {
   const envId = readyEnv({ claudeCredential: "api-key" });

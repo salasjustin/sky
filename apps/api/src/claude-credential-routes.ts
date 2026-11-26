@@ -1,5 +1,9 @@
 import { environments, runs } from "@sky/db";
-import { type ClaudeCredentialSummary, POOL_CREDENTIAL } from "@sky/shared";
+import {
+  type ClaudeCredentialSummary,
+  type ClaudeCreditCleared,
+  POOL_CREDENTIAL,
+} from "@sky/shared";
 import { asc, gte, sql } from "drizzle-orm";
 import { adminOnly } from "./auth.js";
 import {
@@ -37,7 +41,7 @@ export function claudeCredentialRoutes(launcher: Launcher) {
           name: cleared.credential,
           outOfCredit: false,
           wasOutOfCredit: cleared.wasOut,
-        },
+        } satisfies ClaudeCreditCleared,
         200,
       );
     })

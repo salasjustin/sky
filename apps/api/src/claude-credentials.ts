@@ -40,17 +40,30 @@ const CREDITED: ApiKeyCredit = { outOfCredit: () => false };
 export const isCreditExhausted = (error: string): boolean =>
   /credit balance is too low/i.test(error);
 
-/** How an out-of-credit API key comes back: a top-up alone doesn't, its mark has to be cleared. */
-export const CREDIT_RECOVERY =
-  "top the key up, then clear its mark with sky claude-credentials clear-credit <name> (or restart the API, which a new key secret does)";
+/**
+ * How every API key this server holds comes back once all are out of credit: a top-up alone doesn't,
+ * each mark has to be cleared, so this names the command for each key.
+ */
+export function creditRecovery(config: Config): string {
+  const commands = apiKeyCredentials(config).map(
+    (credential) =>
+      `sky claude-credentials clear-credit ${apiKeyNameOf(credential)}`,
+  );
+  const last = commands.pop();
+  const steps =
+    commands.length === 0
+      ? `top the key up, then clear its mark with ${last}`
+      : `top the keys up, then clear their marks with ${commands.join(", ")} and ${last}`;
+  return `${steps} (or restart the API, which a new key secret does)`;
+}
 
 /** What every API key being out of credit is called in an error. */
 export const ALL_KEYS_OUT = `all Anthropic API keys are out of credit (Anthropic answered "Credit balance is too low")`;
 
 /** What a launch refused for want of an API key with credit says; `role` names what the key was for. */
-const outOfCredit = (role: string) =>
+const outOfCredit = (config: Config, role: string) =>
   new ClaudeCredentialError(
-    `claude_unavailable: ${role} needs an Anthropic API key, and ${ALL_KEYS_OUT}; ${CREDIT_RECOVERY}`,
+    `claude_unavailable: ${role} needs an Anthropic API key, and ${ALL_KEYS_OUT}; ${creditRecovery(config)}`,
   );
 
 /**
@@ -253,7 +266,7 @@ export function apiKeyAuth(
   }
   const credential = nextApiKey(config, credit, [], preferred);
   const key = credential && apiKeyValue(config, credential);
-  if (!credential || !key) throw outOfCredit(role);
+  if (!credential || !key) throw outOfCredit(config, role);
   return { kind: "api-key", credential, key };
 }
 

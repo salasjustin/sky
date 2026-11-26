@@ -40,8 +40,8 @@ import {
   apiKeyValue,
   type ClaudeAuth,
   ClaudeCredentialError,
-  CREDIT_RECOVERY,
   credentialNameOf,
+  creditRecovery,
   isCloudflareChallenge,
   isCreditExhausted,
   limitedUntil,
@@ -1379,7 +1379,7 @@ export function createLauncher({
       : ALL_KEYS_OUT;
     return {
       skip: "not retried: every Anthropic API key is out of credit",
-      unavailable: `${CLAUDE_UNAVAILABLE} ${cause}; ${CREDIT_RECOVERY}`,
+      unavailable: `${CLAUDE_UNAVAILABLE} ${cause}; ${creditRecovery(config)}`,
     };
   }
 
