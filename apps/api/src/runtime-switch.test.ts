@@ -317,17 +317,35 @@ test("a run on the API key that finishes does not clear the out-of-credit mark; 
   expect(c.file.SKY_CLAUDE_AUTH).toBe("api-key");
 });
 
-test("clear-credit is admin only and names a key the server holds", async () => {
+test("clear-credit refuses a key the server doesn't hold", async () => {
   const unknown = await call(
     "POST",
     "/v1/claude-credentials/api-key%3Aspare/clear-credit",
   );
   expect(unknown.status).toBe(404);
+});
+
+test("clear-credit is admin only: an issued runs key gets 403 and the key stays out of credit", async () => {
+  const envId = readyEnv({ claudeCredential: "api-key" });
+  const r = await launched(envId);
+  await start(r);
+  await fail(r, CREDIT_LOW);
+  const minted = await call("POST", "/v1/keys", {
+    name: "ci",
+    role: "runs",
+    environmentIds: [envId],
+  });
+  expect(minted.status).toBe(201);
+  const { secret } = CreatedApiKey.parse(await minted.json());
+
   const denied = await app.request(
     "/v1/claude-credentials/api-key/clear-credit",
-    { method: "POST" },
+    { method: "POST", headers: { Authorization: `Bearer ${secret}` } },
   );
-  expect([401, 403]).toContain(denied.status);
+  expect(denied.status).toBe(403);
+  // the mark held: a launch still fails at once, with no runner started
+  expect(await refused(envId)).toMatch(/^claude_unavailable: /);
+  expect(wire.sessions).toHaveLength(1);
 });
 
 test("a subscription run finishing leaves the out-of-credit mark on the API key", async () => {
@@ -516,6 +534,30 @@ test("a Codex launch whose install fails fails the run naming why, before any ru
   expect(error).toContain("installing Codex 0.172.0 failed");
   expect(error).toContain("network unreachable");
   expect(error.endsWith(`sky env set-runtime ${envId} claude-code`)).toBe(true);
+  expect(wire.sessions).toHaveLength(0);
+});
+
+test("a Codex install exec that fails for the sprite's sake is not codex_unavailable: the run fails launch_failed and the gone sprite fails the environment", async () => {
+  const envId = readyEnv({ runtime: "codex" });
+  await setGatewayKey(envId);
+  const base = wire.exec;
+  wire.exec = (argv, sprite) => {
+    if (argv[0] === "sh" && argv[2]?.includes("npm install")) {
+      // the sprite vanishes under the install, and its exec stream ends with no exit frame
+      if (sprite) wire.sprites.delete(sprite);
+      wire.execDrops = true;
+      return { exitCode: 0 };
+    }
+    return base(argv, sprite);
+  };
+  const error = await refused(envId);
+  expect(error).toMatch(/^launch_failed: /);
+  expect(error).not.toContain("codex_unavailable");
+  await vi.waitFor(() =>
+    expect(
+      db.select().from(environments).where(eq(environments.id, envId)).get(),
+    ).toMatchObject({ status: "failed", failureStep: "create" }),
+  );
   expect(wire.sessions).toHaveLength(0);
 });
 

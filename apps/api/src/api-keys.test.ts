@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import { type Db, environments, events, migrate, openDb, runs } from "@sky/db";
 import type { EnvironmentId, RunId } from "@sky/shared";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
 import {
@@ -166,7 +166,7 @@ const failureOf = (runId: string) => {
   const row = db
     .select({ payload: events.payload })
     .from(events)
-    .where(eq(events.runId, runId as RunId))
+    .where(and(eq(events.runId, runId as RunId), eq(events.type, "run.failed")))
     .get();
   return String((row?.payload as { error?: string } | undefined)?.error);
 };
@@ -375,6 +375,27 @@ test("with every key out of credit the run fails claude_unavailable with the swi
   expect(
     data.filter((c) => c.kind === "api-key").map((c) => c.outOfCredit),
   ).toEqual([true, true, true]);
+});
+
+test("a retry skips a key its chain already tried, even once that key's mark is cleared", async () => {
+  const envId = readyEnv({ claudeCredential: "api-key" });
+  const first = await launchedRun(envId);
+  expect(first.file.SKY_CLAUDE_API_KEY).toBe(PLAIN_KEY);
+  await failWith(first, CREDIT_LOW);
+  await sessionOpened(2);
+  const second = {
+    run: { id: String(wire.sessions[1]?.env.RUN_ID) },
+    file: envFileOf(wire, wire.sessions[1]),
+  };
+  expect(second.file.SKY_CLAUDE_API_KEY).toBe(BACKUP_KEY);
+
+  // the plain key is topped up and cleared while the retry is running on backup
+  expect((await clearCredit("api-key")).status).toBe(200);
+  await failWith(second as Awaited<ReturnType<typeof launchedRun>>, CREDIT_LOW);
+
+  await sessionOpened(3);
+  expect(envFileOf(wire, wire.sessions[2]).SKY_CLAUDE_API_KEY).toBe(SPARE_KEY);
+  expect(wire.sessions).toHaveLength(3);
 });
 
 test("a run finishing on a key does not clear its mark, and clear-credit clears only that key", async () => {

@@ -474,6 +474,25 @@ test("env set-claude api-key is accepted as a name", async () => {
   expect(bodies).toEqual([{ claudeCredential: "api-key" }]);
 });
 
+test("env set-claude api-key:backup assigns that named key and prints it", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(
+        claudeAssignment({ claudeCredential: "api-key:backup" }),
+      );
+    }),
+  );
+  const r = await runCli(["env", "set-claude", "web", "api-key:backup"]);
+  expect(r.code).toBe(0);
+  expect(bodies).toEqual([{ claudeCredential: "api-key:backup" }]);
+  expect(r.stdout).toBe(
+    "env_1 ready acme/web web\nclaude credential: api-key:backup (fallback: api-key)\n",
+  );
+});
+
 test("the API refusing a credential its server doesn't hold is the CLI's failure, message intact", async () => {
   server.use(
     list,
