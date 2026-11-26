@@ -1404,7 +1404,10 @@ test("migrating a populated 0023 file keeps every run column and every child row
 
   migrate(db);
 
-  expect(db.$client.prepare("select * from runs").all()).toEqual(runBefore);
+  // 0025 adds `runtime`, null on a run launched before it
+  expect(db.$client.prepare("select * from runs").all()).toEqual(
+    runBefore.map((row) => ({ ...(row as object), runtime: null })),
+  );
   expect(
     db.$client.prepare("select * from run_env_vars order by name").all(),
   ).toEqual(envVarsBefore);
@@ -1517,7 +1520,7 @@ test("the refusal names the pending migrations, the sizes in MB and the fix, on 
     message = err instanceof Error ? err.message : String(err);
   }
   expect(message).toBe(
-    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine, 0021_magical_klaw, 0022_aberrant_wolverine, 0023_tiny_madame_hydra, 0024_condemned_wild_pack needs ${mb(needed)} (${mb(copied)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
+    `not enough free disk space to migrate ${path}: applying 0017_plain_ultimatum, 0018_mute_triathlon, 0019_absurd_eternals, 0020_windy_newton_destine, 0021_magical_klaw, 0022_aberrant_wolverine, 0023_tiny_madame_hydra, 0024_condemned_wild_pack, 0025_empty_bloodscream needs ${mb(needed)} (${mb(copied)} of rebuilt tables in the WAL, ${mb(growth)} of file growth, ${mb(MIGRATION_MARGIN_BYTES)} margin) but ${mb(free)} is free; free space on the volume or extend it with fly volumes extend`,
   );
 });
 

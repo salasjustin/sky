@@ -9,6 +9,7 @@ import {
   PluginRefresh,
   PreviewState,
   RunStatus,
+  type Runtime,
 } from "@sky/shared";
 import { z } from "zod";
 import type { Config } from "./config.js";
@@ -442,6 +443,15 @@ export function createApi(config: Config) {
         "PATCH",
         `/v1/environments/${encodeURIComponent(id)}`,
         body,
+      );
+      return env(status, json);
+    },
+    /** Sets the runtime the env's runs use; 409 `gateway_key_missing` for Codex without the env's AI_GATEWAY_API_KEY. */
+    async setEnvironmentRuntime(id: string, runtime: Runtime) {
+      const { status, json } = await request(
+        "PUT",
+        `/v1/environments/${encodeURIComponent(id)}/runtime`,
+        { runtime },
       );
       return env(status, json);
     },

@@ -12,7 +12,7 @@ import {
   runs,
 } from "@sky/db";
 import { CreatedApiKey, type EnvironmentId, type RunId } from "@sky/shared";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -260,21 +260,11 @@ const credentialsUsed = () =>
 const tokenOfFile = (file: Record<string, string>) =>
   file.CLAUDE_CODE_OAUTH_TOKEN ?? file.SKY_CLAUDE_API_KEY;
 
-const warningsOf = (runId: string) =>
-  db
-    .select({ payload: events.payload })
-    .from(events)
-    .where(eq(events.runId, runId as RunId))
-    .all()
-    .map((e) => e.payload as { message?: string })
-    .map((p) => p.message)
-    .filter((m): m is string => m !== undefined);
-
 const failureOf = (runId: string) => {
   const row = db
     .select({ payload: events.payload })
     .from(events)
-    .where(eq(events.runId, runId as RunId))
+    .where(and(eq(events.runId, runId as RunId), eq(events.type, "run.failed")))
     .get();
   return String((row?.payload as { error?: string } | undefined)?.error);
 };
@@ -608,10 +598,13 @@ test("with no API key, the end of the pool is the failed run noting the earliest
     type: "run.failed",
     payload: { error: WEEKLY },
   });
-  await vi.waitFor(() => expect(warningsOf(second)).toHaveLength(1));
-  const [warning] = warningsOf(second);
-  expect(warning).toContain("pool is at its usage limit");
-  expect(warning).toContain(`earliest resets ${soon.at} (UTC)`);
+  // the run's own error says so, with the command that moves the environment to Codex
+  const error = failureOf(second);
+  expect(error).toMatch(/^claude_unavailable: /);
+  expect(error).toContain("pool is at its usage limit");
+  expect(error).toContain(`earliest resets ${soon.at} (UTC)`);
+  expect(error).toContain(`sky env set-runtime ${env} codex`);
+  expect(exitWaits()).toBe(1);
   expect(wire.sessions).toHaveLength(2);
 });
 
@@ -621,7 +614,10 @@ test("claudeFallback none ends the pool without spending the key", async () => {
     poolEnv(["personal"], { claudeFallback: "none" }),
   );
   await failWith(r, FIVE_HOUR);
-  await vi.waitFor(() => expect(warningsOf(r.run.id)).toHaveLength(1));
+  expect(failureOf(r.run.id)).toMatch(
+    /^claude_unavailable: every subscription in this environment's pool is at its usage limit.*fallback is off/,
+  );
+  expect(exitWaits()).toBe(0);
   expect(wire.sessions).toHaveLength(1);
 });
 
@@ -664,8 +660,9 @@ test("with every subscription limited and no key, the launch fails at once namin
   const { run } = (await res.json()) as Launched;
   await vi.waitFor(() => expect(runRow(run.id)?.status).toBe("failed"));
   const error = failureOf(run.id);
-  expect(error).toContain("claude_limited");
+  expect(error).toMatch(/^claude_unavailable: /);
   expect(error).toContain(soon.toISOString());
+  expect(error).toContain(`sky env set-runtime ${env} codex`);
   expect(wire.sessions).toHaveLength(0);
 });
 
@@ -706,7 +703,7 @@ test("a non-pool environment with no key fails a limited launch rather than move
   });
   const { run } = (await res.json()) as Launched;
   await vi.waitFor(() => expect(runRow(run.id)?.status).toBe("failed"));
-  expect(failureOf(run.id)).toContain("claude_limited");
+  expect(failureOf(run.id)).toMatch(/^claude_unavailable: /);
   expect(wire.sessions).toHaveLength(0);
   expect(probes).toHaveLength(0);
 });
@@ -936,7 +933,7 @@ test("an environment whose API key fallback is turned off while a retry waits do
   // the retry is refused as a fresh launch would be: personal is limited and the key is off
   await vi.waitFor(() => expect(retryOf(r.run.id)?.status).toBe("failed"));
   const retry = retryOf(r.run.id);
-  expect(failureOf(String(retry?.id))).toContain("claude_limited");
+  expect(failureOf(String(retry?.id))).toMatch(/^claude_unavailable: /);
   expect(wire.sessions).toHaveLength(1);
 });
 

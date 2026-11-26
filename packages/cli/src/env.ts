@@ -2,6 +2,7 @@ import {
   ClaudeCredentialName,
   ClaudeFallback,
   ClaudeSubscriptionName,
+  Runtime,
 } from "@sky/shared";
 import type { AgentCommand } from "./agent.js";
 import { type ApiEnvironment, ApiError } from "./api.js";
@@ -78,6 +79,10 @@ function parsePool(value: string | undefined): string[] | null | undefined {
 const claudeLine = (env: ApiEnvironment) =>
   `claude credential: ${env.claudeCredential ?? "default"}${env.claudePool ? ` [${env.claudePool.join(", ")}]` : ""} (fallback: ${env.claudeFallback})`;
 
+/** The runtime `env show` and `env set-runtime` print; null follows the env's `SKY_RUNTIME` secret. */
+const runtimeLine = (env: ApiEnvironment) =>
+  `runtime: ${env.runtime ?? "default (the SKY_RUNTIME secret, else claude-code)"}`;
+
 export const env: AgentCommand = {
   options: {
     yes: { type: "boolean" },
@@ -115,7 +120,7 @@ export const env: AgentCommand = {
         const envId = await resolveEnvId(api, ref, out);
         if (envId === undefined) return 1;
         const { raw, env } = await api.getEnvironment(envId);
-        const lines = [envLine(env)];
+        const lines = [envLine(env), runtimeLine(env)];
         if (env.claudeCredential !== null || env.claudeFallback !== "api-key") {
           lines.push(claudeLine(env));
         }
@@ -215,9 +220,35 @@ export const env: AgentCommand = {
         return 0;
       };
     }
+    if (sub === "set-runtime") {
+      const [ref, runtime, ...extra] = rest;
+      if (ref === undefined || runtime === undefined || extra.length > 0) {
+        throw new UsageError(
+          "env set-runtime takes <env> <claude-code|codex>",
+          true,
+        );
+      }
+      const parsed = Runtime.safeParse(runtime);
+      if (!parsed.success) {
+        throw new UsageError(
+          `${JSON.stringify(runtime)} is not a runtime: use claude-code or codex`,
+          true,
+        );
+      }
+      return async (api, _io, out) => {
+        const envId = await resolveEnvId(api, ref, out);
+        if (envId === undefined) return 1;
+        const { raw, env } = await api.setEnvironmentRuntime(
+          envId,
+          parsed.data,
+        );
+        out.result(raw, `${envLine(env)}\n${runtimeLine(env)}`);
+        return 0;
+      };
+    }
     throw new UsageError(
       sub === undefined
-        ? "env needs a subcommand: list, show, delete, retry or set-claude"
+        ? "env needs a subcommand: list, show, delete, retry, set-claude or set-runtime"
         : `unknown env subcommand '${sub}'`,
       true,
     );

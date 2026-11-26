@@ -247,6 +247,7 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   });
   // the secrets ride in a file only the sprite user can read, which the command sources and deletes
   expect(envFileOf(wire, session)).toEqual({
+    SKY_RUNTIME: "claude-code",
     SKY_CLAUDE_AUTH: "oauth",
     CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
     AGENT_TOKEN: expect.any(String),
@@ -412,6 +413,7 @@ test("the env's secrets reach the runner through the env file, quotes intact; a 
     TRICKY: tricky,
     DB_URL: "postgres://u:p@db/x",
     GITHUB_CONNECTOR: "VPpb7x",
+    SKY_RUNTIME: "claude-code",
     SKY_CLAUDE_AUTH: "oauth",
     CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
     AGENT_TOKEN: expect.any(String),
@@ -5546,6 +5548,7 @@ test("launch envVars reach that run's env file, are stored encrypted until their
   expect(envFileOf(wire, wire.sessions[0])).toEqual({
     A_VAR: envVarValue,
     B_SECRET: "overrides-the-env-one",
+    SKY_RUNTIME: "claude-code",
     SKY_CLAUDE_AUTH: "oauth",
     CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
     AGENT_TOKEN: expect.any(String),

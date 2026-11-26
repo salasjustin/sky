@@ -11,10 +11,12 @@ import {
   webhooks,
 } from "@sky/db";
 import {
+  CODEX_GATEWAY_SECRET,
   DEFAULT_CLAUDE_CREDENTIAL,
   Environment,
   EnvironmentId,
   POOL_CREDENTIAL,
+  Runtime,
 } from "@sky/shared";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -25,8 +27,10 @@ import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
 import type { Previews } from "./previews.js";
-import type { Provisioner } from "./provision.js";
+import { ensureCodex, type Provisioner } from "./provision.js";
+import { redact } from "./redact.js";
 import { activeRunStatuses, type Tx } from "./runs.js";
+import { hasSecret } from "./secrets.js";
 import { destroySprite, type SpriteOps, spriteNameFor } from "./sprites.js";
 import { body, jsonBody } from "./validation.js";
 
@@ -75,6 +79,8 @@ const EnvironmentPatch = z.strictObject({
   claudeFallback: claudeFallback.unwrap().optional(),
 });
 
+const RuntimeInput = z.strictObject({ runtime: Runtime });
+
 type EnvRow = typeof environments.$inferSelect;
 
 const present = (row: EnvRow) => ({
@@ -93,6 +99,7 @@ const present = (row: EnvRow) => ({
     claudeCredential: row.claudeCredential,
     claudePool: row.claudePool ?? null,
     claudeFallback: row.claudeFallback,
+    runtime: row.runtime ?? null,
   } satisfies Environment),
   // while provisioning, failure_step holds the step in progress
   failure:
@@ -188,329 +195,383 @@ export function environmentRoutes(
   log: (line: string) => void,
   previews: Previews,
 ) {
-  return factory
-    .createApp()
-    .on("POST", ["/", "/:id/retry"], adminOnly)
-    .on(["PATCH", "DELETE"], "/:id", adminOnly)
-    .get("/", (c) => {
-      const { principal } = c.var;
-      const rows = c.var.db
-        .select()
-        .from(environments)
-        .where(
-          principal.role === "admin"
-            ? undefined
-            : inArray(environments.id, principal.environmentIds),
-        )
-        // ties within a millisecond go by insert order (rowid); ids are random
-        .orderBy(asc(environments.createdAt), asc(sql`rowid`))
-        .all();
-      return c.json({ data: rows.map(present) }, 200);
-    })
-    .post("/", jsonBody, body(EnvironmentInput), (c) => {
-      const input = {
-        ...c.req.valid("json"),
-      };
-      input.claudeCredential =
-        normalizeCredential(input.claudeCredential) ?? null;
-      const credentialProblem = assignmentProblem(
-        c.var.config,
-        input.claudeCredential,
-      );
-      if (credentialProblem) {
-        return apiError(c, 400, "unknown_credential", credentialProblem);
-      }
-      const poolIssue = poolProblem(
-        c.var.config,
-        input.claudeCredential,
-        input.claudePool,
-      );
-      if (poolIssue) return apiError(c, 400, "invalid_pool", poolIssue);
-      const profiles = Object.keys(c.var.config.baseProfiles);
-      if (input.base !== null && !profiles.includes(input.base)) {
-        return apiError(
-          c,
-          400,
-          "unknown_base",
-          unknownBase(input.base, profiles),
-        );
-      }
-      const id = mintId("env");
-      const row = nameTakenOnConflict(() =>
-        c.var.db.transaction(
-          (tx) => {
-            if (nameTaken(tx, input.name)) return nameTakenResult;
-            return tx
-              .insert(environments)
-              .values({
-                ...input,
-                id,
-                status: "provisioning",
-                spriteName: spriteNameFor(id),
-                checkpointId: null,
-              })
-              .returning()
-              .get();
-          },
-          { behavior: "immediate" },
-        ),
-      );
-      if ("kind" in row) {
-        return apiError(c, 409, "name_taken", nameTakenMessage);
-      }
-      provisioner.start(row);
-      c.header("Location", `/v1/environments/${id}`);
-      return c.json(present(row), 202);
-    })
-    .get("/:id", envParam, (c) => {
-      const { id } = c.req.valid("param");
-      const row = canUseEnv(c.var.principal, id)
-        ? findEnv(c.var.db, id)
-        : undefined;
-      if (!row) return apiError(c, 404, "not_found", notFound);
-      return c.json(present(row), 200);
-    })
-    .patch("/:id", envParam, jsonBody, body(EnvironmentPatch), (c) => {
-      const { id } = c.req.valid("param");
-      const patch = c.req.valid("json");
-      if (patch.claudeCredential !== undefined) {
-        patch.claudeCredential =
-          normalizeCredential(patch.claudeCredential) ?? null;
+  return (
+    factory
+      .createApp()
+      .on("POST", ["/", "/:id/retry"], adminOnly)
+      .on(["PATCH", "DELETE"], "/:id", adminOnly)
+      .on("PUT", "/:id/runtime", adminOnly)
+      .get("/", (c) => {
+        const { principal } = c.var;
+        const rows = c.var.db
+          .select()
+          .from(environments)
+          .where(
+            principal.role === "admin"
+              ? undefined
+              : inArray(environments.id, principal.environmentIds),
+          )
+          // ties within a millisecond go by insert order (rowid); ids are random
+          .orderBy(asc(environments.createdAt), asc(sql`rowid`))
+          .all();
+        return c.json({ data: rows.map(present) }, 200);
+      })
+      .post("/", jsonBody, body(EnvironmentInput), (c) => {
+        const input = {
+          ...c.req.valid("json"),
+        };
+        input.claudeCredential =
+          normalizeCredential(input.claudeCredential) ?? null;
         const credentialProblem = assignmentProblem(
           c.var.config,
-          patch.claudeCredential,
+          input.claudeCredential,
         );
         if (credentialProblem) {
           return apiError(c, 400, "unknown_credential", credentialProblem);
         }
-      }
-      const profiles = Object.keys(c.var.config.baseProfiles);
-      if (
-        patch.base !== undefined &&
-        patch.base !== null &&
-        !profiles.includes(patch.base)
-      ) {
-        return apiError(
-          c,
-          400,
-          "unknown_base",
-          unknownBase(patch.base, profiles),
+        const poolIssue = poolProblem(
+          c.var.config,
+          input.claudeCredential,
+          input.claudePool,
         );
-      }
-      const outcome = nameTakenOnConflict(() =>
-        c.var.db.transaction(
-          (tx) => {
-            const env = findEnv(tx, id);
-            if (!env) return { kind: "not_found" } as const;
-            if (hasActiveRun(tx, id)) return { kind: "run_active" } as const;
-            const reprovision =
-              (patch.repo !== undefined && patch.repo !== env.repo) ||
-              (patch.setup !== undefined && patch.setup !== env.setup) ||
-              (patch.base !== undefined && patch.base !== env.base);
-            if (reprovision && env.status === "provisioning") {
-              return { kind: "provisioning" } as const;
-            }
-            // reprovisioning removes the repo and every worktree, and the agents' branches exist nowhere else
-            const agentIds = reprovision ? unarchivedAgentIds(tx, id) : [];
-            if (agentIds.length > 0) {
-              return { kind: "agents_exist", agentIds } as const;
-            }
-            if (
-              patch.name !== undefined &&
-              patch.name !== env.name &&
-              nameTaken(tx, patch.name)
-            ) {
-              return nameTakenResult;
-            }
-            // a pool list goes with the pool assignment, and leaves with it
-            const credential =
-              patch.claudeCredential !== undefined
-                ? patch.claudeCredential
-                : env.claudeCredential;
-            const poolIssue = poolProblem(
-              c.var.config,
-              credential,
-              patch.claudePool !== undefined
-                ? patch.claudePool
-                : credential === POOL_CREDENTIAL
-                  ? env.claudePool
-                  : null,
-            );
-            if (poolIssue) return { kind: "invalid_pool", poolIssue } as const;
-            const { autoApprove: sentAutoApprove, ...rest } = patch;
-            if (credential !== POOL_CREDENTIAL) rest.claudePool = null;
-            const fields =
-              sentAutoApprove === undefined
-                ? rest
-                : {
-                    ...rest,
-                    autoApprove: { ...env.autoApprove, ...sentAutoApprove },
-                  };
-            const changes = reprovision
-              ? { ...fields, ...reprovisioning }
-              : fields;
-            // drizzle refuses an update with nothing to set
-            const row =
-              Object.keys(changes).length === 0
-                ? env
-                : tx
-                    .update(environments)
-                    .set(changes)
-                    .where(eq(environments.id, id))
-                    .returning()
-                    .get();
-            return { kind: "updated", row, reprovision } as const;
-          },
-          { behavior: "immediate" },
-        ),
-      );
-      switch (outcome.kind) {
-        case "not_found":
-          return apiError(c, 404, "not_found", notFound);
-        case "run_active":
-          return apiError(c, 409, "run_active", runActive);
-        case "provisioning":
-          return apiError(c, 409, "provisioning", stillProvisioning);
-        case "name_taken":
-          return apiError(c, 409, "name_taken", nameTakenMessage);
-        case "invalid_pool":
-          return apiError(c, 400, "invalid_pool", outcome.poolIssue);
-        case "agents_exist":
+        if (poolIssue) return apiError(c, 400, "invalid_pool", poolIssue);
+        const profiles = Object.keys(c.var.config.baseProfiles);
+        if (input.base !== null && !profiles.includes(input.base)) {
           return apiError(
             c,
-            409,
-            "agents_exist",
-            `changing repo, setup or base replaces every agent's worktree and branch; archive agents ${outcome.agentIds.join(", ")} first`,
+            400,
+            "unknown_base",
+            unknownBase(input.base, profiles),
           );
-      }
-      if (outcome.reprovision) {
-        provisioner.start(outcome.row);
-        return c.json(present(outcome.row), 202);
-      }
-      return c.json(present(outcome.row), 200);
-    })
-    .post("/:id/retry", envParam, (c) => {
-      const { id } = c.req.valid("param");
-      const outcome = c.var.db.transaction(
-        (tx) => {
-          const env = findEnv(tx, id);
-          if (!env) return { kind: "not_found" } as const;
-          if (env.status !== "failed") return { kind: "not_failed" } as const;
-          const row = tx
+        }
+        const id = mintId("env");
+        const row = nameTakenOnConflict(() =>
+          c.var.db.transaction(
+            (tx) => {
+              if (nameTaken(tx, input.name)) return nameTakenResult;
+              return tx
+                .insert(environments)
+                .values({
+                  ...input,
+                  id,
+                  status: "provisioning",
+                  spriteName: spriteNameFor(id),
+                  checkpointId: null,
+                })
+                .returning()
+                .get();
+            },
+            { behavior: "immediate" },
+          ),
+        );
+        if ("kind" in row) {
+          return apiError(c, 409, "name_taken", nameTakenMessage);
+        }
+        provisioner.start(row);
+        c.header("Location", `/v1/environments/${id}`);
+        return c.json(present(row), 202);
+      })
+      .get("/:id", envParam, (c) => {
+        const { id } = c.req.valid("param");
+        const row = canUseEnv(c.var.principal, id)
+          ? findEnv(c.var.db, id)
+          : undefined;
+        if (!row) return apiError(c, 404, "not_found", notFound);
+        return c.json(present(row), 200);
+      })
+      .patch("/:id", envParam, jsonBody, body(EnvironmentPatch), (c) => {
+        const { id } = c.req.valid("param");
+        const patch = c.req.valid("json");
+        if (patch.claudeCredential !== undefined) {
+          patch.claudeCredential =
+            normalizeCredential(patch.claudeCredential) ?? null;
+          const credentialProblem = assignmentProblem(
+            c.var.config,
+            patch.claudeCredential,
+          );
+          if (credentialProblem) {
+            return apiError(c, 400, "unknown_credential", credentialProblem);
+          }
+        }
+        const profiles = Object.keys(c.var.config.baseProfiles);
+        if (
+          patch.base !== undefined &&
+          patch.base !== null &&
+          !profiles.includes(patch.base)
+        ) {
+          return apiError(
+            c,
+            400,
+            "unknown_base",
+            unknownBase(patch.base, profiles),
+          );
+        }
+        const outcome = nameTakenOnConflict(() =>
+          c.var.db.transaction(
+            (tx) => {
+              const env = findEnv(tx, id);
+              if (!env) return { kind: "not_found" } as const;
+              if (hasActiveRun(tx, id)) return { kind: "run_active" } as const;
+              const reprovision =
+                (patch.repo !== undefined && patch.repo !== env.repo) ||
+                (patch.setup !== undefined && patch.setup !== env.setup) ||
+                (patch.base !== undefined && patch.base !== env.base);
+              if (reprovision && env.status === "provisioning") {
+                return { kind: "provisioning" } as const;
+              }
+              // reprovisioning removes the repo and every worktree, and the agents' branches exist nowhere else
+              const agentIds = reprovision ? unarchivedAgentIds(tx, id) : [];
+              if (agentIds.length > 0) {
+                return { kind: "agents_exist", agentIds } as const;
+              }
+              if (
+                patch.name !== undefined &&
+                patch.name !== env.name &&
+                nameTaken(tx, patch.name)
+              ) {
+                return nameTakenResult;
+              }
+              // a pool list goes with the pool assignment, and leaves with it
+              const credential =
+                patch.claudeCredential !== undefined
+                  ? patch.claudeCredential
+                  : env.claudeCredential;
+              const poolIssue = poolProblem(
+                c.var.config,
+                credential,
+                patch.claudePool !== undefined
+                  ? patch.claudePool
+                  : credential === POOL_CREDENTIAL
+                    ? env.claudePool
+                    : null,
+              );
+              if (poolIssue)
+                return { kind: "invalid_pool", poolIssue } as const;
+              const { autoApprove: sentAutoApprove, ...rest } = patch;
+              if (credential !== POOL_CREDENTIAL) rest.claudePool = null;
+              const fields =
+                sentAutoApprove === undefined
+                  ? rest
+                  : {
+                      ...rest,
+                      autoApprove: { ...env.autoApprove, ...sentAutoApprove },
+                    };
+              const changes = reprovision
+                ? { ...fields, ...reprovisioning }
+                : fields;
+              // drizzle refuses an update with nothing to set
+              const row =
+                Object.keys(changes).length === 0
+                  ? env
+                  : tx
+                      .update(environments)
+                      .set(changes)
+                      .where(eq(environments.id, id))
+                      .returning()
+                      .get();
+              return { kind: "updated", row, reprovision } as const;
+            },
+            { behavior: "immediate" },
+          ),
+        );
+        switch (outcome.kind) {
+          case "not_found":
+            return apiError(c, 404, "not_found", notFound);
+          case "run_active":
+            return apiError(c, 409, "run_active", runActive);
+          case "provisioning":
+            return apiError(c, 409, "provisioning", stillProvisioning);
+          case "name_taken":
+            return apiError(c, 409, "name_taken", nameTakenMessage);
+          case "invalid_pool":
+            return apiError(c, 400, "invalid_pool", outcome.poolIssue);
+          case "agents_exist":
+            return apiError(
+              c,
+              409,
+              "agents_exist",
+              `changing repo, setup or base replaces every agent's worktree and branch; archive agents ${outcome.agentIds.join(", ")} first`,
+            );
+        }
+        if (outcome.reprovision) {
+          provisioner.start(outcome.row);
+          return c.json(present(outcome.row), 202);
+        }
+        return c.json(present(outcome.row), 200);
+      })
+      // only later launches change: a run in progress keeps its runtime, and an agent whose session ran on
+      // the other one starts its next run fresh (`launch.ts`)
+      .put(
+        "/:id/runtime",
+        envParam,
+        jsonBody,
+        body(RuntimeInput),
+        async (c) => {
+          const { id } = c.req.valid("param");
+          const { runtime } = c.req.valid("json");
+          const db = c.var.db;
+          const env = findEnv(db, id);
+          if (!env) return apiError(c, 404, "not_found", notFound);
+          if (runtime === "codex") {
+            if (!hasSecret(db, id, CODEX_GATEWAY_SECRET)) {
+              return apiError(
+                c,
+                409,
+                "gateway_key_missing",
+                `this environment has no ${CODEX_GATEWAY_SECRET} secret, which Codex runs need; set it with sky secret set ${env.name} ${CODEX_GATEWAY_SECRET}, then switch again`,
+              );
+            }
+            // a sprite provisioned before Codex was lacks it; one still provisioning gets it there
+            if (env.status === "ready") {
+              try {
+                const codex = await ensureCodex(sprites, env.spriteName);
+                if (codex === "installed") {
+                  log(`installed Codex on ${env.spriteName} for ${id}`);
+                }
+              } catch (err) {
+                log(`installing Codex on ${env.spriteName} failed: ${err}`);
+                return apiError(
+                  c,
+                  502,
+                  "codex_install_failed",
+                  `could not install Codex on the environment's sprite; the runtime is unchanged: ${redact(err instanceof Error ? err.message : String(err), [...c.var.secrets.values()])}`,
+                );
+              }
+            }
+          }
+          const row = db
             .update(environments)
-            .set(reprovisioning)
+            .set({ runtime })
             .where(eq(environments.id, id))
             .returning()
             .get();
-          // reprovisioning wipes the sprite's sessions, so a resume would name one that is gone
-          tx.update(agents)
-            .set({ sessionId: null })
-            .where(eq(agents.envId, id))
-            .run();
-          return { kind: "retrying", row } as const;
+          if (!row) return apiError(c, 404, "not_found", notFound);
+          return c.json(present(row), 200);
         },
-        { behavior: "immediate" },
-      );
-      switch (outcome.kind) {
-        case "not_found":
-          return apiError(c, 404, "not_found", notFound);
-        case "not_failed":
+      )
+      .post("/:id/retry", envParam, (c) => {
+        const { id } = c.req.valid("param");
+        const outcome = c.var.db.transaction(
+          (tx) => {
+            const env = findEnv(tx, id);
+            if (!env) return { kind: "not_found" } as const;
+            if (env.status !== "failed") return { kind: "not_failed" } as const;
+            const row = tx
+              .update(environments)
+              .set(reprovisioning)
+              .where(eq(environments.id, id))
+              .returning()
+              .get();
+            // reprovisioning wipes the sprite's sessions, so a resume would name one that is gone
+            tx.update(agents)
+              .set({ sessionId: null })
+              .where(eq(agents.envId, id))
+              .run();
+            return { kind: "retrying", row } as const;
+          },
+          { behavior: "immediate" },
+        );
+        switch (outcome.kind) {
+          case "not_found":
+            return apiError(c, 404, "not_found", notFound);
+          case "not_failed":
+            return apiError(
+              c,
+              409,
+              "not_failed",
+              "only a failed environment can be retried",
+            );
+        }
+        provisioner.start(outcome.row);
+        return c.json(present(outcome.row), 202);
+      })
+      .delete("/:id", envParam, async (c) => {
+        const { id } = c.req.valid("param");
+        const db = c.var.db;
+        const env = findEnv(db, id);
+        if (!env) return apiError(c, 404, "not_found", notFound);
+        if (hasActiveRun(db, id)) {
+          return apiError(c, 409, "run_active", runActive);
+        }
+        if (env.status === "provisioning") {
+          return apiError(c, 409, "provisioning", stillProvisioning);
+        }
+        const filtering = db
+          .select({ id: webhooks.id, environmentIds: webhooks.environmentIds })
+          .from(webhooks)
+          .all()
+          .filter((w) => w.environmentIds?.includes(id));
+        if (filtering.length > 0) {
+          const webhookIds = filtering.map((w) => w.id);
+          return c.json(
+            {
+              error: {
+                code: "webhooks_filter",
+                message: `webhooks filter on this environment: ${webhookIds.join(", ")}; delete them first`,
+                webhookIds,
+              },
+            },
+            409,
+          );
+        }
+        // the preview's public URL and services end with the env, and its token with them
+        try {
+          await previews.stopForEnv(id);
+        } catch (err) {
+          log(`stopping the preview of ${id} failed: ${err}`);
           return apiError(
             c,
-            409,
-            "not_failed",
-            "only a failed environment can be retried",
+            502,
+            "preview_stop_failed",
+            "could not stop the environment's preview; retry the delete",
           );
-      }
-      provisioner.start(outcome.row);
-      return c.json(present(outcome.row), 202);
-    })
-    .delete("/:id", envParam, async (c) => {
-      const { id } = c.req.valid("param");
-      const db = c.var.db;
-      const env = findEnv(db, id);
-      if (!env) return apiError(c, 404, "not_found", notFound);
-      if (hasActiveRun(db, id)) {
-        return apiError(c, 409, "run_active", runActive);
-      }
-      if (env.status === "provisioning") {
-        return apiError(c, 409, "provisioning", stillProvisioning);
-      }
-      const filtering = db
-        .select({ id: webhooks.id, environmentIds: webhooks.environmentIds })
-        .from(webhooks)
-        .all()
-        .filter((w) => w.environmentIds?.includes(id));
-      if (filtering.length > 0) {
-        const webhookIds = filtering.map((w) => w.id);
-        return c.json(
-          {
-            error: {
-              code: "webhooks_filter",
-              message: `webhooks filter on this environment: ${webhookIds.join(", ")}; delete them first`,
-              webhookIds,
-            },
+        }
+        try {
+          await destroySprite(sprites, env.spriteName);
+        } catch (err) {
+          log(`destroying sprite ${env.spriteName} failed: ${err}`);
+          return apiError(
+            c,
+            502,
+            "sprite_destroy_failed",
+            "could not destroy the environment's sprite; retry the delete",
+          );
+        }
+        // committed on its own: if the row delete below fails, the env must not stay ready on a destroyed sprite
+        db.update(environments)
+          .set({ status: "failed" })
+          .where(eq(environments.id, id))
+          .run();
+        db.transaction(
+          (tx) => {
+            const envAgents = tx
+              .select({ id: agents.id })
+              .from(agents)
+              .where(eq(agents.envId, id));
+            const envRuns = tx
+              .select({ id: runs.id })
+              .from(runs)
+              .where(inArray(runs.agentId, envAgents));
+            const envEvents = tx
+              .select({ id: events.id })
+              .from(events)
+              .where(inArray(events.runId, envRuns));
+            // both pin their parent without cascade (db/src/schema.ts), so they go first
+            tx.delete(webhookDeliveries)
+              .where(inArray(webhookDeliveries.eventId, envEvents))
+              .run();
+            tx.delete(runRequests)
+              .where(inArray(runRequests.runId, envRuns))
+              .run();
+            tx.delete(events).where(inArray(events.runId, envRuns)).run();
+            tx.delete(previewRows).where(eq(previewRows.envId, id)).run();
+            tx.delete(runs).where(inArray(runs.agentId, envAgents)).run();
+            tx.delete(agents).where(eq(agents.envId, id)).run();
+            tx.delete(environments).where(eq(environments.id, id)).run();
           },
-          409,
+          { behavior: "immediate" },
         );
-      }
-      // the preview's public URL and services end with the env, and its token with them
-      try {
-        await previews.stopForEnv(id);
-      } catch (err) {
-        log(`stopping the preview of ${id} failed: ${err}`);
-        return apiError(
-          c,
-          502,
-          "preview_stop_failed",
-          "could not stop the environment's preview; retry the delete",
-        );
-      }
-      try {
-        await destroySprite(sprites, env.spriteName);
-      } catch (err) {
-        log(`destroying sprite ${env.spriteName} failed: ${err}`);
-        return apiError(
-          c,
-          502,
-          "sprite_destroy_failed",
-          "could not destroy the environment's sprite; retry the delete",
-        );
-      }
-      // committed on its own: if the row delete below fails, the env must not stay ready on a destroyed sprite
-      db.update(environments)
-        .set({ status: "failed" })
-        .where(eq(environments.id, id))
-        .run();
-      db.transaction(
-        (tx) => {
-          const envAgents = tx
-            .select({ id: agents.id })
-            .from(agents)
-            .where(eq(agents.envId, id));
-          const envRuns = tx
-            .select({ id: runs.id })
-            .from(runs)
-            .where(inArray(runs.agentId, envAgents));
-          const envEvents = tx
-            .select({ id: events.id })
-            .from(events)
-            .where(inArray(events.runId, envRuns));
-          // both pin their parent without cascade (db/src/schema.ts), so they go first
-          tx.delete(webhookDeliveries)
-            .where(inArray(webhookDeliveries.eventId, envEvents))
-            .run();
-          tx.delete(runRequests)
-            .where(inArray(runRequests.runId, envRuns))
-            .run();
-          tx.delete(events).where(inArray(events.runId, envRuns)).run();
-          tx.delete(previewRows).where(eq(previewRows.envId, id)).run();
-          tx.delete(runs).where(inArray(runs.agentId, envAgents)).run();
-          tx.delete(agents).where(eq(agents.envId, id)).run();
-          tx.delete(environments).where(eq(environments.id, id)).run();
-        },
-        { behavior: "immediate" },
-      );
-      return c.body(null, 204);
-    });
+        return c.body(null, 204);
+      })
+  );
 }

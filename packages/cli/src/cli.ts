@@ -50,8 +50,9 @@ const help = (io: Io) => `Usage:
   sky env list [options]
       Print "<id> <status> <repo> <name>" per environment.
   sky env show <env> [options]
-      Print the same line for one environment (<env> is its id or name);
-      a failed one adds the step it failed at and that step's stderr.
+      Print the same line for one environment (<env> is its id or name),
+      then its runtime; a failed one adds the step it failed at and that
+      step's stderr.
   sky env delete <env> [--yes] [options]
       Destroy the environment's sandbox and delete it with all its agents,
       runs and events. Refused while a run is active or it is provisioning.
@@ -75,6 +76,13 @@ const help = (io: Io) => `Usage:
       subscription named "all" can be listed there. Without --pool the
       list stays as it is, so --fallback alone never widens an ordered
       pool. Needs the admin key.
+  sky env set-runtime <env> <claude-code|codex> [options]
+      Switch the environment's runs between Claude Code and Codex. Codex
+      needs the environment's AI_GATEWAY_API_KEY secret, and is installed
+      on the sandbox if it lacks it. An agent's next run after a switch
+      starts a fresh session on its branch. A run that fails with
+      claude_unavailable: or codex_unavailable: names the exact
+      set-runtime command to run. Needs the admin key.
   sky claude-credentials [options]
       Print "<name> <subscription|api-key> <limited-until=<time>|-> <runs
       today> <env ids|-> <5h=N%|-> <7d=N%|-> <pool env ids|->" per

@@ -21,6 +21,7 @@ test("accepts an environment and defaults its cap and approval policy", () => {
     claudeCredential: null,
     claudePool: null,
     claudeFallback: "api-key",
+    runtime: null,
   });
 });
 

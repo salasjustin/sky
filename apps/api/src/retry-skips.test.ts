@@ -189,6 +189,16 @@ const warningsOf = (runId: string) =>
 const exitWaits = () =>
   logs.filter((line) => line.includes("await-exit: start")).length;
 
+/** The error the API stored on a failed run. */
+const failureOf = (runId: string) => {
+  const row = db
+    .select({ payload: events.payload })
+    .from(events)
+    .where(and(eq(events.runId, runId as RunId), eq(events.type, "run.failed")))
+    .get();
+  return String((row?.payload as { error?: string } | undefined)?.error);
+};
+
 const retriesOf = (failedId: string) =>
   db
     .select()
@@ -426,13 +436,16 @@ test("a limit failure whose environment is no longer ready is not retried and sa
   expect(exitWaits()).toBe(0);
 });
 
-test("a limit failure with the API-key fallback off is not retried and says so", async () => {
-  const r = await launchedRun(readyEnv({ claudeFallback: "none" }));
+test("a limit failure with the API-key fallback off is not retried and says so in its error", async () => {
+  const envId = readyEnv({ claudeFallback: "none" });
+  const r = await launchedRun(envId);
   await failWith(r, FIVE_HOUR);
-  await vi.waitFor(() => expect(warningsOf(r.run.id)).toHaveLength(1));
-  expect(warningsOf(r.run.id)[0]).toContain(
-    "not retried: its environment has no other credential to use",
+  const error = failureOf(r.run.id);
+  expect(error).toMatch(
+    /^claude_unavailable: the Claude credential "\w+" is at its usage limit and resets .* \(UTC\); this environment's API key fallback is off/,
   );
+  expect(error).toContain(`sky env set-runtime ${envId} codex`);
+  expect(exitWaits()).toBe(0);
   expect(wire.sessions).toHaveLength(1);
 });
 

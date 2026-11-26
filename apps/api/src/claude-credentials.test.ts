@@ -484,9 +484,10 @@ test("with no API key set, a limited subscription fails the launch at once, nami
   const { run } = await launch(personal);
   await vi.waitFor(() => expect(runRow(run.id)?.status).toBe("failed"));
   const error = failureOf(run.id);
-  expect(error).toContain("claude_limited");
+  expect(error).toMatch(/^claude_unavailable: /);
   expect(error).toContain(until.toISOString());
   expect(error).toContain("UTC");
+  expect(error).toContain(`sky env set-runtime ${personal} codex`);
   // no sprite was touched: nothing was started to die
   expect(wire.sessions).toHaveLength(0);
   expect(wire.calls).toEqual([]);
@@ -582,7 +583,7 @@ test("with no API key set, a limited default token fails an unassigned environme
   markLimited(db, "default", until);
   const { run } = await launch(readyEnv());
   await vi.waitFor(() => expect(runRow(run.id)?.status).toBe("failed"));
-  expect(failureOf(run.id)).toContain("claude_limited");
+  expect(failureOf(run.id)).toMatch(/^claude_unavailable: /);
   expect(failureOf(run.id)).toContain(until.toISOString());
   expect(wire.sessions).toHaveLength(0);
 });
