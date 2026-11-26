@@ -840,46 +840,49 @@ test.each([
     "codex",
     "sky: cannot reach https://sky.test: no response in 15 min; the switch may still complete on the server: check with sky env show env_1\n",
   ],
-  [
-    "claude-code",
-    "sky: cannot reach https://sky.test: no response in 30s\n",
-  ],
-])("a timed-out switch to %s exits 1 as unreachable", async (runtime, message) => {
-  server.use(list);
-  const fetchOf = globalThis.fetch;
-  const spy = vi.spyOn(globalThis, "fetch");
-  // what undici rejects with when the request's AbortSignal.timeout fires
-  spy.mockImplementation(async (input, init) => {
-    if (init?.method !== "PUT") return fetchOf(input, init);
-    throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
-  });
-  try {
-    const r = await runCli(["env", "set-runtime", "web", runtime]);
-    expect(r.code).toBe(1);
-    expect(r.stdout).toBe("");
-    expect(r.stderr).toBe(
-      `${runtime === "codex" ? INSTALL_NOTICE : ""}${message}`,
-    );
-    const json = await runCli([
-      "env",
-      "set-runtime",
-      "web",
-      runtime,
-      "--json",
-    ]);
-    expect(json.code).toBe(1);
-    expect(json.stdout).toBe("");
-    const lines = json.stderr.trimEnd().split("\n");
-    expect(JSON.parse(lines[lines.length - 1] ?? "")).toEqual({
-      error: {
-        code: "unreachable",
-        message: message.replace(/^sky: /, "").trimEnd(),
-      },
+  ["claude-code", "sky: cannot reach https://sky.test: no response in 30s\n"],
+])(
+  "a timed-out switch to %s exits 1 as unreachable",
+  async (runtime, message) => {
+    server.use(list);
+    const fetchOf = globalThis.fetch;
+    const spy = vi.spyOn(globalThis, "fetch");
+    // what undici rejects with when the request's AbortSignal.timeout fires
+    spy.mockImplementation(async (input, init) => {
+      if (init?.method !== "PUT") return fetchOf(input, init);
+      throw new DOMException(
+        "The operation was aborted due to timeout",
+        "TimeoutError",
+      );
     });
-  } finally {
-    spy.mockRestore();
-  }
-});
+    try {
+      const r = await runCli(["env", "set-runtime", "web", runtime]);
+      expect(r.code).toBe(1);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toBe(
+        `${runtime === "codex" ? INSTALL_NOTICE : ""}${message}`,
+      );
+      const json = await runCli([
+        "env",
+        "set-runtime",
+        "web",
+        runtime,
+        "--json",
+      ]);
+      expect(json.code).toBe(1);
+      expect(json.stdout).toBe("");
+      const lines = json.stderr.trimEnd().split("\n");
+      expect(JSON.parse(lines[lines.length - 1] ?? "")).toEqual({
+        error: {
+          code: "unreachable",
+          message: message.replace(/^sky: /, "").trimEnd(),
+        },
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  },
+);
 
 test.each([
   [["env", "set-runtime", "web"], /takes <env> <claude-code\|codex>/],
