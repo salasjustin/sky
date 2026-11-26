@@ -347,7 +347,7 @@ export function internalRoutes(
           tx.update(agents)
             .set({
               status: agentStatusFor(next ?? run.status),
-              // which runtime the session is, so a follow-up on the other one doesn't try to resume it
+              // the runtime the session runs on, so a follow-up on the other one doesn't try to resume it
               ...(event.type === "run.started"
                 ? {
                     sessionId: event.payload.sessionId,

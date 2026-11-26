@@ -672,9 +672,9 @@ test("a same-runtime follow-up resumes its session as before", async () => {
   expect(next.prompt).toBe("more");
 });
 
-// --- sessions recorded before their runtime was ---------------------------------------------------
+// --- sessions from before runtimes were recorded --------------------------------------------------
 
-/** An agent of `envId` whose session's runtime is unrecorded, as every session from before it was. */
+/** An agent of `envId` whose session's runtime is unrecorded, like one from before runtimes were recorded. */
 async function unrecordedSession(envId: EnvironmentId, summary = "done") {
   const first = await launched(envId);
   await start(first, "old-session");

@@ -421,7 +421,7 @@ export function environmentRoutes(
                 `this environment has no ${CODEX_GATEWAY_SECRET} secret, which Codex runs need; set it with sky secret set ${env.name} ${CODEX_GATEWAY_SECRET}, then switch again`,
               );
             }
-            // a sprite provisioned before Codex was lacks it; one still provisioning gets it there
+            // a sprite provisioned before Codex was lacks it; provisioning installs it on one still provisioning
             if (env.status === "ready") {
               try {
                 const codex = await ensureCodex(sprites, env.spriteName);

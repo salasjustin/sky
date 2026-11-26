@@ -40,7 +40,10 @@ export const withSwitch = (message: string, envName: string, to: Runtime) =>
 
 /** The code a Claude run that can't run on any credential fails with. */
 export const CLAUDE_UNAVAILABLE = "claude_unavailable:";
-/** The code a Codex run the AI Gateway refused for credit, quota or rate limit fails with (the runner's wording). */
+/**
+ * The code a Codex run fails with when the AI Gateway refused it for credit, quota or rate limit
+ * (the runner's wording), or when its environment has no gateway key.
+ */
 export const CODEX_UNAVAILABLE = "codex_unavailable:";
 
 /**

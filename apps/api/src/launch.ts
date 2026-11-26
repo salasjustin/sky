@@ -808,7 +808,7 @@ export function createLauncher({
       .where(eq(agents.id, launch.agentId))
       .get();
     if (!agent) return same;
-    // a session recorded before its runtime was ran on what the environment picks with none stored
+    // a session from before runtimes were recorded ran on what the environment picks with none stored
     const from = agent.sessionRuntime ?? unrecordedRuntime;
     if (from === runtime) return same;
     const last = db
@@ -858,7 +858,7 @@ export function createLauncher({
     );
     const envVars = unreserved(openRunEnvVars(db, key, launch.runId), "envVar");
     const env = envOf(launch.envId);
-    // a run's envVars override the env's secrets, and the environment's stored runtime both
+    // the environment's stored runtime wins; without one, a run's envVars override the env's secrets
     const runtimeVariable =
       envVars.get(RUNTIME_VARIABLE) ?? envSecrets.get(RUNTIME_VARIABLE);
     const runtime = effectiveRuntime(env.runtime, runtimeVariable);
