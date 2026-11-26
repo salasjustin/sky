@@ -794,6 +794,7 @@ export function createLauncher({
   function sessionFor(
     launch: Launch,
     runtime: Runtime,
+    unrecordedRuntime: Runtime,
   ): { sessionId: string | null; prompt: string } {
     const same = { sessionId: launch.sessionId, prompt: launch.prompt };
     if (!launch.sessionId) return same;
@@ -806,8 +807,10 @@ export function createLauncher({
       .from(agents)
       .where(eq(agents.id, launch.agentId))
       .get();
-    // a session recorded before its runtime was is resumed, as every one was until then
-    if (!agent?.sessionRuntime || agent.sessionRuntime === runtime) return same;
+    if (!agent) return same;
+    // a session recorded before its runtime was ran on what the environment picks with none stored
+    const from = agent.sessionRuntime ?? unrecordedRuntime;
+    if (from === runtime) return same;
     const last = db
       .select({ summary: runs.summary })
       .from(runs)
@@ -821,13 +824,13 @@ export function createLauncher({
       .orderBy(desc(runs.createdAt), desc(sql`${runs}.rowid`))
       .get();
     log(
-      `launching ${launch.runId}: the agent's session ran on ${agent.sessionRuntime}, not ${runtime}; starting a fresh session`,
+      `launching ${launch.runId}: the agent's session ran on ${from}, not ${runtime}; starting a fresh session`,
     );
     return {
       sessionId: null,
       prompt: crossRuntimePrompt({
         prompt: launch.prompt,
-        from: agent.sessionRuntime,
+        from,
         to: runtime,
         branch: agent.remoteBranch ?? agent.branch,
         summary: last?.summary ?? null,
@@ -856,10 +859,9 @@ export function createLauncher({
     const envVars = unreserved(openRunEnvVars(db, key, launch.runId), "envVar");
     const env = envOf(launch.envId);
     // a run's envVars override the env's secrets, and the environment's stored runtime both
-    const runtime = effectiveRuntime(
-      env.runtime,
-      envVars.get(RUNTIME_VARIABLE) ?? envSecrets.get(RUNTIME_VARIABLE),
-    );
+    const runtimeVariable =
+      envVars.get(RUNTIME_VARIABLE) ?? envSecrets.get(RUNTIME_VARIABLE);
+    const runtime = effectiveRuntime(env.runtime, runtimeVariable);
     db.update(runs).set({ runtime }).where(eq(runs.id, launch.runId)).run();
     // before any sprite work: a launch with no usable credential fails at once, not after a dead run.
     // A Codex run's model calls carry the gateway key, never a Claude credential
@@ -899,7 +901,11 @@ export function createLauncher({
         .run();
       log(`launching ${launch.runId}: Claude credential ${auth.credential}`);
     }
-    const session = sessionFor(launch, runtime);
+    const session = sessionFor(
+      launch,
+      runtime,
+      effectiveRuntime(null, runtimeVariable),
+    );
     await step(launch, "memory check", () => checkMemory(launch));
     await step(launch, "bundle", () =>
       ensureBundle(launch.spriteName, launch.runId),

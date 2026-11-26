@@ -11,7 +11,7 @@ import {
   openDb,
   runs,
 } from "@sky/db";
-import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
+import type { AgentId, EnvironmentId, RunId, Runtime } from "@sky/shared";
 import { and, eq } from "drizzle-orm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
@@ -562,16 +562,90 @@ test("a same-runtime follow-up resumes its session as before", async () => {
   expect(next.prompt).toBe("more");
 });
 
-test("a session recorded before its runtime was is resumed, as before", async () => {
-  const envId = readyEnv({ runtime: "codex" });
-  await setGatewayKey(envId);
+// --- sessions recorded before their runtime was ---------------------------------------------------
+
+/** An agent of `envId` whose session's runtime is unrecorded, as every session from before it was. */
+async function unrecordedSession(envId: EnvironmentId, summary = "done") {
   const first = await launched(envId);
   await start(first, "old-session");
-  await finish(first, "done");
+  await finish(first, summary);
   db.update(agents)
     .set({ sessionRuntime: null })
     .where(eq(agents.id, first.agent.id))
     .run();
-  const next = await launched(envId, first.agent.id, "more");
+  return first.agent.id;
+}
+
+const storeRuntime = (envId: EnvironmentId, runtime: Runtime) =>
+  db
+    .update(environments)
+    .set({ runtime })
+    .where(eq(environments.id, envId))
+    .run();
+
+const setRuntimeSecret = async (envId: EnvironmentId) =>
+  expect(
+    (
+      await call("PUT", `/v1/environments/${envId}/secrets/SKY_RUNTIME`, {
+        value: "codex",
+      })
+    ).status,
+  ).toBe(200);
+
+test("with no runtime stored or set, an unrecorded session is resumed, as before", async () => {
+  const envId = readyEnv();
+  const agentId = await unrecordedSession(envId);
+  const next = await launched(envId, agentId, "more");
   expect(next.session?.env.SESSION_ID).toBe("old-session");
+  expect(next.prompt).toBe("more");
+});
+
+test("an unrecorded session in an environment switched to Codex ran on Claude Code: a fresh session, told so", async () => {
+  const envId = readyEnv();
+  await setGatewayKey(envId);
+  const agentId = await unrecordedSession(envId, "Did the first half.");
+  storeRuntime(envId, "codex");
+  const next = await launched(envId, agentId, "more");
+  expect(next.session?.env).not.toHaveProperty("SESSION_ID");
+  expect(next.file.SKY_RUNTIME).toBe("codex");
+  expect(next.prompt).toBe(
+    crossRuntimePrompt({
+      prompt: "more",
+      from: "claude-code",
+      to: "codex",
+      branch: `claude/${agentId}`,
+      summary: "Did the first half.",
+    }),
+  );
+});
+
+test("an unrecorded session from a SKY_RUNTIME=codex environment that now stores Codex is resumed", async () => {
+  const envId = readyEnv();
+  await setGatewayKey(envId);
+  await setRuntimeSecret(envId);
+  const agentId = await unrecordedSession(envId);
+  storeRuntime(envId, "codex");
+  const next = await launched(envId, agentId, "more");
+  expect(next.session?.env.SESSION_ID).toBe("old-session");
+  expect(next.prompt).toBe("more");
+});
+
+test("an unrecorded session from a SKY_RUNTIME=codex environment switched to Claude Code ran on Codex: a fresh session, told so", async () => {
+  const envId = readyEnv();
+  await setGatewayKey(envId);
+  await setRuntimeSecret(envId);
+  const agentId = await unrecordedSession(envId, "Did the first half.");
+  storeRuntime(envId, "claude-code");
+  const next = await launched(envId, agentId, "more");
+  expect(next.session?.env).not.toHaveProperty("SESSION_ID");
+  expect(next.file.SKY_RUNTIME).toBe("claude-code");
+  expect(next.prompt).toBe(
+    crossRuntimePrompt({
+      prompt: "more",
+      from: "codex",
+      to: "claude-code",
+      branch: `claude/${agentId}`,
+      summary: "Did the first half.",
+    }),
+  );
 });
