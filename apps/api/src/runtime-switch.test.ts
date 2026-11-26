@@ -252,9 +252,10 @@ test("the switch command quotes an environment name a shell would split", () => 
 
 // --- named failures ------------------------------------------------------------------------------
 
-test("a run whose API key is out of credit fails claude_unavailable with the switch command, and the next launch fails fast", async () => {
-  const recovery =
-    "top it up and restart the API (fly apps restart <app>), or set a new SKY_ANTHROPIC_API_KEY, which restarts it";
+const RECOVERY =
+  "top the key up, then clear its mark with sky claude-credentials clear-credit <name> (or restart the API, which a new key secret does)";
+
+test("a run whose only API key is out of credit fails claude_unavailable with the switch command, and the next launch fails fast", async () => {
   const envId = readyEnv({ claudeCredential: "api-key" });
   const r = await launched(envId);
   expect(r.file.SKY_CLAUDE_AUTH).toBe("api-key");
@@ -262,18 +263,16 @@ test("a run whose API key is out of credit fails claude_unavailable with the swi
   await fail(r, CREDIT_LOW);
   const error = failureOf(r.run.id);
   expect(error).toMatch(/^claude_unavailable: /);
-  expect(error).toContain("out of credit");
+  expect(error).toContain("all Anthropic API keys are out of credit");
   expect(error).toContain(
-    `${recovery}; to run this environment on Codex instead: sky env set-runtime ${envId} codex`,
+    `${RECOVERY}; to run this environment on Codex instead: sky env set-runtime ${envId} codex`,
   );
 
   // no runner is started for a launch that would die the same way
   const next = await refused(envId);
   expect(next).toMatch(/^claude_unavailable: /);
-  expect(next).toContain("out of credit");
-  expect(next).toContain(
-    `${recovery}; to run this environment on Codex instead: sky env set-runtime ${envId} codex`,
-  );
+  expect(next).toContain("all Anthropic API keys are out of credit");
+  expect(next.endsWith(`sky env set-runtime ${envId} codex`)).toBe(true);
   expect(wire.sessions).toHaveLength(1);
 
   // nor for one whose subscription is limited and would fall back on the key
@@ -281,12 +280,12 @@ test("a run whose API key is out of credit fails claude_unavailable with the swi
   markLimited(db, "personal", new Date(Date.now() + 3_600_000));
   const fallback = await refused(other);
   expect(fallback).toMatch(/^claude_unavailable: /);
-  expect(fallback).toContain("falls back on is out of credit");
+  expect(fallback).toContain("falls back on are out of credit");
   expect(fallback).toContain(`sky env set-runtime ${other} codex`);
   expect(wire.sessions).toHaveLength(1);
 });
 
-test("a run on the API key that finishes clears the out-of-credit mark", async () => {
+test("a run on the API key that finishes does not clear the out-of-credit mark; clear-credit does", async () => {
   const envId = readyEnv({ claudeCredential: "api-key", concurrency: 2 });
   const a = await launched(envId);
   const b = await launched(envId);
@@ -294,9 +293,41 @@ test("a run on the API key that finishes clears the out-of-credit mark", async (
   await start(b, "sess-2");
   await fail(a, CREDIT_LOW);
   expect(await refused(envId)).toMatch(/^claude_unavailable: /);
+  // b started before the credit ran out and finishes after: it says nothing of the key's credit now
   await finish(b, "done");
+  expect(await refused(envId)).toMatch(/^claude_unavailable: /);
+  const listed = await (await call("GET", "/v1/claude-credentials")).json();
+  expect(
+    (listed as { data: { name: string; outOfCredit: boolean }[] }).data.find(
+      (c) => c.name === "api-key",
+    )?.outOfCredit,
+  ).toBe(true);
+
+  const cleared = await call(
+    "POST",
+    "/v1/claude-credentials/api-key/clear-credit",
+  );
+  expect(cleared.status).toBe(200);
+  expect(await cleared.json()).toEqual({
+    name: "api-key",
+    outOfCredit: false,
+    wasOutOfCredit: true,
+  });
   const c = await launched(envId);
   expect(c.file.SKY_CLAUDE_AUTH).toBe("api-key");
+});
+
+test("clear-credit is admin only and names a key the server holds", async () => {
+  const unknown = await call(
+    "POST",
+    "/v1/claude-credentials/api-key%3Aspare/clear-credit",
+  );
+  expect(unknown.status).toBe(404);
+  const denied = await app.request(
+    "/v1/claude-credentials/api-key/clear-credit",
+    { method: "POST" },
+  );
+  expect([401, 403]).toContain(denied.status);
 });
 
 test("a subscription run finishing leaves the out-of-credit mark on the API key", async () => {
@@ -481,8 +512,10 @@ test("a Codex launch whose install fails fails the run naming why, before any ru
       ? { exitCode: 1, stderr: "npm ERR! network unreachable\n" }
       : base(argv, sprite);
   const error = await refused(envId);
+  expect(error).toMatch(/^codex_unavailable: /);
   expect(error).toContain("installing Codex 0.172.0 failed");
   expect(error).toContain("network unreachable");
+  expect(error.endsWith(`sky env set-runtime ${envId} claude-code`)).toBe(true);
   expect(wire.sessions).toHaveLength(0);
 });
 
@@ -561,6 +594,30 @@ test("a switch that can't install Codex leaves the runtime as it was", async () 
     db.select().from(environments).where(eq(environments.id, envId)).get()
       ?.runtime,
   ).toBeNull();
+});
+
+test("switching to default stores no runtime, so the environment follows its SKY_RUNTIME secret again", async () => {
+  const envId = readyEnv({ runtime: "codex" });
+  expect(
+    (
+      await call("PUT", `/v1/environments/${envId}/secrets/SKY_RUNTIME`, {
+        value: "claude-code",
+      })
+    ).status,
+  ).toBe(200);
+  const before = wire.calls.length;
+  const res = await call("PUT", `/v1/environments/${envId}/runtime`, {
+    runtime: null,
+  });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ id: envId, runtime: null });
+  expect(wire.calls.slice(before)).toEqual([]);
+  expect(
+    db.select().from(environments).where(eq(environments.id, envId)).get()
+      ?.runtime,
+  ).toBeNull();
+  // the secret now decides
+  expect((await launched(envId)).file.SKY_RUNTIME).toBe("claude-code");
 });
 
 test("an unknown runtime is a 400", async () => {

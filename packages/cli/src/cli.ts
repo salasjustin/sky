@@ -61,14 +61,16 @@ const help = (io: Io) => `Usage:
   sky env retry <env> [options]
       Provision a failed environment again. Prints its line, now
       provisioning; sky env show reports when it's ready.
-  sky env set-claude <env> <name|api-key|pool|default>
+  sky env set-claude <env> <name|api-key|api-key:<name>|pool|default>
       [--pool=<name,...>] [--fallback=api-key|none] [options]
       Choose the Claude credential the environment's runs use: the name of
       a subscription token the server holds (CLAUDE_OAUTH_TOKEN_<NAME>),
-      api-key for the pay-per-use Anthropic API key, or default for the
-      server's default token. --fallback=none stops a run from using the
-      API key while its subscription is at its usage limit; the launch
-      fails with the reset time instead. Only pool moves runs between
+      api-key for the pay-per-use Anthropic API key (api-key:<name> for a
+      named one, SKY_ANTHROPIC_API_KEY_<NAME>), or default for the
+      server's default token. A run on an API key whose credit runs out
+      moves on to the next key with credit. --fallback=none stops a run
+      from using the API keys while its subscription is at its usage
+      limit; the launch fails with the reset time instead. Only pool moves runs between
       subscriptions: the environment's runs go to the subscription with
       the most headroom and, on a usage limit, on to the next one.
       --pool=a,b limits and orders the choice; --pool=all (any case)
@@ -76,8 +78,10 @@ const help = (io: Io) => `Usage:
       subscription named "all" can be listed there. Without --pool the
       list stays as it is, so --fallback alone never widens an ordered
       pool. Needs the admin key.
-  sky env set-runtime <env> <claude-code|codex> [options]
-      Switch the environment's runs between Claude Code and Codex. Codex
+  sky env set-runtime <env> <claude-code|codex|default> [options]
+      Switch the environment's runs between Claude Code and Codex; default
+      stores no runtime, so the environment follows its SKY_RUNTIME secret
+      again (Claude Code without one). Codex
       needs the environment's AI_GATEWAY_API_KEY secret, else the switch is
       refused with gateway_key_missing. Codex is installed on the sandbox
       if it lacks it, so the first switch to Codex can take a few minutes;
@@ -87,11 +91,18 @@ const help = (io: Io) => `Usage:
       claude_unavailable: or codex_unavailable: names the exact
       set-runtime command to run. Needs the admin key.
   sky claude-credentials [options]
-      Print "<name> <subscription|api-key> <limited-until=<time>|-> <runs
-      today> <env ids|-> <5h=N%|-> <7d=N%|-> <pool env ids|->" per
-      credential: its limit, its environments, its last-seen usage and the
-      pool environments that may use it. Values are never printed. Needs
-      the admin key.
+      Print "<name> <subscription|api-key> <limited-until=<time>|out-of-
+      credit|-> <runs today> <env ids|-> <5h=N%|-> <7d=N%|-> <pool env
+      ids|->" per credential: its limit or, for an API key (api-key, or
+      api-key:<name> for a named one), whether it is marked out of
+      credit, its environments, its last-seen usage and the pool
+      environments that may use it. Values are never printed. Needs the
+      admin key.
+  sky claude-credentials clear-credit <name> [options]
+      Clear an API key's out-of-credit mark once it is topped up; <name> is
+      as the list prints it (api-key:backup) or the bare name (backup,
+      default for the plain key). Nothing else clears a mark but an API
+      restart: a run that finishes on the key doesn't. Needs the admin key.
   sky webhook add <url> --events=<types,...> [options]
       [--format=standard|openbot --secret=@file|-] [--env=<id|name>,...]
       Subscribe an https URL to event types. --format=standard signs

@@ -57,10 +57,13 @@ export async function ensureCodex(
   );
   if (out.exitCode === 0) return "present";
   if (out.exitCode === 3) return "installed";
-  throw new Error(
+  throw new CodexInstallError(
     `installing Codex ${CODEX_VERSION} failed (exit ${out.exitCode}): ${out.stderr.trim().slice(-TAIL_CHARS)}`,
   );
 }
+
+/** The Codex install ran on the sprite and failed; any other failure of `ensureCodex` is the exec's own. */
+export class CodexInstallError extends Error {}
 // finds the SDK's bundled `claude` under the runner dir, which is the script's first argument
 const FIND_CLAUDE = `
 const sdk = process.argv[1] + "/node_modules/@anthropic-ai";

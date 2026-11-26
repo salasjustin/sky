@@ -1,8 +1,11 @@
 import { claudeLimits, type Db } from "@sky/db";
 import {
   API_KEY_CREDENTIAL,
+  apiKeyCredential,
+  apiKeyNameOf,
   type ClaudeFallback,
   DEFAULT_CLAUDE_CREDENTIAL,
+  isApiKeyCredential,
   POOL_CREDENTIAL,
 } from "@sky/shared";
 import { eq } from "drizzle-orm";
@@ -11,7 +14,7 @@ import type { Config } from "./config.js";
 /** What a run's Claude session authenticates with; `credential` is the name recorded on the run. */
 export type ClaudeAuth =
   | { kind: "subscription"; credential: string; token: string }
-  | { kind: "api-key"; credential: typeof API_KEY_CREDENTIAL; key: string };
+  | { kind: "api-key"; credential: string; key: string };
 
 /** The env's assignment as it reaches a launch. */
 export type ClaudeAssignment = {
@@ -23,11 +26,13 @@ export type ClaudeAssignment = {
 export class ClaudeCredentialError extends Error {}
 
 /**
- * Whether the API key is out of credit: set when a run on it fails with Anthropic's "Credit balance
- * is too low", cleared when a run on it finishes. In memory, so a restart (with a new key, or the
- * old one topped up) clears it too.
+ * Whether an API key, by the credential recorded for it (`api-key`, `api-key:<name>`), is out of
+ * credit: set when a run on it fails with Anthropic's "Credit balance is too low". Cleared only by
+ * a restart of the API (with a new key, or the old one topped up) or by a command that clears that
+ * one key; a run finishing on the key doesn't, since it may have started before the credit ran out.
+ * In memory.
  */
-export type ApiKeyCredit = { outOfCredit: () => boolean };
+export type ApiKeyCredit = { outOfCredit: (credential: string) => boolean };
 
 const CREDITED: ApiKeyCredit = { outOfCredit: () => false };
 
@@ -35,18 +40,60 @@ const CREDITED: ApiKeyCredit = { outOfCredit: () => false };
 export const isCreditExhausted = (error: string): boolean =>
   /credit balance is too low/i.test(error);
 
-/**
- * How an out-of-credit API key comes back. A top-up alone doesn't: the mark stays until the API
- * restarts, and only a new secret restarts it on its own.
- */
+/** How an out-of-credit API key comes back: a top-up alone doesn't, its mark has to be cleared. */
 export const CREDIT_RECOVERY =
-  "top it up and restart the API (fly apps restart <app>), or set a new SKY_ANTHROPIC_API_KEY, which restarts it";
+  "top the key up, then clear its mark with sky claude-credentials clear-credit <name> (or restart the API, which a new key secret does)";
 
-/** What a launch refused on an out-of-credit key says of it; `role` names what the key was for. */
+/** What every API key being out of credit is called in an error. */
+export const ALL_KEYS_OUT = `all Anthropic API keys are out of credit (Anthropic answered "Credit balance is too low")`;
+
+/** What a launch refused for want of an API key with credit says; `role` names what the key was for. */
 const outOfCredit = (role: string) =>
   new ClaudeCredentialError(
-    `claude_unavailable: ${role} is the Anthropic API key, which is out of credit (Anthropic answered "Credit balance is too low"); ${CREDIT_RECOVERY}`,
+    `claude_unavailable: ${role} needs an Anthropic API key, and ${ALL_KEYS_OUT}; ${CREDIT_RECOVERY}`,
   );
+
+/**
+ * The API keys this server holds as credentials, in the order they are tried: the plain key first,
+ * then the named keys by name.
+ */
+export const apiKeyCredentials = (config: Config): string[] => [
+  ...(config.anthropicApiKey ? [API_KEY_CREDENTIAL] : []),
+  ...Object.keys(config.anthropicApiKeys)
+    .sort()
+    .map((name) => apiKeyCredential(name)),
+];
+
+/** The value of the API key a credential names; undefined when this server holds none by that name. */
+export const apiKeyValue = (
+  config: Config,
+  credential: string,
+): string | undefined => {
+  const name = apiKeyNameOf(credential);
+  if (name === undefined) return undefined;
+  return name === DEFAULT_CLAUDE_CREDENTIAL
+    ? config.anthropicApiKey
+    : config.anthropicApiKeys[name];
+};
+
+/**
+ * The first API key, in try order, that has credit and isn't in `skip`; `preferred` goes first when
+ * it is held. Undefined when every key is out of credit, tried or not held.
+ */
+export function nextApiKey(
+  config: Config,
+  credit: ApiKeyCredit,
+  skip: Iterable<string> = [],
+  preferred?: string,
+): string | undefined {
+  const skipped = new Set(skip);
+  const held = apiKeyCredentials(config);
+  const order =
+    preferred && held.includes(preferred)
+      ? [preferred, ...held.filter((c) => c !== preferred)]
+      : held;
+  return order.find((c) => !skipped.has(c) && !credit.outOfCredit(c));
+}
 
 /** `default` and unset are the same assignment. */
 export const credentialNameOf = (assigned: string | null) =>
@@ -70,14 +117,15 @@ export function assignmentProblem(
   ) {
     return undefined;
   }
-  if (assigned === API_KEY_CREDENTIAL) {
-    return config.anthropicApiKey
-      ? undefined
-      : "this server has no SKY_ANTHROPIC_API_KEY";
+  if (isApiKeyCredential(assigned)) {
+    if (apiKeyValue(config, assigned)) return undefined;
+    return assigned === API_KEY_CREDENTIAL
+      ? "this server has no SKY_ANTHROPIC_API_KEY"
+      : `this server has no SKY_ANTHROPIC_API_KEY_${(apiKeyNameOf(assigned) ?? "").toUpperCase()}`;
   }
   return Object.hasOwn(config.claudeOauthTokens, assigned)
     ? undefined
-    : `unknown Claude credential ${JSON.stringify(assigned)}; this server has: ${[...subscriptionNames(config), ...(config.anthropicApiKey ? [API_KEY_CREDENTIAL] : [])].join(", ")}`;
+    : `unknown Claude credential ${JSON.stringify(assigned)}; this server has: ${[...subscriptionNames(config), ...apiKeyCredentials(config)].join(", ")}`;
 }
 
 export const tokenOf = (config: Config, name: string): string | undefined =>
@@ -145,8 +193,8 @@ export function resolveClaudeAuth(
   if (name === POOL_CREDENTIAL) {
     throw new Error("a pool assignment goes through resolvePoolAuth");
   }
-  if (name === API_KEY_CREDENTIAL) {
-    return apiKeyAuth(config, "the environment", credit);
+  if (isApiKeyCredential(name)) {
+    return apiKeyAuth(config, "the environment", credit, name);
   }
   const token = tokenOf(config, name);
   if (!token) {
@@ -163,17 +211,17 @@ export function resolveClaudeAuth(
       `${limited}; this environment's API key fallback is off, so launch again after the reset`,
     );
   }
-  if (!config.anthropicApiKey) {
+  if (apiKeyCredentials(config).length === 0) {
     throw new ClaudeCredentialError(
       `${limited}; this server has no SKY_ANTHROPIC_API_KEY to fall back on, so launch again after the reset`,
     );
   }
-  if (credit.outOfCredit()) {
+  if (!nextApiKey(config, credit)) {
     throw new ClaudeCredentialError(
-      `${limited}; the Anthropic API key it falls back on is out of credit, so launch again after the reset`,
+      `${limited}; the API keys it falls back on are out of credit, so launch again after the reset`,
     );
   }
-  return apiKeyAuth(config, "the fallback");
+  return apiKeyAuth(config, "the fallback", credit);
 }
 
 /** A subscription as a credential, by name; throws when this server holds no token for it. */
@@ -187,23 +235,26 @@ export function subscriptionAuth(config: Config, name: string): ClaudeAuth {
   return { kind: "subscription", credential: name, token };
 }
 
-/** The API key as a credential, for an env assigned it or a launch that fell back to it. */
+/**
+ * An API key as a credential, for an env assigned one or a launch that fell back to them. Starts at
+ * `preferred` (default: the first key) and moves on to the next key with credit; throws when every
+ * key is out of credit, or when this server holds none.
+ */
 export function apiKeyAuth(
   config: Config,
   role: string,
   credit: ApiKeyCredit = CREDITED,
+  preferred?: string,
 ): ClaudeAuth {
-  if (!config.anthropicApiKey) {
+  if (apiKeyCredentials(config).length === 0) {
     throw new ClaudeCredentialError(
       `claude_credential_missing: ${role} is the Anthropic API key, but this server has no SKY_ANTHROPIC_API_KEY`,
     );
   }
-  if (credit.outOfCredit()) throw outOfCredit(role);
-  return {
-    kind: "api-key",
-    credential: API_KEY_CREDENTIAL,
-    key: config.anthropicApiKey,
-  };
+  const credential = nextApiKey(config, credit, [], preferred);
+  const key = credential && apiKeyValue(config, credential);
+  if (!credential || !key) throw outOfCredit(role);
+  return { kind: "api-key", credential, key };
 }
 
 /** A usage-limit failure of a Claude subscription, and when it lifts if the message said. */

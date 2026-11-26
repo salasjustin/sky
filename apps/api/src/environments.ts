@@ -79,7 +79,8 @@ const EnvironmentPatch = z.strictObject({
   claudeFallback: claudeFallback.unwrap().optional(),
 });
 
-const RuntimeInput = z.strictObject({ runtime: Runtime });
+/** `null` returns the environment to following its `SKY_RUNTIME` secret. */
+const RuntimeInput = z.strictObject({ runtime: Runtime.nullable() });
 
 type EnvRow = typeof environments.$inferSelect;
 

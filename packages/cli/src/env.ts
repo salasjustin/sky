@@ -183,7 +183,7 @@ export const env: AgentCommand = {
       const [ref, credential, ...extra] = rest;
       if (ref === undefined || credential === undefined || extra.length > 0) {
         throw new UsageError(
-          "env set-claude takes <env> <name|api-key|pool|default> [--pool=<names>] [--fallback=api-key|none]",
+          "env set-claude takes <env> <name|api-key|api-key:<name>|pool|default> [--pool=<names>] [--fallback=api-key|none]",
           true,
         );
       }
@@ -192,7 +192,7 @@ export const env: AgentCommand = {
         !ClaudeCredentialName.safeParse(credential).success
       ) {
         throw new UsageError(
-          `${JSON.stringify(credential)} is not a credential name: use a subscription's name, api-key, pool or default`,
+          `${JSON.stringify(credential)} is not a credential name: use a subscription's name, api-key, api-key:<name>, pool or default`,
           true,
         );
       }
@@ -224,14 +224,18 @@ export const env: AgentCommand = {
       const [ref, runtime, ...extra] = rest;
       if (ref === undefined || runtime === undefined || extra.length > 0) {
         throw new UsageError(
-          "env set-runtime takes <env> <claude-code|codex>",
+          "env set-runtime takes <env> <claude-code|codex|default>",
           true,
         );
       }
-      const parsed = Runtime.safeParse(runtime);
+      // default stores nothing, so the env follows its SKY_RUNTIME secret again
+      const parsed =
+        runtime === "default"
+          ? ({ success: true, data: null } as const)
+          : Runtime.safeParse(runtime);
       if (!parsed.success) {
         throw new UsageError(
-          `${JSON.stringify(runtime)} is not a runtime: use claude-code or codex`,
+          `${JSON.stringify(runtime)} is not a runtime: use claude-code, codex or default`,
           true,
         );
       }

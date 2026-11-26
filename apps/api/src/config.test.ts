@@ -26,6 +26,7 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       claudeOauthToken,
       claudeOauthTokens: {},
       anthropicApiKey: undefined,
+      anthropicApiKeys: {},
       publicBaseUrl: "https://sky.example.com",
       runnerBundlePath: expect.stringMatching(/\/runner\.mjs$/),
       cliBundlePath: expect.stringMatching(/\/sky\.mjs$/),
@@ -351,6 +352,41 @@ test("a token variable that names no usable credential is refused by its variabl
     "CLAUDE_OAUTH_TOKEN_DEFAULT",
     `CLAUDE_OAUTH_TOKEN_${"A".repeat(65)}`,
     "CLAUDE_OAUTH_TOKEN_NOT-A-NAME",
+  ]) {
+    const result = loadConfig({ ...required, [variable]: value });
+    expect(result).toEqual({
+      ok: false,
+      message: expect.stringContaining(`${variable} is invalid`),
+    });
+    if (!result.ok) expect(result.message).not.toContain(value);
+  }
+});
+
+test("named API keys come from SKY_ANTHROPIC_API_KEY_<NAME>, by lowercased name, beside the plain key", () => {
+  const result = loadConfig({
+    ...required,
+    SKY_ANTHROPIC_API_KEY: "plain-key-opaque",
+    SKY_ANTHROPIC_API_KEY_BACKUP: "backup-key-opaque",
+    SKY_ANTHROPIC_API_KEY_TEAM_2: "team-key-opaque",
+    SKY_ANTHROPIC_API_KEY_EMPTY: "",
+  });
+  expect(result.ok).toBe(true);
+  if (result.ok) {
+    expect(result.config.anthropicApiKey).toBe("plain-key-opaque");
+    expect(result.config.anthropicApiKeys).toEqual({
+      backup: "backup-key-opaque",
+      team_2: "team-key-opaque",
+    });
+  }
+});
+
+test("an API key variable that names no usable key is refused by its variable name, never its value", () => {
+  const value = "never-echoed-key-value";
+  for (const variable of [
+    "SKY_ANTHROPIC_API_KEY_DEFAULT",
+    "SKY_ANTHROPIC_API_KEY_POOL",
+    `SKY_ANTHROPIC_API_KEY_${"A".repeat(65)}`,
+    "SKY_ANTHROPIC_API_KEY_NOT-A-NAME",
   ]) {
     const result = loadConfig({ ...required, [variable]: value });
     expect(result).toEqual({

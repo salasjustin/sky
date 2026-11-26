@@ -7,6 +7,7 @@ const data = [
   {
     name: "default",
     kind: "subscription",
+    outOfCredit: false,
     environments: [{ id: "env_1", name: "web" }],
     limitedUntil: null,
     runsToday: 4,
@@ -20,6 +21,7 @@ const data = [
   {
     name: "personal",
     kind: "subscription",
+    outOfCredit: false,
     environments: [
       { id: "env_2", name: "api" },
       { id: "env_3", name: "docs" },
@@ -33,8 +35,19 @@ const data = [
     name: "api-key",
     kind: "api-key",
     environments: [],
+    outOfCredit: false,
     limitedUntil: null,
     runsToday: 1,
+    usage: null,
+    poolEnvironments: [],
+  },
+  {
+    name: "api-key:backup",
+    kind: "api-key",
+    environments: [],
+    outOfCredit: true,
+    limitedUntil: null,
+    runsToday: 3,
     usage: null,
     poolEnvironments: [],
   },
@@ -53,6 +66,7 @@ test("claude-credentials prints name, kind, limit, runs today and env ids per cr
       "default subscription - 4 env_1 5h=42% 7d=10% env_4",
       "personal subscription limited-until=2026-11-12T10:20:00.000Z 2 env_2,env_3 - - -",
       "api-key api-key - 1 - - - -",
+      "api-key:backup api-key out-of-credit 3 - - - -",
       "",
     ].join("\n"),
   );
@@ -85,6 +99,66 @@ test("a runs key's 403 is the CLI's failure", async () => {
 
 test("an argument is a usage error", async () => {
   expect((await runCli(["claude-credentials", "extra"])).code).toBe(2);
+  expect((await runCli(["claude-credentials", "clear-credit"])).code).toBe(2);
+  expect(
+    (await runCli(["claude-credentials", "clear-credit", "a", "b"])).code,
+  ).toBe(2);
+});
+
+test("clear-credit posts the key's name, URL-encoded, and prints what it cleared", async () => {
+  const paths: string[] = [];
+  server.use(
+    http.post(
+      `${apiUrl}/v1/claude-credentials/:name/clear-credit`,
+      ({ request }) => {
+        paths.push(new URL(request.url).pathname);
+        return HttpResponse.json({
+          name: "api-key:backup",
+          outOfCredit: false,
+          wasOutOfCredit: true,
+        });
+      },
+    ),
+  );
+  const r = await runCli([
+    "claude-credentials",
+    "clear-credit",
+    "api-key:backup",
+  ]);
+  expect(r.code).toBe(0);
+  expect(paths).toEqual([
+    "/v1/claude-credentials/api-key%3Abackup/clear-credit",
+  ]);
+  expect(r.stdout).toBe("api-key:backup: out-of-credit mark cleared\n");
+  const json = await runCli([
+    "claude-credentials",
+    "clear-credit",
+    "backup",
+    "--json",
+  ]);
+  expect(JSON.parse(json.stdout)).toEqual({
+    name: "api-key:backup",
+    outOfCredit: false,
+    wasOutOfCredit: true,
+  });
+});
+
+test("clear-credit on a key the server doesn't hold is the CLI's failure", async () => {
+  server.use(
+    http.post(`${apiUrl}/v1/claude-credentials/:name/clear-credit`, () =>
+      HttpResponse.json(
+        { error: { code: "not_found", message: "this server holds no key" } },
+        { status: 404 },
+      ),
+    ),
+  );
+  const r = await runCli(["claude-credentials", "clear-credit", "nope"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("this server holds no key");
+});
+
+test("an unknown subcommand is a usage error", async () => {
+  expect((await runCli(["claude-credentials", "reset"])).code).toBe(2);
 });
 
 test("a value in the API's answer never reaches the output: only the fields the CLI knows are read", async () => {

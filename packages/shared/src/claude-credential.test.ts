@@ -1,7 +1,10 @@
 import { expect, test } from "vitest";
 import {
+  apiKeyCredential,
+  apiKeyNameOf,
   ClaudeCredentialName,
   ClaudeSubscriptionName,
+  isApiKeyCredential,
 } from "./claude-credential.js";
 import { Environment } from "./environment.js";
 
@@ -56,6 +59,22 @@ test("an invalid credential name lists every kind of name", () => {
   expect(
     ClaudeCredentialName.safeParse("Default").error?.issues[0]?.message,
   ).toBe(
-    "expected a credential name: a subscription (lowercase letters, digits, _), default, pool or api-key",
+    "expected a credential name: a subscription (lowercase letters, digits, _), default, pool, api-key or api-key:<name>",
   );
+});
+
+test("the plain API key stays api-key and a named one is api-key:<name>", () => {
+  expect(apiKeyCredential("default")).toBe("api-key");
+  expect(apiKeyCredential("backup")).toBe("api-key:backup");
+  expect(apiKeyNameOf("api-key")).toBe("default");
+  expect(apiKeyNameOf("api-key:backup")).toBe("backup");
+  expect(apiKeyNameOf("work")).toBeUndefined();
+  expect(isApiKeyCredential("api-key:backup")).toBe(true);
+  expect(isApiKeyCredential("api-keys")).toBe(false);
+});
+
+test("an environment can be assigned a named API key", () => {
+  expect(ClaudeCredentialName.parse("api-key:backup")).toBe("api-key:backup");
+  expect(ClaudeCredentialName.safeParse("api-key:Backup").success).toBe(false);
+  expect(ClaudeCredentialName.safeParse("api-key:").success).toBe(false);
 });

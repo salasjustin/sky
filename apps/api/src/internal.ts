@@ -209,8 +209,6 @@ export function internalRoutes(
   hooks: {
     /** The error a failed run is stored with, given the redacted one it reported; inside the commit. */
     failureError?: (runId: RunId, error: string) => string;
-    /** Told of every run that finished, once that is committed. */
-    onRunFinished?: (runId: RunId) => void;
   } = {},
 ) {
   const requireToken = factory.createMiddleware(async (c, next) => {
@@ -365,7 +363,6 @@ export function internalRoutes(
               redacted.type === "run.failed"
                 ? { runId: run.id, error: redacted.payload.error }
                 : undefined,
-            finished: redacted.type === "run.finished" ? run.id : undefined,
           } as const;
         },
         { behavior: "immediate" },
@@ -406,9 +403,6 @@ export function internalRoutes(
       }
       // after the commit, so the dispatcher sees the rows; never awaited, so delivery can't slow the runner
       if (outcome.enqueued > 0) c.var.nudgeDeliveries();
-      if ("finished" in outcome && outcome.finished) {
-        hooks.onRunFinished?.(outcome.finished);
-      }
       if (outcome.failure) {
         try {
           onRunFailed(outcome.failure.runId, outcome.failure.error);

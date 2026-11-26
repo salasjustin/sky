@@ -4,10 +4,12 @@ import { eq } from "drizzle-orm";
 import {
   type ApiKeyCredit,
   apiKeyAuth,
+  apiKeyCredentials,
   type ClaudeAssignment,
   type ClaudeAuth,
   ClaudeCredentialError,
   limitedUntil,
+  nextApiKey,
   subscriptionAuth,
   subscriptionNames,
 } from "./claude-credentials.js";
@@ -143,7 +145,7 @@ export async function resolvePoolAuth(
       refused,
     );
   }
-  if (!config.anthropicApiKey) {
+  if (apiKeyCredentials(config).length === 0) {
     throw poolExhausted(
       db,
       members,
@@ -152,16 +154,16 @@ export async function resolvePoolAuth(
       refused,
     );
   }
-  if (credit?.outOfCredit()) {
+  if (credit && !nextApiKey(config, credit)) {
     throw poolExhausted(
       db,
       members,
       now,
-      "the Anthropic API key it falls back on is out of credit, so launch again after the reset",
+      "the Anthropic API keys it falls back on are out of credit, so launch again after the reset",
       refused,
     );
   }
-  return apiKeyAuth(config, "the fallback");
+  return apiKeyAuth(config, "the fallback", credit);
 }
 
 /**

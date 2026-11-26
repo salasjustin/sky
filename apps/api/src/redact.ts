@@ -33,7 +33,12 @@ export class KnownSecrets {
       | "webhookSigningKey"
       | "secretEncryptionKey"
     > &
-      Partial<Pick<Config, "claudeOauthTokens" | "anthropicApiKey">>,
+      Partial<
+        Pick<
+          Config,
+          "claudeOauthTokens" | "anthropicApiKey" | "anthropicApiKeys"
+        >
+      >,
   ): KnownSecrets {
     const secrets = new KnownSecrets();
     secrets.add("SKY_API_KEY", config.apiKey);
@@ -46,6 +51,9 @@ export class KnownSecrets {
     }
     if (config.anthropicApiKey) {
       secrets.add("SKY_ANTHROPIC_API_KEY", config.anthropicApiKey);
+    }
+    for (const [name, key] of Object.entries(config.anthropicApiKeys ?? {})) {
+      secrets.add(`SKY_ANTHROPIC_API_KEY_${name}`, key);
     }
     secrets.add("WEBHOOK_SIGNING_KEY", config.webhookSigningKey);
     secrets.add(
