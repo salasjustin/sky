@@ -182,6 +182,8 @@ export class ApiError extends Error {
 }
 
 const requestTimeoutMs = 30_000;
+/** A switch to Codex waits for the server to install it on the sandbox when it's missing. */
+const codexSwitchTimeoutMs = 15 * 60_000;
 
 export type Api = ReturnType<typeof createApi>;
 
@@ -190,8 +192,14 @@ export function createApi(config: Config) {
     method: string,
     path: string,
     body?: unknown,
+    opts: {
+      timeoutMs?: number;
+      /** Appended to the error when no response came in time. */
+      timeoutHint?: string;
+    } = {},
   ): Promise<{ status: number; json: unknown }> {
     const url = `${config.url}${path}`;
+    const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
     let res: Response;
     let text: string;
     try {
@@ -202,15 +210,23 @@ export function createApi(config: Config) {
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(requestTimeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       // read on every path, the error one included, so the connection is released
       text = await res.text();
     } catch (err) {
+      const timedOut = isTimeout(err);
+      const reason = timedOut
+        ? `no response in ${duration(timeoutMs)}`
+        : describe(err);
+      const hint =
+        timedOut && opts.timeoutHint !== undefined
+          ? `; ${opts.timeoutHint}`
+          : "";
       throw new ApiError(
         0,
         "unreachable",
-        `cannot reach ${config.url}: ${describe(err)}`,
+        `cannot reach ${config.url}: ${reason}${hint}`,
       );
     }
     let json: unknown;
@@ -446,12 +462,19 @@ export function createApi(config: Config) {
       );
       return env(status, json);
     },
-    /** Sets the runtime the env's runs use; 409 `gateway_key_missing` for Codex without the env's AI_GATEWAY_API_KEY. */
+    /** Sets the runtime the env's runs use; 409 `gateway_key_missing` for Codex without the env's AI_GATEWAY_API_KEY, 502 `codex_install_failed` when Codex can't be installed. */
     async setEnvironmentRuntime(id: string, runtime: Runtime) {
       const { status, json } = await request(
         "PUT",
         `/v1/environments/${encodeURIComponent(id)}/runtime`,
         { runtime },
+        runtime === "codex"
+          ? {
+              timeoutMs: codexSwitchTimeoutMs,
+              // the server goes on installing and stores the runtime after the CLI gives up
+              timeoutHint: `the switch may still complete on the server: check with sky env show ${id}`,
+            }
+          : {},
       );
       return env(status, json);
     },
@@ -587,10 +610,13 @@ export function createApi(config: Config) {
   };
 }
 
+const isTimeout = (err: unknown) =>
+  err instanceof DOMException && err.name === "TimeoutError";
+
+const duration = (ms: number) =>
+  ms >= 60_000 ? `${ms / 60_000} min` : `${ms / 1000}s`;
+
 function describe(err: unknown): string {
-  if (err instanceof DOMException && err.name === "TimeoutError") {
-    return `no response in ${requestTimeoutMs / 1000}s`;
-  }
   // a network failure reads "fetch failed", or "terminated" mid-body; the reason is in cause
   const cause = (err as { cause?: { code?: unknown; message?: unknown } })
     .cause;

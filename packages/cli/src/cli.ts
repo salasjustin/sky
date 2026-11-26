@@ -78,8 +78,11 @@ const help = (io: Io) => `Usage:
       pool. Needs the admin key.
   sky env set-runtime <env> <claude-code|codex> [options]
       Switch the environment's runs between Claude Code and Codex. Codex
-      needs the environment's AI_GATEWAY_API_KEY secret, and is installed
-      on the sandbox if it lacks it. An agent's next run after a switch
+      needs the environment's AI_GATEWAY_API_KEY secret, else the switch is
+      refused with gateway_key_missing. Codex is installed on the sandbox
+      if it lacks it, so the first switch to Codex can take a few minutes;
+      if the install fails the switch is refused with codex_install_failed
+      and the runtime is unchanged. An agent's next run after a switch
       starts a fresh session on its branch. A run that fails with
       claude_unavailable: or codex_unavailable: names the exact
       set-runtime command to run. Needs the admin key.

@@ -238,6 +238,11 @@ export const env: AgentCommand = {
       return async (api, _io, out) => {
         const envId = await resolveEnvId(api, ref, out);
         if (envId === undefined) return 1;
+        if (parsed.data === "codex") {
+          out.progress(
+            "installing Codex on the sandbox if it's missing; this can take a few minutes",
+          );
+        }
         const { raw, env } = await api.setEnvironmentRuntime(
           envId,
           parsed.data,
