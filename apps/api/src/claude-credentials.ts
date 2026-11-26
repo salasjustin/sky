@@ -38,7 +38,7 @@ export const isCreditExhausted = (error: string): boolean =>
 /** What a launch refused on an out-of-credit key says of it; `role` names what the key was for. */
 const outOfCredit = (role: string) =>
   new ClaudeCredentialError(
-    `claude_unavailable: ${role} is the Anthropic API key, which is out of credit (Anthropic answered "Credit balance is too low"); it is tried again once the API restarts`,
+    `claude_unavailable: ${role} is the Anthropic API key, which is out of credit (Anthropic answered "Credit balance is too low"); top it up or set a new SKY_ANTHROPIC_API_KEY, and Sky tries it again once the API restarts`,
   );
 
 /** `default` and unset are the same assignment. */
