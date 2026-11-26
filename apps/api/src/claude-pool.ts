@@ -2,6 +2,7 @@ import { type Db, runs } from "@sky/db";
 import { POOL_CREDENTIAL } from "@sky/shared";
 import { eq } from "drizzle-orm";
 import {
+  type ApiKeyCredit,
   apiKeyAuth,
   type ClaudeAssignment,
   type ClaudeAuth,
@@ -89,7 +90,7 @@ export function poolExhausted(
       ? ""
       : ` or had its token refused (${refused.map((n) => JSON.stringify(n)).join(", ")})`;
   return new ClaudeCredentialError(
-    `claude_limited: every subscription in this environment's pool is at its usage limit${refusedNote}${first ? `; the earliest resets ${first.toISOString()} (UTC)` : ""}; ${detail}`,
+    `claude_unavailable: every subscription in this environment's pool is at its usage limit${refusedNote}${first ? `; the earliest resets ${first.toISOString()} (UTC)` : ""}; ${detail}`,
   );
 }
 
@@ -102,10 +103,10 @@ export function poolExhausted(
  * environment allows it and the server has one, else an error naming the earliest reset in UTC.
  */
 export async function resolvePoolAuth(
-  deps: { db: Db; config: Config; usage: UsageProbe },
+  deps: { db: Db; config: Config; usage: UsageProbe; credit?: ApiKeyCredit },
   env: PoolAssignment,
 ): Promise<ClaudeAuth> {
-  const { db, config, usage } = deps;
+  const { db, config, usage, credit } = deps;
   const members = poolMembers(config, env.claudePool);
   if (members.length === 0) {
     throw new ClaudeCredentialError(
@@ -148,6 +149,15 @@ export async function resolvePoolAuth(
       members,
       now,
       "this server has no SKY_ANTHROPIC_API_KEY to fall back on, so launch again after the reset",
+      refused,
+    );
+  }
+  if (credit?.outOfCredit()) {
+    throw poolExhausted(
+      db,
+      members,
+      now,
+      "the Anthropic API key it falls back on is out of credit, so launch again after the reset",
       refused,
     );
   }

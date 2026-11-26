@@ -206,6 +206,12 @@ export function internalRoutes(
   log: (line: string) => void,
   /** Told of every run that failed, with its stored (redacted) error, once the failure is committed. */
   onRunFailed: (runId: RunId, error: string) => void = () => {},
+  hooks: {
+    /** The error a failed run is stored with, given the redacted one it reported; inside the commit. */
+    failureError?: (runId: RunId, error: string) => string;
+    /** Told of every run that finished, once that is committed. */
+    onRunFinished?: (runId: RunId) => void;
+  } = {},
 ) {
   const requireToken = factory.createMiddleware(async (c, next) => {
     if (!bearer(c.req.header("authorization"))) {
@@ -298,6 +304,13 @@ export function internalRoutes(
           ) {
             redacted.payload.error = UPSTREAM_BLOCKED;
           }
+          // a runtime that can't run says so, and names the command that switches the environment
+          if (redacted.type === "run.failed" && hooks.failureError) {
+            redacted.payload.error = hooks.failureError(
+              run.id,
+              redacted.payload.error,
+            );
+          }
           // a failed commit or worktree setup quotes git's or a hook's whole stderr
           if (redacted.type === "run.failed") {
             redacted.payload.error = cut(
@@ -334,8 +347,12 @@ export function internalRoutes(
           tx.update(agents)
             .set({
               status: agentStatusFor(next ?? run.status),
+              // the runtime the session runs on, so a follow-up on the other one doesn't try to resume it
               ...(event.type === "run.started"
-                ? { sessionId: event.payload.sessionId }
+                ? {
+                    sessionId: event.payload.sessionId,
+                    sessionRuntime: run.runtime,
+                  }
                 : {}),
             })
             .where(eq(agents.id, run.agentId))
@@ -348,6 +365,7 @@ export function internalRoutes(
               redacted.type === "run.failed"
                 ? { runId: run.id, error: redacted.payload.error }
                 : undefined,
+            finished: redacted.type === "run.finished" ? run.id : undefined,
           } as const;
         },
         { behavior: "immediate" },
@@ -388,6 +406,9 @@ export function internalRoutes(
       }
       // after the commit, so the dispatcher sees the rows; never awaited, so delivery can't slow the runner
       if (outcome.enqueued > 0) c.var.nudgeDeliveries();
+      if ("finished" in outcome && outcome.finished) {
+        hooks.onRunFinished?.(outcome.finished);
+      }
       if (outcome.failure) {
         try {
           onRunFailed(outcome.failure.runId, outcome.failure.error);

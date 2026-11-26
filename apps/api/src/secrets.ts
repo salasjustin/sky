@@ -121,6 +121,17 @@ export function openEnvSecrets(
   );
 }
 
+/** Whether the env stores a secret named `name`, of either kind; nothing is decrypted. */
+export function hasSecret(db: Db, envId: EnvironmentId, name: string): boolean {
+  return (
+    db
+      .select({ name: secrets.name })
+      .from(secrets)
+      .where(and(eq(secrets.envId, envId), eq(secrets.name, name)))
+      .get() !== undefined
+  );
+}
+
 /** Whether the env stores `name` as a connector secret, not a value. */
 export function hasConnectorSecret(
   db: Db,

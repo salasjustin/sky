@@ -11,6 +11,13 @@ import { EnvironmentId } from "./ids.js";
 export const EnvironmentStatus = z.enum(["provisioning", "ready", "failed"]);
 export type EnvironmentStatus = z.infer<typeof EnvironmentStatus>;
 
+/** Which agent drives an environment's runs: Claude Code, or Codex through the AI Gateway. */
+export const Runtime = z.enum(["claude-code", "codex"]);
+export type Runtime = z.infer<typeof Runtime>;
+
+/** The env secret a Codex run's model calls carry; switching an environment to Codex needs it. */
+export const CODEX_GATEWAY_SECRET = "AI_GATEWAY_API_KEY";
+
 /** Which Bash commands run without an approval request; see `isAutoApproved`. */
 export const AutoApproveConfig = z.strictObject({
   /** Keep the built-in read-only commands; false leaves only `commands` (none turns it off). */
@@ -71,5 +78,7 @@ export const Environment = z.object({
     .default(null),
   /** What a run does while its subscription is at its usage limit: use the API key, or fail the launch. */
   claudeFallback: ClaudeFallback.default("api-key"),
+  /** The runtime set by `PUT /v1/environments/:id/runtime`; null follows the env's `SKY_RUNTIME` secret, else Claude Code. */
+  runtime: Runtime.nullable().default(null),
 });
 export type Environment = z.infer<typeof Environment>;

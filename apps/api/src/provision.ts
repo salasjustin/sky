@@ -25,11 +25,42 @@ export const RUNNER_DIR = "/opt/sky";
 export const RUNNER = `${RUNNER_DIR}/runner.mjs`;
 // = the version in packages/runner/package.json; the runner bundle leaves the SDK external
 const RUNNER_SDK = "@anthropic-ai/claude-agent-sdk@0.3.312";
-// = CODEX_VERSION in packages/runner/src/codex.ts: the runtime a run with SKY_RUNTIME=codex drives
-const RUNNER_CODEX = "@openai/codex@0.172.0";
+// = CODEX_VERSION in packages/runner/src/codex.ts: the Codex version a Codex run drives
+const CODEX_VERSION = "0.172.0";
+const RUNNER_CODEX = `@openai/codex@${CODEX_VERSION}`;
 // no --omit=optional: the SDK ships the Claude Code binary as a platform-specific optional dep, and
 // Codex its own binary the same way
 const installRunnerSdk = `[ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" -g "$(id -g)" ${RUNNER_DIR}; npm install --prefix ${RUNNER_DIR} --no-audit --no-fund ${RUNNER_SDK} ${RUNNER_CODEX}`;
+// exits 0 when CODEX_BIN is already the pinned version, 3 when npm had to install it beside the SDK,
+// 1 otherwise; under a lock, so two launches on one sprite don't run npm over each other.
+// Touches nothing but the runner dir's node_modules: no reprovision, no worktree
+const CODEX_PACKAGE = `${RUNNER_DIR}/node_modules/@openai/codex/package.json`;
+export const ENSURE_CODEX = `pinned() { [ -x ${RUNNER_DIR}/node_modules/.bin/codex ] && [ "$(node -p 'require(process.argv[1]).version' ${CODEX_PACKAGE} 2>/dev/null)" = ${CODEX_VERSION} ]; }; pinned && exit 0; exec 9>/tmp/sky-codex-install.lock && flock -w 600 9 || exit 1; pinned && exit 0; [ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" -g "$(id -g)" ${RUNNER_DIR}; npm install --prefix ${RUNNER_DIR} --no-audit --no-fund ${RUNNER_CODEX} >&2 && pinned && exit 3; echo "Codex ${CODEX_VERSION} is still not under ${RUNNER_DIR} after npm install" >&2; exit 1`;
+
+/**
+ * Makes the sprite hold the pinned Codex under the runner dir, as provisioning installs it, for a
+ * sprite provisioned before Codex was: `installed` when it had to, `present` when it was there.
+ * Throws with npm's output tail when the install fails.
+ */
+export async function ensureCodex(
+  sprites: SpriteOps,
+  spriteName: string,
+): Promise<"present" | "installed"> {
+  const out = await execInSprite(
+    sprites,
+    spriteName,
+    ["sh", "-c", ENSURE_CODEX],
+    {
+      op: "ensure-codex",
+      timeoutMs: sprites.longTimeoutMs,
+    },
+  );
+  if (out.exitCode === 0) return "present";
+  if (out.exitCode === 3) return "installed";
+  throw new Error(
+    `installing Codex ${CODEX_VERSION} failed (exit ${out.exitCode}): ${out.stderr.trim().slice(-TAIL_CHARS)}`,
+  );
+}
 // finds the SDK's bundled `claude` under the runner dir, which is the script's first argument
 const FIND_CLAUDE = `
 const sdk = process.argv[1] + "/node_modules/@anthropic-ai";

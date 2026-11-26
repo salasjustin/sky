@@ -1,5 +1,5 @@
 import { HttpResponse, http } from "msw";
-import { beforeEach, expect, test } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { apiUrl, runCli } from "./testing.js";
 
@@ -70,7 +70,9 @@ test("env show by id prints the environment", async () => {
   server.use(list, getEnv);
   const r = await runCli(["env", "show", "env_1"]);
   expect(r.code).toBe(0);
-  expect(r.stdout).toBe("env_1 ready acme/web web\n");
+  expect(r.stdout).toBe(
+    "env_1 ready acme/web web\nruntime: default (the SKY_RUNTIME secret, else claude-code)\n",
+  );
 });
 
 test("env show by name resolves the id, and a failed env shows its step and stderr", async () => {
@@ -78,7 +80,7 @@ test("env show by name resolves the id, and a failed env shows its step and stde
   const r = await runCli(["env", "show", "api docs"]);
   expect(r.code).toBe(0);
   expect(r.stdout).toBe(
-    "env_2 failed acme/api api docs\nfailed at step setup\n  npm ERR! missing script\n  exit 1\n",
+    "env_2 failed acme/api api docs\nruntime: default (the SKY_RUNTIME secret, else claude-code)\nfailed at step setup\n  npm ERR! missing script\n  exit 1\n",
   );
 });
 
@@ -126,7 +128,7 @@ test("env show of a name shaped like an id resolves it by name", async () => {
   );
   const r = await runCli(["env", "show", "env_prod"]);
   expect(r.code).toBe(0);
-  expect(r.stdout).toBe("env_7 ready acme/web env_prod\n");
+  expect(r.stdout.split("\n")[0]).toBe("env_7 ready acme/web env_prod");
 });
 
 const deletes: string[] = [];
@@ -514,7 +516,7 @@ test("env show says which credential an environment uses once it isn't the defau
   );
   const r = await runCli(["env", "show", "env_1"]);
   expect(r.stdout).toBe(
-    "env_1 ready acme/web web\nclaude credential: work (fallback: none)\n",
+    "env_1 ready acme/web web\nruntime: default (the SKY_RUNTIME secret, else claude-code)\nclaude credential: work (fallback: none)\n",
   );
 });
 
@@ -695,4 +697,207 @@ test("a --pool name that isn't a subscription name is a usage error, with no req
     /"PERSONAL" in --pool is not a subscription name: use one the server holds, in lowercase letters, digits and _/,
   );
   expect(bodies).toEqual([]);
+});
+
+const DEFAULT_RUNTIME =
+  "runtime: default (the SKY_RUNTIME secret, else claude-code)";
+
+test("env show prints the stored runtime, or that it follows the secret", async () => {
+  server.use(
+    list,
+    http.get(`${apiUrl}/v1/environments/env_1`, () =>
+      HttpResponse.json(envJson({ runtime: "codex" })),
+    ),
+  );
+  expect((await runCli(["env", "show", "env_1"])).stdout).toBe(
+    "env_1 ready acme/web web\nruntime: codex\n",
+  );
+  server.use(
+    http.get(`${apiUrl}/v1/environments/env_1`, () =>
+      HttpResponse.json(envJson({ runtime: null })),
+    ),
+  );
+  expect((await runCli(["env", "show", "env_1"])).stdout).toBe(
+    `env_1 ready acme/web web\n${DEFAULT_RUNTIME}\n`,
+  );
+});
+
+test("env set-runtime puts the runtime and prints it", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.put(`${apiUrl}/v1/environments/env_1/runtime`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(envJson({ runtime: "codex" }));
+    }),
+  );
+  const r = await runCli(["env", "set-runtime", "web", "codex"]);
+  expect(r.code).toBe(0);
+  expect(bodies).toEqual([{ runtime: "codex" }]);
+  expect(r.stdout).toBe("env_1 ready acme/web web\nruntime: codex\n");
+});
+
+test("env set-runtime --json prints the API's environment object", async () => {
+  const back = envJson({ runtime: "claude-code" });
+  server.use(
+    list,
+    http.put(`${apiUrl}/v1/environments/env_1/runtime`, () =>
+      HttpResponse.json(back),
+    ),
+  );
+  const r = await runCli([
+    "env",
+    "set-runtime",
+    "web",
+    "claude-code",
+    "--json",
+  ]);
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.stdout)).toEqual(back);
+});
+
+test("env set-runtime refused for want of the gateway key fails with the API's message", async () => {
+  const message =
+    "this environment has no AI_GATEWAY_API_KEY secret; set it with sky secret set web AI_GATEWAY_API_KEY, then switch again";
+  server.use(
+    list,
+    http.put(`${apiUrl}/v1/environments/env_1/runtime`, () =>
+      HttpResponse.json(
+        { error: { code: "gateway_key_missing", message } },
+        { status: 409 },
+      ),
+    ),
+  );
+  const r = await runCli(["env", "set-runtime", "web", "codex"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(message);
+  expect(r.stdout).toBe("");
+});
+
+const INSTALL_NOTICE =
+  "installing Codex on the sandbox if it's missing; this can take a few minutes\n";
+
+/** Runs the CLI recording the timeout each request was given, in request order. */
+async function timeoutsOf(argv: string[]) {
+  const spy = vi.spyOn(AbortSignal, "timeout");
+  try {
+    const r = await runCli(argv);
+    return { r, timeouts: spy.mock.calls.map(([ms]) => ms) };
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+const putRuntime = (runtime: string) =>
+  http.put(`${apiUrl}/v1/environments/env_1/runtime`, () =>
+    HttpResponse.json(envJson({ runtime })),
+  );
+
+test("env set-runtime codex waits 15 minutes for the switch; the env lookup keeps 30 s", async () => {
+  server.use(list, putRuntime("codex"));
+  const { r, timeouts } = await timeoutsOf([
+    "env",
+    "set-runtime",
+    "web",
+    "codex",
+  ]);
+  expect(r.code).toBe(0);
+  expect(timeouts).toEqual([30_000, 15 * 60_000]);
+});
+
+test("env set-runtime claude-code and other commands keep the 30 s timeout", async () => {
+  server.use(list, getEnv, putRuntime("claude-code"));
+  const set = await timeoutsOf(["env", "set-runtime", "web", "claude-code"]);
+  expect(set.r.code).toBe(0);
+  expect(set.timeouts).toEqual([30_000, 30_000]);
+  const show = await timeoutsOf(["env", "show", "web"]);
+  expect(show.r.code).toBe(0);
+  expect(show.timeouts.length).toBeGreaterThan(0);
+  expect(new Set(show.timeouts)).toEqual(new Set([30_000]));
+});
+
+test("env set-runtime codex says on stderr that Codex may be installed, stdout unchanged", async () => {
+  server.use(list, putRuntime("codex"));
+  const plain = await runCli(["env", "set-runtime", "web", "codex"]);
+  expect(plain.code).toBe(0);
+  expect(plain.stderr).toBe(INSTALL_NOTICE);
+  expect(plain.stdout).toBe("env_1 ready acme/web web\nruntime: codex\n");
+  const json = await runCli(["env", "set-runtime", "web", "codex", "--json"]);
+  expect(json.code).toBe(0);
+  expect(json.stderr).toBe(INSTALL_NOTICE);
+  expect(JSON.parse(json.stdout)).toEqual(envJson({ runtime: "codex" }));
+});
+
+test("env set-runtime claude-code prints no install notice", async () => {
+  server.use(list, putRuntime("claude-code"));
+  const r = await runCli(["env", "set-runtime", "web", "claude-code"]);
+  expect(r.code).toBe(0);
+  expect(r.stderr).toBe("");
+});
+
+test.each([
+  [
+    "codex",
+    "sky: cannot reach https://sky.test: no response in 15 min; the switch may still complete on the server: check with sky env show env_1\n",
+  ],
+  ["claude-code", "sky: cannot reach https://sky.test: no response in 30s\n"],
+])(
+  "a timed-out switch to %s exits 1 as unreachable",
+  async (runtime, message) => {
+    server.use(list);
+    const fetchOf = globalThis.fetch;
+    const spy = vi.spyOn(globalThis, "fetch");
+    // what undici rejects with when the request's AbortSignal.timeout fires
+    spy.mockImplementation(async (input, init) => {
+      if (init?.method !== "PUT") return fetchOf(input, init);
+      throw new DOMException(
+        "The operation was aborted due to timeout",
+        "TimeoutError",
+      );
+    });
+    try {
+      const r = await runCli(["env", "set-runtime", "web", runtime]);
+      expect(r.code).toBe(1);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toBe(
+        `${runtime === "codex" ? INSTALL_NOTICE : ""}${message}`,
+      );
+      const json = await runCli([
+        "env",
+        "set-runtime",
+        "web",
+        runtime,
+        "--json",
+      ]);
+      expect(json.code).toBe(1);
+      expect(json.stdout).toBe("");
+      const lines = json.stderr.trimEnd().split("\n");
+      expect(JSON.parse(lines[lines.length - 1] ?? "")).toEqual({
+        error: {
+          code: "unreachable",
+          message: message.replace(/^sky: /, "").trimEnd(),
+        },
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  },
+);
+
+test.each([
+  [["env", "set-runtime", "web"], /takes <env> <claude-code\|codex>/],
+  [["env", "set-runtime", "web", "codex", "extra"], /takes <env>/],
+  [["env", "set-runtime", "web", "claude"], /use claude-code or codex/],
+])("%j is a usage error with no request", async (argv, message) => {
+  let requests = 0;
+  server.use(
+    http.all(`${apiUrl}/*`, () => {
+      requests++;
+      return HttpResponse.json({}, { status: 500 });
+    }),
+  );
+  const r = await runCli(argv);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toMatch(message);
+  expect(requests).toBe(0);
 });

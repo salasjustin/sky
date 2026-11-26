@@ -4,18 +4,21 @@ import {
   API_KEY_CREDENTIAL,
   type AutoApprove,
   type BaseProfile,
+  CODEX_GATEWAY_SECRET,
   type DrainStatus,
   EnvironmentId,
   POOL_CREDENTIAL,
   REPO_LOCK_FILE,
   REPO_LOCK_TIMED_OUT,
   RunId,
+  type Runtime,
   spriteTaskNameFor,
 } from "@sky/shared";
 import {
   and,
   asc,
   count,
+  desc,
   eq,
   gte,
   inArray,
@@ -32,8 +35,10 @@ import {
   apiKeyAuth,
   type ClaudeAuth,
   ClaudeCredentialError,
+  CREDIT_RECOVERY,
   credentialNameOf,
   isCloudflareChallenge,
+  isCreditExhausted,
   limitedUntil,
   markLimited,
   parseUsageLimit,
@@ -43,6 +48,7 @@ import {
 } from "./claude-credentials.js";
 import {
   credentialsTried,
+  earliestReset,
   nextInPool,
   poolExhausted,
   poolMembers,
@@ -54,6 +60,7 @@ import { open, runLaunchAad, seal } from "./crypto.js";
 import { mintId } from "./ids.js";
 import { readMemory } from "./memory.js";
 import {
+  ensureCodex,
   envFile,
   REPO_DIR,
   RUNNER,
@@ -72,6 +79,14 @@ import {
   recordEvent,
   type Tx,
 } from "./runs.js";
+import {
+  CLAUDE_UNAVAILABLE,
+  CODEX_UNAVAILABLE,
+  crossRuntimePrompt,
+  effectiveRuntime,
+  RUNTIME_VARIABLE,
+  withSwitch,
+} from "./runtime.js";
 import {
   CONNECTOR_NAMES,
   hasConnectorSecret,
@@ -159,6 +174,9 @@ const claudeEnv = (auth: ClaudeAuth): [string, string][] =>
 
 /** A launch refused for want of memory on its sprite; its message is the run's error. */
 class LowMemoryError extends Error {}
+
+/** A Codex launch refused before any sprite work (no gateway key); its message is the run's error. */
+class CodexLaunchError extends Error {}
 
 /**
  * `pgrep -f`/`pkill -f` pattern matching only this run's runner, never its Claude child. Unanchored,
@@ -506,6 +524,12 @@ export function createLauncher({
   runnerExitBackoffMs = DEFAULT_RUNNER_EXIT_BACKOFF_MS,
   wake,
 }: Deps) {
+  // set when a run on the API key fails with "Credit balance is too low", so launches that would use
+  // the key fail at once instead of starting a run that dies the same way; cleared when a run on the
+  // key finishes. In memory: a restart, the way a new or topped-up key reaches the server, clears it
+  let keyOutOfCredit = false;
+  const credit = { outOfCredit: () => keyOutOfCredit };
+
   /** The env's base profile, without its store when there is no connector to reach GitHub with. */
   function profileFor(
     envId: EnvironmentId,
@@ -670,7 +694,9 @@ export function createLauncher({
     credential: string,
     env: NonNullable<ReturnType<typeof assignmentOf>>,
   ): boolean {
-    if (credential === API_KEY_CREDENTIAL) return env.claudeFallback !== "none";
+    if (credential === API_KEY_CREDENTIAL) {
+      return env.claudeFallback !== "none" && !keyOutOfCredit;
+    }
     return (
       env.claudeCredential === POOL_CREDENTIAL &&
       poolMembers(config, env.claudePool).includes(credential) &&
@@ -683,12 +709,12 @@ export function createLauncher({
     const forced = launch.forceCredential;
     if (forced && launch.keepCredential) {
       return forced === API_KEY_CREDENTIAL
-        ? apiKeyAuth(config, "the retry")
+        ? apiKeyAuth(config, "the retry", credit)
         : subscriptionAuth(config, forced);
     }
     if (forced && stillAllowed(forced, currentAssignment(launch.envId))) {
       return forced === API_KEY_CREDENTIAL
-        ? apiKeyAuth(config, "the retry")
+        ? apiKeyAuth(config, "the retry", credit)
         : subscriptionAuth(config, forced);
     }
     // a pool's pick waits on usage probes: an admin change meanwhile sends it round again. Each round
@@ -697,9 +723,12 @@ export function createLauncher({
       const assignment = currentAssignment(launch.envId);
       // only a pool environment's launch may land on a subscription it isn't assigned
       if (assignment.claudeCredential !== POOL_CREDENTIAL) {
-        return resolveClaudeAuth(db, config, assignment);
+        return resolveClaudeAuth(db, config, assignment, new Date(), credit);
       }
-      const auth = await resolvePoolAuth({ db, config, usage }, assignment);
+      const auth = await resolvePoolAuth(
+        { db, config, usage, credit },
+        assignment,
+      );
       const after = currentAssignment(launch.envId);
       if (
         after.claudeCredential === POOL_CREDENTIAL &&
@@ -747,37 +776,71 @@ export function createLauncher({
       .where(eq(environments.id, envId))
       .get();
 
+  /** The name and stored runtime of the launch's environment. */
+  function envOf(envId: EnvironmentId) {
+    const row = db
+      .select({ name: environments.name, runtime: environments.runtime })
+      .from(environments)
+      .where(eq(environments.id, envId))
+      .get();
+    if (!row) throw new Error(`environment ${envId} is gone`);
+    return row;
+  }
+
+  /**
+   * The session the launch resumes and the prompt it gets: as the launch says, unless the agent's
+   * session ran on the other runtime, which can't resume it. Then a fresh session on the agent's
+   * branch, told so at the top of its prompt with the last run's summary.
+   */
+  function sessionFor(
+    launch: Launch,
+    runtime: Runtime,
+    unrecordedRuntime: Runtime,
+  ): { sessionId: string | null; prompt: string } {
+    const same = { sessionId: launch.sessionId, prompt: launch.prompt };
+    if (!launch.sessionId) return same;
+    const agent = db
+      .select({
+        sessionRuntime: agents.sessionRuntime,
+        branch: agents.branch,
+        remoteBranch: agents.remoteBranch,
+      })
+      .from(agents)
+      .where(eq(agents.id, launch.agentId))
+      .get();
+    if (!agent) return same;
+    // a session from before runtimes were recorded ran on what this launch picks with no runtime stored
+    const from = agent.sessionRuntime ?? unrecordedRuntime;
+    if (from === runtime) return same;
+    const last = db
+      .select({ summary: runs.summary })
+      .from(runs)
+      .where(
+        and(
+          eq(runs.agentId, launch.agentId),
+          ne(runs.id, launch.runId),
+          isNotNull(runs.summary),
+        ),
+      )
+      .orderBy(desc(runs.createdAt), desc(sql`${runs}.rowid`))
+      .get();
+    log(
+      `launching ${launch.runId}: the agent's session ran on ${from}, not ${runtime}; starting a fresh session`,
+    );
+    return {
+      sessionId: null,
+      prompt: crossRuntimePrompt({
+        prompt: launch.prompt,
+        from,
+        to: runtime,
+        branch: agent.remoteBranch ?? agent.branch,
+        summary: last?.summary ?? null,
+      }),
+    };
+  }
+
   async function run(launch: Launch, agentToken: string): Promise<void> {
     const known = [agentToken];
-    // before any sprite work: a launch with no usable credential fails at once, not after a dead run
-    const auth = await claudeAuthFor(launch);
-    known.push(auth.kind === "api-key" ? auth.key : auth.token);
-    db.update(runs)
-      .set({ claudeCredential: auth.credential })
-      .where(eq(runs.id, launch.runId))
-      .run();
-    log(`launching ${launch.runId}: Claude credential ${auth.credential}`);
-    await step(launch, "memory check", () => checkMemory(launch));
-    await step(launch, "bundle", () =>
-      ensureBundle(launch.spriteName, launch.runId),
-    );
-    const promptFile = `/workspace/runs/${launch.runId}.prompt`;
-    await step(launch, "prompt file", () =>
-      writeSpriteFile(sprites, launch.spriteName, promptFile, launch.prompt, {
-        op: "write-prompt",
-        known,
-      }),
-    );
-    // a stop that landed mid-launch found no runner to signal
-    const current = db
-      .select({ status: runs.status })
-      .from(runs)
-      .where(eq(runs.id, launch.runId))
-      .get();
-    if (!current || !isActive(current.status)) {
-      log(`${launch.runId} ended before its runner started`);
-      return;
-    }
     const key = config.secretEncryptionKey;
     // a name reserved after it was stored would override the runner's own variable once sourced
     const unreserved = (vars: Map<string, string>, kind: string) => {
@@ -795,6 +858,82 @@ export function createLauncher({
       "secret",
     );
     const envVars = unreserved(openRunEnvVars(db, key, launch.runId), "envVar");
+    const env = envOf(launch.envId);
+    // the environment's stored runtime wins; without one, a run's envVars override the env's secrets
+    const runtimeVariable =
+      envVars.get(RUNTIME_VARIABLE) ?? envSecrets.get(RUNTIME_VARIABLE);
+    const runtime = effectiveRuntime(env.runtime, runtimeVariable);
+    db.update(runs).set({ runtime }).where(eq(runs.id, launch.runId)).run();
+    // before any sprite work: a launch with no usable credential fails at once, not after a dead run.
+    // A Codex run's model calls carry the gateway key, never a Claude credential
+    let auth: ClaudeAuth | undefined;
+    if (runtime === "codex") {
+      if (
+        !envVars.has(CODEX_GATEWAY_SECRET) &&
+        !envSecrets.has(CODEX_GATEWAY_SECRET)
+      ) {
+        throw new CodexLaunchError(
+          withSwitch(
+            `codex_unavailable: this environment runs on Codex but has no ${CODEX_GATEWAY_SECRET} secret; set it with sky secret set ${env.name} ${CODEX_GATEWAY_SECRET}`,
+            env.name,
+            "claude-code",
+          ),
+        );
+      }
+      log(`launching ${launch.runId}: runtime codex`);
+    } else {
+      try {
+        auth = await claudeAuthFor(launch);
+      } catch (err) {
+        if (
+          err instanceof ClaudeCredentialError &&
+          err.message.startsWith(CLAUDE_UNAVAILABLE)
+        ) {
+          throw new ClaudeCredentialError(
+            withSwitch(err.message, env.name, "codex"),
+          );
+        }
+        throw err;
+      }
+      known.push(auth.kind === "api-key" ? auth.key : auth.token);
+      db.update(runs)
+        .set({ claudeCredential: auth.credential })
+        .where(eq(runs.id, launch.runId))
+        .run();
+      log(`launching ${launch.runId}: Claude credential ${auth.credential}`);
+    }
+    const session = sessionFor(
+      launch,
+      runtime,
+      effectiveRuntime(null, runtimeVariable),
+    );
+    await step(launch, "memory check", () => checkMemory(launch));
+    await step(launch, "bundle", () =>
+      ensureBundle(launch.spriteName, launch.runId),
+    );
+    // a sprite provisioned before Codex was has no Codex binary, which the runner would fail on
+    if (runtime === "codex") {
+      await step(launch, "codex", () =>
+        ensureCodex(sprites, launch.spriteName),
+      );
+    }
+    const promptFile = `/workspace/runs/${launch.runId}.prompt`;
+    await step(launch, "prompt file", () =>
+      writeSpriteFile(sprites, launch.spriteName, promptFile, session.prompt, {
+        op: "write-prompt",
+        known,
+      }),
+    );
+    // a stop that landed mid-launch found no runner to signal
+    const current = db
+      .select({ status: runs.status })
+      .from(runs)
+      .where(eq(runs.id, launch.runId))
+      .get();
+    if (!current || !isActive(current.status)) {
+      log(`${launch.runId} ended before its runner started`);
+      return;
+    }
     // a launch or retry stored before the API refused these names: a run's envVars override the env's
     // secrets, and would point the runner's gateway calls, the connection id in them included, anywhere
     for (const name of CONNECTOR_NAMES) {
@@ -828,7 +967,9 @@ export function createLauncher({
               hasConnectorSecret(db, launch.envId, "GITHUB_CONNECTOR"),
             ),
           ),
-          ...claudeEnv(auth),
+          // the runtime resolved here, over the env's secret and the run's envVars
+          [RUNTIME_VARIABLE, runtime],
+          ...(auth ? claudeEnv(auth) : []),
           ["AGENT_TOKEN", agentToken],
         ]),
         { op: "write-env-file", mode: 0o600, known },
@@ -856,7 +997,7 @@ export function createLauncher({
             AUTO_APPROVE: JSON.stringify(launch.autoApprove),
             WAIT_TIMEOUT_MINUTES: String(config.waitTimeoutMs / 60_000),
             LAUNCH_DEADLINE_MINUTES: String(launchMinutesLeft(launch.runId)),
-            ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
+            ...(session.sessionId ? { SESSION_ID: session.sessionId } : {}),
             ...(launch.remoteBranch
               ? { START_BRANCH: launch.remoteBranch }
               : {}),
@@ -987,10 +1128,24 @@ export function createLauncher({
    */
   function onRunFailed(runId: RunId, error: string): void {
     const failed = db
-      .select({ credential: runs.claudeCredential, agentId: runs.agentId })
+      .select({
+        credential: runs.claudeCredential,
+        agentId: runs.agentId,
+        runtime: runs.runtime,
+      })
       .from(runs)
       .where(eq(runs.id, runId))
       .get();
+    // `failureError` already found nothing left to run it on, and a Codex run has no Claude credential
+    // to move off
+    if (
+      failed?.runtime === "codex" ||
+      error.startsWith(CLAUDE_UNAVAILABLE) ||
+      error.startsWith(CODEX_UNAVAILABLE)
+    ) {
+      forgetLaunch(runId);
+      return;
+    }
     const credential = failed?.credential;
     if (isCloudflareChallenge(error)) {
       // transient: the credential is untouched and the retry stays on it
@@ -1039,20 +1194,44 @@ export function createLauncher({
   }
 
   /** Where a run that hit its subscription's limit goes next, if anywhere. */
-  function retryTarget(failedId: RunId, launch: Launch): RetryTarget {
-    const env = assignmentOf(launch.envId);
+  const retryTarget = (failedId: RunId, launch: Launch): RetryTarget =>
+    limitTarget(failedId, launch.envId);
+
+  /**
+   * Where a run in `envId` that hit its subscription's limit goes next, if anywhere; with nothing left
+   * to try, `unavailable` is the `claude_unavailable` error that says so, its reset time included.
+   */
+  function limitTarget(
+    failedId: RunId,
+    envId: EnvironmentId,
+  ): RetryTarget | { skip: string; unavailable: string } {
+    const env = assignmentOf(envId);
     if (env?.status !== "ready") {
       return { skip: "not retried: its environment is not ready" };
     }
-    const fallback =
-      env.claudeFallback !== "none" && config.anthropicApiKey
-        ? API_KEY_CREDENTIAL
-        : undefined;
-    const noFallback = {
-      skip: "not retried: its environment has no other credential to use (the API-key fallback is off or the server has no key)",
-    };
+    const noKey =
+      env.claudeFallback === "none"
+        ? "this environment's API key fallback is off"
+        : !config.anthropicApiKey
+          ? "this server has no SKY_ANTHROPIC_API_KEY to fall back on"
+          : keyOutOfCredit
+            ? "the Anthropic API key it falls back on is out of credit"
+            : undefined;
+    const fallback = noKey === undefined ? API_KEY_CREDENTIAL : undefined;
     if (env.claudeCredential !== POOL_CREDENTIAL) {
-      return fallback ? { target: fallback } : noFallback;
+      if (fallback) return { target: fallback };
+      const tried = [...credentialsTried(db, failedId)].filter(
+        (name) => name !== API_KEY_CREDENTIAL,
+      );
+      const reset = earliestReset(db, tried, new Date());
+      const which =
+        tried.length === 1
+          ? `the Claude credential ${JSON.stringify(tried[0])}`
+          : "this environment's Claude credential";
+      return {
+        skip: "not retried: its environment has no other credential to use (the API-key fallback is off, the server has no key, or the key is out of credit)",
+        unavailable: `${CLAUDE_UNAVAILABLE} ${which} is at its usage limit${reset ? ` and resets ${reset.toISOString()} (UTC)` : ""}; ${noKey}, so launch again after the reset`,
+      };
     }
     const next = nextInPool(
       { db, config },
@@ -1066,7 +1245,87 @@ export function createLauncher({
     return {
       skip: poolExhausted(db, members, new Date(), "this run is not retried")
         .message,
+      unavailable: poolExhausted(
+        db,
+        members,
+        new Date(),
+        `${noKey}, so launch again after the reset`,
+      ).message,
     };
+  }
+
+  /**
+   * The error a failed run is stored with: `error`, unless it says the run's runtime can't run. A
+   * Claude run whose subscription hit its limit with no credential left to retry on, or whose API key
+   * is out of credit (which marks the key so), fails `claude_unavailable`; a Codex run the runner
+   * found refused by the AI Gateway (`codex_unavailable`) keeps its words. Either gets the command
+   * that moves its environment to the other runtime. Marks a limited subscription as `onRunFailed`
+   * does, so the retry it then picks agrees with what this said.
+   */
+  function failureError(runId: RunId, error: string): string {
+    const row = db
+      .select({
+        credential: runs.claudeCredential,
+        runtime: runs.runtime,
+        envId: agents.envId,
+        envName: environments.name,
+      })
+      .from(runs)
+      .innerJoin(agents, eq(runs.agentId, agents.id))
+      .innerJoin(environments, eq(agents.envId, environments.id))
+      .where(eq(runs.id, runId))
+      .get();
+    if (!row) return error;
+    if (row.runtime === "codex") {
+      return error.startsWith(CODEX_UNAVAILABLE)
+        ? withSwitch(error, row.envName, "claude-code")
+        : error;
+    }
+    const credential = row.credential;
+    if (!credential) return error;
+    if (credential === API_KEY_CREDENTIAL) {
+      if (!isCreditExhausted(error)) return error;
+      keyOutOfCredit = true;
+      log(
+        `the Anthropic API key is out of credit (${runId}); launches that need it fail until a run on it finishes or the API restarts`,
+      );
+      // a subscription earlier in the run's chain hit its limit before it fell back on the key
+      const tried = [...credentialsTried(db, runId)].filter(
+        (name) => name !== API_KEY_CREDENTIAL,
+      );
+      const reset = earliestReset(db, tried, new Date());
+      const cause = reset
+        ? `the Claude subscriptions this run tried are at their usage limit until ${reset.toISOString()} (UTC), and the Anthropic API key it fell back on is out of credit`
+        : "the Anthropic API key this run used is out of credit";
+      return withSwitch(
+        `${CLAUDE_UNAVAILABLE} ${cause} (Anthropic answered "Credit balance is too low"); ${CREDIT_RECOVERY}`,
+        row.envName,
+        "codex",
+      );
+    }
+    const limit = parseUsageLimit(error);
+    if (!limit) return error;
+    markLimited(
+      db,
+      credential,
+      limit.resetsAt ?? new Date(Date.now() + UNKNOWN_RESET_MS),
+    );
+    const target = limitTarget(runId, row.envId);
+    if (!("unavailable" in target)) return error;
+    return withSwitch(target.unavailable, row.envName, "codex");
+  }
+
+  /** A run that finished on the API key shows the key has credit again. */
+  function onRunFinished(runId: RunId): void {
+    if (!keyOutOfCredit) return;
+    const row = db
+      .select({ credential: runs.claudeCredential })
+      .from(runs)
+      .where(eq(runs.id, runId))
+      .get();
+    if (row?.credential !== API_KEY_CREDENTIAL) return;
+    keyOutOfCredit = false;
+    log(`the Anthropic API key has credit again (${runId} finished on it)`);
   }
 
   /** Where a run that met Cloudflare's challenge on `credential` goes next: that one, while its environment still assigns it. */
@@ -1264,6 +1523,8 @@ export function createLauncher({
 
   const api = {
     onRunFailed,
+    failureError,
+    onRunFinished,
     /**
      * Cancels the agent's pending retries, of a Cloudflare challenge or of a usage limit (one waiting
      * on its failed runner's exit): a stop ends the task, run or not.
@@ -1515,7 +1776,12 @@ export function createLauncher({
     run(launch, agentToken)
       .catch(async (err: unknown) => {
         // no sprite to blame: the launch never reached one
-        if (err instanceof ClaudeCredentialError) throw err;
+        if (
+          err instanceof ClaudeCredentialError ||
+          err instanceof CodexLaunchError
+        ) {
+          throw err;
+        }
         await failEnvIfSpriteGone(launch).catch((checkErr: unknown) => {
           log(
             `checking whether the sprite of environment ${launch.envId} exists failed: ${checkErr}`,
@@ -1542,7 +1808,8 @@ export function createLauncher({
               launch.runId,
               // already worded as a run error, with its own code
               err instanceof LowMemoryError ||
-                err instanceof ClaudeCredentialError
+                err instanceof ClaudeCredentialError ||
+                err instanceof CodexLaunchError
                 ? stored
                 : `launch_failed: ${stored}`,
             );

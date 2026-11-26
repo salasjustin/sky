@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { Environment } from "./environment.js";
+import { Environment, Runtime } from "./environment.js";
 
 const env = {
   id: "env_1",
@@ -21,6 +21,7 @@ test("accepts an environment and defaults its cap and approval policy", () => {
     claudeCredential: null,
     claudePool: null,
     claudeFallback: "api-key",
+    runtime: null,
   });
 });
 
@@ -49,6 +50,17 @@ test("rejects a malformed repo, a zero cap and an unknown status", () => {
   expect(Environment.safeParse({ ...env, status: "booting" }).success).toBe(
     false,
   );
+});
+
+test("a runtime is Claude Code or Codex and nothing else", () => {
+  expect(Runtime.parse("claude-code")).toBe("claude-code");
+  expect(Runtime.parse("codex")).toBe("codex");
+  expect(Runtime.safeParse("gpt").success).toBe(false);
+});
+
+test("an environment keeps its Codex runtime and rejects an unknown one", () => {
+  expect(Environment.parse({ ...env, runtime: "codex" }).runtime).toBe("codex");
+  expect(Environment.safeParse({ ...env, runtime: "gpt" }).success).toBe(false);
 });
 
 test("a provisioning environment has no checkpoint yet", () => {
