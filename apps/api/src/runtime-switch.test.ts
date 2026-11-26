@@ -253,6 +253,8 @@ test("the switch command quotes an environment name a shell would split", () => 
 // --- named failures ------------------------------------------------------------------------------
 
 test("a run whose API key is out of credit fails claude_unavailable with the switch command, and the next launch fails fast", async () => {
+  const recovery =
+    "top it up and restart the API (fly apps restart <app>), or set a new SKY_ANTHROPIC_API_KEY, which restarts it";
   const envId = readyEnv({ claudeCredential: "api-key" });
   const r = await launched(envId);
   expect(r.file.SKY_CLAUDE_AUTH).toBe("api-key");
@@ -261,13 +263,17 @@ test("a run whose API key is out of credit fails claude_unavailable with the swi
   const error = failureOf(r.run.id);
   expect(error).toMatch(/^claude_unavailable: /);
   expect(error).toContain("out of credit");
-  expect(error).toContain(`sky env set-runtime ${envId} codex`);
+  expect(error).toContain(
+    `${recovery}; to run this environment on Codex instead: sky env set-runtime ${envId} codex`,
+  );
 
   // no runner is started for a launch that would die the same way
   const next = await refused(envId);
   expect(next).toMatch(/^claude_unavailable: /);
   expect(next).toContain("out of credit");
-  expect(next).toContain(`sky env set-runtime ${envId} codex`);
+  expect(next).toContain(
+    `${recovery}; to run this environment on Codex instead: sky env set-runtime ${envId} codex`,
+  );
   expect(wire.sessions).toHaveLength(1);
 
   // nor for one whose subscription is limited and would fall back on the key

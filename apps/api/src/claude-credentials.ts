@@ -35,10 +35,17 @@ const CREDITED: ApiKeyCredit = { outOfCredit: () => false };
 export const isCreditExhausted = (error: string): boolean =>
   /credit balance is too low/i.test(error);
 
+/**
+ * How an out-of-credit API key comes back. A top-up alone doesn't: the mark stays until the API
+ * restarts, and only a new secret restarts it on its own.
+ */
+export const CREDIT_RECOVERY =
+  "top it up and restart the API (fly apps restart <app>), or set a new SKY_ANTHROPIC_API_KEY, which restarts it";
+
 /** What a launch refused on an out-of-credit key says of it; `role` names what the key was for. */
 const outOfCredit = (role: string) =>
   new ClaudeCredentialError(
-    `claude_unavailable: ${role} is the Anthropic API key, which is out of credit (Anthropic answered "Credit balance is too low"); top it up or set a new SKY_ANTHROPIC_API_KEY, and Sky tries it again once the API restarts`,
+    `claude_unavailable: ${role} is the Anthropic API key, which is out of credit (Anthropic answered "Credit balance is too low"); ${CREDIT_RECOVERY}`,
   );
 
 /** `default` and unset are the same assignment. */

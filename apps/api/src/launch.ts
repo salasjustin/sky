@@ -36,6 +36,7 @@ import {
   type ClaudeAuth,
   ClaudeCredentialError,
   credentialNameOf,
+  CREDIT_RECOVERY,
   isCloudflareChallenge,
   isCreditExhausted,
   limitedUntil,
@@ -1297,7 +1298,7 @@ export function createLauncher({
         ? `the Claude subscriptions this run tried are at their usage limit until ${reset.toISOString()} (UTC), and the Anthropic API key it fell back on is out of credit`
         : "the Anthropic API key this run used is out of credit";
       return withSwitch(
-        `${CLAUDE_UNAVAILABLE} ${cause} (Anthropic answered "Credit balance is too low")`,
+        `${CLAUDE_UNAVAILABLE} ${cause} (Anthropic answered "Credit balance is too low"); ${CREDIT_RECOVERY}`,
         row.envName,
         "codex",
       );
