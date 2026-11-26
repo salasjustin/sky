@@ -570,17 +570,19 @@ A `runs` key lists only the agents it started, and `env` names it may not use ma
 
 Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you'll meet:
 
-| code                | means                                                                              |
-| ------------------- | ---------------------------------------------------------------------------------- |
-| `concurrency_cap`   | the environment already runs its max agents; wait for one to end or stop one       |
-| `run_active`        | a run is in progress; wait for it or stop it                                       |
-| `env_not_ready`     | the environment isn't ready to launch agents yet                                   |
-| `provisioning`      | the environment is still provisioning; wait for it to finish                       |
-| `agents_exist`      | repo or setup can't change while unarchived agents exist                           |
-| `already_decided`   | the request was already decided differently; that decision stands                  |
-| `request_closed`    | the request's run ended with the request still open; nothing was applied           |
-| `request_withdrawn` | the run stopped waiting on the request before it was answered; nothing was applied |
-| `webhooks_filter`   | webhooks filter on the environment; delete them first (ids in `webhookIds`)        |
+| code                   | means                                                                                                          |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `concurrency_cap`      | the environment already runs its max agents; wait for one to end or stop one                                   |
+| `run_active`           | a run is in progress; wait for it or stop it                                                                   |
+| `env_not_ready`        | the environment isn't ready to launch agents yet                                                               |
+| `provisioning`         | the environment is still provisioning; wait for it to finish                                                   |
+| `agents_exist`         | repo or setup can't change while unarchived agents exist                                                       |
+| `already_decided`      | the request was already decided differently; that decision stands                                              |
+| `request_closed`       | the request's run ended with the request still open; nothing was applied                                       |
+| `request_withdrawn`    | the run stopped waiting on the request before it was answered; nothing was applied                             |
+| `webhooks_filter`      | webhooks filter on the environment; delete them first (ids in `webhookIds`)                                    |
+| `gateway_key_missing`  | the environment has no `AI_GATEWAY_API_KEY` secret, so it can't switch to Codex; set it first                  |
+| `codex_install_failed` | Codex couldn't be installed on the sandbox; the runtime is unchanged, and the message has the install's output |
 
 ### Draining before a restart
 
