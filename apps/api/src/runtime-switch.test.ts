@@ -11,11 +11,17 @@ import {
   openDb,
   runs,
 } from "@sky/db";
-import type { AgentId, EnvironmentId, RunId, Runtime } from "@sky/shared";
+import {
+  type AgentId,
+  CreatedApiKey,
+  type EnvironmentId,
+  type RunId,
+  type Runtime,
+} from "@sky/shared";
 import { and, eq } from "drizzle-orm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
-import { markLimited } from "./claude-credentials.js";
+import { limitedUntil, markLimited } from "./claude-credentials.js";
 import type { Config } from "./config.js";
 import {
   crossRuntimePrompt,
@@ -126,11 +132,16 @@ const sessionOpened = (count: number) =>
   vi.waitFor(() => expect(wire.sessions).toHaveLength(count));
 
 /** Launches a run, or a follow-up of `agentId`, and returns what its runner was handed. */
-async function launched(envId: string, agentId?: AgentId, prompt = "go") {
+async function launched(
+  envId: string,
+  agentId?: AgentId,
+  prompt = "go",
+  envVars?: Record<string, string>,
+) {
   const before = wire.sessions.length;
   const res = agentId
-    ? await call("POST", `/v1/agents/${agentId}/runs`, { prompt })
-    : await call("POST", "/v1/agents", { envId, prompt });
+    ? await call("POST", `/v1/agents/${agentId}/runs`, { prompt, envVars })
+    : await call("POST", "/v1/agents", { envId, prompt, envVars });
   expect(res.status).toBe(202);
   const ids = (await res.json()) as Launched;
   await sessionOpened(before + 1);
@@ -282,6 +293,32 @@ test("a run on the API key that finishes clears the out-of-credit mark", async (
   expect(c.file.SKY_CLAUDE_AUTH).toBe("api-key");
 });
 
+test("a subscription run finishing leaves the out-of-credit mark on the API key", async () => {
+  const keyEnv = readyEnv({ claudeCredential: "api-key" });
+  const subscriptionEnv = readyEnv({ claudeCredential: "personal" });
+  const onKey = await launched(keyEnv);
+  const onSubscription = await launched(subscriptionEnv);
+  expect(onSubscription.file.SKY_CLAUDE_AUTH).toBe("oauth");
+  await start(onKey);
+  await start(onSubscription, "sess-2");
+  await fail(onKey, CREDIT_LOW);
+  await finish(onSubscription, "done");
+  const next = await refused(keyEnv);
+  expect(next).toMatch(/^claude_unavailable: /);
+  expect(next).toContain("out of credit");
+  expect(wire.sessions).toHaveLength(2);
+});
+
+test("a run on the API key failing for another reason does not mark the key out of credit", async () => {
+  const envId = readyEnv({ claudeCredential: "api-key" });
+  const a = await launched(envId);
+  await start(a);
+  await fail(a, "the turn failed");
+  expect(failureOf(a.run.id)).toBe("the turn failed");
+  const b = await launched(envId);
+  expect(b.file.SKY_CLAUDE_AUTH).toBe("api-key");
+});
+
 test("a run that hits its limit with nothing left to retry on fails claude_unavailable, naming the reset and the switch command", async () => {
   buildApp({ anthropicApiKey: undefined });
   const envId = readyEnv({ claudeCredential: "personal" });
@@ -320,6 +357,31 @@ test("a Codex run's other failures keep their words", async () => {
   await start(r, "thread-1");
   await fail(r, "the turn failed");
   expect(failureOf(r.run.id)).toBe("the turn failed");
+});
+
+test("a Codex run failing with Claude's usage-limit wording keeps it, limits no credential and starts no retry", async () => {
+  const envId = readyEnv({ runtime: "codex", claudeCredential: "personal" });
+  await setGatewayKey(envId);
+  const r = await launched(envId);
+  await start(r, "thread-1");
+  const limit = fiveHourLimit();
+  await fail(r, limit.text);
+  expect(failureOf(r.run.id)).toBe(limit.text);
+  for (const name of ["default", "personal"]) {
+    expect(limitedUntil(db, name)).toBeUndefined();
+  }
+  expect(db.select().from(runs).all()).toHaveLength(1);
+  expect(wire.sessions).toHaveLength(1);
+});
+
+test("the same usage-limit wording on a Claude run limits its credential", async () => {
+  buildApp({ anthropicApiKey: undefined });
+  const envId = readyEnv({ claudeCredential: "personal" });
+  const r = await launched(envId);
+  await start(r);
+  const limit = fiveHourLimit();
+  await fail(r, limit.text);
+  expect(limitedUntil(db, "personal")).toEqual(new Date(limit.at));
 });
 
 // --- Codex launches -------------------------------------------------------------------------------
@@ -503,6 +565,54 @@ test("an unknown runtime is a 400", async () => {
   expect(res.status).toBe(400);
 });
 
+test("a key scoped to an environment cannot switch its runtime", async () => {
+  const envId = readyEnv();
+  await setGatewayKey(envId);
+  const minted = await call("POST", "/v1/keys", {
+    name: "ci",
+    role: "runs",
+    environmentIds: [envId],
+  });
+  expect(minted.status).toBe(201);
+  const { secret } = CreatedApiKey.parse(await minted.json());
+  const res = await app.request(`/v1/environments/${envId}/runtime`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${secret}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ runtime: "codex" }),
+  });
+  expect(res.status).toBe(403);
+  expect(
+    db.select().from(environments).where(eq(environments.id, envId)).get()
+      ?.runtime,
+  ).toBeNull();
+});
+
+test("switching an unknown environment is a 404", async () => {
+  const res = await call("PUT", "/v1/environments/env_missing/runtime", {
+    runtime: "claude-code",
+  });
+  expect(res.status).toBe(404);
+});
+
+test("switching to Codex on an environment still provisioning stores it with no sprite work", async () => {
+  const envId = readyEnv({ status: "provisioning", checkpointId: null });
+  await setGatewayKey(envId);
+  const before = wire.calls.length;
+  const res = await call("PUT", `/v1/environments/${envId}/runtime`, {
+    runtime: "codex",
+  });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ id: envId, runtime: "codex" });
+  expect(wire.calls.slice(before)).toEqual([]);
+  expect(
+    db.select().from(environments).where(eq(environments.id, envId)).get()
+      ?.runtime,
+  ).toBe("codex");
+});
+
 // --- follow-ups after a switch --------------------------------------------------------------------
 
 test("a follow-up after a switch starts a fresh session on the agent's branch, told what came before", async () => {
@@ -648,4 +758,35 @@ test("an unrecorded session from a SKY_RUNTIME=codex environment switched to Cla
       summary: "Did the first half.",
     }),
   );
+});
+
+// --- where the runtime comes from -----------------------------------------------------------------
+
+test("a run's SKY_RUNTIME envVar picks Codex for an environment with no stored runtime", async () => {
+  const envId = readyEnv();
+  await setGatewayKey(envId);
+  const r = await launched(envId, undefined, "go", { SKY_RUNTIME: "codex" });
+  expect(r.file.SKY_RUNTIME).toBe("codex");
+  expect(r.file).not.toHaveProperty("SKY_CLAUDE_AUTH");
+  expect(runRow(r.run.id)?.runtime).toBe("codex");
+});
+
+test("a run's SKY_RUNTIME envVar beats a conflicting SKY_RUNTIME secret", async () => {
+  const envId = readyEnv();
+  await setGatewayKey(envId);
+  await setRuntimeSecret(envId);
+  const r = await launched(envId, undefined, "go", {
+    SKY_RUNTIME: "claude-code",
+  });
+  expect(r.file.SKY_RUNTIME).toBe("claude-code");
+  expect(r.file.SKY_CLAUDE_AUTH).toBe("oauth");
+});
+
+test("the stored runtime beats both a SKY_RUNTIME envVar and the secret", async () => {
+  const envId = readyEnv({ runtime: "claude-code" });
+  await setGatewayKey(envId);
+  await setRuntimeSecret(envId);
+  const r = await launched(envId, undefined, "go", { SKY_RUNTIME: "codex" });
+  expect(r.file.SKY_RUNTIME).toBe("claude-code");
+  expect(r.file.SKY_CLAUDE_AUTH).toBe("oauth");
 });
