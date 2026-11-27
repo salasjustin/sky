@@ -251,8 +251,9 @@ test("api-key:default is the plain key: stored as api-key and listed under it", 
   ).toBe("api-key");
 
   const plain = (await credentialsOf()).find((c) => c.name === "api-key");
+  if (!plain) throw new Error("the plain key is missing from the list");
   expect(
-    (plain?.environments as { id: string }[]).map((e) => e.id).sort(),
+    (plain.environments as { id: string }[]).map((e) => e.id).sort(),
   ).toEqual([made.id, envId].sort());
 });
 
@@ -263,11 +264,9 @@ test("with every key out of credit the error names a clear-credit command for ea
     apiKeyAuth(config, "the env", { outOfCredit: () => true }),
   ).toThrow(recovery);
   expect(() =>
-    apiKeyAuth(
-      { ...config, anthropicApiKeys: {} },
-      "the env",
-      { outOfCredit: () => true },
-    ),
+    apiKeyAuth({ ...config, anthropicApiKeys: {} }, "the env", {
+      outOfCredit: () => true,
+    }),
   ).toThrow(
     "top the key up, then clear its mark with sky claude-credentials clear-credit default (or restart",
   );
