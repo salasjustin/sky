@@ -895,3 +895,224 @@ test("the stored runtime beats both a SKY_RUNTIME envVar and the secret", async 
   expect(r.file.SKY_RUNTIME).toBe("claude-code");
   expect(r.file.SKY_CLAUDE_AUTH).toBe("oauth");
 });
+
+// --- pi --------------------------------------------------------------------------------------------
+
+const PI_PACKAGE = "@earendil-works/pi-coding-agent@1.6.1";
+
+test("a pi run the AI Gateway refused fails pi_unavailable with the command back to Claude Code", async () => {
+  const envId = readyEnv({ runtime: "pi" });
+  await setGatewayKey(envId);
+  const r = await launched(envId);
+  await start(r, "pi-session");
+  await fail(
+    r,
+    "pi_unavailable: the AI Gateway is out of credit (pi said: 402 Payment Required)",
+  );
+  const error = failureOf(r.run.id);
+  expect(error).toMatch(/^pi_unavailable: the AI Gateway is out of credit/);
+  expect(error).toContain(`sky env set-runtime ${envId} claude-code`);
+  // a pi failure never touches a Claude credential, nor retries on one
+  expect(wire.sessions).toHaveLength(1);
+});
+
+test("a pi run's other failures keep their words", async () => {
+  const envId = readyEnv({ runtime: "pi" });
+  await setGatewayKey(envId);
+  const r = await launched(envId);
+  await start(r, "pi-session");
+  await fail(r, "the model call failed");
+  expect(failureOf(r.run.id)).toBe("the model call failed");
+});
+
+test("the stored pi runtime goes to the runner, with the gateway key and no Claude credential", async () => {
+  const envId = readyEnv({ runtime: "pi" });
+  await setGatewayKey(envId);
+  const r = await launched(envId);
+  expect(r.file.SKY_RUNTIME).toBe("pi");
+  expect(r.file.AI_GATEWAY_API_KEY).toBe(GATEWAY_KEY);
+  expect(r.file).not.toHaveProperty("SKY_CLAUDE_AUTH");
+});
+
+test("the SKY_RUNTIME secret picks pi for an environment with no stored runtime", async () => {
+  const envId = readyEnv();
+  await setGatewayKey(envId);
+  expect(
+    (
+      await call("PUT", `/v1/environments/${envId}/secrets/SKY_RUNTIME`, {
+        value: "pi",
+      })
+    ).status,
+  ).toBe(200);
+  expect((await launched(envId)).file.SKY_RUNTIME).toBe("pi");
+});
+
+test("a pi launch on a sprite without pi installs it before the runner starts", async () => {
+  const envId = readyEnv({ runtime: "pi" });
+  await setGatewayKey(envId);
+  const base = wire.exec;
+  const ensures: string[] = [];
+  wire.exec = (argv, sprite) => {
+    if (argv[0] === "sh" && argv[2]?.includes("npm install")) {
+      ensures.push(argv[2]);
+      return { exitCode: 3 };
+    }
+    return base(argv, sprite);
+  };
+  await launched(envId);
+  expect(ensures).toHaveLength(1);
+  expect(ensures[0]).toContain(PI_PACKAGE);
+  expect(ensures[0]).not.toContain("@openai/codex");
+  const order = wire.calls.filter(
+    (line) => line.includes("npm install") || line.startsWith("session "),
+  );
+  expect(order[0]).toContain("npm install");
+  expect(order[1]).toMatch(/^session /);
+});
+
+test("a pi launch whose install fails fails the run naming why, before any runner", async () => {
+  const envId = readyEnv({ runtime: "pi" });
+  await setGatewayKey(envId);
+  const base = wire.exec;
+  wire.exec = (argv, sprite) =>
+    argv[0] === "sh" && argv[2]?.includes("npm install")
+      ? { exitCode: 1, stderr: "npm ERR! network unreachable\n" }
+      : base(argv, sprite);
+  const error = await refused(envId);
+  expect(error).toMatch(/^pi_unavailable: /);
+  expect(error).toContain("installing pi 1.6.1 failed");
+  expect(error).toContain("network unreachable");
+  expect(error.endsWith(`sky env set-runtime ${envId} claude-code`)).toBe(true);
+  expect(wire.sessions).toHaveLength(0);
+});
+
+test("a pi launch in an environment with no gateway key fails at once, saying how to fix it", async () => {
+  const envId = readyEnv({ runtime: "pi" });
+  const error = await refused(envId);
+  expect(error).toMatch(/^pi_unavailable: /);
+  expect(error).toContain("runs on pi but has no AI_GATEWAY_API_KEY");
+  expect(error).toContain(`sky env set-runtime ${envId} claude-code`);
+  expect(wire.calls).toEqual([]);
+});
+
+test("switching to pi is refused while the environment has no AI_GATEWAY_API_KEY", async () => {
+  const envId = readyEnv();
+  const res = await call("PUT", `/v1/environments/${envId}/runtime`, {
+    runtime: "pi",
+  });
+  expect(res.status).toBe(409);
+  const body = (await res.json()) as {
+    error: { code: string; message: string };
+  };
+  expect(body.error.code).toBe("gateway_key_missing");
+  expect(body.error.message).toContain("which pi runs need");
+  expect(body.error.message).toContain(
+    `sky secret set ${envId} AI_GATEWAY_API_KEY`,
+  );
+  expect(
+    db.select().from(environments).where(eq(environments.id, envId)).get()
+      ?.runtime,
+  ).toBeNull();
+});
+
+test("switching to pi installs it on the live sprite, stores the runtime and shows it", async () => {
+  const envId = readyEnv();
+  await setGatewayKey(envId);
+  const before = wire.calls.length;
+  const res = await call("PUT", `/v1/environments/${envId}/runtime`, {
+    runtime: "pi",
+  });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ id: envId, runtime: "pi" });
+  const made = wire.calls.slice(before);
+  // one exec, the pinned install, and nothing that reprovisions or touches a worktree
+  expect(made).toHaveLength(1);
+  expect(made[0]).toContain(PI_PACKAGE);
+  expect(made.join("\n")).not.toMatch(/worktree|rm -rf|checkpoint|create /);
+  const shown = await call("GET", `/v1/environments/${envId}`);
+  expect(await shown.json()).toMatchObject({ runtime: "pi" });
+});
+
+test("a switch that can't install pi leaves the runtime as it was", async () => {
+  const envId = readyEnv({ runtime: "codex" });
+  await setGatewayKey(envId);
+  wire.exec = () => ({ exitCode: 1, stderr: "npm ERR! disk full\n" });
+  const res = await call("PUT", `/v1/environments/${envId}/runtime`, {
+    runtime: "pi",
+  });
+  expect(res.status).toBe(502);
+  const body = (await res.json()) as {
+    error: { code: string; message: string };
+  };
+  expect(body.error.code).toBe("pi_install_failed");
+  expect(body.error.message).toContain("install pi on");
+  expect(body.error.message).toContain("disk full");
+  expect(
+    db.select().from(environments).where(eq(environments.id, envId)).get()
+      ?.runtime,
+  ).toBe("codex");
+});
+
+test("switching to pi on an environment still provisioning stores it with no sprite work", async () => {
+  const envId = readyEnv({ status: "provisioning", checkpointId: null });
+  await setGatewayKey(envId);
+  const before = wire.calls.length;
+  const res = await call("PUT", `/v1/environments/${envId}/runtime`, {
+    runtime: "pi",
+  });
+  expect(res.status).toBe(200);
+  expect(wire.calls.slice(before)).toEqual([]);
+  expect(
+    db.select().from(environments).where(eq(environments.id, envId)).get()
+      ?.runtime,
+  ).toBe("pi");
+});
+
+test("switching from pi back to Claude Code needs no gateway key and no sprite work", async () => {
+  const envId = readyEnv({ runtime: "pi" });
+  const res = await call("PUT", `/v1/environments/${envId}/runtime`, {
+    runtime: "claude-code",
+  });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ runtime: "claude-code" });
+  expect(wire.calls).toEqual([]);
+});
+
+test("a follow-up resumes a pi session; one after a switch to or from pi starts a fresh one", async () => {
+  const envId = readyEnv({ runtime: "pi" });
+  await setGatewayKey(envId);
+  const first = await launched(envId, undefined, "build it");
+  await start(first, "pi-session");
+  await finish(first, "Built it.");
+  expect(
+    db.select().from(agents).where(eq(agents.id, first.agent.id)).get(),
+  ).toMatchObject({ sessionId: "pi-session", sessionRuntime: "pi" });
+
+  const same = await launched(envId, first.agent.id, "more");
+  expect(same.session?.env.SESSION_ID).toBe("pi-session");
+  expect(same.prompt).toBe("more");
+  await start(same, "pi-session");
+  await finish(same, "More.");
+
+  expect(
+    (
+      await call("PUT", `/v1/environments/${envId}/runtime`, {
+        runtime: "codex",
+      })
+    ).status,
+  ).toBe(200);
+  const across = await launched(envId, first.agent.id, "now on codex");
+  expect(across.session?.env).not.toHaveProperty("SESSION_ID");
+  expect(across.prompt).toBe(
+    crossRuntimePrompt({
+      prompt: "now on codex",
+      from: "pi",
+      to: "codex",
+      branch: `claude/${first.agent.id}`,
+      summary: "More.",
+    }),
+  );
+  expect(across.prompt).toMatch(
+    /^Note from Sky: this agent's earlier work ran on pi, and this environment now runs on Codex/,
+  );
+});

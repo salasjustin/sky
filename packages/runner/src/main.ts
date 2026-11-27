@@ -8,12 +8,13 @@ import {
   sweepCredentialFiles,
   withdrawCredential,
 } from "./claude-auth.js";
-import { runCodexSession, withdrawCodexKey } from "./codex.js";
+import { runCodexSession, withdrawGatewayKey } from "./codex.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { takeConnector } from "./connector.js";
 import { removeSkyLogin } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
 import { holdSprite, spriteApiFrom } from "./keepalive.js";
+import { runPiSession } from "./pi.js";
 import {
   killRefreshCommands,
   type PluginRefreshRecord,
@@ -87,7 +88,9 @@ async function main(): Promise<void> {
   const credentialEnv = withdrawCredential(process.env);
   // a Codex run's AI Gateway key leaves the env the same way, for the run's gateway proxy alone
   const codexEnv =
-    config.runtime === "codex" ? withdrawCodexKey(process.env) : {};
+    config.runtime === "codex" || config.runtime === "pi"
+      ? withdrawGatewayKey(process.env)
+      : {};
   const seal = createSeal();
   const claim = process.env.PROMPT_FILE
     ? claimRunLog(process.env.PROMPT_FILE)
@@ -174,15 +177,15 @@ async function main(): Promise<void> {
     signal: controller.signal,
   });
   await step("sprite hold", () => hold.ready);
-  // a stop while the hold was landing skips setup; the session reports it as run.failed. A Codex run
-  // only pulls the store: the plugin refresh runs `claude`, whose plugins Codex doesn't load
-  const codex = config.runtime === "codex";
-  if (codex && !controller.signal.aborted)
+  // a stop while the hold was landing skips setup; the session reports it as run.failed. A Codex or pi
+  // run only pulls the store: the plugin refresh runs `claude`, whose plugins they don't load
+  const gatewayRuntime = config.runtime === "codex" || config.runtime === "pi";
+  if (gatewayRuntime && !controller.signal.aborted)
     await step("store sync", () =>
       syncStoreQuietly("pull", { ...process.env, ...connector }, warn),
     );
   const pluginRefresh =
-    controller.signal.aborted || codex
+    controller.signal.aborted || gatewayRuntime
       ? undefined
       : await setUpSession(
           controller.signal,
@@ -191,27 +194,38 @@ async function main(): Promise<void> {
         );
   warn("runner: session starting");
   try {
-    process.exitCode = codex
-      ? await runCodexSession(config, {
-          post,
-          awaitDecision: createDecisionWaiter(config),
-          signal: controller.signal,
-          warn,
-          codexEnv,
-          seal,
-          connector,
-        })
-      : await runSession(config, {
-          query,
-          post,
-          awaitDecision: createDecisionWaiter(config),
-          signal: controller.signal,
-          warn,
-          credentialEnv,
-          seal,
-          pluginRefresh,
-          connector,
-        });
+    process.exitCode =
+      config.runtime === "codex"
+        ? await runCodexSession(config, {
+            post,
+            awaitDecision: createDecisionWaiter(config),
+            signal: controller.signal,
+            warn,
+            codexEnv,
+            seal,
+            connector,
+          })
+        : config.runtime === "pi"
+          ? await runPiSession(config, {
+              post,
+              awaitDecision: createDecisionWaiter(config),
+              signal: controller.signal,
+              warn,
+              gatewayEnv: codexEnv,
+              seal,
+              connector,
+            })
+          : await runSession(config, {
+              query,
+              post,
+              awaitDecision: createDecisionWaiter(config),
+              signal: controller.signal,
+              warn,
+              credentialEnv,
+              seal,
+              pluginRefresh,
+              connector,
+            });
   } finally {
     // the run is over, whatever way: nothing it started may keep its memory on a sprite other runs share
     await endSessionProcesses({ runId: config.runId, warn });

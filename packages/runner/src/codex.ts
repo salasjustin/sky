@@ -97,8 +97,8 @@ export const GATEWAY_CODEX_URL = "https://ai-gateway.vercel.sh/codex/v1";
 /** Where `provision.ts` installs Codex; `SKY_CODEX_BIN` overrides it. */
 export const CODEX_BIN = "/opt/sky/node_modules/.bin/codex";
 
-const PUBLISH_TOOL = "sky_publish";
-const SYNC_TOOL = "sky_sync";
+export const PUBLISH_TOOL = "sky_publish";
+export const SYNC_TOOL = "sky_sync";
 
 const PLATFORM_PACKAGES: Record<string, { pkg: string; triple: string }> = {
   x64: {
@@ -135,8 +135,11 @@ export function resolveCodexExecutable(
   );
 }
 
-/** Takes the AI Gateway key out of `env`, as `withdrawCredential` does Claude's, so only the run's gateway proxy gets it. */
-export function withdrawCodexKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+/**
+ * Takes the AI Gateway key out of `env`, as `withdrawCredential` does Claude's, so only the run's
+ * gateway proxy gets it. Codex and pi runs share it.
+ */
+export function withdrawGatewayKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const held: NodeJS.ProcessEnv = {};
   const value = env[CODEX_KEY_ENV];
   if (value !== undefined) {
@@ -257,7 +260,7 @@ const summaryOf = (toolName: string, input: Record<string, unknown>) => {
   return String(input.command ?? input.file_path ?? toolName);
 };
 
-const outside = (root: string, path: string) => {
+export const outside = (root: string, path: string) => {
   const rel = relative(root, path);
   return rel === ".." || rel.startsWith("../") || isAbsolute(rel);
 };
@@ -306,7 +309,7 @@ export function codexInstructions(options: {
 }
 
 /** The tools the runner serves itself: the agent's `publish` and `sync`, through the broker. */
-const DYNAMIC_TOOLS = [
+export const DYNAMIC_TOOLS = [
   {
     type: "function",
     name: PUBLISH_TOOL,
@@ -354,13 +357,13 @@ const DYNAMIC_TOOLS = [
   },
 ];
 
-const PublishArgs = z.object({
+export const PublishArgs = z.object({
   title: z.string().min(1),
   body: z.string().optional(),
   base: z.string().min(1).optional(),
   branch: z.string().min(1).optional(),
 });
-const SyncArgs = z.object({ branch: z.string().min(1).optional() });
+export const SyncArgs = z.object({ branch: z.string().min(1).optional() });
 
 const Item = z.looseObject({ type: z.string(), id: z.string() });
 const CommandItem = z.looseObject({

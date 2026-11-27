@@ -78,18 +78,18 @@ const help = (io: Io) => `Usage:
       subscription named "all" can be listed there. Without --pool the
       list stays as it is, so --fallback alone never widens an ordered
       pool. Needs the admin key.
-  sky env set-runtime <env> <claude-code|codex|default> [options]
-      Switch the environment's runs between Claude Code and Codex; default
-      stores no runtime, so the environment follows its SKY_RUNTIME secret
-      again (Claude Code without one). Codex
-      needs the environment's AI_GATEWAY_API_KEY secret, else the switch is
-      refused with gateway_key_missing. Codex is installed on the sandbox
-      if it lacks it, so the first switch to Codex can take a few minutes;
+  sky env set-runtime <env> <claude-code|codex|pi|default> [options]
+      Switch the environment's runs between Claude Code, Codex and pi;
+      default stores no runtime, so the environment follows its SKY_RUNTIME
+      secret again (Claude Code without one). Codex and pi
+      need the environment's AI_GATEWAY_API_KEY secret, else the switch is
+      refused with gateway_key_missing. Each is installed on the sandbox
+      if it lacks it, so the first switch to either can take a few minutes;
       if the install fails the switch is refused with codex_install_failed
-      and the runtime is unchanged. An agent's next run after a switch
-      starts a fresh session on its branch. A run that fails with
-      claude_unavailable: or codex_unavailable: names the exact
-      set-runtime command to run. Needs the admin key.
+      or pi_install_failed and the runtime is unchanged. An agent's next
+      run after a switch starts a fresh session on its branch. A run that
+      fails with claude_unavailable:, codex_unavailable: or pi_unavailable:
+      names the exact set-runtime command to run. Needs the admin key.
   sky claude-credentials [options]
       Print "<name> <subscription|api-key>
       <limited-until=<time>|out-of-credit|-> <runs today> <env ids|->

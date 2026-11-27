@@ -20,6 +20,7 @@ export function effectiveRuntime(
 const RUNTIME_NAMES: Record<Runtime, string> = {
   "claude-code": "Claude Code",
   codex: "Codex",
+  pi: "pi",
 };
 
 export const runtimeName = (runtime: Runtime) => RUNTIME_NAMES[runtime];
@@ -45,6 +46,20 @@ export const CLAUDE_UNAVAILABLE = "claude_unavailable:";
  * (the runner's wording), or when its environment has no gateway key.
  */
 export const CODEX_UNAVAILABLE = "codex_unavailable:";
+/** The same for a pi run: the runner's wording when the AI Gateway refused it, or the environment has no gateway key. */
+export const PI_UNAVAILABLE = "pi_unavailable:";
+
+/** Whether a runtime reaches its model through the AI Gateway with the environment's key, rather than a Claude credential. */
+export const usesGateway = (runtime: Runtime | null | undefined) =>
+  runtime === "codex" || runtime === "pi";
+
+/** The code a gateway runtime's run fails with when its model is unavailable. */
+export const unavailableCode = (runtime: Runtime) =>
+  runtime === "pi" ? PI_UNAVAILABLE : CODEX_UNAVAILABLE;
+
+/** Whether `error` is a gateway runtime's unavailable failure, of either kind. */
+export const isGatewayUnavailable = (error: string) =>
+  error.startsWith(CODEX_UNAVAILABLE) || error.startsWith(PI_UNAVAILABLE);
 
 /**
  * The prompt of a follow-up whose agent's last session ran on the other runtime, which can't resume

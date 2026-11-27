@@ -29,9 +29,10 @@ import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
 import type { Previews } from "./previews.js";
-import { ensureCodex, type Provisioner } from "./provision.js";
+import { ensureCodex, ensurePi, type Provisioner } from "./provision.js";
 import { redact } from "./redact.js";
 import { activeRunStatuses, type Tx } from "./runs.js";
+import { runtimeName, usesGateway } from "./runtime.js";
 import { hasSecret } from "./secrets.js";
 import { destroySprite, type SpriteOps, spriteNameFor } from "./sprites.js";
 import { body, jsonBody } from "./validation.js";
@@ -419,29 +420,32 @@ export function environmentRoutes(
           const db = c.var.db;
           const env = findEnv(db, id);
           if (!env) return apiError(c, 404, "not_found", notFound);
-          if (runtime === "codex") {
+          if (usesGateway(runtime)) {
+            const name = runtimeName(runtime);
             if (!hasSecret(db, id, CODEX_GATEWAY_SECRET)) {
               return apiError(
                 c,
                 409,
                 "gateway_key_missing",
-                `this environment has no ${CODEX_GATEWAY_SECRET} secret, which Codex runs need; set it with sky secret set ${env.name} ${CODEX_GATEWAY_SECRET}, then switch again`,
+                `this environment has no ${CODEX_GATEWAY_SECRET} secret, which ${name} runs need; set it with sky secret set ${env.name} ${CODEX_GATEWAY_SECRET}, then switch again`,
               );
             }
-            // a sprite provisioned before Codex was lacks it; provisioning installs it on one still provisioning
+            // a sprite provisioned before the runtime was lacks it; provisioning installs it on one still provisioning
             if (env.status === "ready") {
               try {
-                const codex = await ensureCodex(sprites, env.spriteName);
-                if (codex === "installed") {
-                  log(`installed Codex on ${env.spriteName} for ${id}`);
+                const installed = await (runtime === "pi"
+                  ? ensurePi
+                  : ensureCodex)(sprites, env.spriteName);
+                if (installed === "installed") {
+                  log(`installed ${name} on ${env.spriteName} for ${id}`);
                 }
               } catch (err) {
-                log(`installing Codex on ${env.spriteName} failed: ${err}`);
+                log(`installing ${name} on ${env.spriteName} failed: ${err}`);
                 return apiError(
                   c,
                   502,
-                  "codex_install_failed",
-                  `could not install Codex on the environment's sprite; the runtime is unchanged: ${redact(err instanceof Error ? err.message : String(err), [...c.var.secrets.values()])}`,
+                  `${runtime}_install_failed`,
+                  `could not install ${name} on the environment's sprite; the runtime is unchanged: ${redact(err instanceof Error ? err.message : String(err), [...c.var.secrets.values()])}`,
                 );
               }
             }

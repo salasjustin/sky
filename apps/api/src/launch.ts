@@ -68,7 +68,9 @@ import { readMemory } from "./memory.js";
 import {
   CodexInstallError,
   ensureCodex,
+  ensurePi,
   envFile,
+  PiInstallError,
   REPO_DIR,
   RUNNER,
   WITH_PACKAGE_MANAGERS,
@@ -88,10 +90,13 @@ import {
 } from "./runs.js";
 import {
   CLAUDE_UNAVAILABLE,
-  CODEX_UNAVAILABLE,
   crossRuntimePrompt,
   effectiveRuntime,
+  isGatewayUnavailable,
   RUNTIME_VARIABLE,
+  runtimeName,
+  unavailableCode,
+  usesGateway,
   withSwitch,
 } from "./runtime.js";
 import {
@@ -182,7 +187,7 @@ const claudeEnv = (auth: ClaudeAuth): [string, string][] =>
 /** A launch refused for want of memory on its sprite; its message is the run's error. */
 class LowMemoryError extends Error {}
 
-/** A Codex launch refused before any sprite work (no gateway key); its message is the run's error. */
+/** A Codex or pi launch refused before any sprite work (no gateway key); its message is the run's error. */
 class CodexLaunchError extends Error {}
 
 /**
@@ -881,22 +886,22 @@ export function createLauncher({
     const runtime = effectiveRuntime(env.runtime, runtimeVariable);
     db.update(runs).set({ runtime }).where(eq(runs.id, launch.runId)).run();
     // before any sprite work: a launch with no usable credential fails at once, not after a dead run.
-    // A Codex run's model calls carry the gateway key, never a Claude credential
+    // A Codex or pi run's model calls carry the gateway key, never a Claude credential
     let auth: ClaudeAuth | undefined;
-    if (runtime === "codex") {
+    if (usesGateway(runtime)) {
       if (
         !envVars.has(CODEX_GATEWAY_SECRET) &&
         !envSecrets.has(CODEX_GATEWAY_SECRET)
       ) {
         throw new CodexLaunchError(
           withSwitch(
-            `codex_unavailable: this environment runs on Codex but has no ${CODEX_GATEWAY_SECRET} secret; set it with sky secret set ${env.name} ${CODEX_GATEWAY_SECRET}`,
+            `${unavailableCode(runtime)} this environment runs on ${runtimeName(runtime)} but has no ${CODEX_GATEWAY_SECRET} secret; set it with sky secret set ${env.name} ${CODEX_GATEWAY_SECRET}`,
             env.name,
             "claude-code",
           ),
         );
       }
-      log(`launching ${launch.runId}: runtime codex`);
+      log(`launching ${launch.runId}: runtime ${runtime}`);
     } else {
       try {
         auth = await claudeAuthFor(launch);
@@ -927,15 +932,22 @@ export function createLauncher({
     await step(launch, "bundle", () =>
       ensureBundle(launch.spriteName, launch.runId),
     );
-    // a sprite provisioned before Codex was has no Codex binary, which the runner would fail on
-    if (runtime === "codex") {
-      await step(launch, "codex", () =>
-        ensureCodex(sprites, launch.spriteName).catch((err: unknown) => {
+    // a sprite provisioned before Codex or pi was has no such binary, which the runner would fail on
+    if (usesGateway(runtime)) {
+      await step(launch, runtime, () =>
+        (runtime === "pi" ? ensurePi : ensureCodex)(
+          sprites,
+          launch.spriteName,
+        ).catch((err: unknown) => {
           // the install's own failure is the environment's to fix or leave; the sprite's is not
-          if (!(err instanceof CodexInstallError)) throw err;
+          if (
+            !(err instanceof CodexInstallError) &&
+            !(err instanceof PiInstallError)
+          )
+            throw err;
           throw new CodexLaunchError(
             withSwitch(
-              `${CODEX_UNAVAILABLE} ${err.message}`,
+              `${unavailableCode(runtime)} ${err.message}`,
               env.name,
               "claude-code",
             ),
@@ -1165,12 +1177,12 @@ export function createLauncher({
       .from(runs)
       .where(eq(runs.id, runId))
       .get();
-    // `failureError` already found nothing left to run it on, and a Codex run has no Claude credential
-    // to move off
+    // `failureError` already found nothing left to run it on, and a Codex or pi run has no Claude
+    // credential to move off
     if (
-      failed?.runtime === "codex" ||
+      usesGateway(failed?.runtime) ||
       error.startsWith(CLAUDE_UNAVAILABLE) ||
-      error.startsWith(CODEX_UNAVAILABLE)
+      isGatewayUnavailable(error)
     ) {
       forgetLaunch(runId);
       return;
@@ -1300,8 +1312,8 @@ export function createLauncher({
    * The error a failed run is stored with: `error`, unless it says the run's runtime can't run. A
    * Claude run whose subscription hit its limit with no credential left to retry on, or whose API
    * key is out of credit (which marks the key so) with no key left to retry on, fails
-   * `claude_unavailable`; a Codex run the runner found refused by the AI Gateway
-   * (`codex_unavailable`) keeps its words. Either gets the command that moves its environment to
+   * `claude_unavailable`; a Codex or pi run the runner found refused by the AI Gateway
+   * (`codex_unavailable`, `pi_unavailable`) keeps its words. Either gets the command that moves its environment to
    * the other runtime. Marks a limited subscription as `onRunFailed` does, so the retry it then
    * picks agrees with what this said.
    */
@@ -1319,8 +1331,8 @@ export function createLauncher({
       .where(eq(runs.id, runId))
       .get();
     if (!row) return error;
-    if (row.runtime === "codex") {
-      return error.startsWith(CODEX_UNAVAILABLE)
+    if (usesGateway(row.runtime)) {
+      return isGatewayUnavailable(error)
         ? withSwitch(error, row.envName, "claude-code")
         : error;
     }

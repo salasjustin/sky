@@ -131,7 +131,7 @@ sky secret delete web NPM_TOKEN
 sky env list                    # id, status, repo and name per environment
 sky env show web                # one env; a failed one shows its step and stderr
 sky env retry web               # provision a failed env again
-sky env set-runtime web codex   # admin only: run web on Codex (or claude-code); see "Switching runtime"
+sky env set-runtime web codex   # admin only: run web on Codex, pi or claude-code; see "Switching runtime"
 sky env delete web              # destroy its sandbox, agents, runs and events; asks first
 sky env delete web --yes        # the same without asking; required off a terminal and with --json
                                 # refused while a webhook added with --env=web exists; sky webhook delete it first
@@ -262,12 +262,36 @@ A run on Codex runs OpenAI's Codex CLI instead of Claude Code, with the model se
 - **Not carried over** from Claude Code runs: the base profile's MCP servers, background tasks, the default git identity, and the outside-read gate (Codex runs commands it counts as read-only, such as `cat` and `ls`, without asking).
 - **No Claude credential.** A Codex launch never picks a Claude credential, so a limited subscription, a pool with nothing left or `claudeFallback: none` doesn't stop it, and its failures are never retried on another credential.
 
+### pi runs
+
+A run on pi drives [pi](https://pi.dev), the coding agent `pi --mode rpc`, instead of Claude Code, with the model served by the Vercel AI Gateway, as on Codex. An environment runs on pi once `sky env set-runtime <env> pi` sets it (see [Switching runtime](#switching-runtime)); with no runtime set, `SKY_RUNTIME=pi` (an environment secret, or one run's `envVars`) picks it. Provisioning installs the pinned pi (`@earendil-works/pi-coding-agent`, a Node program with no platform binary) at `/opt/sky/node_modules/.bin/pi`; the runner's `SKY_PI_BIN` points it at another pi, a compiled release included; on a sandbox provisioned before pi was added, `sky env set-runtime <env> pi` or a pi launch that finds it missing installs it, as for Codex.
+
+What an environment needs, and the two knobs:
+
+- **`AI_GATEWAY_API_KEY`**, an environment secret (`sky secret set web AI_GATEWAY_API_KEY`). Without it the switch is refused with `gateway_key_missing`, and a pi launch fails at once with `pi_unavailable`.
+- **`SKY_PI_MODEL`** picks the model, as the gateway names it; `deepseek/deepseek-v4.1-flash-1017` when unset. The run reaches the gateway's OpenAI-compatible endpoint, so a model that endpoint serves works.
+- **`SKY_PI_SKILLS`** lists directories of ordinary `SKILL.md` skills a run loads, separated by commas, each absolute or under the home (`~/.sky/pi/skills`). The environment's `setup` installs them, the same files the Claude Code and Codex runs load; pi advertises each skill's name and description and reads one when the task calls for it. A directory that isn't there is skipped, with a `runner.warning`. Nothing else is loaded: skills, extensions and packages that merely sit in pi's directories, or in the repo's own `.pi`, are ignored.
+
+What a PM should expect:
+
+- **The same approvals.** Sky's approval policy, `approval` events and `sky inbox` lines are the ones Claude Code and Codex runs produce: a `bash` call is `Bash`, a `write` is `Write`, an `edit` is `Edit`, with the real command or file in the request. Read-only commands that self-approve on the other runtimes self-approve here, a change outside the worktree is always held, and a policy pattern that names a command (`Bash(git push:*)`) holds it however it is wrapped (`bash -lc`, `sudo -u`, `env …`, `timeout`). A denial's reason goes back to the model as the refused call's result. A run waiting for a decision fails at `WAIT_TIMEOUT_MINUTES` like any other.
+- **`sky_publish` and `sky_sync`** are pi tools the runner serves; they open the one Publish or Sync approval, and the GitHub connector never leaves the runner. They exist on a resumed session too. Follow-ups resume the agent's pi session on its branch, and `sessionId` is stored as for the other runtimes.
+- **The gateway key stays in the runner,** as on Codex. pi reaches the gateway through a loopback proxy the runner starts for the run, with a token made for that run; the token is read from pi's environment as it starts and removed, so the agent's commands never hold it, and pi's process is sealed as Claude's is. A run whose runner can't be hidden fails `credential_exposed` before it starts.
+- **MCP servers** from the base profile reach pi through a config the runner writes for the run, each secret as a reference to the run's environment, never a value; every tool is declared to the model.
+- **No subagents.** pi has none, so a pi run can't dispatch kru's seats the way a Claude Code run does: it does the work itself. Skills, instructions and checks still apply.
+- **Cost is tokens only.** pi prices a call from its model's catalog entry, which the gateway's models don't have, so `run.finished` reports the tokens (every prompt token counts as input, cache reads included) and `costUsd: 0`; the gateway's dashboard has the dollars.
+- **Not carried over** from Claude Code runs: background tasks, the default git identity, and the outside-read gate (pi's `read`, `grep`, `find` and `ls` run without asking, wherever they read). A prompt that begins with `/` can be taken by pi as one of its slash commands.
+- **No Claude credential,** as for Codex: a limited subscription or a pool with nothing left doesn't stop a pi launch, and its failures are never retried on another credential.
+
+`packages/runner/e2e/pi-e2e.mjs` runs the real runner and pi against a real model with only Sky's API and GitHub stood in for (see the header); `--mock-gateway` swaps the model for a scripted one.
+
 ### Switching runtime
 
-An environment runs either Claude Code or Codex. When one can't run, its runs say so, and one command moves the environment to the other. Nothing switches on its own.
+An environment runs Claude Code, Codex or pi. When one can't run, its runs say so, and one command moves the environment to another. Nothing switches on its own.
 
 ```
 sky env set-runtime web codex          # run web's next launches on Codex
+sky env set-runtime web pi             # or on pi
 sky env set-runtime web claude-code    # and back
 sky env set-runtime web default        # follow web's SKY_RUNTIME secret again
 sky env show web                       # shows `runtime: …`
@@ -277,8 +301,9 @@ sky env show web                       # shows `runtime: …`
 
 - `claude_unavailable: …; to run this environment on Codex instead: sky env set-runtime web codex`: every Claude credential the environment may use is at its usage limit (the error gives the earliest reset in UTC), or every Anthropic API key is out of credit.
 - `codex_unavailable: …; to run this environment on Claude Code instead: sky env set-runtime web claude-code`: the AI Gateway refused the run for credit, quota or rate limit (the error quotes what Codex reported), the environment has no `AI_GATEWAY_API_KEY`, or Codex couldn't be installed on the sandbox at launch (the error quotes what the install reported).
+- `pi_unavailable: …; to run this environment on Claude Code instead: sky env set-runtime web claude-code`: the same for a pi run (the error quotes what pi reported).
 
-**What the switch does.** It sets the environment's `runtime` (`PUT /v1/environments/:id/runtime` with `{"runtime": "codex"}`; admin key only), which wins over a `SKY_RUNTIME` secret or envVar. An environment that has never been switched has no runtime set and follows `SKY_RUNTIME`; `sky env set-runtime <env> default` (`{"runtime": null}`) clears the stored runtime so it follows the secret again, and `sky env show` prints that as `runtime: default`. Switching to Codex is refused with `gateway_key_missing` until the environment has an `AI_GATEWAY_API_KEY` secret (`sky secret set web AI_GATEWAY_API_KEY`), and installs the pinned Codex on the sandbox when it isn't there; if that install fails the switch is refused with `codex_install_failed` and the runtime stays as it was. A run already going keeps its runtime; the switch applies from the next launch.
+**What the switch does.** It sets the environment's `runtime` (`PUT /v1/environments/:id/runtime` with `{"runtime": "codex"}`; admin key only), which wins over a `SKY_RUNTIME` secret or envVar. An environment that has never been switched has no runtime set and follows `SKY_RUNTIME`; `sky env set-runtime <env> default` (`{"runtime": null}`) clears the stored runtime so it follows the secret again, and `sky env show` prints that as `runtime: default`. Switching to Codex or pi is refused with `gateway_key_missing` until the environment has an `AI_GATEWAY_API_KEY` secret (`sky secret set web AI_GATEWAY_API_KEY`), and installs the pinned Codex or pi on the sandbox when it isn't there; if that install fails the switch is refused with `codex_install_failed` or `pi_install_failed` and the runtime stays as it was. A run already going keeps its runtime; the switch applies from the next launch.
 
 **Agents after a switch.** An agent whose last session ran on the other runtime can't resume it. Its next run starts a fresh session on the agent's branch, which holds the earlier work's commits, and its prompt opens with a short note saying the earlier work ran on the other runtime, with the last run's summary. Follow-ups on the same runtime resume their session. An agent whose session started before Sky recorded runtimes counts as having run on what its next launch picks with no runtime set: the run's `SKY_RUNTIME` envVar, else the environment's `SKY_RUNTIME` secret, else Claude Code.
 
@@ -585,8 +610,9 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 | `request_closed`       | the request's run ended with the request still open; nothing was applied                                       |
 | `request_withdrawn`    | the run stopped waiting on the request before it was answered; nothing was applied                             |
 | `webhooks_filter`      | webhooks filter on the environment; delete them first (ids in `webhookIds`)                                    |
-| `gateway_key_missing`  | the environment has no `AI_GATEWAY_API_KEY` secret, so it can't switch to Codex; set it first                  |
+| `gateway_key_missing`  | the environment has no `AI_GATEWAY_API_KEY` secret, so it can't switch to Codex or pi; set it first            |
 | `codex_install_failed` | Codex couldn't be installed on the sandbox; the runtime is unchanged, and the message has the install's output |
+| `pi_install_failed`    | pi couldn't be installed on the sandbox; the runtime is unchanged, and the message has the install's output    |
 
 ### Draining before a restart
 
@@ -633,6 +659,7 @@ A run the API fails ends with `run.failed`, and its `error` is one of:
 | `launch_timeout`            | the runner never reported in within `LAUNCH_DEADLINE_MINUTES` (default 15) of the run's creation; a `runner.warning` or heartbeat doesn't count as reporting in. A run queued for the repo lock fails sooner, from the runner: see **Launch** below                                                                                                                                                                                                                                             |
 | `claude_unavailable`        | Claude Code can't run in the environment: every credential it may use is at its usage limit and no API key can stand in (none is set, `claudeFallback` is `none`, or every key is out of credit), or every API key is out of credit. Raised at launch or when a run fails on it; names the reset time in UTC when there is one, and ends with the `sky env set-runtime <env> codex` command, see [Switching runtime](#switching-runtime)                                                        |
 | `codex_unavailable`         | Codex can't run in the environment: the AI Gateway refused the run for credit, quota or rate limit (the error quotes what Codex reported), the environment has no `AI_GATEWAY_API_KEY`, or the Codex install at launch failed. Ends with the `sky env set-runtime <env> claude-code` command                                                                                                                                                                                                    |
+| `pi_unavailable`            | pi can't run in the environment: the AI Gateway refused the run for credit, quota or rate limit (the error quotes what pi reported), the environment has no `AI_GATEWAY_API_KEY`, or the pi install at launch failed. Ends with the `sky env set-runtime <env> claude-code` command                                                                                                                                                                                                             |
 | `claude_credential_missing` | the environment is assigned a credential this server no longer holds, or the API key it is assigned isn't set                                                                                                                                                                                                                                                                                                                                                                                   |
 | `settings_redirect`         | the runner refused to start Claude: a settings file sets a key that would redirect its credential, see [What Sky refuses in Claude settings](#what-sky-refuses-in-claude-settings); the error names the file and key. Not retried                                                                                                                                                                                                                                                               |
 | `credential_exposed`        | the runner refused to start Claude, or stopped it, because the repo's commands could read the run's Claude credential, see [What a repo's hooks, MCP servers and commands can see](#what-a-repos-hooks-mcp-servers-and-commands-can-see). Not retried                                                                                                                                                                                                                                           |

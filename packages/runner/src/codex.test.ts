@@ -26,7 +26,7 @@ import {
   runCodexSession,
   toolCallOf,
   unwrapShell,
-  withdrawCodexKey,
+  withdrawGatewayKey,
 } from "./codex.js";
 import { type Config, loadConfig } from "./config.js";
 import type { PostEvent } from "./events.js";
@@ -99,10 +99,10 @@ describe("SKY_RUNTIME", () => {
   });
 });
 
-describe("withdrawCodexKey", () => {
+describe("withdrawGatewayKey", () => {
   test("takes the gateway key out of the env and returns it", () => {
     const env: NodeJS.ProcessEnv = { AI_GATEWAY_API_KEY: "k", OTHER: "1" };
-    expect(withdrawCodexKey(env)).toEqual({ AI_GATEWAY_API_KEY: "k" });
+    expect(withdrawGatewayKey(env)).toEqual({ AI_GATEWAY_API_KEY: "k" });
     expect(env).toEqual({ OTHER: "1" });
   });
 });

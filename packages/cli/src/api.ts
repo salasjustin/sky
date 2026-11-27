@@ -183,7 +183,7 @@ export class ApiError extends Error {
 }
 
 const requestTimeoutMs = 30_000;
-/** A switch to Codex waits for the server to install it on the sandbox when it's missing. */
+/** A switch to Codex or pi waits for the server to install it on the sandbox when it's missing. */
 const codexSwitchTimeoutMs = 15 * 60_000;
 
 export type Api = ReturnType<typeof createApi>;
@@ -463,13 +463,13 @@ export function createApi(config: Config) {
       );
       return env(status, json);
     },
-    /** Sets the runtime the env's runs use, or null to follow its `SKY_RUNTIME` secret again; 409 `gateway_key_missing` for Codex without the env's AI_GATEWAY_API_KEY, 502 `codex_install_failed` when Codex can't be installed. */
+    /** Sets the runtime the env's runs use, or null to follow its `SKY_RUNTIME` secret again; 409 `gateway_key_missing` for Codex or pi without the env's AI_GATEWAY_API_KEY, 502 `codex_install_failed` or `pi_install_failed` when it can't be installed. */
     async setEnvironmentRuntime(id: string, runtime: Runtime | null) {
       const { status, json } = await request(
         "PUT",
         `/v1/environments/${encodeURIComponent(id)}/runtime`,
         { runtime },
-        runtime === "codex"
+        runtime === "codex" || runtime === "pi"
           ? {
               timeoutMs: codexSwitchTimeoutMs,
               // the server goes on installing and stores the runtime after the CLI gives up

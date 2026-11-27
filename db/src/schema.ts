@@ -95,8 +95,8 @@ export const environments = sqliteTable(
     claudeFallback: text("claude_fallback", { enum: claudeFallbacks })
       .notNull()
       .default("api-key"),
-    // "claude-code" or "codex", set by `sky env set-runtime`; null follows the env's SKY_RUNTIME secret. No CHECK, for the same reason as claude_fallback
-    runtime: text({ enum: ["claude-code", "codex"] }),
+    // "claude-code", "codex" or "pi", set by `sky env set-runtime`; null follows the env's SKY_RUNTIME secret. No CHECK, for the same reason as claude_fallback
+    runtime: text({ enum: ["claude-code", "codex", "pi"] }),
     failureStep: text("failure_step", { enum: environmentFailureSteps }),
     // redacted and truncated by the API before it lands here
     failureStderr: text("failure_stderr"),
@@ -167,8 +167,10 @@ export const agents = sqliteTable(
       .notNull()
       .references(() => environments.id),
     sessionId: text("session_id"),
-    // the runtime ("claude-code" or "codex") session_id belongs to; null for a session started before it was recorded. No CHECK, for the same reason as archivedAt
-    sessionRuntime: text("session_runtime", { enum: ["claude-code", "codex"] }),
+    // the runtime ("claude-code", "codex" or "pi") session_id belongs to; null for a session started before it was recorded. No CHECK, for the same reason as archivedAt
+    sessionRuntime: text("session_runtime", {
+      enum: ["claude-code", "codex", "pi"],
+    }),
     branch: text().$type<`claude/${AgentId}`>().notNull(),
     status: text().$type<AgentStatus>().notNull(),
     createdAt: createdAt(),
@@ -262,8 +264,8 @@ export const runs = sqliteTable(
     secretNames: text("secret_names", { mode: "json" }).$type<string[]>(),
     // the Claude credential the launch used, by name ("default", a subscription's name or "api-key"); null before it picks one. No CHECK, for the same reason as rollup
     claudeCredential: text("claude_credential"),
-    // the runtime ("claude-code" or "codex") the launch ran it on; null before it is resolved. No CHECK, for the same reason as rollup
-    runtime: text({ enum: ["claude-code", "codex"] }),
+    // the runtime ("claude-code", "codex" or "pi") the launch ran it on; null before it is resolved. No CHECK, for the same reason as rollup
+    runtime: text({ enum: ["claude-code", "codex", "pi"] }),
     // the failed run this one retries after a usage limit, on the API key or a pool's next subscription; null for any other run
     retryOf: text("retry_of").$type<RunId>(),
     // what a retry of this run needs from its launch (JSON: the prompt and the run's ids and settings, never its env vars or a credential), so one survives an API restart. Sealed by the API like a run's env values, AAD bound to the run id; the three are all null when none is kept (before the launch is recorded, and once a retry takes it or it is cleared). No CHECK, for the same reason as rollup

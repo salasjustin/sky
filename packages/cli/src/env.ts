@@ -224,7 +224,7 @@ export const env: AgentCommand = {
       const [ref, runtime, ...extra] = rest;
       if (ref === undefined || runtime === undefined || extra.length > 0) {
         throw new UsageError(
-          "env set-runtime takes <env> <claude-code|codex|default>",
+          "env set-runtime takes <env> <claude-code|codex|pi|default>",
           true,
         );
       }
@@ -235,16 +235,16 @@ export const env: AgentCommand = {
           : Runtime.safeParse(runtime);
       if (!parsed.success) {
         throw new UsageError(
-          `${JSON.stringify(runtime)} is not a runtime: use claude-code, codex or default`,
+          `${JSON.stringify(runtime)} is not a runtime: use claude-code, codex, pi or default`,
           true,
         );
       }
       return async (api, _io, out) => {
         const envId = await resolveEnvId(api, ref, out);
         if (envId === undefined) return 1;
-        if (parsed.data === "codex") {
+        if (parsed.data === "codex" || parsed.data === "pi") {
           out.progress(
-            "installing Codex on the sandbox if it's missing; this can take a few minutes",
+            `installing ${parsed.data === "pi" ? "pi" : "Codex"} on the sandbox if it's missing; this can take a few minutes`,
           );
         }
         const { raw, env } = await api.setEnvironmentRuntime(

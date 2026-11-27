@@ -21,6 +21,9 @@ const json = z.string().transform((s, ctx) => {
 const CODEX_PLUGIN_ID =
   /^[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
+/** A pi skill directory: absolute or `~/…`, so it can't read as one of pi's flags, with no control characters. */
+const PI_SKILL_DIR = /^(?:\/|~\/)[^\p{Cc}]*$/u;
+
 const Env = z.object({
   AGENT_ID: AgentId,
   RUN_ID: RunId,
@@ -31,9 +34,27 @@ const Env = z.object({
     .transform((s) => s || undefined),
   API_BASE_URL: z.url(),
   AGENT_TOKEN: z.string().min(1),
-  // which agent drives the session: Claude Code through the Agent SDK, or Codex through its app server
-  // (`codex.ts`), whose model is reached through the Vercel AI Gateway rather than a Claude credential
-  SKY_RUNTIME: z.enum(["claude-code", "codex"]).default("claude-code"),
+  // which agent drives the session: Claude Code through the Agent SDK, Codex through its app server
+  // (`codex.ts`), or pi through its RPC mode (`pi.ts`); the last two reach their model through the
+  // Vercel AI Gateway rather than a Claude credential
+  SKY_RUNTIME: z.enum(["claude-code", "codex", "pi"]).default("claude-code"),
+  // the pi session's model, as the AI Gateway names it; `DEFAULT_PI_MODEL` when unset
+  SKY_PI_MODEL: z
+    .string()
+    .optional()
+    .transform((s) => s || undefined),
+  // the directories of `SKILL.md` skills a pi run loads, separated by commas: absolute, or `~/` for the
+  // run's home. The environment's setup installs them
+  SKY_PI_SKILLS: z
+    .string()
+    .optional()
+    .transform((s) =>
+      (s ?? "")
+        .split(",")
+        .map((dir) => dir.trim())
+        .filter(Boolean),
+    )
+    .pipe(z.array(z.string().regex(PI_SKILL_DIR))),
   // the Codex session's model, as the AI Gateway names it; `DEFAULT_CODEX_MODEL` when unset
   SKY_CODEX_MODEL: z
     .string()
@@ -86,24 +107,28 @@ const Env = z.object({
 
 /**
  * The variable holding the credential the run's session can't start without: for Claude Code, the one
- * `SKY_CLAUDE_AUTH` names; for Codex, the AI Gateway key, which only the run's gateway proxy reads.
+ * `SKY_CLAUDE_AUTH` names; for Codex and pi, the AI Gateway key, which only the run's gateway proxy reads.
  */
 const credentialVariable = (env: NodeJS.ProcessEnv) =>
-  env.SKY_RUNTIME === "codex"
+  env.SKY_RUNTIME === "codex" || env.SKY_RUNTIME === "pi"
     ? CODEX_KEY_ENV
     : env.SKY_CLAUDE_AUTH === "api-key"
       ? "SKY_CLAUDE_API_KEY"
       : "CLAUDE_CODE_OAUTH_TOKEN";
 
-/** The AI Gateway key a Codex run's model calls carry; `main` takes it out of the env for the run's gateway proxy alone. */
+/** The AI Gateway key a Codex or pi run's model calls carry; `main` takes it out of the env for the run's gateway proxy alone. */
 export const CODEX_KEY_ENV = "AI_GATEWAY_API_KEY";
 
 export type Config = {
   /**
-   * `codex` when `SKY_RUNTIME=codex`, which runs through `runCodexSession`; absent for Claude Code, so a
-   * Claude Code run's config holds no runtime field at all.
+   * `codex` when `SKY_RUNTIME=codex`, which runs through `runCodexSession`, or `pi` when it is `pi`
+   * (`runPiSession`); absent for Claude Code, so a Claude Code run's config holds no runtime field at all.
    */
-  runtime?: "codex";
+  runtime?: "codex" | "pi";
+  /** The pi session's model, from `SKY_PI_MODEL`; set only on a pi run that names one. */
+  piModel?: string;
+  /** The skill directories a pi run loads, from `SKY_PI_SKILLS`; set only on a pi run that names some. */
+  piSkills?: string[];
   /** The Codex session's model, from `SKY_CODEX_MODEL`; set only on a Codex run that names one. */
   codexModel?: string;
   /** The Codex plugins the run turns on, from `SKY_CODEX_PLUGINS`; set only on a Codex run that names some. */
@@ -166,6 +191,11 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
       ...(e.SKY_CODEX_PLUGINS.length > 0 && {
         codexPlugins: e.SKY_CODEX_PLUGINS,
       }),
+    }),
+    ...(e.SKY_RUNTIME === "pi" && {
+      runtime: e.SKY_RUNTIME,
+      ...(e.SKY_PI_MODEL && { piModel: e.SKY_PI_MODEL }),
+      ...(e.SKY_PI_SKILLS.length > 0 && { piSkills: e.SKY_PI_SKILLS }),
     }),
     agentId: e.AGENT_ID,
     runId: e.RUN_ID,

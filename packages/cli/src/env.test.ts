@@ -866,6 +866,23 @@ test("env set-runtime codex says on stderr that Codex may be installed, stdout u
   expect(JSON.parse(json.stdout)).toEqual(envJson({ runtime: "codex" }));
 });
 
+test("env set-runtime pi says on stderr that pi may be installed, stdout unchanged", async () => {
+  server.use(list, putRuntime("pi"));
+  const plain = await runCli(["env", "set-runtime", "web", "pi"]);
+  expect(plain.code).toBe(0);
+  expect(plain.stderr).toBe(
+    "installing pi on the sandbox if it's missing; this can take a few minutes\n",
+  );
+  expect(plain.stdout).toBe("env_1 ready acme/web web\nruntime: pi\n");
+});
+
+test("env set-runtime pi waits 15 minutes for the switch", async () => {
+  server.use(list, putRuntime("pi"));
+  const { r, timeouts } = await timeoutsOf(["env", "set-runtime", "web", "pi"]);
+  expect(r.code).toBe(0);
+  expect(timeouts).toEqual([30_000, 15 * 60_000]);
+});
+
 test("env set-runtime claude-code prints no install notice", async () => {
   server.use(list, putRuntime("claude-code"));
   const r = await runCli(["env", "set-runtime", "web", "claude-code"]);
@@ -923,11 +940,14 @@ test.each([
 );
 
 test.each([
-  [["env", "set-runtime", "web"], /takes <env> <claude-code\|codex\|default>/],
+  [
+    ["env", "set-runtime", "web"],
+    /takes <env> <claude-code\|codex\|pi\|default>/,
+  ],
   [["env", "set-runtime", "web", "codex", "extra"], /takes <env>/],
   [
     ["env", "set-runtime", "web", "claude"],
-    /use claude-code, codex or default/,
+    /use claude-code, codex, pi or default/,
   ],
 ])("%j is a usage error with no request", async (argv, message) => {
   let requests = 0;

@@ -28,9 +28,12 @@ const RUNNER_SDK = "@anthropic-ai/claude-agent-sdk@0.3.312";
 // = CODEX_VERSION in packages/runner/src/codex.ts: the Codex version a Codex run drives
 const CODEX_VERSION = "0.172.0";
 const RUNNER_CODEX = `@openai/codex@${CODEX_VERSION}`;
+// = PI_VERSION in packages/runner/src/pi.ts: the pi version a pi run drives
+const PI_VERSION = "1.6.1";
+const RUNNER_PI = `@earendil-works/pi-coding-agent@${PI_VERSION}`;
 // no --omit=optional: the SDK ships the Claude Code binary as a platform-specific optional dep, and
-// Codex its own binary the same way
-const installRunnerSdk = `[ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" -g "$(id -g)" ${RUNNER_DIR}; npm install --prefix ${RUNNER_DIR} --no-audit --no-fund ${RUNNER_SDK} ${RUNNER_CODEX}`;
+// Codex its own binary the same way; pi is one JavaScript bundle and needs none
+const installRunnerSdk = `[ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" -g "$(id -g)" ${RUNNER_DIR}; npm install --prefix ${RUNNER_DIR} --no-audit --no-fund ${RUNNER_SDK} ${RUNNER_CODEX} ${RUNNER_PI}`;
 // exits 0 when CODEX_BIN is already the pinned version, 3 when npm had to install it beside the SDK,
 // 1 otherwise; under a lock, so two launches on one sprite don't run npm over each other.
 // Touches nothing but the runner dir's node_modules: no reprovision, no worktree
@@ -64,6 +67,33 @@ export async function ensureCodex(
 
 /** The Codex install ran on the sprite and failed; any other failure of `ensureCodex` is the exec's own. */
 export class CodexInstallError extends Error {}
+
+// the same as ENSURE_CODEX for pi, whose launcher `node_modules/.bin/pi` is a link to its `cli.js`
+const PI_PACKAGE = `${RUNNER_DIR}/node_modules/@earendil-works/pi-coding-agent/package.json`;
+export const ENSURE_PI = `pinned() { [ -x ${RUNNER_DIR}/node_modules/.bin/pi ] && [ "$(node -p 'require(process.argv[1]).version' ${PI_PACKAGE} 2>/dev/null)" = ${PI_VERSION} ]; }; pinned && exit 0; exec 9>/tmp/sky-pi-install.lock && flock -w 600 9 || exit 1; pinned && exit 0; [ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" -g "$(id -g)" ${RUNNER_DIR}; npm install --prefix ${RUNNER_DIR} --no-audit --no-fund ${RUNNER_PI} >&2 && pinned && exit 3; echo "pi ${PI_VERSION} is still not under ${RUNNER_DIR} after npm install" >&2; exit 1`;
+
+/**
+ * Makes the sprite hold the pinned pi under the runner dir, as provisioning installs it, for a sprite
+ * provisioned before pi was: `installed` when it had to, `present` when it was there. Throws with npm's
+ * output tail when the install fails.
+ */
+export async function ensurePi(
+  sprites: SpriteOps,
+  spriteName: string,
+): Promise<"present" | "installed"> {
+  const out = await execInSprite(sprites, spriteName, ["sh", "-c", ENSURE_PI], {
+    op: "ensure-pi",
+    timeoutMs: sprites.longTimeoutMs,
+  });
+  if (out.exitCode === 0) return "present";
+  if (out.exitCode === 3) return "installed";
+  throw new PiInstallError(
+    `installing pi ${PI_VERSION} failed (exit ${out.exitCode}): ${out.stderr.trim().slice(-TAIL_CHARS)}`,
+  );
+}
+
+/** The pi install ran on the sprite and failed; any other failure of `ensurePi` is the exec's own. */
+export class PiInstallError extends Error {}
 // finds the SDK's bundled `claude` under the runner dir, which is the script's first argument
 const FIND_CLAUDE = `
 const sdk = process.argv[1] + "/node_modules/@anthropic-ai";

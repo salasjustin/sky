@@ -11,11 +11,11 @@ import { EnvironmentId } from "./ids.js";
 export const EnvironmentStatus = z.enum(["provisioning", "ready", "failed"]);
 export type EnvironmentStatus = z.infer<typeof EnvironmentStatus>;
 
-/** Which agent drives an environment's runs: Claude Code, or Codex through the AI Gateway. */
-export const Runtime = z.enum(["claude-code", "codex"]);
+/** Which agent drives an environment's runs: Claude Code, or Codex or pi through the AI Gateway. */
+export const Runtime = z.enum(["claude-code", "codex", "pi"]);
 export type Runtime = z.infer<typeof Runtime>;
 
-/** The env secret a Codex run's model calls carry; switching an environment to Codex needs it. */
+/** The env secret a Codex or pi run's model calls carry; switching an environment to either needs it. */
 export const CODEX_GATEWAY_SECRET = "AI_GATEWAY_API_KEY";
 
 /** Which Bash commands run without an approval request; see `isAutoApproved`. */
