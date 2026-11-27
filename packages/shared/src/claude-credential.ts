@@ -5,9 +5,9 @@ import { EnvironmentId } from "./ids.js";
 export const DEFAULT_CLAUDE_CREDENTIAL = "default";
 
 /**
- * The pay-per-use Anthropic API key (`SKY_ANTHROPIC_API_KEY`), the only fallback for a limited
- * subscription. It is the key named `default`; a named key `SKY_ANTHROPIC_API_KEY_<NAME>` is
- * {@link apiKeyCredential}`(name)`, `api-key:<name>`.
+ * The plain pay-per-use Anthropic API key (`SKY_ANTHROPIC_API_KEY`); the API keys are the only
+ * fallback for a limited subscription. It is the key named `default`; a named key
+ * `SKY_ANTHROPIC_API_KEY_<NAME>` is {@link apiKeyCredential}`(name)`, `api-key:<name>`.
  */
 export const API_KEY_CREDENTIAL = "api-key";
 
@@ -64,7 +64,7 @@ export const ClaudeCredentialName = z
     "expected a credential name: a subscription (lowercase letters, digits, _), default, pool, api-key or api-key:<name>",
   );
 
-/** Whether a limited subscription's environment may spend the API key until the reset. */
+/** Whether a limited subscription's environment may spend the API keys until the reset. */
 export const ClaudeFallback = z.enum([API_KEY_CREDENTIAL, "none"]);
 export type ClaudeFallback = z.infer<typeof ClaudeFallback>;
 
@@ -85,6 +85,7 @@ export type ClaudeUsage = z.infer<typeof ClaudeUsage>;
 
 /** One credential as `GET /v1/claude-credentials` lists it. */
 export const ClaudeCredentialSummary = z.object({
+  /** A subscription's name, or an API key's credential: `api-key`, or `api-key:<name>` for a named one. */
   name: z.string(),
   kind: z.enum(["subscription", "api-key"]),
   /** The environments assigned this credential. */
@@ -95,7 +96,7 @@ export const ClaudeCredentialSummary = z.object({
   outOfCredit: z.boolean().default(false),
   /** Runs started on it since midnight UTC. */
   runsToday: z.int().nonnegative(),
-  /** A subscription's last-seen usage; null before it has been probed, and for the API key. */
+  /** A subscription's last-seen usage; null before it has been probed, and for an API key. */
   usage: ClaudeUsage.nullable().default(null),
   /** The pool environments that may use this subscription. */
   poolEnvironments: z

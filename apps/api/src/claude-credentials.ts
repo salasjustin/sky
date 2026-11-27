@@ -190,9 +190,10 @@ export function markLimited(db: Db, credential: string, until: Date): void {
 }
 
 /**
- * The credential a launch in an environment with this assignment runs on. The assigned subscription,
- * unless it is at its usage limit: then the API key, when set and the env allows it. Never another
- * subscription. Throws a `ClaudeCredentialError` naming the reset time when no credential is usable.
+ * The credential a launch in an environment with this assignment runs on. The assigned
+ * subscription, unless it is at its usage limit: then an API key with credit, when set and the env
+ * allows it. Never another subscription. Throws a `ClaudeCredentialError` naming the reset time
+ * when no credential is usable.
  */
 export function resolveClaudeAuth(
   db: Db,

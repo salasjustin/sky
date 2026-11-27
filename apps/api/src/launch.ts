@@ -1138,19 +1138,22 @@ export function createLauncher({
   const maybeStarted = new Set<RunId>();
 
   /**
-   * A run failed with `error`, and is retried once, resuming its session, when that is either of:
+   * A run failed with `error`, and is retried once, resuming its session, when that is any of:
    *
    * - Cloudflare's challenge on Claude's login: after `CHALLENGE_RETRY_MS`, on the same credential
    *   even if it is limited by then, which is never marked limited. Dropped when the environment is
    *   no longer ready or no longer assigns the credential, and cancelled by a stop on the agent.
    * - its subscription reaching its usage limit: the subscription is marked limited until the reset
    *   time the error gives and the retry launches at once. An environment that isn't a pool retries
-   *   on the API key, unless it turns the fallback off or the server has none: never on another
-   *   subscription. A pool environment goes on to the next subscription in its pool that its chain of
-   *   retries hasn't tried, then to the API key on the same terms, else notes the earliest reset on
-   *   the run.
+   *   on an API key with credit, unless it turns the fallback off or the server has none: never on
+   *   another subscription. A pool environment goes on to the next subscription in its pool that its
+   *   chain of retries hasn't tried, then to an API key on the same terms, else notes the earliest
+   *   reset on the run.
+   * - its API key being out of credit: the key is marked out of credit and the retry goes to the next
+   *   key with credit that its chain of retries hasn't tried; with none left, the run fails
+   *   `claude_unavailable`.
    *
-   * Either retry is dropped when the agent has a run created after the failed one.
+   * Any retry is dropped when the agent has a run created after the failed one.
    */
   function onRunFailed(runId: RunId, error: string): void {
     const failed = db
@@ -1268,7 +1271,7 @@ export function createLauncher({
           ? `the Claude credential ${JSON.stringify(tried[0])}`
           : "this environment's Claude credential";
       return {
-        skip: "not retried: its environment has no other credential to use (the API-key fallback is off, the server has no key, or the key is out of credit)",
+        skip: "not retried: its environment has no other credential to use (the API-key fallback is off, the server has no key, or every key is out of credit)",
         unavailable: `${CLAUDE_UNAVAILABLE} ${which} is at its usage limit${reset ? ` and resets ${reset.toISOString()} (UTC)` : ""}; ${noKey}, so launch again after the reset`,
       };
     }
@@ -1295,11 +1298,12 @@ export function createLauncher({
 
   /**
    * The error a failed run is stored with: `error`, unless it says the run's runtime can't run. A
-   * Claude run whose subscription hit its limit with no credential left to retry on, or whose API key
-   * is out of credit (which marks the key so), fails `claude_unavailable`; a Codex run the runner
-   * found refused by the AI Gateway (`codex_unavailable`) keeps its words. Either gets the command
-   * that moves its environment to the other runtime. Marks a limited subscription as `onRunFailed`
-   * does, so the retry it then picks agrees with what this said.
+   * Claude run whose subscription hit its limit with no credential left to retry on, or whose API
+   * key is out of credit (which marks the key so) with no key left to retry on, fails
+   * `claude_unavailable`; a Codex run the runner found refused by the AI Gateway
+   * (`codex_unavailable`) keeps its words. Either gets the command that moves its environment to
+   * the other runtime. Marks a limited subscription as `onRunFailed` does, so the retry it then
+   * picks agrees with what this said.
    */
   function failureError(runId: RunId, error: string): string {
     const row = db
@@ -1598,7 +1602,7 @@ export function createLauncher({
     onRunFailed,
     failureError,
     clearCredit,
-    /** Whether the API key, by credential, is marked out of credit. */
+    /** Whether an API key, by credential, is marked out of credit. */
     outOfCredit: (credential: string) => credit.outOfCredit(credential),
     /**
      * Cancels the agent's pending retries, of a Cloudflare challenge or of a usage limit (one waiting

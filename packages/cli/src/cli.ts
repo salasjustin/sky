@@ -91,13 +91,13 @@ const help = (io: Io) => `Usage:
       claude_unavailable: or codex_unavailable: names the exact
       set-runtime command to run. Needs the admin key.
   sky claude-credentials [options]
-      Print "<name> <subscription|api-key> <limited-until=<time>|out-of-
-      credit|-> <runs today> <env ids|-> <5h=N%|-> <7d=N%|-> <pool env
-      ids|->" per credential: its limit or, for an API key (api-key, or
-      api-key:<name> for a named one), whether it is marked out of
-      credit, its environments, its last-seen usage and the pool
-      environments that may use it. Values are never printed. Needs the
-      admin key.
+      Print "<name> <subscription|api-key>
+      <limited-until=<time>|out-of-credit|-> <runs today> <env ids|->
+      <5h=N%|-> <7d=N%|-> <pool env ids|->" per credential: its limit or,
+      for an API key (api-key, or api-key:<name> for a named one), whether
+      it is marked out of credit, its environments, its last-seen usage and
+      the pool environments that may use it. Values are never printed. Needs
+      the admin key.
   sky claude-credentials clear-credit <name> [options]
       Clear an API key's out-of-credit mark once it is topped up; <name> is
       as the list prints it (api-key:backup) or the bare name (backup,

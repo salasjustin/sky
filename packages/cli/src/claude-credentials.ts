@@ -9,10 +9,10 @@ const percent = (
 
 /**
  * Name and kind, when it resets (a dash when not limited; an API key shows out-of-credit once its
- * run failed with "Credit balance is too low", until it is cleared), runs since midnight UTC, the assigned env
- * ids, its last-seen 5-hour and 7-day usage as percentages, then the pool env ids that may use it;
- * ids comma-joined, and a dash for an empty list or a window never read. No field can hold a value:
- * the API has none to send.
+ * run failed with "Credit balance is too low", until it is cleared), runs since midnight UTC, the
+ * assigned env ids, its last-seen 5-hour and 7-day usage as percentages, then the pool env ids that
+ * may use it; ids comma-joined, and a dash for an empty list or a window never read. No field can
+ * hold a value: the API has none to send.
  */
 const credentialLine = (c: ClaudeCredentialSummary) =>
   [

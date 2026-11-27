@@ -46,7 +46,7 @@ export function poolMembers(config: Config, pool: string[] | null): string[] {
 export function credentialsTried(db: Db, runId: string): Set<string> {
   const tried = new Set<string>();
   let next: string | null = runId;
-  // a chain is at most a run per subscription and one on the key
+  // a chain is at most a run per subscription and one per API key
   for (let i = 0; next !== null && i < 64; i++) {
     const row:
       | { credential: string | null; retryOf: string | null }
@@ -99,10 +99,11 @@ export function poolExhausted(
 /**
  * The credential a launch in a pool environment runs on: the subscription in its pool that isn't
  * limited and has the most headroom (the lowest of the larger of its 5-hour and 7-day use), from
- * usage no older than `USAGE_STALE_MS`; ties go to the earlier in the list, and a subscription never
- * probed, or whose last probe failed, ranks after those that answered. One whose token the probe
- * found refused is left out, like a limited one. With every subscription out, the API key when the
- * environment allows it and the server has one, else an error naming the earliest reset in UTC.
+ * usage no older than `USAGE_STALE_MS`; ties go to the earlier in the list, and a subscription
+ * never probed, or whose last probe failed, ranks after those that answered. One whose token the
+ * probe found refused is left out, like a limited one. With every subscription out, an API key with
+ * credit when the environment allows it and the server has one, else an error naming the earliest
+ * reset in UTC.
  */
 export async function resolvePoolAuth(
   deps: { db: Db; config: Config; usage: UsageProbe; credit?: ApiKeyCredit },
