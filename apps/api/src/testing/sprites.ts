@@ -15,6 +15,7 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   claudeOauthToken: "sk-ant-oat01-test-oauth-token",
   claudeOauthTokens: {},
   anthropicApiKey: undefined,
+  anthropicApiKeys: {},
   publicBaseUrl: "https://sky.test",
   runnerBundlePath: "/unused/runner.mjs",
   cliBundlePath: "/unused/sky.mjs",

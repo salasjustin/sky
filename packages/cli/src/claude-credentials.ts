@@ -8,16 +8,21 @@ const percent = (
 ) => (window ? `${label}=${Math.round(window.utilization * 100)}%` : "-");
 
 /**
- * Name and kind, when it resets (a dash when not limited), runs since midnight UTC, the assigned env
- * ids, its last-seen 5-hour and 7-day usage as percentages, then the pool env ids that may use it;
- * ids comma-joined, and a dash for an empty list or a window never read. No field can hold a value:
- * the API has none to send.
+ * Name and kind, when it resets (a dash when not limited; an API key shows out-of-credit once its
+ * run failed with "Credit balance is too low", until it is cleared), runs since midnight UTC, the
+ * assigned env ids, its last-seen 5-hour and 7-day usage as percentages, then the pool env ids that
+ * may use it; ids comma-joined, and a dash for an empty list or a window never read. No field can
+ * hold a value: the API has none to send.
  */
 const credentialLine = (c: ClaudeCredentialSummary) =>
   [
     c.name,
     c.kind,
-    c.limitedUntil === null ? "-" : `limited-until=${c.limitedUntil}`,
+    c.outOfCredit
+      ? "out-of-credit"
+      : c.limitedUntil === null
+        ? "-"
+        : `limited-until=${c.limitedUntil}`,
     c.runsToday,
     c.environments.length === 0
       ? "-"
@@ -32,8 +37,29 @@ const credentialLine = (c: ClaudeCredentialSummary) =>
 export const claudeCredentials: AgentCommand = {
   options: {},
   prepare(positionals) {
-    if (positionals.length > 0) {
-      throw new UsageError("claude-credentials takes no arguments", true);
+    const [sub, ...rest] = positionals;
+    if (sub === "clear-credit") {
+      const [name, ...extra] = rest;
+      if (name === undefined || extra.length > 0) {
+        throw new UsageError(
+          "claude-credentials clear-credit takes <name>: an API key's name, as sky claude-credentials lists it",
+          true,
+        );
+      }
+      return async (api, _io, out) => {
+        const cleared = await api.clearCredit(name);
+        out.result(
+          cleared,
+          `${cleared.name}: ${cleared.wasOutOfCredit ? "out-of-credit mark cleared" : "was not marked out of credit"}`,
+        );
+        return 0;
+      };
+    }
+    if (sub !== undefined) {
+      throw new UsageError(
+        `unknown claude-credentials subcommand '${sub}'; the only one is clear-credit`,
+        true,
+      );
     }
     return async (api, _io, out) => {
       const credentials = await api.listClaudeCredentials();

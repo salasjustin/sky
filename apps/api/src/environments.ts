@@ -11,6 +11,8 @@ import {
   webhooks,
 } from "@sky/db";
 import {
+  apiKeyCredential,
+  apiKeyNameOf,
   CODEX_GATEWAY_SECRET,
   DEFAULT_CLAUDE_CREDENTIAL,
   Environment,
@@ -79,7 +81,8 @@ const EnvironmentPatch = z.strictObject({
   claudeFallback: claudeFallback.unwrap().optional(),
 });
 
-const RuntimeInput = z.strictObject({ runtime: Runtime });
+/** `null` returns the environment to following its `SKY_RUNTIME` secret. */
+const RuntimeInput = z.strictObject({ runtime: Runtime.nullable() });
 
 type EnvRow = typeof environments.$inferSelect;
 
@@ -116,9 +119,15 @@ const unknownBase = (base: string, known: string[]) =>
       : `this server has: ${known.join(", ")}`
   }`;
 
-/** `default` is the unset assignment; stored as null so the two never differ. */
-const normalizeCredential = (value: string | null | undefined) =>
-  value === DEFAULT_CLAUDE_CREDENTIAL ? null : value;
+/**
+ * `default` is the unset assignment, stored as null, and `api-key:default` is the plain key, stored
+ * as `api-key`, so no two spellings of one credential differ.
+ */
+const normalizeCredential = (value: string | null | undefined) => {
+  if (value == null || value === DEFAULT_CLAUDE_CREDENTIAL) return null;
+  const keyName = apiKeyNameOf(value);
+  return keyName === undefined ? value : apiKeyCredential(keyName);
+};
 
 const nameTakenResult = { kind: "name_taken" } as const;
 
@@ -220,8 +229,7 @@ export function environmentRoutes(
         const input = {
           ...c.req.valid("json"),
         };
-        input.claudeCredential =
-          normalizeCredential(input.claudeCredential) ?? null;
+        input.claudeCredential = normalizeCredential(input.claudeCredential);
         const credentialProblem = assignmentProblem(
           c.var.config,
           input.claudeCredential,
@@ -283,8 +291,7 @@ export function environmentRoutes(
         const { id } = c.req.valid("param");
         const patch = c.req.valid("json");
         if (patch.claudeCredential !== undefined) {
-          patch.claudeCredential =
-            normalizeCredential(patch.claudeCredential) ?? null;
+          patch.claudeCredential = normalizeCredential(patch.claudeCredential);
           const credentialProblem = assignmentProblem(
             c.var.config,
             patch.claudeCredential,

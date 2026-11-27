@@ -2,6 +2,7 @@ import {
   AgentState,
   ApiKey,
   ClaudeCredentialSummary,
+  ClaudeCreditCleared,
   CreatedApiKey,
   DrainStatus,
   Environment,
@@ -462,8 +463,8 @@ export function createApi(config: Config) {
       );
       return env(status, json);
     },
-    /** Sets the runtime the env's runs use; 409 `gateway_key_missing` for Codex without the env's AI_GATEWAY_API_KEY, 502 `codex_install_failed` when Codex can't be installed. */
-    async setEnvironmentRuntime(id: string, runtime: Runtime) {
+    /** Sets the runtime the env's runs use, or null to follow its `SKY_RUNTIME` secret again; 409 `gateway_key_missing` for Codex without the env's AI_GATEWAY_API_KEY, 502 `codex_install_failed` when Codex can't be installed. */
+    async setEnvironmentRuntime(id: string, runtime: Runtime | null) {
       const { status, json } = await request(
         "PUT",
         `/v1/environments/${encodeURIComponent(id)}/runtime`,
@@ -584,6 +585,14 @@ export function createApi(config: Config) {
         json,
         "a Claude credential list",
       ).data;
+    },
+    /** Admin only: clears an API key's out-of-credit mark, by name or credential; 404 for a key the server doesn't hold. */
+    async clearCredit(name: string) {
+      const { status, json } = await request(
+        "POST",
+        `/v1/claude-credentials/${encodeURIComponent(name)}/clear-credit`,
+      );
+      return parseKey(ClaudeCreditCleared, status, json, "a cleared API key");
     },
     async listSecrets(envId: string): Promise<SecretSummary[]> {
       const { status, json } = await request(

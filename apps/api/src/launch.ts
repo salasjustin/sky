@@ -1,12 +1,13 @@
 import { agents, type Db, environments, runs } from "@sky/db";
 import {
   AgentId,
-  API_KEY_CREDENTIAL,
   type AutoApprove,
+  apiKeyCredential,
   type BaseProfile,
   CODEX_GATEWAY_SECRET,
   type DrainStatus,
   EnvironmentId,
+  isApiKeyCredential,
   POOL_CREDENTIAL,
   REPO_LOCK_FILE,
   REPO_LOCK_TIMED_OUT,
@@ -32,15 +33,20 @@ import { z } from "zod";
 import { mintAgentToken } from "./agent-token.js";
 import { runEnv } from "./base-profile.js";
 import {
+  ALL_KEYS_OUT,
+  type ApiKeyCredit,
   apiKeyAuth,
+  apiKeyCredentials,
+  apiKeyValue,
   type ClaudeAuth,
   ClaudeCredentialError,
-  CREDIT_RECOVERY,
   credentialNameOf,
+  creditRecovery,
   isCloudflareChallenge,
   isCreditExhausted,
   limitedUntil,
   markLimited,
+  nextApiKey,
   parseUsageLimit,
   resolveClaudeAuth,
   subscriptionAuth,
@@ -60,6 +66,7 @@ import { open, runLaunchAad, seal } from "./crypto.js";
 import { mintId } from "./ids.js";
 import { readMemory } from "./memory.js";
 import {
+  CodexInstallError,
   ensureCodex,
   envFile,
   REPO_DIR,
@@ -524,11 +531,15 @@ export function createLauncher({
   runnerExitBackoffMs = DEFAULT_RUNNER_EXIT_BACKOFF_MS,
   wake,
 }: Deps) {
-  // set when a run on the API key fails with "Credit balance is too low", so launches that would use
-  // the key fail at once instead of starting a run that dies the same way; cleared when a run on the
-  // key finishes. In memory: a restart, the way a new or topped-up key reaches the server, clears it
-  let keyOutOfCredit = false;
-  const credit = { outOfCredit: () => keyOutOfCredit };
+  // the API keys, by credential, whose run failed with "Credit balance is too low", so launches that
+  // would use one skip it, and fail at once when every key is marked, instead of starting a run that
+  // dies the same way. A run finishing on a key doesn't clear it (it may have started before the
+  // credit ran out); `clearCredit` does, and so does a restart, the way a new or topped-up key
+  // reaches the server. In memory
+  const keysOutOfCredit = new Set<string>();
+  const credit: ApiKeyCredit = {
+    outOfCredit: (credential) => keysOutOfCredit.has(credential),
+  };
 
   /** The env's base profile, without its store when there is no connector to reach GitHub with. */
   function profileFor(
@@ -694,8 +705,12 @@ export function createLauncher({
     credential: string,
     env: NonNullable<ReturnType<typeof assignmentOf>>,
   ): boolean {
-    if (credential === API_KEY_CREDENTIAL) {
-      return env.claudeFallback !== "none" && !keyOutOfCredit;
+    if (isApiKeyCredential(credential)) {
+      return (
+        env.claudeFallback !== "none" &&
+        apiKeyValue(config, credential) !== undefined &&
+        !credit.outOfCredit(credential)
+      );
     }
     return (
       env.claudeCredential === POOL_CREDENTIAL &&
@@ -708,13 +723,13 @@ export function createLauncher({
   async function claudeAuthFor(launch: Launch): Promise<ClaudeAuth> {
     const forced = launch.forceCredential;
     if (forced && launch.keepCredential) {
-      return forced === API_KEY_CREDENTIAL
-        ? apiKeyAuth(config, "the retry", credit)
+      return isApiKeyCredential(forced)
+        ? apiKeyAuth(config, "the retry", credit, forced)
         : subscriptionAuth(config, forced);
     }
     if (forced && stillAllowed(forced, currentAssignment(launch.envId))) {
-      return forced === API_KEY_CREDENTIAL
-        ? apiKeyAuth(config, "the retry", credit)
+      return isApiKeyCredential(forced)
+        ? apiKeyAuth(config, "the retry", credit, forced)
         : subscriptionAuth(config, forced);
     }
     // a pool's pick waits on usage probes: an admin change meanwhile sends it round again. Each round
@@ -752,9 +767,10 @@ export function createLauncher({
   function stillAssigned(credential: string, envId: EnvironmentId): boolean {
     const env = assignmentOf(envId);
     if (env?.status !== "ready") return false;
-    if (credential === API_KEY_CREDENTIAL) {
+    if (isApiKeyCredential(credential)) {
       return (
-        env.claudeCredential === API_KEY_CREDENTIAL ||
+        (env.claudeCredential !== null &&
+          isApiKeyCredential(env.claudeCredential)) ||
         env.claudeFallback !== "none"
       );
     }
@@ -914,7 +930,17 @@ export function createLauncher({
     // a sprite provisioned before Codex was has no Codex binary, which the runner would fail on
     if (runtime === "codex") {
       await step(launch, "codex", () =>
-        ensureCodex(sprites, launch.spriteName),
+        ensureCodex(sprites, launch.spriteName).catch((err: unknown) => {
+          // the install's own failure is the environment's to fix or leave; the sprite's is not
+          if (!(err instanceof CodexInstallError)) throw err;
+          throw new CodexLaunchError(
+            withSwitch(
+              `${CODEX_UNAVAILABLE} ${err.message}`,
+              env.name,
+              "claude-code",
+            ),
+          );
+        }),
       );
     }
     const promptFile = `/workspace/runs/${launch.runId}.prompt`;
@@ -1112,19 +1138,22 @@ export function createLauncher({
   const maybeStarted = new Set<RunId>();
 
   /**
-   * A run failed with `error`, and is retried once, resuming its session, when that is either of:
+   * A run failed with `error`, and is retried once, resuming its session, when that is any of:
    *
    * - Cloudflare's challenge on Claude's login: after `CHALLENGE_RETRY_MS`, on the same credential
    *   even if it is limited by then, which is never marked limited. Dropped when the environment is
    *   no longer ready or no longer assigns the credential, and cancelled by a stop on the agent.
    * - its subscription reaching its usage limit: the subscription is marked limited until the reset
    *   time the error gives and the retry launches at once. An environment that isn't a pool retries
-   *   on the API key, unless it turns the fallback off or the server has none: never on another
-   *   subscription. A pool environment goes on to the next subscription in its pool that its chain of
-   *   retries hasn't tried, then to the API key on the same terms, else notes the earliest reset on
-   *   the run.
+   *   on an API key with credit, unless it turns the fallback off or the server has none: never on
+   *   another subscription. A pool environment goes on to the next subscription in its pool that its
+   *   chain of retries hasn't tried, then to an API key on the same terms, else notes the earliest
+   *   reset on the run.
+   * - its API key being out of credit: the key is marked out of credit and the retry goes to the next
+   *   key with credit that its chain of retries hasn't tried; with none left, the run fails
+   *   `claude_unavailable`.
    *
-   * Either retry is dropped when the agent has a run created after the failed one.
+   * Any retry is dropped when the agent has a run created after the failed one.
    */
   function onRunFailed(runId: RunId, error: string): void {
     const failed = db
@@ -1172,14 +1201,26 @@ export function createLauncher({
       challengeRetries.set(runId, { agentId: failed.agentId, timer });
       return;
     }
-    const limit = parseUsageLimit(error);
-    // not a retry candidate: nothing will use the launch kept for it
-    if (!limit) {
-      forgetLaunch(runId);
+    // a run on an API key that ran out of credit goes on to the next key with credit; any other
+    // failure on a key is not a retry candidate
+    if (credential && isApiKeyCredential(credential)) {
+      if (!isCreditExhausted(error)) {
+        forgetLaunch(runId);
+        return;
+      }
+      markOutOfCredit(credential, runId);
+      void retryFailedRun(runId, (failedId, launch) =>
+        creditTarget(failedId, launch.envId),
+      ).catch((err: unknown) => {
+        log(
+          `retrying ${runId} after its API key ran out of credit failed: ${err}`,
+        );
+      });
       return;
     }
-    // a run on the API key hit something other than a subscription's limit
-    if (!credential || credential === API_KEY_CREDENTIAL) {
+    const limit = parseUsageLimit(error);
+    // not a retry candidate: nothing will use the launch kept for it
+    if (!limit || !credential) {
       forgetLaunch(runId);
       return;
     }
@@ -1209,19 +1250,20 @@ export function createLauncher({
     if (env?.status !== "ready") {
       return { skip: "not retried: its environment is not ready" };
     }
+    const key = nextApiKey(config, credit, credentialsTried(db, failedId));
     const noKey =
       env.claudeFallback === "none"
         ? "this environment's API key fallback is off"
-        : !config.anthropicApiKey
+        : apiKeyCredentials(config).length === 0
           ? "this server has no SKY_ANTHROPIC_API_KEY to fall back on"
-          : keyOutOfCredit
-            ? "the Anthropic API key it falls back on is out of credit"
+          : key === undefined
+            ? "the Anthropic API keys it falls back on are out of credit"
             : undefined;
-    const fallback = noKey === undefined ? API_KEY_CREDENTIAL : undefined;
+    const fallback = noKey === undefined ? key : undefined;
     if (env.claudeCredential !== POOL_CREDENTIAL) {
       if (fallback) return { target: fallback };
       const tried = [...credentialsTried(db, failedId)].filter(
-        (name) => name !== API_KEY_CREDENTIAL,
+        (name) => !isApiKeyCredential(name),
       );
       const reset = earliestReset(db, tried, new Date());
       const which =
@@ -1229,7 +1271,7 @@ export function createLauncher({
           ? `the Claude credential ${JSON.stringify(tried[0])}`
           : "this environment's Claude credential";
       return {
-        skip: "not retried: its environment has no other credential to use (the API-key fallback is off, the server has no key, or the key is out of credit)",
+        skip: "not retried: its environment has no other credential to use (the API-key fallback is off, the server has no key, or every key is out of credit)",
         unavailable: `${CLAUDE_UNAVAILABLE} ${which} is at its usage limit${reset ? ` and resets ${reset.toISOString()} (UTC)` : ""}; ${noKey}, so launch again after the reset`,
       };
     }
@@ -1256,11 +1298,12 @@ export function createLauncher({
 
   /**
    * The error a failed run is stored with: `error`, unless it says the run's runtime can't run. A
-   * Claude run whose subscription hit its limit with no credential left to retry on, or whose API key
-   * is out of credit (which marks the key so), fails `claude_unavailable`; a Codex run the runner
-   * found refused by the AI Gateway (`codex_unavailable`) keeps its words. Either gets the command
-   * that moves its environment to the other runtime. Marks a limited subscription as `onRunFailed`
-   * does, so the retry it then picks agrees with what this said.
+   * Claude run whose subscription hit its limit with no credential left to retry on, or whose API
+   * key is out of credit (which marks the key so) with no key left to retry on, fails
+   * `claude_unavailable`; a Codex run the runner found refused by the AI Gateway
+   * (`codex_unavailable`) keeps its words. Either gets the command that moves its environment to
+   * the other runtime. Marks a limited subscription as `onRunFailed` does, so the retry it then
+   * picks agrees with what this said.
    */
   function failureError(runId: RunId, error: string): string {
     const row = db
@@ -1283,25 +1326,13 @@ export function createLauncher({
     }
     const credential = row.credential;
     if (!credential) return error;
-    if (credential === API_KEY_CREDENTIAL) {
+    if (isApiKeyCredential(credential)) {
       if (!isCreditExhausted(error)) return error;
-      keyOutOfCredit = true;
-      log(
-        `the Anthropic API key is out of credit (${runId}); launches that need it fail until a run on it finishes or the API restarts`,
-      );
-      // a subscription earlier in the run's chain hit its limit before it fell back on the key
-      const tried = [...credentialsTried(db, runId)].filter(
-        (name) => name !== API_KEY_CREDENTIAL,
-      );
-      const reset = earliestReset(db, tried, new Date());
-      const cause = reset
-        ? `the Claude subscriptions this run tried are at their usage limit until ${reset.toISOString()} (UTC), and the Anthropic API key it fell back on is out of credit`
-        : "the Anthropic API key this run used is out of credit";
-      return withSwitch(
-        `${CLAUDE_UNAVAILABLE} ${cause} (Anthropic answered "Credit balance is too low"); ${CREDIT_RECOVERY}`,
-        row.envName,
-        "codex",
-      );
+      markOutOfCredit(credential, runId);
+      const target = creditTarget(runId, row.envId);
+      // another key has credit: the run is retried on it, and keeps its own error
+      if (!("unavailable" in target)) return error;
+      return withSwitch(target.unavailable, row.envName, "codex");
     }
     const limit = parseUsageLimit(error);
     if (!limit) return error;
@@ -1315,17 +1346,63 @@ export function createLauncher({
     return withSwitch(target.unavailable, row.envName, "codex");
   }
 
-  /** A run that finished on the API key shows the key has credit again. */
-  function onRunFinished(runId: RunId): void {
-    if (!keyOutOfCredit) return;
-    const row = db
-      .select({ credential: runs.claudeCredential })
-      .from(runs)
-      .where(eq(runs.id, runId))
-      .get();
-    if (row?.credential !== API_KEY_CREDENTIAL) return;
-    keyOutOfCredit = false;
-    log(`the Anthropic API key has credit again (${runId} finished on it)`);
+  /** Marks the API key `credential` out of credit, after the failure of `runId`. */
+  function markOutOfCredit(credential: string, runId: RunId): void {
+    if (keysOutOfCredit.has(credential)) return;
+    keysOutOfCredit.add(credential);
+    log(
+      `the Anthropic API key ${credential} is out of credit (${runId}); launches skip it until it is cleared or the API restarts`,
+    );
+  }
+
+  /**
+   * Where a run in `envId` whose API key ran out of credit goes next, if anywhere: the next key with
+   * credit that its chain of retries hasn't tried. With none left, `unavailable` is the
+   * `claude_unavailable` error that says every key is out.
+   */
+  function creditTarget(
+    failedId: RunId,
+    envId: EnvironmentId,
+  ): RetryTarget | { skip: string; unavailable: string } {
+    const tried = credentialsTried(db, failedId);
+    const next = nextApiKey(config, credit, tried);
+    if (next) {
+      return stillAssigned(next, envId)
+        ? { target: next }
+        : {
+            skip: "not retried: its environment is not ready or no longer allows an API key",
+          };
+    }
+    // a subscription earlier in the run's chain hit its limit before it fell back on the keys
+    const subscriptions = [...tried].filter(
+      (name) => !isApiKeyCredential(name),
+    );
+    const reset = earliestReset(db, subscriptions, new Date());
+    const cause = reset
+      ? `the Claude subscriptions this run tried are at their usage limit until ${reset.toISOString()} (UTC), and ${ALL_KEYS_OUT}`
+      : ALL_KEYS_OUT;
+    return {
+      skip: "not retried: every Anthropic API key is out of credit",
+      unavailable: `${CLAUDE_UNAVAILABLE} ${cause}; ${creditRecovery(config)}`,
+    };
+  }
+
+  /**
+   * Clears the out-of-credit mark of one API key, by its name (`backup`, `default`) or its credential
+   * (`api-key:backup`, `api-key`), for after it is topped up. Returns the credential, or undefined
+   * when this server holds no key by that name.
+   */
+  function clearCredit(
+    name: string,
+  ): { credential: string; wasOut: boolean } | undefined {
+    const credential = apiKeyCredentials(config).find(
+      (c) => c === name || c === apiKeyCredential(name),
+    );
+    if (!credential) return undefined;
+    const wasOut = keysOutOfCredit.delete(credential);
+    if (wasOut)
+      log(`the Anthropic API key ${credential} was cleared as having credit`);
+    return { credential, wasOut };
   }
 
   /** Where a run that met Cloudflare's challenge on `credential` goes next: that one, while its environment still assigns it. */
@@ -1524,7 +1601,9 @@ export function createLauncher({
   const api = {
     onRunFailed,
     failureError,
-    onRunFinished,
+    clearCredit,
+    /** Whether an API key, by credential, is marked out of credit. */
+    outOfCredit: (credential: string) => credit.outOfCredit(credential),
     /**
      * Cancels the agent's pending retries, of a Cloudflare challenge or of a usage limit (one waiting
      * on its failed runner's exit): a stop ends the task, run or not.

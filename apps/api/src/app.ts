@@ -170,7 +170,7 @@ export function createApp({
     .route("/admin", adminRoutes(launcher))
     .route("/webhooks", webhookRoutes())
     .route("/keys", keyRoutes())
-    .route("/claude-credentials", claudeCredentialRoutes())
+    .route("/claude-credentials", claudeCredentialRoutes(launcher))
     .route("/", accountEventRoutes(heartbeatMs, log));
 
   const app = factory
@@ -209,7 +209,6 @@ export function createApp({
       "/internal",
       internalRoutes(longPollMs, log, launcher.onRunFailed, {
         failureError: launcher.failureError,
-        onRunFinished: launcher.onRunFinished,
       }),
     )
     .use("/v1/*", guard)

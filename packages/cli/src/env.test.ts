@@ -474,6 +474,25 @@ test("env set-claude api-key is accepted as a name", async () => {
   expect(bodies).toEqual([{ claudeCredential: "api-key" }]);
 });
 
+test("env set-claude api-key:backup assigns that named key and prints it", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(
+        claudeAssignment({ claudeCredential: "api-key:backup" }),
+      );
+    }),
+  );
+  const r = await runCli(["env", "set-claude", "web", "api-key:backup"]);
+  expect(r.code).toBe(0);
+  expect(bodies).toEqual([{ claudeCredential: "api-key:backup" }]);
+  expect(r.stdout).toBe(
+    "env_1 ready acme/web web\nclaude credential: api-key:backup (fallback: api-key)\n",
+  );
+});
+
 test("the API refusing a credential its server doesn't hold is the CLI's failure, message intact", async () => {
   server.use(
     list,
@@ -495,7 +514,10 @@ test("the API refusing a credential its server doesn't hold is the CLI's failure
 });
 
 test.each([
-  [["env", "set-claude", "web"], /takes <env> <name\|api-key\|pool\|default>/],
+  [
+    ["env", "set-claude", "web"],
+    /takes <env> <name\|api-key\|api-key:<name>\|pool\|default>/,
+  ],
   [["env", "set-claude", "web", "Not A Name"], /not a credential name/],
   [["env", "set-claude", "web", "x", "--fallback=maybe"], /api-key or none/],
   [["env", "list", "--fallback=none"], /only goes with env set-claude/],
@@ -737,6 +759,22 @@ test("env set-runtime puts the runtime and prints it", async () => {
   expect(r.stdout).toBe("env_1 ready acme/web web\nruntime: codex\n");
 });
 
+test("env set-runtime default stores no runtime, so the env follows its SKY_RUNTIME secret, and shows that", async () => {
+  const bodies: unknown[] = [];
+  server.use(
+    list,
+    http.put(`${apiUrl}/v1/environments/env_1/runtime`, async ({ request }) => {
+      bodies.push(await request.json());
+      return HttpResponse.json(envJson({ runtime: null }));
+    }),
+  );
+  const r = await runCli(["env", "set-runtime", "web", "default"]);
+  expect(r.code).toBe(0);
+  expect(bodies).toEqual([{ runtime: null }]);
+  expect(r.stdout).toBe(`env_1 ready acme/web web\n${DEFAULT_RUNTIME}\n`);
+  expect(r.stderr).toBe("");
+});
+
 test("env set-runtime --json prints the API's environment object", async () => {
   const back = envJson({ runtime: "claude-code" });
   server.use(
@@ -788,7 +826,7 @@ async function timeoutsOf(argv: string[]) {
   }
 }
 
-const putRuntime = (runtime: string) =>
+const putRuntime = (runtime: string | null) =>
   http.put(`${apiUrl}/v1/environments/env_1/runtime`, () =>
     HttpResponse.json(envJson({ runtime })),
   );
@@ -885,9 +923,12 @@ test.each([
 );
 
 test.each([
-  [["env", "set-runtime", "web"], /takes <env> <claude-code\|codex>/],
+  [["env", "set-runtime", "web"], /takes <env> <claude-code\|codex\|default>/],
   [["env", "set-runtime", "web", "codex", "extra"], /takes <env>/],
-  [["env", "set-runtime", "web", "claude"], /use claude-code or codex/],
+  [
+    ["env", "set-runtime", "web", "claude"],
+    /use claude-code, codex or default/,
+  ],
 ])("%j is a usage error with no request", async (argv, message) => {
   let requests = 0;
   server.use(

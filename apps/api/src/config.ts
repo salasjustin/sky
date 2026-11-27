@@ -88,8 +88,10 @@ export type Config = {
   claudeOauthToken: string;
   /** Named subscription tokens, `CLAUDE_OAUTH_TOKEN_<NAME>` by lowercased name; the default is not among them. */
   claudeOauthTokens: Record<string, string>;
-  /** The pay-per-use fallback, `SKY_ANTHROPIC_API_KEY`; undefined when unset. */
+  /** The pay-per-use key named `default`, `SKY_ANTHROPIC_API_KEY`; undefined when unset. */
   anthropicApiKey: string | undefined;
+  /** Named pay-per-use keys, `SKY_ANTHROPIC_API_KEY_<NAME>` by lowercased name; the plain key is not among them. */
+  anthropicApiKeys: Record<string, string>;
   publicBaseUrl: string;
   runnerBundlePath: string;
   cliBundlePath: string;
@@ -107,16 +109,17 @@ export type Config = {
 type Env = Record<string, string | undefined>;
 
 const NAMED_TOKEN = /^CLAUDE_OAUTH_TOKEN_(.+)$/;
+const NAMED_API_KEY = /^SKY_ANTHROPIC_API_KEY_(.+)$/;
 
 /**
- * The named subscription tokens in `env`, by lowercased name, and the variables whose names can't be
- * a credential's. Empty values are skipped: a secret set to nothing holds no credential.
+ * The named credentials in `env` that `pattern` matches, by lowercased name, and the variables whose
+ * names can't be a credential's. Empty values are skipped: a secret set to nothing holds no credential.
  */
-function namedClaudeTokens(env: Env) {
+function namedClaudeTokens(env: Env, pattern: RegExp = NAMED_TOKEN) {
   const tokens: Record<string, string> = {};
   const invalid: string[] = [];
   for (const [variable, value] of Object.entries(env)) {
-    const suffix = NAMED_TOKEN.exec(variable)?.[1];
+    const suffix = pattern.exec(variable)?.[1];
     if (suffix === undefined || !value) continue;
     const name = suffix.toLowerCase();
     if (
@@ -153,7 +156,12 @@ export function loadConfig(
 ): { ok: true; config: Config } | { ok: false; message: string } {
   const parsed = configSchema.safeParse(env);
   const named = namedClaudeTokens(env);
-  if (parsed.success && named.invalid.length === 0) {
+  const namedKeys = namedClaudeTokens(env, NAMED_API_KEY);
+  if (
+    parsed.success &&
+    named.invalid.length === 0 &&
+    namedKeys.invalid.length === 0
+  ) {
     const e = parsed.data;
     return {
       ok: true,
@@ -165,6 +173,7 @@ export function loadConfig(
         claudeOauthToken: e.CLAUDE_CODE_OAUTH_TOKEN,
         claudeOauthTokens: named.tokens,
         anthropicApiKey: env.SKY_ANTHROPIC_API_KEY || undefined,
+        anthropicApiKeys: namedKeys.tokens,
         publicBaseUrl: e.PUBLIC_BASE_URL,
         runnerBundlePath: e.RUNNER_BUNDLE_PATH,
         cliBundlePath: e.CLI_BUNDLE_PATH,
@@ -198,6 +207,12 @@ export function loadConfig(
     ...named.invalid.map(
       (variable) =>
         `${variable} is invalid: a name is lowercase letters, digits and _ (up to 64), and not "default" (which is CLAUDE_CODE_OAUTH_TOKEN) or "pool"`,
+    ),
+  );
+  problems.push(
+    ...namedKeys.invalid.map(
+      (variable) =>
+        `${variable} is invalid: a name is lowercase letters, digits and _ (up to 64), and not "default" (which is SKY_ANTHROPIC_API_KEY) or "pool"`,
     ),
   );
   return { ok: false, message: `invalid config: ${problems.join("; ")}` };
