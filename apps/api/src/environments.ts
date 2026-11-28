@@ -208,8 +208,8 @@ function unpublishedMessage(work: UnpublishedWork): string {
   const where =
     work.source === "sprite"
       ? "found in the agents' worktrees"
-      : `from what the runs recorded; the sprite could not be asked (${work.unreachable})`;
-  return `rebuilding removes every worktree, and these agents have work that exists only on the sprite (${where}): ${lines.join("; ")}. Publish it first, or send force: true to rebuild anyway and lose it`;
+      : `the sprite could not be read (${work.unreachable}), so every agent that has run is listed, its commits and uncommitted changes unknown`;
+  return `rebuilding removes every worktree, and these agents may have work that exists only on the sprite (${where}): ${lines.join("; ")}. Publish it first, or send force: true to rebuild anyway and lose it`;
 }
 
 const nameTakenMessage = "an environment with this name already exists";
@@ -573,35 +573,29 @@ export function environmentRoutes(
           const refused = refuse(first);
           if (refused) return refused;
           if (first.kind !== "open") throw new Error("unreachable");
-          let rebuildCheck:
-            | { checked: "records"; unreachable: string }
-            | undefined;
-          if (!force) {
-            const work = await findUnpublishedWork(db, sprites, first.env, log);
-            if (work.agents.length > 0) {
-              return c.json(
-                {
-                  error: {
-                    code: "unpublished_work",
-                    message: unpublishedMessage(work),
-                    checked: work.source,
-                    ...(work.unreachable !== undefined && {
-                      unreachable: work.unreachable,
-                    }),
-                    agents: work.agents,
-                  },
+          // asked even under force, to tell the caller when the sprite could not be read
+          const work = await findUnpublishedWork(db, sprites, first.env, log);
+          if (!force && work.agents.length > 0) {
+            return c.json(
+              {
+                error: {
+                  code: "unpublished_work",
+                  message: unpublishedMessage(work),
+                  checked: work.source,
+                  ...(work.unreachable !== undefined && {
+                    unreachable: work.unreachable,
+                  }),
+                  agents: work.agents,
                 },
-                409,
-              );
-            }
-            // the records can't show uncommitted changes, so the caller is told what was checked
-            if (work.unreachable !== undefined) {
-              rebuildCheck = {
-                checked: "records",
-                unreachable: work.unreachable,
-              };
-            }
+              },
+              409,
+            );
           }
+          // the records can't show uncommitted changes, so the caller is told what was checked
+          const rebuildCheck =
+            work.unreachable === undefined
+              ? undefined
+              : { checked: "records", unreachable: work.unreachable };
           // the checks run again where nothing can slip in between them and the update: a run may have
           // started while the sprite was asked
           const outcome = db.transaction(

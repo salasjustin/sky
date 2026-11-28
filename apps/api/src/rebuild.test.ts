@@ -39,6 +39,8 @@ beforeEach(() => {
   db = openDb(":memory:");
   migrate(db);
   wire = stubSprites();
+  // a sprite that answers the worktree check with no worktrees; tests that need more layer their own on it
+  worktreeCheck({});
   logs = [];
   app = createApp({
     db,
@@ -195,8 +197,6 @@ function worktreeCheck(lines: Record<string, string>) {
   };
   return asked;
 }
-
-const workChecks = () => wire.calls.filter((c) => c.includes("sky-published"));
 
 // ——— what a rebuild does ———
 
@@ -450,25 +450,27 @@ function sprite503() {
 
 test.each([
   [
-    "commits never published",
+    "with a rollup that shows commits never published",
     rollupOf(["2", "1"]),
-    { uncommitted: null, unpublishedCommits: 2, neverPublished: true },
+    true,
   ],
   [
-    "commits past the last published head",
-    rollupOf(["3", "2", "1"], { head: sha("2"), branch: "feature/login" }),
-    { uncommitted: null, unpublishedCommits: 1, neverPublished: false },
+    "with a rollup that shows everything published",
+    rollupOf(["2", "1"], { head: sha("2"), branch: "feature/login" }),
+    false,
   ],
+  ["with a rollup of no commits", rollupOf([]), false],
   [
-    "a published head the rollup no longer lists",
-    rollupOf(["3", "2"], { head: sha("9"), branch: "feature/login" }),
-    { uncommitted: null, unpublishedCommits: 2, neverPublished: false },
+    "whose run left no rollup, as one in flight when the sprite went down",
+    undefined,
+    false,
   ],
 ])(
-  "a sprite that doesn't answer falls back to what the runs recorded: %s",
-  async (_, rollup, risk) => {
+  "a sprite that doesn't answer refuses an agent that has run, its commits and uncommitted changes unknown, %s",
+  async (_, rollup, neverPublished) => {
     const envId = readyEnv();
     const { agent } = await agentWith(envId, rollup);
+    const branch = rollup?.published?.branch ?? `claude/${agent.id}`;
     sprite503();
     const res = await rebuild(envId);
     expect(res.status).toBe(409);
@@ -477,22 +479,62 @@ test.each([
       code: "unpublished_work",
       checked: "records",
       unreachable: expect.any(String),
-      agents: [{ agentId: agent.id, ...risk }],
+      agents: [
+        {
+          agentId: agent.id,
+          branch,
+          uncommitted: null,
+          unpublishedCommits: null,
+          neverPublished,
+        },
+      ],
     });
-    expect(String(error.message)).toContain("the sprite could not be asked");
-    expect(String(error.message)).toContain("uncommitted changes unknown");
+    expect(String(error.message)).toContain("the sprite could not be read");
+    expect(String(error.message)).toContain(
+      `${agent.id} (${branch}): commits and uncommitted changes unknown`,
+    );
     expect(await getEnv(envId)).toMatchObject({ status: "ready" });
+    expect(agentRow(agent.id)?.sessionId).not.toBeNull();
   },
 );
 
-test("a sprite that doesn't answer rebuilds when the records show everything published, or nothing committed, and says the sprite couldn't be asked", async () => {
+test("records name the branch the last publish went to, else the one the agent started on", async () => {
   const envId = readyEnv();
-  await agentWith(
+  const published = await agentWith(
     envId,
-    rollupOf(["2", "1"], { head: sha("2"), branch: "feature/login" }),
+    rollupOf(["1"], { head: sha("1"), branch: "feature/published" }),
   );
-  await agentWith(envId, rollupOf([]));
-  await agentWith(envId);
+  const started = await agentWith(envId, rollupOf(["1"]));
+  db.update(agents)
+    .set({ remoteBranch: "feature/started" })
+    .where(eq(agents.id, started.agent.id))
+    .run();
+  sprite503();
+  const { error } = (await (await rebuild(envId)).json()) as {
+    error: Record<string, unknown>;
+  };
+  expect(error.agents).toMatchObject([
+    { agentId: published.agent.id, branch: "feature/published" },
+    { agentId: started.agent.id, branch: "feature/started" },
+  ]);
+});
+
+test("a sprite that doesn't answer rebuilds when no agent ever ran, and says only the records were read", async () => {
+  const envId = readyEnv();
+  // an agent with no run has no worktree to lose; an archived one is not at risk
+  db.insert(agents)
+    .values({
+      id: "agt_neverran" as AgentId,
+      envId,
+      branch: "claude/agt_neverran",
+      status: "idle",
+    })
+    .run();
+  const ran = await agentWith(envId);
+  await app.request(`/v1/agents/${ran.agent.id}/archive`, {
+    method: "POST",
+    headers: auth,
+  });
   sprite503();
   const res = await rebuild(envId);
   expect(res.status).toBe(202);
@@ -503,28 +545,33 @@ test("a sprite that doesn't answer rebuilds when the records show everything pub
   });
 });
 
-test("the branch of an agent started on one is the one it publishes to in the records", async () => {
+test("an agent that has run is refused alongside one that hasn't been listed, but one that never ran is not", async () => {
   const envId = readyEnv();
-  const { agent } = await agentWith(envId, rollupOf(["1"]));
-  db.update(agents)
-    .set({ remoteBranch: "feature/started" })
-    .where(eq(agents.id, agent.id))
+  db.insert(agents)
+    .values({
+      id: "agt_neverran" as AgentId,
+      envId,
+      branch: "claude/agt_neverran",
+      status: "idle",
+    })
     .run();
+  const ran = await agentWith(envId);
   sprite503();
   const { error } = (await (await rebuild(envId)).json()) as {
-    error: Record<string, unknown>;
+    error: { agents: { agentId: string }[] };
   };
-  expect(error.agents).toMatchObject([{ branch: "feature/started" }]);
+  expect(error.agents.map((a) => a.agentId)).toEqual([ran.agent.id]);
 });
 
-test("force rebuilds without checking, keeping the agents with their sessions dropped", async () => {
+test("force still asks the sprite, rebuilds past what it finds, and keeps the agents with their sessions dropped", async () => {
   const envId = readyEnv();
   const { agent } = await agentWith(envId);
   const asked = worktreeCheck({ [agent.id]: "ok\t5\t3\t1\t" });
   const res = await rebuild(envId, { force: true });
   expect(res.status).toBe(202);
-  expect(asked).toEqual([]);
-  expect(workChecks()).toEqual([]);
+  expect(asked).toEqual([[agent.id]]);
+  // the sprite answered, so there is nothing to caveat
+  expect(await res.json()).not.toHaveProperty("rebuildCheck");
   await settled(envId);
   expect(agentRow(agent.id)).toMatchObject({
     sessionId: null,
@@ -532,14 +579,17 @@ test("force rebuilds without checking, keeping the agents with their sessions dr
   });
 });
 
-test("force works on a sprite that doesn't answer the check", async () => {
+test("force goes through on a sprite that doesn't answer, and still reports that only the records were read", async () => {
   const envId = readyEnv();
-  await agentWith(envId, rollupOf(["1"]));
+  const { agent } = await agentWith(envId, rollupOf(["1"]));
   sprite503();
   const res = await rebuild(envId, { force: true });
   expect(res.status).toBe(202);
-  // force skips the check, so it never reached for the records
-  expect(await res.json()).not.toHaveProperty("rebuildCheck");
+  expect(await res.json()).toMatchObject({
+    status: "provisioning",
+    rebuildCheck: { checked: "records", unreachable: expect.any(String) },
+  });
+  expect(agentRow(agent.id)).toMatchObject({ sessionId: null });
 });
 
 test("the body takes only force, as a boolean", async () => {
@@ -673,10 +723,7 @@ async function rebuiltOnBranch(remoteBranch: string) {
   const envId = readyEnv();
   await connect(envId);
   const { agent } = await agentWith(envId, rollupOf(["1"]));
-  db.update(agents)
-    .set({ remoteBranch })
-    .where(eq(agents.id, agent.id))
-    .run();
+  db.update(agents).set({ remoteBranch }).where(eq(agents.id, agent.id)).run();
   expect((await rebuild(envId, { force: true })).status).toBe(202);
   await settled(envId);
   return agent;

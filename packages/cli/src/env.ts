@@ -47,6 +47,11 @@ function filteringWebhookIds(err: unknown): string[] | undefined {
     : undefined;
 }
 
+const asObject = (value: unknown): Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+
 /** What a 409 `unpublished_work` refusal says, and what is at risk; undefined for any other error. */
 function unpublishedWork(err: unknown):
   | {
@@ -81,7 +86,7 @@ function unpublishedLines(
     ...work.agents.map(describeUnpublished),
     ...(work.checked === "records"
       ? [
-          `could not reach the sprite to look (${work.unreachable ?? "no answer"}); this is from what the agents' runs recorded, so uncommitted changes are not known and the list may be incomplete`,
+          `could not read the sprite (${work.unreachable ?? "no answer"}), so every agent that has run is listed: each may hold commits or uncommitted changes there that no one could see`,
         ]
       : []),
   ];
@@ -292,41 +297,46 @@ export const env: AgentCommand = {
           return 1;
         }
         let rebuilt: Awaited<ReturnType<typeof api.rebuildEnvironment>>;
+        // what a forced rebuild loses, for --json to carry
+        let lost: Record<string, unknown> | undefined;
         try {
           rebuilt = await api.rebuildEnvironment(envId, false);
         } catch (err) {
           const work = unpublishedWork(err);
           if (work === undefined) throw err;
           const lines = unpublishedLines(work);
+          const { message: _, ...fields } = work;
           if (!values.force) {
-            if (out.json) {
-              // the agents at risk stay fields, not prose, for a script to read
-              io.stderr(
-                `${JSON.stringify({ error: { code: "unpublished_work", ...work } })}\n`,
-              );
-              return 1;
-            }
             return out.fail(
               "unpublished_work",
               `${target.name} (${envId}) has work that exists only on its sprite, and a rebuild would lose it`,
-              `${lines.join("\n")}\nhave each agent publish it first (for example sky agent follow-up ${work.agents[0]?.agentId} --prompt="publish your work"), or run sky env rebuild ${ref} --force to rebuild anyway and lose it`,
+              work.checked === "records"
+                ? `${lines.join("\n")}\nthe sprite isn't answering, so nothing can be published from it; run sky env rebuild ${ref} --force to rebuild anyway and lose whatever is only there`
+                : `${lines.join("\n")}\nhave each agent publish it first (for example sky agent follow-up ${work.agents[0]?.agentId} --prompt="publish your work"), or run sky env rebuild ${ref} --force to rebuild anyway and lose it`,
+              fields,
             );
           }
-          out.progress(
-            `rebuilding ${target.name} (${envId}) loses this work:\n${lines.map((line) => `  ${line}`).join("\n")}`,
-          );
+          lost = fields;
+          if (!out.json) {
+            out.progress(
+              `rebuilding ${target.name} (${envId}) ${work.checked === "records" ? "may lose" : "loses"} this work:\n${lines.map((line) => `  ${line}`).join("\n")}`,
+            );
+          }
           if (!values.yes && !(await confirm("lose it and rebuild? [y/N] "))) {
             out.progress("nothing rebuilt");
             return 1;
           }
           rebuilt = await api.rebuildEnvironment(envId, true);
         }
-        if (rebuilt.rebuildCheck) {
+        if (rebuilt.rebuildCheck && !out.json) {
           out.warn(
-            `the sprite didn't answer (${rebuilt.rebuildCheck.unreachable}), so the check for unpublished work used what the agents' runs recorded and could not see uncommitted changes`,
+            `the sprite didn't answer (${rebuilt.rebuildCheck.unreachable}), so the check for unpublished work could only read what the agents' runs recorded, and the rebuild loses any commits or uncommitted changes that were only there`,
           );
         }
-        out.result(rebuilt.raw, envLine(rebuilt.env));
+        out.result(
+          lost === undefined ? rebuilt.raw : { ...asObject(rebuilt.raw), lost },
+          envLine(rebuilt.env),
+        );
         return 0;
       };
     }

@@ -207,10 +207,15 @@ test("env rebuild --json refused for unpublished work keeps the API's error, wit
     const r = await runCli(["env", "rebuild", "web", "--json", "--yes"]);
     expect(r.code).toBe(1);
     expect(r.stdout).toBe("");
+    // through Output.fail, so the error is the CLI's own, with the API's fields beside it for a script
     expect(JSON.parse(r.stderr)).toEqual({
       error: {
         code: "unpublished_work",
-        message: "the API's own words",
+        message:
+          "web (env_1) has work that exists only on its sprite, and a rebuild would lose it",
+        detail: expect.stringContaining(
+          "agt_a (claude/agt_a): 2 uncommitted files",
+        ),
         agents: atRisk,
         ...extra,
       },
@@ -218,7 +223,7 @@ test("env rebuild --json refused for unpublished work keeps the API's error, wit
   }
 });
 
-test("a refusal from records says the sprite could not be reached and that uncommitted changes are unknown", async () => {
+test("a refusal from records lists every agent that has run as unknown, says the sprite could not be read, and says nothing can be published", async () => {
   server.use(
     list,
     rebuild(() =>
@@ -228,8 +233,8 @@ test("a refusal from records says the sprite could not be reached and that uncom
             agentId: "agt_a",
             branch: "claude/agt_a",
             uncommitted: null,
-            unpublishedCommits: 2,
-            neverPublished: true,
+            unpublishedCommits: null,
+            neverPublished: false,
           },
         ],
         { checked: "records", unreachable: "503 Storage not ready" },
@@ -239,11 +244,83 @@ test("a refusal from records says the sprite could not be reached and that uncom
   const r = await runCli(["env", "rebuild", "web", "--yes"]);
   expect(r.code).toBe(1);
   expect(r.stderr).toContain(
-    "agt_a (claude/agt_a): 2 commits on a branch never published, uncommitted changes unknown",
+    "agt_a (claude/agt_a): commits and uncommitted changes unknown (the sprite couldn't be read)",
   );
   expect(r.stderr).toContain(
-    "could not reach the sprite to look (503 Storage not ready); this is from what the agents' runs recorded, so uncommitted changes are not known and the list may be incomplete",
+    "could not read the sprite (503 Storage not ready), so every agent that has run is listed: each may hold commits or uncommitted changes there that no one could see",
   );
+  expect(r.stderr).toContain(
+    "the sprite isn't answering, so nothing can be published from it; run sky env rebuild web --force",
+  );
+  expect(r.stderr).not.toContain("publish it first");
+  expect(bodies).toEqual([{ force: false }]);
+});
+
+const unknownAgents = [
+  {
+    agentId: "agt_a",
+    branch: "claude/agt_a",
+    uncommitted: null,
+    unpublishedCommits: null,
+    neverPublished: false,
+  },
+];
+const recordsOnly = {
+  checked: "records",
+  unreachable: "503 Storage not ready",
+};
+
+test("env rebuild --force on a records-only check lists those agents as possibly losing work, then rebuilds with force", async () => {
+  server.use(
+    list,
+    rebuild((body) =>
+      body.force
+        ? HttpResponse.json(
+            { ...rebuilding, rebuildCheck: recordsOnly },
+            { status: 202 },
+          )
+        : refused(unknownAgents, recordsOnly),
+    ),
+  );
+  const r = await runCli(["env", "rebuild", "web", "--force", "--yes"]);
+  expect(r.code).toBe(0);
+  expect(r.stderr).toContain("rebuilding web (env_1) may lose this work:");
+  expect(r.stderr).toContain(
+    "  agt_a (claude/agt_a): commits and uncommitted changes unknown",
+  );
+  expect(r.stderr).toContain(
+    "sky: warning: the sprite didn't answer (503 Storage not ready)",
+  );
+  expect(bodies).toEqual([{ force: false }, { force: true }]);
+});
+
+test("env rebuild --json --yes --force carries the loss list in the JSON, and writes nothing to stderr", async () => {
+  server.use(
+    list,
+    rebuild((body) =>
+      body.force
+        ? HttpResponse.json(
+            { ...rebuilding, rebuildCheck: recordsOnly },
+            { status: 202 },
+          )
+        : refused(unknownAgents, recordsOnly),
+    ),
+  );
+  const r = await runCli([
+    "env",
+    "rebuild",
+    "web",
+    "--json",
+    "--yes",
+    "--force",
+  ]);
+  expect(r.code).toBe(0);
+  expect(r.stderr).toBe("");
+  expect(JSON.parse(r.stdout)).toEqual({
+    ...rebuilding,
+    rebuildCheck: recordsOnly,
+    lost: { agents: unknownAgents, ...recordsOnly },
+  });
 });
 
 test("env rebuild --force --yes lists what is lost, then rebuilds with force", async () => {
@@ -360,7 +437,7 @@ test("a rebuild whose check could only read the run records warns on stderr, and
     unreachable: "503 Storage not ready",
   };
   const warning =
-    "sky: warning: the sprite didn't answer (503 Storage not ready), so the check for unpublished work used what the agents' runs recorded and could not see uncommitted changes\n";
+    "sky: warning: the sprite didn't answer (503 Storage not ready), so the check for unpublished work could only read what the agents' runs recorded, and the rebuild loses any commits or uncommitted changes that were only there\n";
   server.use(
     list,
     rebuild(() =>
@@ -374,7 +451,8 @@ test("a rebuild whose check could only read the run records warns on stderr, and
   const json = await runCli(["env", "rebuild", "web", "--json", "--yes"]);
   expect(json.code).toBe(0);
   expect(JSON.parse(json.stdout)).toEqual({ ...rebuilding, rebuildCheck });
-  expect(json.stderr).toBe(warning);
+  // the JSON carries rebuildCheck, so there is no prose beside it
+  expect(json.stderr).toBe("");
 });
 
 test("env rebuild refused while a run is active exits 1 with the API's message", async () => {

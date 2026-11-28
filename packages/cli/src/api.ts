@@ -194,7 +194,7 @@ const codexSwitchTimeoutMs = 15 * 60_000;
 /** A rebuild answers after its unpublished-work check (up to SPRITES_TIMEOUT_MS in apps/api/src/sprites.ts) and the preview stop, both sprite calls. */
 const rebuildTimeoutMs = 3 * 60_000;
 
-/** On a rebuild's 202 when the sprite didn't answer the work check and the run records showed nothing at risk. */
+/** On a rebuild's 202 when the sprite didn't answer the work check, so only the run records were read: no agent had run, or `force` skipped the refusal. */
 const RebuildCheck = z.object({
   checked: z.literal("records"),
   unreachable: z.string(),
@@ -508,7 +508,7 @@ export function createApi(config: Config) {
     /**
      * Reprovisions a ready or failed env and keeps its agents; 409 `run_active`, `provisioning`, or
      * `unpublished_work` (with the agents at risk) unless `force`. `rebuildCheck` is set when the
-     * check could only read the run records, so uncommitted changes went unseen.
+     * sprite couldn't be read, so the check had only the run records to go on.
      */
     async rebuildEnvironment(id: string, force: boolean) {
       const { status, json } = await request(

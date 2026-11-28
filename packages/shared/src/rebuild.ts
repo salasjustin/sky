@@ -25,16 +25,17 @@ export const RebuildInput = z.strictObject({
 export type RebuildInput = z.infer<typeof RebuildInput>;
 
 /**
- * One agent whose work exists only on the sprite, and what of it is at risk: `uncommitted` files
- * (null when the sprite couldn't be asked), `unpublishedCommits` not on the GitHub branch the agent
- * publishes to, and whether that branch was never published at all.
+ * One agent whose work exists only on the sprite, and what of it is at risk: `uncommitted` files and
+ * `unpublishedCommits` not on the GitHub branch the agent publishes to (each null when the sprite
+ * couldn't be read: the agent has run, so either may exist), and whether that branch was never
+ * published at all.
  */
 export const UnpublishedAgent = z.object({
   agentId: AgentId,
   /** The GitHub branch the agent publishes to. */
   branch: z.string(),
   uncommitted: z.int().nonnegative().nullable(),
-  unpublishedCommits: z.int().nonnegative(),
+  unpublishedCommits: z.int().nonnegative().nullable(),
   neverPublished: z.boolean(),
 });
 export type UnpublishedAgent = z.infer<typeof UnpublishedAgent>;
@@ -48,16 +49,23 @@ const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
 /** One agent's line in the refusal and in what the CLI lists: its id, its branch and what is at risk. */
 export function describeUnpublished(agent: UnpublishedAgent): string {
   const parts: string[] = [];
-  if (agent.uncommitted) {
-    parts.push(plural(agent.uncommitted, "uncommitted file"));
-  }
-  if (agent.unpublishedCommits > 0) {
+  if (agent.uncommitted === null && agent.unpublishedCommits === null) {
     parts.push(
-      agent.neverPublished
-        ? `${plural(agent.unpublishedCommits, "commit")} on a branch never published`
-        : `${plural(agent.unpublishedCommits, "commit")} not on GitHub`,
+      "commits and uncommitted changes unknown (the sprite couldn't be read)",
     );
+  } else {
+    if (agent.uncommitted) {
+      parts.push(plural(agent.uncommitted, "uncommitted file"));
+    }
+    if (agent.unpublishedCommits) {
+      parts.push(
+        agent.neverPublished
+          ? `${plural(agent.unpublishedCommits, "commit")} on a branch never published`
+          : `${plural(agent.unpublishedCommits, "commit")} not on GitHub`,
+      );
+    }
+    if (agent.uncommitted === null) parts.push("uncommitted changes unknown");
+    if (agent.unpublishedCommits === null) parts.push("commits unknown");
   }
-  if (agent.uncommitted === null) parts.push("uncommitted changes unknown");
   return `${agent.agentId} (${agent.branch}): ${parts.join(", ")}`;
 }

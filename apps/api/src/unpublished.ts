@@ -92,34 +92,40 @@ export function parseWorkCheck(
 }
 
 /**
- * What the API recorded of each agent's last run that carried a rollup, read against the commit the
- * sprite last published: the commits newer than it, or every commit when none was. The rollup lists
- * at most 50 commits, so a longer branch counts 50. Uncommitted changes are not in any record, so
- * they come back `null`: unknown.
+ * What the API recorded, for a sprite that can't be asked: every unarchived agent that has had a run,
+ * as at risk with its commits and uncommitted changes unknown. The records can't clear an agent: a
+ * run in flight when the sprite went down has no rollup, and a rollup says nothing of uncommitted
+ * changes. The branch is the last publish's, else the one the agent was started on, else its own.
  */
 export function recordedWork(db: Db, rows: AgentRow[]): UnpublishedAgent[] {
   const found: UnpublishedAgent[] = [];
   for (const row of rows) {
+    const ran =
+      db
+        .select({ id: runs.id })
+        .from(runs)
+        .where(eq(runs.agentId, row.id))
+        .get() !== undefined;
+    // an agent that never ran has no worktree to lose
+    if (!ran) continue;
+    // a run in flight when the sprite went down has no rollup, so the records read clean for it
+    // while its commits and files are lost: every agent that has run is at risk, and unknown
     const rollup = db
       .select({ rollup: runs.rollup })
       .from(runs)
       .where(and(eq(runs.agentId, row.id), isNotNull(runs.rollup)))
       .orderBy(desc(runs.createdAt), desc(sql`${runs}.rowid`))
       .get()?.rollup;
-    const commits = rollup?.cumulative.commits ?? [];
-    const head = commits[0]?.sha;
-    if (!rollup || !head) continue;
-    const { published } = rollup;
-    if (published?.head === head) continue;
-    const at = published
-      ? commits.findIndex((commit) => commit.sha === published.head)
-      : -1;
+    const published = rollup?.published;
     found.push({
       agentId: row.id,
       branch: published?.branch || row.remoteBranch || row.branch,
       uncommitted: null,
-      unpublishedCommits: at >= 0 ? at : commits.length,
-      neverPublished: published === undefined,
+      unpublishedCommits: null,
+      neverPublished:
+        rollup != null &&
+        rollup.cumulative.commits.length > 0 &&
+        published === undefined,
     });
   }
   return found;
