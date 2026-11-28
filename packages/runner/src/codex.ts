@@ -13,7 +13,7 @@
  * call. Codex's own sandbox is off (`danger-full-access`): the sprite is the sandbox, as it is for
  * Claude Code. The agent's `publish` and `sync` are tools (`sky_publish`, `sky_sync`) of a stdio MCP
  * server the runner writes into every run's `config.toml` (`codex-tools.ts`), first run or follow-up,
- * since a resumed thread takes no tool list. The server forwards each call to the runner over a socket
+ * so they follow the environment's connector on every run. The server forwards each call to the runner over a socket
  * only it is told of, and the runner serves it through the same broker and the same one approval, so
  * neither the GitHub connector nor a broker token reaches the agent's commands.
  *

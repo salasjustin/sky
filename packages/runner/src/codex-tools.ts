@@ -7,10 +7,12 @@ import { SKY_TOOLS_SERVER, tomlString } from "./codex-mcp.js";
 
 /**
  * `sky_publish` and `sky_sync` for Codex runs: tools of a stdio MCP server the runner writes into the
- * run's `config.toml`, so a resumed thread has them as a new one does (`thread/resume` takes no tool
- * list, so `dynamicTools` given at `thread/start` are gone from every follow-up). The server is the
- * runner's own bundle (`runner.mjs codex-tools`), started by Codex; it holds no connector and no broker
- * token. It forwards each call over the run's tools socket to the runner, which opens the approval,
+ * run's `config.toml`. The file is rewritten every run, so the tools follow the environment's
+ * connector on a resumed thread as on a new one; `thread/resume` takes no tool list, so a thread
+ * started without `dynamicTools` could never gain them. (Codex 0.172.0 does restore the `dynamicTools`
+ * a thread started with, so a thread started before this server existed has both copies.) The server
+ * is the runner's own bundle (`runner.mjs codex-tools`), started by Codex; it holds no connector and no
+ * broker token. It forwards each call over the run's tools socket to the runner, which opens the approval,
  * issues a token for that one call and runs it through the broker.
  */
 
