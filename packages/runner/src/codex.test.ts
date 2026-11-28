@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   AppServer,
   CODEX_PROVIDER,
+  CODEX_PROXY_TOKEN_ENV,
   codexConfigToml,
   codexInstructions,
   DEFAULT_CODEX_MODEL,
@@ -30,6 +31,7 @@ import {
   withdrawCodexKey,
 } from "./codex.js";
 import { type Config, loadConfig } from "./config.js";
+import { CONNECTOR_ENV } from "./connector.js";
 import type { PostEvent } from "./events.js";
 import { runEnvRefresh } from "./refresh.js";
 import type { AwaitDecision } from "./requests.js";
@@ -343,7 +345,7 @@ const { appendFileSync, writeFileSync } = require("node:fs");
 const { createInterface } = require("node:readline");
 const { join } = require("node:path");
 const log = (entry) => appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify(entry) + "\\n");
-log({ env: { key: process.env.AI_GATEWAY_API_KEY ?? null, gatewayToken: process.env.SKY_CODEX_GATEWAY_TOKEN ? "set" : null, home: process.env.CODEX_HOME, connector: process.env.GITHUB_CONNECTOR ?? null, token: process.env.AGENT_TOKEN ?? null, lastGitConfig: process.env["GIT_CONFIG_KEY_" + (process.env.GIT_CONFIG_COUNT - 1)] + "=" + process.env["GIT_CONFIG_VALUE_" + (process.env.GIT_CONFIG_COUNT - 1)] }, marker: require("node:fs").existsSync(join(process.env.CODEX_HOME ?? "", "plugins", "marker")) });
+log({ env: { key: process.env.AI_GATEWAY_API_KEY ?? null, gatewayToken: process.env.SKY_CODEX_GATEWAY_TOKEN ? "set" : null, home: process.env.CODEX_HOME, connector: process.env.GITHUB_CONNECTOR ?? null, token: process.env.AGENT_TOKEN ?? null, lastGitConfig: process.env["GIT_CONFIG_KEY_" + (process.env.GIT_CONFIG_COUNT - 1)] + "=" + process.env["GIT_CONFIG_VALUE_" + (process.env.GIT_CONFIG_COUNT - 1)], doopKey: process.env.DOOP_KEY }, marker: require("node:fs").existsSync(join(process.env.CODEX_HOME ?? "", "plugins", "marker")) });
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
 const waiting = new Map();
 let nextId = 100;
@@ -421,7 +423,8 @@ const scenarios = {
     await Promise.all(asks.map((a) => ask("mcpServer/elicitation/request", { threadId: thread, turnId: turn, ...a })));
     for (const call of calls) note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: item(call, "completed") });
     usage(10, 1);
-    finish("completed");
+    // the turn outlasts a denial's steer, as the command scenario's does
+    setTimeout(() => finish("completed"), 50);
   },
   async publish() {
     const reply = await ask("item/tool/call", { threadId: thread, turnId: turn, callId: "call_1", namespace: null, tool: "sky_publish", arguments: { title: "T" } });
@@ -477,7 +480,7 @@ describe("runCodexSession", () => {
   let seal: Seal;
   let decide: (request: {
     toolName?: string;
-  }) => Decision["decision"] | "deny-with-reason";
+  }) => Decision["decision"] | "deny-with-reason" | "nobody";
 
   beforeEach(() => {
     vi.stubEnv("GITHUB_CONNECTOR", undefined);
@@ -567,6 +570,7 @@ describe("runCodexSession", () => {
     const request =
       waiting?.type === "run.waiting" ? waiting.payload.request : undefined;
     const verdict = decide(request && "toolName" in request ? request : {});
+    if (verdict === "nobody") return { kind: "expired" };
     if (verdict === "deny-with-reason")
       return {
         kind: "decided",
@@ -1021,6 +1025,126 @@ describe("runCodexSession", () => {
         'env_http_headers = { "Authorization" = "DOOP_KEY" }',
       );
       expect(toml).not.toContain("fake-secret-value");
+    });
+
+    const unresolvedWarning = (named: string) =>
+      `base-profile MCP server${named.includes(";") ? "s" : ""} not passed to this session, secret not set in this run: ${named}. Set each named secret on the environment with sky secret set.`;
+    const mcpWarnings = () =>
+      ofType("runner.warning")
+        .map((e) => e.payload.message)
+        .filter((m) => m.includes("MCP server"));
+
+    test("a server whose secret the run lacks is left out of the file and named once in a warning", async () => {
+      config.mcpServers = {
+        doop: {
+          url: "https://doop.example/mcp",
+          headers: { Authorization: "DOOP_KEY" },
+        },
+      };
+      expect(await run()).toBe(0);
+      const toml = readFileSync(
+        join(root, "codex-home", "config.toml"),
+        "utf8",
+      );
+      expect(toml).not.toContain("mcp_servers");
+      // the Claude Code run's wording, that the session still loads the server from elsewhere, isn't Codex's
+      expect(mcpWarnings()).toEqual([unresolvedWarning("doop (DOOP_KEY)")]);
+    });
+
+    test("a secret's value reaches Codex's env and nothing posted or written", async () => {
+      config.mcpServers = {
+        doop: {
+          url: "https://doop.example/mcp",
+          headers: { Authorization: "DOOP_KEY" },
+        },
+        notes: {
+          url: "https://notes.example/mcp",
+          headers: { Authorization: "NOTES_KEY" },
+        },
+      };
+      config.sessionEnv.DOOP_KEY = "fake-secret-value";
+      expect(await run()).toBe(0);
+      // the check below can only fail if the value was there to leak
+      expect(sent()[0].env.doopKey).toBe("fake-secret-value");
+      // a warning is posted, so a leak through its text would be seen
+      expect(mcpWarnings()).toEqual([unresolvedWarning("notes (NOTES_KEY)")]);
+      expect(JSON.stringify(events)).not.toContain("fake-secret-value");
+      expect(
+        readFileSync(join(root, "codex-home", "config.toml"), "utf8"),
+      ).not.toContain("fake-secret-value");
+    });
+
+    test("a secret named as the event token, the connector or the gateway token is never Codex's to hold, so its server is left out", async () => {
+      const url = "https://doop.example/mcp";
+      config.mcpServers = {
+        events: { url, headers: { Authorization: "AGENT_TOKEN" } },
+        github: { url, headers: { Authorization: CONNECTOR_ENV } },
+        gateway: { url, headers: { Authorization: CODEX_PROXY_TOKEN_ENV } },
+        kept: { url, headers: { Authorization: "DOOP_KEY" } },
+      };
+      config.sessionEnv.AGENT_TOKEN = "event-token-value";
+      config.sessionEnv[CONNECTOR_ENV] = "connector-id";
+      config.sessionEnv[CODEX_PROXY_TOKEN_ENV] = "gateway-token-value";
+      config.sessionEnv.DOOP_KEY = "fake-secret-value";
+      expect(await run()).toBe(0);
+      const toml = readFileSync(
+        join(root, "codex-home", "config.toml"),
+        "utf8",
+      );
+      // the one resolvable server is written, so the others' absence is the runner's choice
+      expect(toml).toContain('[mcp_servers."kept"]');
+      expect(toml.match(/mcp_servers\./g)).toHaveLength(1);
+      // the gateway token's name is in the file for the provider's own env_key, but under no server
+      expect(toml.match(/env_http_headers/g)).toHaveLength(1);
+      expect(toml).not.toContain("AGENT_TOKEN");
+      expect(toml).not.toContain(CONNECTOR_ENV);
+      expect(mcpWarnings()).toEqual([
+        unresolvedWarning(
+          `events (AGENT_TOKEN); github (${CONNECTOR_ENV}); gateway (${CODEX_PROXY_TOKEN_ENV})`,
+        ),
+      ]);
+    });
+
+    test("a denial with a reason declines the held call and tells the model why", async () => {
+      config.approvalPolicy = ["mcp__doop__draw"];
+      decide = () => "deny-with-reason";
+      expect(
+        await mcpAsks(
+          [{ id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } }],
+          [toolAsk("doop", "draw", { shape: "box" })],
+        ),
+      ).toBe(0);
+      expect(answerAt(0)).toMatchObject({ action: "decline" });
+      expect(
+        sent().find((m) => m.method === "turn/steer")?.params.input[0].text,
+      ).toBe("The person denied mcp__doop__draw: not that file");
+    });
+
+    test("a held call nobody decides is cancelled, not declined", async () => {
+      config.approvalPolicy = ["mcp__doop__draw"];
+      decide = () => "nobody";
+      await mcpAsks(
+        [{ id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } }],
+        [toolAsk("doop", "draw", { shape: "box" })],
+      );
+      expect(answerAt(0)).toMatchObject({ action: "cancel" });
+      expect(sent().some((m) => m.method === "turn/steer")).toBe(false);
+    });
+
+    test("an ask from another thread is declined without reaching the person", async () => {
+      config.approvalPolicy = ["mcp__doop__draw"];
+      decide = () => "approve";
+      const own = toolAsk("doop", "draw", { shape: "box" });
+      expect(
+        await mcpAsks(
+          [{ id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } }],
+          [{ ...own, threadId: "thr_other" }, own],
+        ),
+      ).toBe(0);
+      expect(answerAt(0)).toMatchObject({ action: "decline" });
+      // the same ask on this run's thread is held and approved, so the other thread's wasn't skipped by policy
+      expect(waitingFor()).toHaveLength(1);
+      expect(answerAt(1)).toMatchObject({ action: "accept" });
     });
   });
 
