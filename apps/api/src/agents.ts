@@ -653,9 +653,9 @@ export function agentRoutes(
           );
         }
       }
-      // an agent whose environment was rebuilt has no worktree: its next run makes one from the branch
-      // it published to, when GitHub still has it. The check execs in the sprite, so it runs before
-      // the transaction
+      // an agent whose environment was rebuilt has no worktree: its next run makes one from a branch
+      // of its that GitHub still has (`restartBranchOf`). The check execs in the sprite, so it runs
+      // before the transaction
       const rebuilt = await restartBranchOf(
         c,
         id,

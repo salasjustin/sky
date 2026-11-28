@@ -8,7 +8,7 @@ import { AgentId } from "./ids.js";
  */
 export const EnvironmentHealth = z.object({
   status: z.literal("unreachable"),
-  /** The last error the sprite answered with, redacted. */
+  /** The last error a call to the sprite failed with, redacted. */
   error: z.string(),
   /** When that error was recorded. */
   at: z.iso.datetime(),
