@@ -494,7 +494,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (m.id === undefined) return;
   switch (m.method) {
     case "initialize": return send({ id: m.id, result: { userAgent: "fake" } });
-    case "thread/start": cwd = m.params.cwd; return send({ id: m.id, result: { thread: { id: thread } } });
+    case "thread/start": cwd = m.params.cwd; if (process.env.FAKE_CODEX_MCP_STATUS) note("mcpServer/startupStatus/updated", JSON.parse(process.env.FAKE_CODEX_MCP_STATUS)); return send({ id: m.id, result: { thread: { id: thread } } });
     case "thread/resume":
       if (m.params.threadId !== thread) return send({ id: m.id, error: { code: -32600, message: "no rollout found" } });
       cwd = m.params.cwd; return send({ id: m.id, result: { thread: { id: thread } } });
@@ -1666,7 +1666,10 @@ describe("runCodexSession", () => {
     });
 
     test("the auto-accept is only for server sky's publish and sync: another server's sky_publish and sky's other tools still wait for a person", async () => {
-      config.approvalPolicy = ["mcp__other__sky_publish", "mcp__sky__sky_other"];
+      config.approvalPolicy = [
+        "mcp__other__sky_publish",
+        "mcp__sky__sky_other",
+      ];
       decide = () => "deny";
       const ask = (server: string, tool: string) => ({
         serverName: server,
@@ -1696,6 +1699,70 @@ describe("runCodexSession", () => {
         "decline",
         "decline",
       ]);
+    });
+
+    test("a sky server that fails to start is a runner.warning, even when Codex reports it as the thread opens", async () => {
+      config.sessionEnv.FAKE_CODEX_MCP_STATUS = JSON.stringify({
+        name: "sky",
+        status: "failed",
+        error: "spawn node ENOENT",
+      });
+      expect(await withTools({ scenario: "command" })).toBe(0);
+      expect(ofType("runner.warning").map((e) => e.payload.message)).toEqual([
+        "the sky MCP server (sky_publish and sky_sync) failed to start, so this run can't publish or sync: spawn node ENOENT",
+      ]);
+    });
+
+    test("a failure of another server named sky, in a run that serves no sky tools, is not this run's warning", async () => {
+      config.sessionEnv.FAKE_CODEX_MCP_STATUS = JSON.stringify({
+        name: "sky",
+        status: "failed",
+      });
+      expect(await withTools({ scenario: "command", connector: false })).toBe(
+        0,
+      );
+      expect(
+        ofType("runner.warning").some((e) =>
+          /sky MCP server/.test(e.payload.message),
+        ),
+      ).toBe(false);
+    });
+
+    test("the accept is only for a run that serves its own sky tools: with no connector a plugin's sky_publish waits for a person", async () => {
+      config.approvalPolicy = ["mcp__sky__sky_publish"];
+      decide = () => "deny";
+      config.sessionEnv.FAKE_CODEX_MCP = JSON.stringify({
+        calls: [
+          { id: "m1", server: "sky", tool: "sky_publish", arguments: {} },
+        ],
+        asks: [
+          {
+            serverName: "sky",
+            mode: "form",
+            message: "Allow the sky MCP server to run tool sky_publish?",
+            requestedSchema: { type: "object", properties: {} },
+            _meta: {
+              codex_approval_kind: "mcp_tool_call",
+              tool_name: "sky_publish",
+              tool_params: {},
+            },
+          },
+        ],
+      });
+      expect(await withTools({ scenario: "mcpAsks", connector: false })).toBe(
+        0,
+      );
+      expect(approvals()).toEqual(["mcp__sky__sky_publish"]);
+      expect(sent().find((m) => m.id === 100)?.result.action).toBe("decline");
+    });
+
+    test("Codex's commands are told it is a Codex run, by a name that is no secret, and the instructions say to use the tools", async () => {
+      expect(await withTools()).toBe(0);
+      expect(spawned[0]?.env.SKY_CODEX_RUN).toBe("1");
+      const instructions = sent().find((m) => m.method === "thread/start")
+        .params.developerInstructions;
+      expect(instructions).toContain("never a shell command");
+      expect(instructions).toContain("runner.mjs publish");
     });
 
     test("a base-profile server can't take the sky name", async () => {

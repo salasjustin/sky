@@ -75,7 +75,7 @@ import {
   brokerSocketIn,
   startBroker,
 } from "./broker.js";
-import { askBroker } from "./broker-client.js";
+import { askBroker, CODEX_RUN_ENV } from "./broker-client.js";
 import {
   codexMcpTables,
   codexRefusedWarning,
@@ -351,6 +351,7 @@ export function codexInstructions(options: {
           : []),
         `To publish your branch and open a pull request, commit your work, then call the \`${PUBLISH_TOOL}\` tool with a \`title\` and a \`body\` instead of \`git push\` or \`gh pr create\`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and returns its URL. Call it again after more commits to update the same pull request; add new commits rather than amending published ones. \`branch\` publishes to a GitHub branch of that name instead of your worktree's; pass the same one each time.`,
         `Call \`${SYNC_TOOL}\` when GitHub's default branch may have moved, when the person says they pushed to your branch, or when \`${PUBLISH_TOOL}\` refuses because GitHub's branch moved: it refreshes \`origin/<default>\` (up to ${DEFAULT_MAX_COMMITS} commits) and brings commits pushed to your GitHub branch into your worktree, rebasing your unpublished commits onto them. It refuses on uncommitted changes, a conflict or a merge commit, and then changes nothing. Pass the same \`branch\` you publish with.`,
+        `Publish and sync are these two tools on this runtime, never a shell command: don't run \`node /opt/sky/runner.mjs publish\` or \`sync\` (they work only in Claude Code runs and fail here).`,
         `Each of those two tools opens one approval for the person and waits for it, showing what goes out; a denied approval sends nothing. Don't commit or switch branches while one waits.`,
       ].join("\n"),
     );
@@ -462,6 +463,11 @@ const TurnNote = z.looseObject({
     status: z.string(),
     error: TurnError.nullish(),
   }),
+});
+const McpStatusNote = z.looseObject({
+  name: z.string(),
+  status: z.string(),
+  error: z.string().nullish(),
 });
 const ErrorNote = z.looseObject({
   threadId: z.string().optional(),
@@ -1013,6 +1019,8 @@ export async function runCodexSession(
       cwd,
       env: {
         ...childEnv,
+        // not a secret: the agent's shell form of publish and sync reads it to point at the tools
+        [CODEX_RUN_ENV]: "1",
         ...toolsEnv,
         [CODEX_PROXY_TOKEN_ENV]: proxy.token,
         CODEX_HOME: codexHome,
@@ -1021,6 +1029,23 @@ export async function runCodexSession(
     }) as ChildProcess;
     server = new AppServer(child, warning);
     const app = server;
+    // a missing tool isn't silent: the agent would otherwise just not have publish or sync
+    const reportMcpStatus = (params: unknown) => {
+      const status = McpStatusNote.parse(params);
+      if (
+        status.name === SKY_TOOLS_SERVER &&
+        toolsChannel &&
+        (status.status === "failed" || status.status === "cancelled")
+      )
+        warning(
+          `the sky MCP server (sky_publish and sky_sync) ${status.status === "failed" ? "failed to start" : "was cancelled"}, so this run can't publish or sync${status.error ? `: ${status.error}` : ""}`,
+        );
+    };
+    // Codex starts its MCP servers as the thread opens, before the run's handlers below are set
+    const early: unknown[] = [];
+    app.onNotification = (method, params) => {
+      if (method === "mcpServer/startupStatus/updated") early.push(params);
+    };
     await app.request(
       "initialize",
       {
@@ -1513,7 +1538,9 @@ export async function runCodexSession(
       // Sky's own publish and sync tools: the approval a person answers is the broker's, one per call,
       // showing what goes out, so Codex's ask is answered here, never by the environment's policy and
       // never with a second inbox request. No base-profile server can hold the `sky` name
+      // (only when this run wrote and serves its own `sky` table: a plugin's `sky` server is its own)
       if (
+        toolsChannel &&
         server === SKY_TOOLS_SERVER &&
         (tool === PUBLISH_TOOL || tool === SYNC_TOOL)
       ) {
@@ -1640,6 +1667,9 @@ export async function runCodexSession(
             }
             return;
           }
+          case "mcpServer/startupStatus/updated":
+            reportMcpStatus(params);
+            return;
           case "serverRequest/resolved": {
             const id = (params as { requestId?: unknown } | undefined)
               ?.requestId;
@@ -1653,6 +1683,7 @@ export async function runCodexSession(
         );
       }
     };
+    for (const params of early.splice(0)) reportMcpStatus(params);
     app.onRequest = async (id, method, params) => {
       switch (method) {
         case "item/commandExecution/requestApproval":

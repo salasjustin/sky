@@ -11,15 +11,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import {
+  brokerPublishMain,
+  brokerSyncMain,
+  CODEX_RUN_ENV,
+} from "./broker-client.js";
 import { CODEX_BIN, codexConfigToml } from "./codex.js";
 import { codexMcpTables } from "./codex-mcp.js";
 import {
   codexToolsMain,
   skyToolsTable,
   startToolsChannel,
-  type ToolReply,
   TOOLS_SECRET_ENV,
   TOOLS_SOCKET_ENV,
+  type ToolReply,
   toolsSocketIn,
 } from "./codex-tools.js";
 
@@ -266,4 +271,46 @@ describe.skipIf(!existsSync(codex))("codex mcp list", () => {
     expect(got).toContain("tool_timeout_sec: 900");
     expect(got).toContain("default_tools_approval_mode: approve");
   }, 60_000);
+});
+
+describe("publish and sync from a Codex command's shell", () => {
+  const run = async (
+    main: typeof brokerPublishMain | typeof brokerSyncMain,
+    argv: string[],
+    env: NodeJS.ProcessEnv,
+  ) => {
+    let stderr = "";
+    let stdout = "";
+    const code = await main(argv, env, {
+      cwd: dir,
+      stdout: (s) => {
+        stdout += s;
+      },
+      stderr: (s) => {
+        stderr += s;
+      },
+    });
+    return { code, stderr, stdout };
+  };
+
+  test.each([
+    ["publish", brokerPublishMain, ["--title", "T"]],
+    ["sync", brokerSyncMain, []],
+  ] as const)(
+    "%s points to the tool and sends nothing",
+    async (op, main, argv) => {
+      const out = await run(main, [...argv], { [CODEX_RUN_ENV]: "1" });
+      expect(out.code).toBe(2);
+      expect(out.stdout).toBe("");
+      expect(out.stderr).toBe(
+        `sky ${op}: on Codex runs, publish with the sky_publish tool (and sync with sky_sync); runner.mjs ${op} works only in Claude Code runs. Nothing was sent.\n`,
+      );
+    },
+  );
+
+  test("outside a Codex run the shell form is as it was", async () => {
+    const out = await run(brokerPublishMain, ["--title", "T"], {});
+    expect(out.code).toBe(2);
+    expect(out.stderr).toContain("SKY_BROKER_SOCKET is not set");
+  });
 });

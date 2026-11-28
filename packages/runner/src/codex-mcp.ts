@@ -1,7 +1,19 @@
 import type { BaseProfileMcpServer } from "@sky/shared";
+import { BROKER_SOCKET_ENV, BROKER_TOKEN_ENV } from "./broker.js";
 
 /** The MCP server name Sky's own publish and sync tools hold in `config.toml`; a base-profile server can't take it. */
 export const SKY_TOOLS_SERVER = "sky";
+
+/** The env vars Codex passes the `sky` server (`env_vars`), by name, and keeps out of its commands' env. */
+export const TOOLS_SOCKET_ENV = "SKY_TOOLS_SOCKET";
+export const TOOLS_SECRET_ENV = "SKY_TOOLS_SECRET";
+/** Names the runner's own channels use: no base-profile server is handed what they hold. */
+const CHANNEL_NAMES = new Set([
+  TOOLS_SOCKET_ENV,
+  TOOLS_SECRET_ENV,
+  BROKER_SOCKET_ENV,
+  BROKER_TOKEN_ENV,
+]);
 
 /** A quote, backslash or control character: refused in a name or url, escaped in a command or arg. */
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
@@ -76,6 +88,13 @@ export function codexMcpTables(
     const names = Object.keys(refs);
     if ([...names, ...Object.values(refs)].some(unsafeName)) {
       refused.push({ server: name, why: "a name it passes" });
+      continue;
+    }
+    if ([...names, ...Object.values(refs)].some((n) => CHANNEL_NAMES.has(n))) {
+      refused.push({
+        server: name,
+        why: "a secret name Sky's own publish and sync channels use",
+      });
       continue;
     }
     if (

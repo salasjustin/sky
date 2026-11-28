@@ -3,7 +3,12 @@ import { chmodSync, rmSync } from "node:fs";
 import net from "node:net";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { SKY_TOOLS_SERVER, tomlString } from "./codex-mcp.js";
+import {
+  SKY_TOOLS_SERVER,
+  TOOLS_SECRET_ENV,
+  TOOLS_SOCKET_ENV,
+  tomlString,
+} from "./codex-mcp.js";
 
 /**
  * `sky_publish` and `sky_sync` for Codex runs: tools of a stdio MCP server the runner writes into the
@@ -19,8 +24,7 @@ import { SKY_TOOLS_SERVER, tomlString } from "./codex-mcp.js";
 export const PUBLISH_TOOL = "sky_publish";
 export const SYNC_TOOL = "sky_sync";
 /** The env vars Codex passes the server (`env_vars`), by name, and keeps out of its commands' env. */
-export const TOOLS_SOCKET_ENV = "SKY_TOOLS_SOCKET";
-export const TOOLS_SECRET_ENV = "SKY_TOOLS_SECRET";
+export { TOOLS_SECRET_ENV, TOOLS_SOCKET_ENV };
 
 export const toolsSocketIn = (dir: string) => join(dir, "tools.sock");
 

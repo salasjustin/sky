@@ -259,3 +259,38 @@ describe("an MCP tool call's approval", () => {
     );
   });
 });
+
+describe("secret names the run's own channels use", () => {
+  test.each([
+    "SKY_TOOLS_SOCKET",
+    "SKY_TOOLS_SECRET",
+    "SKY_BROKER_SOCKET",
+    "SKY_BROKER_TOKEN",
+  ])(
+    "%s is refused as a stdio env var and as an http header's secret, with a warning, never written",
+    (name) => {
+      const result = codexMcpTables(
+        {
+          docs: { command: "docs", args: [], env: { [name]: name } },
+          web: { url: "https://x.test/", headers: { Authorization: name } },
+        },
+        { [name]: "channel-value" },
+      );
+      expect(result.tables).toEqual([]);
+      expect(result.unresolved).toEqual([]);
+      expect(result.refused).toEqual([
+        {
+          server: "docs",
+          why: "a secret name Sky's own publish and sync channels use",
+        },
+        {
+          server: "web",
+          why: "a secret name Sky's own publish and sync channels use",
+        },
+      ]);
+      expect(codexRefusedWarning(result.refused)).not.toContain(
+        "channel-value",
+      );
+    },
+  );
+});

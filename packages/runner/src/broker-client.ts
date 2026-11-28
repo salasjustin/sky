@@ -7,6 +7,18 @@ import {
 import { readPublishArgs } from "./publish.js";
 import { SYNC_HELP, SYNC_USAGE, syncArgs } from "./sync.js";
 
+/**
+ * Set to `1` in the env of a Codex run's commands: not a secret. `runner.mjs publish` and `sync` work only
+ * in Claude Code runs, where the runner hands its commands a broker socket; a Codex run publishes with the
+ * `sky_publish` and `sky_sync` tools, so the shell form says so instead of failing for want of a socket.
+ */
+export const CODEX_RUN_ENV = "SKY_CODEX_RUN";
+
+const codexShellForm = (op: "publish" | "sync", env: NodeJS.ProcessEnv) =>
+  env[CODEX_RUN_ENV]
+    ? `sky ${op}: on Codex runs, publish with the sky_publish tool (and sync with sky_sync); runner.mjs ${op} works only in Claude Code runs. Nothing was sent.\n`
+    : undefined;
+
 type Io = {
   cwd: string;
   stdout: (s: string) => void;
@@ -93,6 +105,11 @@ export async function brokerPublishMain(
   env: NodeJS.ProcessEnv,
   io: Io,
 ): Promise<number> {
+  const onCodex = codexShellForm("publish", env);
+  if (onCodex) {
+    io.stderr(onCodex);
+    return 2;
+  }
   // a `--body @file` goes as its path: the runner reads it, and only from where it allows
   const args = await readPublishArgs(argv, io, { deferBodyFile: true });
   if ("code" in args) return args.code;
@@ -114,6 +131,11 @@ export async function brokerSyncMain(
   env: NodeJS.ProcessEnv,
   io: Io,
 ): Promise<number> {
+  const onCodex = codexShellForm("sync", env);
+  if (onCodex) {
+    io.stderr(onCodex);
+    return 2;
+  }
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
     io.stdout(`usage: ${SYNC_USAGE}\n${SYNC_HELP}\n`);
     return 0;
