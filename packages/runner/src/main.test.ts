@@ -279,11 +279,15 @@ describe("the env's refresh script", () => {
       const runId = newRunId();
       const seen = join(runs, "env.seen");
       const ranIn = join(runs, "cwd.seen");
+      // the agent has a worktree, which is not where the script runs
+      const worktrees = join(runs, "worktrees");
+      mkdirSync(join(worktrees, "agt_1"), { recursive: true });
       try {
         const { code, stderr } = await runBundle({
           ...runEnv(`http://127.0.0.1:${port}`, join(runs, `${runId}.prompt`)),
           RUN_ID: runId,
           HOME: runs,
+          WORKTREES_DIR: worktrees,
           ...runtime,
           // the credential variables, the connector and the gateway key, as the API's env file holds them
           SKY_CLAUDE_AUTH: "oauth",
@@ -341,6 +345,34 @@ describe("the env's refresh script", () => {
     },
     30_000,
   );
+
+  test("a Codex run with SKY_CODEX_HOME set gives the script that path as CODEX_HOME", async () => {
+    const runs = mkdtempSync(join(tmpdir(), "runner-main-codexhome-"));
+    const api = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => res.writeHead(204).end());
+    });
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    const { port } = api.address() as AddressInfo;
+    const seen = join(runs, "codex-home.seen");
+    const override = join(runs, "elsewhere", "codex");
+    try {
+      await runBundle({
+        ...runEnv(`http://127.0.0.1:${port}`, join(runs, "c.prompt")),
+        HOME: runs,
+        SKY_RUNTIME: "codex",
+        AI_GATEWAY_API_KEY: "gateway-secret",
+        SKY_CODEX_HOME: override,
+        SKY_REFRESH: `printf '%s' "$CODEX_HOME" > '${seen}'`,
+      });
+      expect(readFileSync(seen, "utf8")).toBe(override);
+    } finally {
+      api.closeAllConnections();
+      api.close();
+      rmSync(runs, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test.each([
     ["installed", true, 0],

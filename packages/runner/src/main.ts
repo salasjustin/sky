@@ -1,4 +1,5 @@
 import { appendFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { brokerPublishMain, brokerSyncMain } from "./broker-client.js";
@@ -201,7 +202,7 @@ async function main(): Promise<void> {
       : await step("env refresh", async () => {
           // what the agent's own commands hold, and no more: see `refreshEnv`. A Codex session's
           // commands find the run's Codex home as CODEX_HOME, so the script does too
-          const env = {
+          const env: NodeJS.ProcessEnv = {
             ...refreshEnv(process.env, config.sessionEnv),
             ...(codex && {
               CODEX_HOME: codexHomeOf({
@@ -212,10 +213,9 @@ async function main(): Promise<void> {
           };
           // one place for every run, not the agent's worktree: a run that waited on another's script
           // skips its own, so what the script does has to be the sprite's, not one agent's
-          const cwd =
-            env.HOME !== undefined && existsSync(env.HOME)
-              ? env.HOME
-              : undefined;
+          // (the home the session and `codexHomeOf` resolve, `homedir()` when HOME is unset)
+          const home = env.HOME || homedir();
+          const cwd = existsSync(home) ? home : undefined;
           const record = await runEnvRefresh({
             script: config.refresh as string,
             env,
