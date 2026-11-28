@@ -62,7 +62,7 @@ export const isGatewayUnavailable = (error: string) =>
   error.startsWith(CODEX_UNAVAILABLE) || error.startsWith(PI_UNAVAILABLE);
 
 /**
- * The prompt of a follow-up whose agent's last session ran on the other runtime, which can't resume
+ * The prompt of a follow-up whose agent's last session ran on a different runtime, which can't resume
  * it: a short note, then the task.
  */
 export function crossRuntimePrompt(input: {

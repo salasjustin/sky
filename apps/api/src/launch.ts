@@ -814,7 +814,7 @@ export function createLauncher({
 
   /**
    * The session the launch resumes and the prompt it gets: as the launch says, unless the agent's
-   * session ran on the other runtime, which can't resume it. Then a fresh session on the agent's
+   * session ran on a different runtime, which can't resume it. Then a fresh session on the agent's
    * branch, told so at the top of its prompt with the last run's summary.
    */
   function sessionFor(
@@ -1322,7 +1322,7 @@ export function createLauncher({
    * key is out of credit (which marks the key so) with no key left to retry on, fails
    * `claude_unavailable`; a Codex or pi run the runner found refused by the AI Gateway
    * (`codex_unavailable`, `pi_unavailable`) keeps its words. Either gets the command that moves its environment to
-   * the other runtime. Marks a limited subscription as `onRunFailed` does, so the retry it then
+   * another runtime. Marks a limited subscription as `onRunFailed` does, so the retry it then
    * picks agrees with what this said.
    */
   function failureError(runId: RunId, error: string): string {

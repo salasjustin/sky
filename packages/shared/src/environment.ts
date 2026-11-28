@@ -15,7 +15,7 @@ export type EnvironmentStatus = z.infer<typeof EnvironmentStatus>;
 export const Runtime = z.enum(["claude-code", "codex", "pi"]);
 export type Runtime = z.infer<typeof Runtime>;
 
-/** The env secret a Codex or pi run's model calls carry; switching an environment to either needs it. */
+/** The env secret the runner's gateway proxy sends upstream for a Codex or pi run, never handed to the agent; switching an environment to either, or launching a run on it, needs it. */
 export const CODEX_GATEWAY_SECRET = "AI_GATEWAY_API_KEY";
 
 /** Which Bash commands run without an approval request; see `isAutoApproved`. */
