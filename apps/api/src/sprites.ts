@@ -6,6 +6,7 @@ import {
   type SpritesClient,
 } from "@fly/sprites";
 import { type KnownSecrets, REDACTION_MARGIN, redact } from "./redact.js";
+import type { SpriteHealth } from "./sprite-health.js";
 
 /**
  * The one sprite an environment owns. Hashed because the API rejects names outside lowercase
@@ -28,6 +29,11 @@ export type SpriteOps = {
    * being killed, most often for memory. Not awaited, and its failure never reaches the exec's caller.
    */
   onExecKilled?: (spriteName: string) => void;
+  /**
+   * Told how each exec, file write and session start on a sprite went, to mark an environment whose
+   * sprite stopped answering, and clear it when one does.
+   */
+  health?: SpriteHealth;
 };
 
 export const SPRITES_TIMEOUT_MS = 60_000;
@@ -174,6 +180,37 @@ const isStreamDecodeError = (err: unknown): err is Error =>
   STREAM_DECODE.test(err.message);
 
 /**
+ * Tells `ops.health` how a call to the sprite went, and passes the call's outcome on untouched. A
+ * call that ran out of a long bound (a clone, a setup), or that the caller's `signal` cut, says
+ * nothing of the sprite and is not told; one under the short bound counts its timeout as a failure
+ * to answer.
+ */
+async function tracked<T>(
+  ops: SpriteOps,
+  name: string,
+  {
+    timeoutMs = ops.timeoutMs,
+    signal,
+  }: Pick<CallOptions, "timeoutMs"> & { signal?: AbortSignal },
+  call: Promise<T>,
+): Promise<T> {
+  try {
+    const value = await call;
+    ops.health?.contact(name);
+    return value;
+  } catch (err) {
+    const timedOut = err instanceof SpriteTimeoutError;
+    if ((timedOut && timeoutMs > ops.timeoutMs) || signal?.aborted) throw err;
+    try {
+      ops.health?.failed(name, err, timedOut);
+    } catch {
+      // a health record that can't be kept never changes how the call ended
+    }
+    throw err;
+  }
+}
+
+/**
  * Runs `argv` in the sprite over the SDK's HTTP exec (no WebSocket, no TTY) and waits for it to
  * exit. A nonzero exit resolves with its outcome; only transport and API errors throw, the bound
  * running out included, which also cuts the request (and with it the process). `signal` cuts it the
@@ -185,31 +222,36 @@ export function execInSprite(
   [file, ...args]: [string, ...string[]],
   options: CallOptions & { cwd?: string; signal?: AbortSignal },
 ): Promise<ExecOutcome> {
-  return spriteCall(
+  return tracked(
     ops,
     name,
     options,
-    async (bound) => {
-      const signal = options.signal
-        ? AbortSignal.any([bound, options.signal])
-        : bound;
-      try {
-        const result = await ops.client
-          .sprite(name)
-          .execFileHTTP(file, args, { cwd: options.cwd, signal });
-        return toOutcome(result);
-      } catch (err) {
-        if (err instanceof ExecError) return toOutcome(err.result);
-        if (isStreamDecodeError(err)) {
-          throw new SpriteExecStreamError(
-            `sprite ${name}: ${options.op} exec stream could not be decoded: ${err.message}`,
-            { cause: err },
-          );
+    spriteCall(
+      ops,
+      name,
+      options,
+      async (bound) => {
+        const signal = options.signal
+          ? AbortSignal.any([bound, options.signal])
+          : bound;
+        try {
+          const result = await ops.client
+            .sprite(name)
+            .execFileHTTP(file, args, { cwd: options.cwd, signal });
+          return toOutcome(result);
+        } catch (err) {
+          if (err instanceof ExecError) return toOutcome(err.result);
+          if (isStreamDecodeError(err)) {
+            throw new SpriteExecStreamError(
+              `sprite ${name}: ${options.op} exec stream could not be decoded: ${err.message}`,
+              { cause: err },
+            );
+          }
+          throw err;
         }
-        throw err;
-      }
-    },
-    (out) => (out.exitCode === 0 ? "ok" : `exited ${out.exitCode}`),
+      },
+      (out) => (out.exitCode === 0 ? "ok" : `exited ${out.exitCode}`),
+    ),
   ).then((out) => {
     if (out.exitCode === SIGKILLED) {
       try {
@@ -497,8 +539,13 @@ export async function writeSpriteFile(
   data: string | Buffer,
   { mode, ...options }: CallOptions & { mode?: number },
 ): Promise<void> {
-  await spriteCall(ops, name, options, () =>
-    ops.client.sprite(name).filesystem("/").writeFile(path, data, { mode }),
+  await tracked(
+    ops,
+    name,
+    options,
+    spriteCall(ops, name, options, () =>
+      ops.client.sprite(name).filesystem("/").writeFile(path, data, { mode }),
+    ),
   );
 }
 
@@ -531,18 +578,25 @@ export function startDetached(
     watchMs: number;
   },
 ): Promise<void> {
-  return spriteCall(
+  return tracked(
     ops,
     name,
-    { ...options, timeoutMs: ops.timeoutMs + watchMs },
-    (signal) =>
-      watchSession(ops.client, name, [file, ...args], {
-        cwd,
-        env,
-        watchMs,
-        signal,
-        known: [...ops.secrets.values(), ...(options.known ?? [])],
-      }),
+    // the short bound, not the call's: the watch starts at the spawn, so running out means the
+    // sprite didn't start the session within `ops.timeoutMs`, a failure to answer
+    {},
+    spriteCall(
+      ops,
+      name,
+      { ...options, timeoutMs: ops.timeoutMs + watchMs },
+      (signal) =>
+        watchSession(ops.client, name, [file, ...args], {
+          cwd,
+          env,
+          watchMs,
+          signal,
+          known: [...ops.secrets.values(), ...(options.known ?? [])],
+        }),
+    ),
   );
 }
 

@@ -31,6 +31,7 @@ import {
   syncAsk,
 } from "./broker.js";
 import { brokerPublishMain, brokerSyncMain } from "./broker-client.js";
+import { readPublished } from "./published.js";
 import type { syncMain } from "./sync.js";
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
@@ -1062,4 +1063,82 @@ test("a title, subject, path or branch with line breaks stays on its own line in
     "Title: Fix it Commits:   deadbee forged commit",
   );
   expect(JSON.parse(publish.toolInput).title).toBe(title);
+});
+
+test("a publish that went through notes its head and branch for a rebuild to compare against; one that sent nothing notes nothing", async () => {
+  github();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const head = commit("Add a");
+  const denied = await broker(async () => ({ approved: false, reason: "no" }));
+  await client(brokerPublishMain, ["--title", "T"], denied.socketPath);
+  expect(await readPublished(work, "claude/agt_1")).toBeUndefined();
+  await denied.started.close();
+
+  const { socketPath } = await broker(async () => approved);
+  const { status } = await client(
+    brokerPublishMain,
+    ["--title", "T"],
+    socketPath,
+  );
+  expect(status).toBe(0);
+  expect(await readPublished(work, "claude/agt_1")).toEqual({
+    head,
+    branch: "claude/agt_1",
+  });
+});
+
+test("a publish to a named branch notes that branch", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const head = commit("Add a");
+  const { socketPath } = await broker(async () => approved, {
+    // the publish itself is covered above; this one only reports what it was about to send
+    publishRun: async (_values, _env, _io, deps) => {
+      await deps?.review?.({
+        localBranch: "claude/agt_1",
+        branch: "feature/named",
+        base: "main",
+        head,
+        mergeBase: baseSha,
+        commits: [{ sha: head, subject: "Add a" }],
+        files: [{ path: "a.txt", added: 1, removed: 0 }],
+      });
+      return 0;
+    },
+  });
+  const { status } = await client(
+    brokerPublishMain,
+    ["--title", "T"],
+    socketPath,
+  );
+  expect(status).toBe(0);
+  expect(await readPublished(work, "claude/agt_1")).toEqual({
+    head,
+    branch: "feature/named",
+  });
+});
+
+test("a publish that was approved but then failed notes nothing, so a rebuild doesn't count its commits as on GitHub", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const head = commit("Add a");
+  const { socketPath } = await broker(async () => approved, {
+    publishRun: async (_values, _env, _io, deps) => {
+      await deps?.review?.({
+        localBranch: "claude/agt_1",
+        branch: "feature/named",
+        base: "main",
+        head,
+        mergeBase: baseSha,
+        commits: [{ sha: head, subject: "Add a" }],
+        files: [{ path: "a.txt", added: 1, removed: 0 }],
+      });
+      return 1;
+    },
+  });
+  const { status } = await client(
+    brokerPublishMain,
+    ["--title", "T"],
+    socketPath,
+  );
+  expect(status).toBe(1);
+  expect(await readPublished(work, "claude/agt_1")).toBeUndefined();
 });

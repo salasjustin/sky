@@ -16,6 +16,7 @@ import {
   REMOTE_BRANCH_KEY,
   subjectsOf,
 } from "./publish.js";
+import { recordPublished } from "./published.js";
 import { STORED_OBJECTS_ENV } from "./store.js";
 import { syncMain } from "./sync.js";
 
@@ -516,12 +517,29 @@ export async function startBroker(deps: BrokerDeps): Promise<Broker> {
             scratch: dirname(deps.socketPath),
           });
         }
+        let sent: PublishPlan | undefined;
         const code = await (deps.publishRun ?? publishWith)(
           values,
           deps.env,
           io,
-          { review: (plan) => ask(publishAsk(plan)) },
+          {
+            review: async (plan) => {
+              await ask(publishAsk(plan));
+              sent = plan;
+            },
+          },
         );
+        // what a rebuild of this sprite checks the branch's commits against; the publish stands without it
+        if (code === 0 && sent) {
+          await recordPublished(deps.cwd, sent.localBranch, {
+            head: sent.head,
+            branch: sent.branch,
+          }).catch((error: unknown) => {
+            deps.warn(
+              `runner: noting what was published failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
+        }
         send({ t: "exit", code });
         return;
       }

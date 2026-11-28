@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { recordPublished } from "./published.js";
 import { commitAll, diffRollup, ensureWorktree, headSha } from "./worktree.js";
 
 const git = (cwd: string, ...args: string[]) =>
@@ -263,4 +264,47 @@ test("the commit list keeps the newest 50", async () => {
   expect(run.commits[0]?.subject).toBe("empty 51");
   expect(run.commits.at(-1)?.subject).toBe("empty 2");
   expect(cumulative.commits).toHaveLength(50);
+});
+
+test("a rollup carries what was last published, for a rebuild to compare the branch against", async () => {
+  const path = await ensureWorktree({
+    repoDir,
+    worktreesDir,
+    agentId: "agt_1",
+  });
+  const since = await headSha(path);
+  writeFileSync(join(path, "a.txt"), "1\n");
+  const first = commit(path, "add a");
+  expect((await diffRollup({ cwd: path, since })).published).toBeUndefined();
+  await recordPublished(path, "claude/agt_1", {
+    head: first,
+    branch: "feature/a",
+  });
+  expect((await diffRollup({ cwd: path, since })).published).toEqual({
+    head: first,
+    branch: "feature/a",
+  });
+});
+
+test("a worktree started on a GitHub branch counts the branch's tip as published until it publishes", async () => {
+  const path = await ensureWorktree({
+    repoDir,
+    worktreesDir,
+    agentId: "agt_1",
+  });
+  const since = await headSha(path);
+  git(repoDir, "update-ref", "refs/sky/starts/agt_1", since);
+  // `continueStartBranch` records the branch the runner publishes to
+  git(
+    repoDir,
+    "config",
+    "branch.claude/agt_1.sky-remote-branch",
+    "feature/theirs",
+  );
+  writeFileSync(join(path, "a.txt"), "1\n");
+  commit(path, "add a");
+  expect((await diffRollup({ cwd: path, since })).published).toEqual({
+    head: since,
+    branch: "feature/theirs",
+  });
 });

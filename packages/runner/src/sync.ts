@@ -17,6 +17,7 @@ import {
   REMOTE_BRANCH_KEY,
   rebaseInProgress,
 } from "./publish.js";
+import { STARTS } from "./published.js";
 import { editShallow, fetchCommit, shallowCommits } from "./repo.js";
 import { RepoLockBusyError, withRepoLock } from "./repo-lock.js";
 import { git, messageOf, STORED_OBJECTS_ENV } from "./store.js";
@@ -1071,8 +1072,7 @@ async function fetchStartBranch(options: {
   return tip;
 }
 
-/** `refs/sky/starts/<agentId>`: the start branch's tip when the agent's worktree was first made from it; never moved. */
-export const STARTS = "refs/sky/starts/";
+export { STARTS };
 
 export const BRANCH_CHECK_USAGE = "branch-check <branch>";
 
@@ -1500,6 +1500,8 @@ async function prepareLocked(
     if (held !== startBranch) await g(["config", key, startBranch]);
     // `publish` reads the checked-out branch's key, which is not this one
     if (!onBranch) return { cwd, notes, refreshed };
+    // a rebuilt agent restarts from its own published branch: nothing to tell apart
+    if (startBranch === branch) return { cwd, notes, refreshed };
     notes.push(
       `This worktree continues the existing GitHub branch \`${startBranch}\`; \`publish\` updates that branch (and its open pull request), not \`${branch}\`.`,
     );

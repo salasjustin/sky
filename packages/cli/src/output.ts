@@ -15,8 +15,13 @@ export interface Output {
   result(raw: unknown, line: string): void;
   progress(line: string): void;
   warn(line: string): void;
-  /** Reports a failure on stderr and returns exit status 1. */
-  fail(code: string, message: string, detail?: string): number;
+  /** Reports a failure on stderr and returns exit status 1. `fields` ride in the error under `--json` only. */
+  fail(
+    code: string,
+    message: string,
+    detail?: string,
+    fields?: Record<string, unknown>,
+  ): number;
 }
 
 export function createOutput(
@@ -35,10 +40,14 @@ export function createOutput(
     warn(line) {
       stderr(`sky: warning: ${line}\n`);
     },
-    fail(code, message, detail) {
+    fail(code, message, detail, fields) {
       if (json) {
-        const error =
-          detail === undefined ? { code, message } : { code, message, detail };
+        const error = {
+          code,
+          message,
+          ...(detail !== undefined && { detail }),
+          ...fields,
+        };
         stderr(`${JSON.stringify({ error })}\n`);
       } else {
         const indented = detail?.replace(/^/gm, "  ");

@@ -12,7 +12,7 @@ import {
   RequestId,
   RunId,
 } from "@sky/shared";
-import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
 import { AgentListQuery, decodeCursor, listAgents } from "./agent-list.js";
@@ -433,6 +433,121 @@ const lastEventId = zValidator(
   badCursor,
 );
 
+/**
+ * Where a rebuilt agent's new worktree starts: a branch GitHub has, else the default branch and why.
+ * `unasked` is an agent that was not rebuilt, or whose environment isn't ready.
+ */
+type RestartFrom =
+  | { branch: string }
+  | { branch: null; because: "unasked" | "not_found" }
+  | {
+      branch: null;
+      because: "needs_connector" | "is_default";
+      candidate: string;
+    };
+
+function startsFrom(from: RestartFrom): string {
+  if (from.branch !== null) {
+    return `from the \`${from.branch}\` branch on GitHub`;
+  }
+  switch (from.because) {
+    case "not_found":
+      return "from the repository's default branch, because Sky found no branch of yours on GitHub to start from";
+    case "needs_connector":
+      return `from the repository's default branch, because this environment has no GitHub connector, so Sky could not look on GitHub for your branch \`${from.candidate}\``;
+    case "is_default":
+      return `from \`${from.candidate}\`, which is both the repository's default branch and the branch you were started on or published to`;
+    case "unasked":
+      return "from the repository's default branch";
+  }
+}
+
+/** The note at the top of an agent's first run after its environment was rebuilt. */
+const rebuiltNote = (from: RestartFrom) =>
+  `The environment was rebuilt since your last run, so your worktree is new: it starts ${startsFrom(from)}. Anything that existed only in the old worktree (uncommitted changes, commits that were never published) is gone, and so is your earlier session: you start a fresh one, so what you remember of the old session may no longer be true of the files. Read the worktree before you rely on it.\n\n`;
+
+/** The GitHub branch the agent's latest published run went to, as the runs recorded it. */
+function publishedBranchOf(db: Db, id: AgentId): string | undefined {
+  const recorded = db
+    .select({ rollup: runs.rollup })
+    .from(runs)
+    .where(and(eq(runs.agentId, id), isNotNull(runs.rollup)))
+    .orderBy(desc(runs.createdAt), desc(sql`${runs}.rowid`))
+    .limit(50)
+    .all();
+  return recorded.find((r) => r.rollup?.published?.branch)?.rollup?.published
+    ?.branch;
+}
+
+/**
+ * For an agent whose environment was rebuilt, the GitHub branch its new worktree starts from: the
+ * first GitHub still has of the one it was started on, the one its runs recorded publishing to, and
+ * its own (where a publish goes by default), else none (the default branch) and why. A `Response`
+ * when GitHub could not be asked: the follow-up is refused to retry, since starting from the default
+ * branch because the question failed would drop the agent's work unannounced. An agent that was not
+ * rebuilt is `unasked` and nothing is checked.
+ */
+async function restartBranchOf(
+  c: Context<AppEnv>,
+  id: AgentId,
+  checkBranch: BranchChecker,
+  log: (line: string) => void,
+  deadlineMs: number,
+) {
+  const found = c.var.db
+    .select({ agent: agents, env: environments })
+    .from(agents)
+    .innerJoin(environments, eq(agents.envId, environments.id))
+    .where(and(eq(agents.id, id), ownAgents(c.var.principal)))
+    .get();
+  const unasked = { branch: null, because: "unasked" } satisfies RestartFrom;
+  if (!found?.agent.rebuiltAt || found.agent.archivedAt) return unasked;
+  const { agent, env } = found;
+  // the follow-up is refused below for an environment that isn't ready
+  if (env.status !== "ready") return unasked;
+  const candidates = new Set(
+    [agent.remoteBranch, publishedBranchOf(c.var.db, id), agent.branch].filter(
+      (branch): branch is string => Boolean(branch),
+    ),
+  );
+  let defaultBranch: string | undefined;
+  for (const candidate of candidates) {
+    const check = await within(deadlineMs, checkBranch(env, candidate), {
+      kind: "failed",
+      detail: `no answer within ${deadlineMs / 1000}s`,
+    } as BranchCheck);
+    if (check.kind === "exists") {
+      return { branch: candidate } satisfies RestartFrom;
+    }
+    if (check.kind === "failed") {
+      log(`branch check of ${candidate} on ${env.id} failed: ${check.detail}`);
+      return apiError(
+        c,
+        502,
+        "branch_check_failed",
+        `the environment was rebuilt, and the agent's new worktree starts from its branch ${candidate} if GitHub still has it; could not check (${check.detail}); retry`,
+      );
+    }
+    // the connector is the environment's: no other candidate can be looked for either
+    if (check.kind === "needs_connector") {
+      return {
+        branch: null,
+        because: "needs_connector",
+        candidate,
+      } satisfies RestartFrom;
+    }
+    if (check.kind === "is_default") defaultBranch ??= candidate;
+    // gone from GitHub, or the default branch: the next one
+  }
+  return defaultBranch === undefined
+    ? ({ branch: null, because: "not_found" } satisfies RestartFrom)
+    : ({
+        branch: null,
+        because: "is_default",
+        candidate: defaultBranch,
+      } satisfies RestartFrom);
+}
+
 export function agentRoutes(
   launcher: Launcher,
   checkBranch: BranchChecker,
@@ -581,6 +696,17 @@ export function agentRoutes(
           );
         }
       }
+      // an agent whose environment was rebuilt has no worktree: its next run makes one from a branch
+      // of its that GitHub still has (`restartBranchOf`). The check execs in the sprite, so it runs
+      // before the transaction
+      const rebuilt = await restartBranchOf(
+        c,
+        id,
+        checkBranch,
+        log,
+        preLaunchDeadlineMs,
+      );
+      if (rebuilt instanceof Response) return rebuilt;
       const runId = mintId("run");
       const outcome = c.var.db.transaction(
         (tx) => {
@@ -610,13 +736,20 @@ export function agentRoutes(
             envVars,
             ttlSeconds,
           );
+          const fresh = agent.rebuiltAt !== null;
           const running = tx
             .update(agents)
-            .set({ status: "running" })
+            .set({
+              status: "running",
+              // once the run exists the worktree is its to make; the branch it starts from is kept
+              // as a started-on branch, so a later rebuild finds it again, and one GitHub no longer
+              // has is dropped, or the runner would make the worktree from it
+              ...(fresh && { rebuiltAt: null, remoteBranch: rebuilt.branch }),
+            })
             .where(eq(agents.id, id))
             .returning()
             .get();
-          return { kind: "created", env, agent: running, run } as const;
+          return { kind: "created", env, agent: running, run, fresh } as const;
         },
         { behavior: "immediate" },
       );
@@ -643,7 +776,7 @@ export function agentRoutes(
         spriteName: outcome.env.spriteName,
         agentId: id,
         runId,
-        prompt,
+        prompt: outcome.fresh ? `${rebuiltNote(rebuilt)}${prompt}` : prompt,
         sessionId: outcome.agent.sessionId,
         approvalPolicy: outcome.env.approvalPolicy,
         autoApprove: outcome.env.autoApprove,

@@ -32,6 +32,7 @@ The status is `provisioning`, `ready` or `failed`.
 ```
 sky env show web          # the env's line; a failed one adds its step and stderr
 sky env retry web         # provision a failed env again
+sky env rebuild web --yes # reprovision a ready or failed env, keeping its agents
 sky env delete web --yes  # destroy its sandbox, agents, runs and events
 sky secret list web       # "<NAME> value" or "<NAME> connector" per secret
 sky secret delete web NPM_TOKEN
@@ -39,9 +40,11 @@ sky secret delete web NPM_TOKEN
 
 An environment may carry a `refresh` script that runs before every run, on Claude Code and Codex alike, to keep what its `setup` installed current without a reprovision; `sky env show` says whether one is set, `sky status` prints what it did before the latest run (`env refresh: ran (exit 0) (3.2s)`), and a Codex run's `config.toml` is rewritten, and its `hooks.json` deleted, after the refresh, so a plugin the refresh installs is what the session loads. `sky env show <env> --yaml` exports an environment as an `env.yaml` that `sky apply` takes as a no-op (secret names appear as a comment, never values), and `sky env set-refresh <env> <@file|->` sets only the script, reading a file or stdin and clearing it when empty: an environment that already has agents can get a Codex plugin this way, since `refresh` can make the first install and changing it never reprovisions. A `sky apply` whose file leaves `refresh` out keeps the script; `refresh: ""` clears it. When a plugin in `SKY_CODEX_PLUGINS` isn't installed after the refresh, the run posts a `runner.warning` naming it and goes on. See the README's Per-run refresh.
 
+`sky env rebuild` is for an environment whose sandbox stopped answering (`sky env show web` then has a `health: unreachable` line and `.health` in `--json`; `status` stays `ready`) and for rerunning `setup` on an environment that has agents. It keeps every agent and drops their sessions; an agent's next follow-up starts a new worktree from the first of its started-on branch, its recorded publish branch and its own `claude/<agentId>` that GitHub still has, or else from the default branch, and its prompt says so. A rebuild removes every worktree, so it first looks for work that exists only on the sandbox (uncommitted files, commits not on GitHub, a branch never published) and refuses with `unpublished_work` naming each agent, its branch and what is at risk: exit 1, and with `--json` an error carrying the API's `agents`, `checked` and `unreachable`. When the sandbox doesn't answer, the records can't clear an agent (a run in flight when it went down has no rollup), so every agent that has run is listed with its commits and uncommitted changes unknown (`checked: "records"`, `uncommitted`, `unpublishedCommits` and `neverPublished` `null`) and only `--force` rebuilds; if no agent has run, it goes ahead with a warning, and its `--json` object carries `rebuildCheck`. Have the agents publish, then rebuild (a sandbox that isn't answering can't publish: `--force`, after listing what may be lost, is the only way); or `--force` rebuilds anyway, after printing what is lost. Under `--json --yes --force` that list is `lost` in the result, with `agents: []` when nothing was at risk. A bot needs `--yes` for the rebuild as for a delete, and `--force` is a decision for a person, not a retry.
+
 A bot must pass `--yes` to `env delete`: without a terminal to ask on, with `CI` set, or with `--json`, it otherwise makes no request and exits 2 (`refusing to delete web without --yes`). Nothing undoes the delete.
 
-`<env>` is a name or an id everywhere, and a name that looks like an id (`env_prod`) still works. `sky secret list` never prints a value, in either mode: `--json` gives `{"data": [{"name": …, "kind": …}]}`. The deletes answer `deleted <id or NAME>`, or `{"id"|"name": …, "deleted": true}` under `--json`. An unknown environment or secret exits 1 with `not_found`; `env delete` while a run is active or the env is provisioning, and `env retry` on an env that hasn't failed, exit 1 too, with the API's reason.
+`<env>` is a name or an id everywhere, and a name that looks like an id (`env_prod`) still works. `sky secret list` never prints a value, in either mode: `--json` gives `{"data": [{"name": …, "kind": …}]}`. The deletes answer `deleted <id or NAME>`, or `{"id"|"name": …, "deleted": true}` under `--json`. An unknown environment or secret exits 1 with `not_found`; `env delete` or `env rebuild` while a run is active or the env is provisioning, and `env retry` on an env that hasn't failed, exit 1 too, with the API's reason.
 
 ## 1. Start
 
@@ -161,4 +164,4 @@ sky agent archive "$agent"
 exit $code
 ```
 
-The [MCP server](../README.md#mcp) offers the same steps as tools (`launch`, `wait_for_events`, `status`, `answer`, `approve`, `followup`, `archive`) for a bot that speaks MCP.
+The [MCP server](../README.md#mcp) offers the same steps as tools (`launch`, `wait_for_events`, `status`, `answer`, `approve`, `followup`, `archive`, and `rebuild_env` for a sandbox that stopped answering) for a bot that speaks MCP.

@@ -45,7 +45,7 @@ A `runs` key, within the environments on its list:
 - can start agents (`POST /v1/agents`), follow up, read agents, runs, events and streams, approve, deny and answer, and stop and archive **its own** agents;
 - can read the environments on its list (`GET` only, no secrets);
 - can add, list and delete **its own** webhooks, which deliver only its own agents' events;
-- is refused with `403 forbidden` on environment create, update, delete and retry, every secret route, and the key routes;
+- is refused with `403 forbidden` on environment create, update, delete, retry and rebuild, every secret route, and the key routes;
 - gets `404 not_found` for an environment not on its list and for any agent that isn't its own, so it can't probe ids.
 
 **Ownership.** Every agent records the key that started it; one started with the admin key is admin-owned, as is every agent created before keys existed. A `runs` key only ever sees and acts on its own agents, including in `GET /v1/events`, `GET /v1/stream` and through `/mcp`. The admin key sees and acts on all of them.
@@ -135,6 +135,7 @@ sky env show web                # one env; a failed one shows its step and stder
 sky env show web --yaml         # the env as an env.yaml sky apply takes as a no-op
 sky env set-refresh web @refresh.sh  # the script every run runs first; - reads stdin, empty clears
 sky env retry web               # provision a failed env again
+sky env rebuild web             # admin only: reprovision web and keep its agents; see "Rebuilding an environment"
 sky env set-runtime web codex   # admin only: run web on Codex (or claude-code); see "Switching runtime"
 sky env delete web              # destroy its sandbox, agents, runs and events; asks first
 sky env delete web --yes        # the same without asking; required off a terminal and with --json
@@ -294,6 +295,26 @@ sky env show web                       # shows `runtime: …`
 **What the switch does.** It sets the environment's `runtime` (`PUT /v1/environments/:id/runtime` with `{"runtime": "codex"}`; admin key only), which wins over a `SKY_RUNTIME` secret or envVar. An environment that has never been switched has no runtime set and follows `SKY_RUNTIME`; `sky env set-runtime <env> default` (`{"runtime": null}`) clears the stored runtime so it follows the secret again, and `sky env show` prints that as `runtime: default`. Switching to Codex is refused with `gateway_key_missing` until the environment has an `AI_GATEWAY_API_KEY` secret (`sky secret set web AI_GATEWAY_API_KEY`), and installs the pinned Codex on the sandbox when it isn't there; if that install fails the switch is refused with `codex_install_failed` and the runtime stays as it was. A run already going keeps its runtime; the switch applies from the next launch.
 
 **Agents after a switch.** An agent whose last session ran on the other runtime can't resume it. Its next run starts a fresh session on the agent's branch, which holds the earlier work's commits, and its prompt opens with a short note saying the earlier work ran on the other runtime, with the last run's summary. Follow-ups on the same runtime resume their session. An agent whose session started before Sky recorded runtimes counts as having run on what its next launch picks with no runtime set: the run's `SKY_RUNTIME` envVar, else the environment's `SKY_RUNTIME` secret, else Claude Code.
+
+### Rebuilding an environment
+
+`sky env rebuild <env> [--yes] [--force]` (`POST /v1/environments/:id/rebuild`, `{ "force": false }`, the `rebuild_env` MCP tool; admin key) reprovisions a `ready` or `failed` environment the way provisioning does (clone, base profile, setup, checkpoint) **and keeps its agents**. It is how to rerun `setup` on an environment that has agents (a `setup` change through `sky apply` is still refused with `agents_exist`), and how to recover a sprite that stopped answering. Like `sky env retry`, it drops every agent's session, since the sprite's sessions are gone. It is refused with `run_active` while a run on the environment is active, and with `provisioning` while it provisions. Once the checks pass it ends the environment's preview, and it answers `202` with the environment, now `provisioning`.
+
+**It never loses unpublished work without saying so.** Rebuilding removes every worktree, so before it starts Sky finds the agents whose work exists only on the sprite: uncommitted changes in the worktree, commits that are not on the GitHub branch the agent publishes to, and a branch that was never published but has commits. It reads each worktree with read-only git, and says `sprite` in `checked`. When the sprite doesn't answer (a "Storage not ready" 503, say), or a worktree's git can't be read, the records can't clear anyone: a run in flight when the sprite went down has no rollup, and a rollup says nothing of uncommitted changes. So the check lists **every unarchived agent that has had a run**, with `uncommitted`, `unpublishedCommits` and `neverPublished` all `null` (unknown, because the sprite couldn't be read), says `records` in `checked` and the sprite's error in `unreachable`, and refuses. Only `force` rebuilds then. An agent that never ran has no worktree to lose and is not listed, so when no agent has run, the rebuild goes ahead and its `202` carries `rebuildCheck: { "checked": "records", "unreachable": … }`. Any agent at risk makes the rebuild `409 unpublished_work`, naming each agent, the branch it publishes to (the last publish's, else the one it was started on, else its own) and what is at risk:
+
+```
+{ "error": { "code": "unpublished_work", "message": "…", "checked": "sprite",
+    "agents": [ { "agentId": "agt_…", "branch": "feature/login", "uncommitted": 2,
+                  "unpublishedCommits": 3, "neverPublished": false } ] } }
+```
+
+`force: true` rebuilds past the refusal. The check still runs under `force`, so the `202` still carries `rebuildCheck` when the sprite couldn't be read. The CLI lists what will be lost first: `sky env rebuild web --force` runs the request without `force`, prints each agent's line from the refusal (agents whose work couldn't be read are listed as possibly losing it), asks again on a terminal, and only then sends `force: true`. Without `--force` it prints the list and exits 1; when the sprite isn't answering it says nothing can be published from it. Under `--json` the refusal is `{ "error": { "code", "message", "detail", "agents", "checked", "unreachable"? } }`, and `--json --yes --force` puts the list in the result as `lost: { agents, checked, unreachable? }` (`agents: []` when nothing was at risk) and writes nothing to stderr. Like `env delete`, a terminal asks to confirm and anywhere else, or with `--json`, `--yes` is required (`refusing to rebuild web without --yes`, exit 2). The check runs once before the rebuild starts; a run that begins in between is caught by `run_active`.
+
+**The agent's next run starts cleanly.** A follow-up to a rebuilt agent finds no worktree. Sky starts a new one the way `sky agent start --branch` does, from the first of these GitHub still has: the branch the agent was started on, the branch its runs last recorded publishing to, and its own `claude/<agentId>`. With none of them, or with no GitHub connector on the environment to ask with, it starts from the default branch. Each is asked of GitHub through the environment's connector, and a check that fails refuses the follow-up with `502 branch_check_failed` to retry, rather than start from the default branch unannounced. The branch it starts from is kept as the agent's `remoteBranch`, so a later rebuild finds it again. The run starts a fresh session, and its prompt begins by saying the environment was rebuilt, that the worktree is new and where it starts from, and that what existed only in the old worktree is gone.
+
+**An environment whose sprite doesn't answer** shows it. When an exec, file write or session start on the sprite fails three times in a row with an HTTP 5xx or an unreachable connection, the environment records `health`: `{ "status": "unreachable", "error": …, "at": …, "message": … }`, where `message` names `sky env rebuild`. It shows in `sky env show`, `GET /v1/environments[/:id]` and the `status` MCP tool, and clears on the next call that gets an answer, or on a rebuild. `status` stays `ready`: it is the provisioning status, and nothing that reads it changes meaning. A call that fails with a 4xx, or an exec that exits nonzero, is an answer and counts as contact. A call that runs out of a long bound (a clone, a setup) or that its caller cancels counts as neither.
+
+The rebuild runs the same provisioning steps, so on a very large repository its first step, which removes the old checkout (`rm-repo`), can run into that step's timeout.
 
 ### Per-run refresh
 
@@ -541,6 +562,7 @@ Add `"branch": "<name>"` to start from an existing GitHub branch ([Fetching from
 | route                                                                   | what it does                                           |
 | ----------------------------------------------------------------------- | ------------------------------------------------------ |
 | `POST /v1/environments` · `GET`, `PATCH`, `DELETE /v1/environments/:id` | environments; create returns `202` while provisioning  |
+| `POST /v1/environments/:id/rebuild`                                     | reprovision an environment and keep its agents         |
 | `PUT`, `GET`, `DELETE /v1/environments/:id/secrets[/:name]`             | environment secrets                                    |
 | `GET /v1/agents`                                                        | list your agents with their latest run                 |
 | `POST /v1/agents/:id/runs`                                              | follow-up run, resuming the agent's session            |
@@ -611,6 +633,7 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 | `env_not_ready`        | the environment isn't ready to launch agents yet                                                               |
 | `provisioning`         | the environment is still provisioning; wait for it to finish                                                   |
 | `agents_exist`         | repo or setup can't change while unarchived agents exist                                                       |
+| `unpublished_work`     | a rebuild would lose work that exists only on the sprite; the agents at risk are in `agents`                   |
 | `already_decided`      | the request was already decided differently; that decision stands                                              |
 | `request_closed`       | the request's run ended with the request still open; nothing was applied                                       |
 | `request_withdrawn`    | the run stopped waiting on the request before it was answered; nothing was applied                             |
@@ -692,7 +715,7 @@ Runs on one sprite share its repo, so a run's worktree setup takes the repo lock
 
 ## MCP
 
-`POST /mcp` (streamable HTTP, same bearer keys) exposes `create_env`, `launch`, `followup`, `status`, `list_agents`, `answer`, `approve`, `stop`, `archive`, `preview` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents. Every tool call runs with the caller's own key, so a `runs` key gets the same limits as over REST.
+`POST /mcp` (streamable HTTP, same bearer keys) exposes `create_env`, `rebuild_env`, `launch`, `followup`, `status`, `list_agents`, `answer`, `approve`, `stop`, `archive`, `preview` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents. Every tool call runs with the caller's own key, so a `runs` key gets the same limits as over REST.
 
 `list_agents` is `GET /v1/agents` ([Listing agents](#listing-agents)): it takes `env` (ids or names) and `status` (states) as arrays, `archived` (`false`, `true` or `all`), `limit` and `cursor`, and returns the page the API sends, with `nextCursor` when more agents match. Use it to find an agent whose id you lost, or to see which are running or waiting on you.
 

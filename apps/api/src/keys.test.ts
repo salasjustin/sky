@@ -834,6 +834,7 @@ test.each([
   ["PATCH", "/v1/environments/:env", { concurrency: 1 }],
   ["DELETE", "/v1/environments/:env"],
   ["POST", "/v1/environments/:env/retry"],
+  ["POST", "/v1/environments/:env/rebuild"],
   ["GET", "/v1/environments/:env/secrets"],
   ["PUT", "/v1/environments/:env/secrets/TOKEN", { value: "v" }],
   ["DELETE", "/v1/environments/:env/secrets/TOKEN"],

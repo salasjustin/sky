@@ -20,6 +20,7 @@ type Values = {
   timeout?: string;
   reason?: string;
   yes?: boolean;
+  force?: boolean;
   branch?: string;
   events?: string;
   format?: string;

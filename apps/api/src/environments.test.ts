@@ -181,6 +181,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     claudeFallback: "api-key",
     runtime: null,
     failure: null,
+    health: null,
     createdAt: expect.stringMatching(
       /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/,
     ),

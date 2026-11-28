@@ -24,6 +24,7 @@ import { createProvisioner } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
 import { createBundleInstaller } from "./runner-bundle.js";
 import { registerStoredValues, secretRoutes } from "./secrets.js";
+import { createSpriteHealth, type SpriteHealth } from "./sprite-health.js";
 import { SPRITES_TIMEOUT_MS, type SpriteOps } from "./sprites.js";
 import { webhookRoutes } from "./webhooks.js";
 
@@ -56,6 +57,8 @@ export type AppDeps = {
   previewReadyPollMs?: number;
   /** Called with a sprite's name when an exec on it exits 137; `boot` probes that sprite's running runs. */
   onExecKilled?: (spriteName: string) => void;
+  /** Marks an environment whose sprite stops answering; one that writes to `db` by default. */
+  health?: SpriteHealth;
   /** The redaction registry, shared with whatever else purges from it; one from `config` by default. */
   secrets?: KnownSecrets;
   /** Aborted at shutdown: event streams send a final `server.shutdown` frame and end, parked event polls answer. */
@@ -80,6 +83,7 @@ export function createApp({
   previewReadyPollMs,
   onExecKilled,
   secrets = KnownSecrets.fromConfig(config),
+  health = createSpriteHealth({ db, secrets, log }),
   closing = new AbortController().signal,
 }: AppDeps) {
   registerStoredValues(db, config.secretEncryptionKey, secrets);
@@ -90,6 +94,7 @@ export function createApp({
     timeoutMs: spritesTimeoutMs,
     longTimeoutMs: config.spritesLongTimeoutMs,
     onExecKilled,
+    health,
   };
   const ensureBundle = createBundleInstaller(
     spriteOps,

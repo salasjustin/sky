@@ -1255,3 +1255,81 @@ test("preview is listed with what the link gives and the one-per-environment rul
     readOnlyHint: false,
   });
 });
+
+test("rebuild_env posts the env's rebuild with force off unless asked, and is listed destructive", async () => {
+  const env = { id: "env_1", name: "web", status: "provisioning" };
+  const seen = route("post", "/v1/environments/env_1/rebuild", 202, env);
+  const client = await connect();
+
+  const plain = await client.callTool({
+    name: "rebuild_env",
+    arguments: { envId: "env_1" },
+  });
+  await client.callTool({
+    name: "rebuild_env",
+    arguments: { envId: "env_1", force: true },
+  });
+  const { tools } = await client.listTools();
+
+  expect(textOf(plain)).toEqual(env);
+  expect(seen).toEqual([
+    { auth: `Bearer ${KEY}`, body: { force: false } },
+    { auth: `Bearer ${KEY}`, body: { force: true } },
+  ]);
+  const tool = tools.find((t) => t.name === "rebuild_env");
+  expect(tool?.annotations?.destructiveHint).toBe(true);
+  expect(tool?.description).toMatch(/unpublished_work/);
+  expect(tool?.description).toMatch(/only when a person has said to/);
+  const force = (tool?.inputSchema.properties?.force ?? {}) as {
+    description?: string;
+  };
+  expect(force.description).toMatch(/only when a person has said to/);
+});
+
+test("rebuild_env passes on the rebuildCheck an accepted rebuild that only read the records carries", async () => {
+  const env = {
+    id: "env_1",
+    name: "web",
+    status: "provisioning",
+    rebuildCheck: { checked: "records", unreachable: "sprite timed out" },
+  };
+  route("post", "/v1/environments/env_1/rebuild", 202, env);
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "rebuild_env",
+    arguments: { envId: "env_1" },
+  });
+  const { tools } = await client.listTools();
+
+  expect(result.isError).toBeFalsy();
+  expect(textOf(result)).toEqual(env);
+  const tool = tools.find((t) => t.name === "rebuild_env");
+  expect(tool?.description).toMatch(/rebuildCheck/);
+  expect(tool?.description).toMatch(/records, with unreachable saying why/);
+  expect(tool?.description).toMatch(
+    /every unarchived agent that has had a run/,
+  );
+  expect(tool?.description).toMatch(
+    /uncommitted, unpublishedCommits and neverPublished null/,
+  );
+});
+
+test("rebuild_env hands back the refusal that names the work at risk", async () => {
+  const error = {
+    code: "unpublished_work",
+    message: "agt_1 (claude/agt_1): 2 uncommitted files",
+    checked: "records",
+    agents: [{ agentId: "agt_1" }],
+  };
+  route("post", "/v1/environments/env_1/rebuild", 409, { error });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "rebuild_env",
+    arguments: { envId: "env_1" },
+  });
+
+  expect(result.isError).toBe(true);
+  expect(textOf(result)).toEqual({ status: 409, error });
+});

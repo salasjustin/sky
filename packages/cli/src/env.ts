@@ -3,8 +3,12 @@ import {
   ClaudeCredentialName,
   ClaudeFallback,
   ClaudeSubscriptionName,
+  describeUnpublished,
+  RebuildCheckSource,
   Runtime,
+  UnpublishedAgent,
 } from "@sky/shared";
+import { z } from "zod";
 import type { AgentCommand } from "./agent.js";
 import { type ApiEnvironment, ApiError } from "./api.js";
 import { envYaml } from "./env-yaml.js";
@@ -41,6 +45,51 @@ function filteringWebhookIds(err: unknown): string[] | undefined {
     ids.every((id) => typeof id === "string")
     ? ids
     : undefined;
+}
+
+const asObject = (value: unknown): Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+
+/** What a 409 `unpublished_work` refusal says, and what is at risk; undefined for any other error. */
+function unpublishedWork(err: unknown):
+  | {
+      message: string;
+      agents: UnpublishedAgent[];
+      checked: RebuildCheckSource;
+      unreachable?: string | undefined;
+    }
+  | undefined {
+  if (
+    !(err instanceof ApiError) ||
+    err.status !== 409 ||
+    err.code !== "unpublished_work"
+  ) {
+    return undefined;
+  }
+  const parsed = z
+    .object({
+      agents: z.array(UnpublishedAgent).min(1),
+      checked: RebuildCheckSource,
+      unreachable: z.string().optional(),
+    })
+    .safeParse(err.details);
+  return parsed.success ? { message: err.message, ...parsed.data } : undefined;
+}
+
+/** Each agent at risk, one line each, and where the answer came from. */
+function unpublishedLines(
+  work: NonNullable<ReturnType<typeof unpublishedWork>>,
+) {
+  return [
+    ...work.agents.map(describeUnpublished),
+    ...(work.checked === "records"
+      ? [
+          `could not read the sprite (${work.unreachable ?? "no answer"}), so every agent that has run is listed: each may hold commits or uncommitted changes there that no one could see`,
+        ]
+      : []),
+  ];
 }
 
 /**
@@ -94,14 +143,21 @@ const refreshLine = (env: ApiEnvironment) =>
 export const env: AgentCommand = {
   options: {
     yes: { type: "boolean" },
+    force: { type: "boolean" },
     fallback: { type: "string" },
     pool: { type: "string" },
     yaml: { type: "boolean" },
   },
   prepare(positionals, values) {
     const [sub, ...rest] = positionals;
-    if (values.yes && sub !== "delete") {
-      throw new UsageError("--yes only goes with env delete", true);
+    if (values.yes && sub !== "delete" && sub !== "rebuild") {
+      throw new UsageError(
+        "--yes only goes with env delete or env rebuild",
+        true,
+      );
+    }
+    if (values.force && sub !== "rebuild") {
+      throw new UsageError("--force only goes with env rebuild", true);
     }
     if (values.yaml && sub !== "show") {
       throw new UsageError("--yaml only goes with env show", true);
@@ -152,6 +208,13 @@ export const env: AgentCommand = {
         if (env.refresh !== "") lines.push(refreshLine(env));
         if (env.claudeCredential !== null || env.claudeFallback !== "api-key") {
           lines.push(claudeLine(env));
+        }
+        // `at` moves on every failure; `message` repeats `error`, so only the next step is printed
+        if (env.health) {
+          lines.push(
+            `health: unreachable (last error ${env.health.at}): ${env.health.error}`,
+            `  if it stays that way, sky env rebuild ${env.id} rebuilds it`,
+          );
         }
         if (env.failure) {
           lines.push(`failed at step ${env.failure.step}`);
@@ -205,6 +268,85 @@ export const env: AgentCommand = {
         if (envId === undefined) return 1;
         const { raw, env } = await api.retryEnvironment(envId);
         out.result(raw, envLine(env));
+        return 0;
+      };
+    }
+    if (sub === "rebuild") {
+      const ref = onlyEnv(sub, rest);
+      // the rebuild removes every agent's worktree and can't be undone, so it asks as a delete does
+      return async (api, io, out) => {
+        const canAsk =
+          io.stdin.isTTY && io.stderrIsTTY && !out.json && !io.env.CI;
+        if (!values.yes && !canAsk) {
+          throw new UsageError(`refusing to rebuild ${ref} without --yes`);
+        }
+        const target = await resolveEnv(api, ref, out);
+        if (target === undefined) return 1;
+        const envId = target.id;
+        const confirm = async (question: string) => {
+          const answer = await io.stdin.prompt(question);
+          return /^y(es)?$/i.test(answer.trim());
+        };
+        if (
+          !values.yes &&
+          !(await confirm(
+            `rebuild ${target.name} (${envId}) from its repo and setup? Its agents are kept and start new worktrees on their next run [y/N] `,
+          ))
+        ) {
+          out.progress("nothing rebuilt");
+          return 1;
+        }
+        let rebuilt: Awaited<ReturnType<typeof api.rebuildEnvironment>>;
+        // what a forced rebuild loses, for --json to carry
+        let lost: Record<string, unknown> | undefined;
+        try {
+          rebuilt = await api.rebuildEnvironment(envId, false);
+        } catch (err) {
+          const work = unpublishedWork(err);
+          if (work === undefined) throw err;
+          const lines = unpublishedLines(work);
+          const { message: _, ...fields } = work;
+          if (!values.force) {
+            return out.fail(
+              "unpublished_work",
+              `${target.name} (${envId}) has work that exists only on its sprite, and a rebuild would lose it`,
+              work.checked === "records"
+                ? `${lines.join("\n")}\nthe sprite isn't answering, so nothing can be published from it; run sky env rebuild ${ref} --force to rebuild anyway and lose whatever is only there`
+                : `${lines.join("\n")}\nhave each agent publish it first (for example sky agent follow-up ${work.agents[0]?.agentId} --prompt="publish your work"), or run sky env rebuild ${ref} --force to rebuild anyway and lose it`,
+              fields,
+            );
+          }
+          lost = fields;
+          if (!out.json) {
+            out.progress(
+              `rebuilding ${target.name} (${envId}) ${work.checked === "records" ? "may lose" : "loses"} this work:\n${lines.map((line) => `  ${line}`).join("\n")}`,
+            );
+          }
+          if (!values.yes && !(await confirm("lose it and rebuild? [y/N] "))) {
+            out.progress("nothing rebuilt");
+            return 1;
+          }
+          rebuilt = await api.rebuildEnvironment(envId, true);
+        }
+        // after a refusal the printed list already said the sprite could not be read; without one, a
+        // records-only check let the rebuild through only because no agent had run
+        if (lost === undefined && rebuilt.rebuildCheck && !out.json) {
+          out.warn(
+            `could not read the sprite (${rebuilt.rebuildCheck.unreachable}), so its worktrees weren't checked for unpublished work (no agent had run)`,
+          );
+        }
+        out.result(
+          values.force
+            ? {
+                ...asObject(rebuilt.raw),
+                lost: lost ?? {
+                  agents: [],
+                  ...(rebuilt.rebuildCheck ?? { checked: "sprite" }),
+                },
+              }
+            : rebuilt.raw,
+          envLine(rebuilt.env),
+        );
         return 0;
       };
     }
@@ -322,7 +464,7 @@ export const env: AgentCommand = {
     }
     throw new UsageError(
       sub === undefined
-        ? "env needs a subcommand: list, show, delete, retry, set-claude, set-runtime or set-refresh"
+        ? "env needs a subcommand: list, show, delete, retry, rebuild, set-claude, set-runtime or set-refresh"
         : `unknown env subcommand '${sub}'`,
       true,
     );

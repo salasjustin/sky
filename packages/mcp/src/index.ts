@@ -337,6 +337,27 @@ function buildServer(call: Call) {
     (input) => api("POST", "/v1/environments", input),
   );
   server.registerTool(
+    "rebuild_env",
+    {
+      description:
+        "Rebuild a ready or failed environment's sprite from its repo and setup, keeping its agents: each starts a fresh session in a new worktree on its next run, from the first GitHub still has of the branch it was started on, the branch its runs recorded publishing to and its own claude/<agentId> branch, else from the default branch, and its prompt says so. The environment's preview ends. Use it when status with envId shows health unreachable (its sprite isn't answering), or to rerun setup on an environment that has agents. Refused with 409 run_active while a run is active and provisioning while it provisions. Refused with 409 unpublished_work, listing each agent with its branch and what is at risk (uncommitted files, commits not on GitHub, a branch never published), when work exists only on the sprite; checked says whether the sprite was looked at (sprite) or couldn't be read (records, with unreachable saying why): then every unarchived agent that has had a run is listed with uncommitted, unpublishedCommits and neverPublished null (unknown), because the records can't show a run that was in flight or uncommitted changes, and only force rebuilds. Tell a person what is at risk. force: true rebuilds anyway and loses that work, so send it only when a person has said to. An accepted rebuild answers 202 with the environment; when the sprite couldn't be read (no agent had run, or force was sent), it also carries rebuildCheck: { checked: records, unreachable }, where unreachable says why. Commits and uncommitted changes on the sprite could not be checked then, and the rebuild loses any there were: tell the person. Provisioning is asynchronous: poll status with envId until it is ready. Needs the admin key.",
+      inputSchema: {
+        envId: EnvironmentId,
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            "true rebuilds even when work exists only on the sprite, losing it. Set it only when a person has said to, after seeing what will be lost.",
+          ),
+      },
+      annotations: { destructiveHint: true },
+    },
+    ({ envId, force }) =>
+      api("POST", `/v1/environments/${envId}/rebuild`, {
+        force: force === true,
+      }),
+  );
+  server.registerTool(
     "launch",
     {
       description:
@@ -355,7 +376,7 @@ function buildServer(call: Call) {
     "followup",
     {
       description:
-        "Start the agent's next run once its current run has ended, resuming its session.",
+        "Start the agent's next run once its current run has ended, resuming its session. After rebuild_env (or a retry of its environment), the next run starts a fresh session in a new worktree instead, and its prompt tells the agent so. Refused with 502 branch_check_failed when GitHub couldn't be asked which branch that worktree starts from (try again).",
       inputSchema: { agentId: AgentId, prompt: nonEmpty },
     },
     ({ agentId, prompt }) =>
@@ -409,7 +430,7 @@ function buildServer(call: Call) {
     "status",
     {
       description:
-        "With agentId: a run (runId, or the newest) with its rollup, compareUrl and any pending request; its diff only with includeDiff, possibly cut, with a note giving the full size and where to read it. With envId: the environment, e.g. to poll provisioning.",
+        "With agentId: a run (runId, or the newest) with its rollup, compareUrl and any pending request; its diff only with includeDiff, possibly cut, with a note giving the full size and where to read it. With envId: the environment, e.g. to poll provisioning; health is set (unreachable, with the last error and when) while its sprite isn't answering, and rebuild_env is the way out.",
       inputSchema: StatusInput,
       annotations: { readOnlyHint: true },
     },
