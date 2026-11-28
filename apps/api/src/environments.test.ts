@@ -1741,13 +1741,16 @@ test("a PATCH of refresh alone succeeds on an env with many agents, one holding 
   expect(agents.n).toBe(27);
 });
 
-test("PATCH of refresh is 409 while a run is active, and a refresh over its bound is 400", async () => {
+test("PATCH of refresh alone succeeds while a run is active, with any other field it is 409, and a refresh over its bound is 400", async () => {
   const id = await ready();
   expect((await patch(id, { refresh: "x".repeat(20_001) })).status).toBe(400);
   seedRun(id, "running");
   const res = await patch(id, { refresh: "make" });
-  expect(res.status).toBe(409);
-  expect(await res.json()).toEqual({
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ refresh: "make", status: "ready" });
+  const mixed = await patch(id, { refresh: "make check", concurrency: 2 });
+  expect(mixed.status).toBe(409);
+  expect(await mixed.json()).toEqual({
     error: { code: "run_active", message: expect.any(String) },
   });
 });
