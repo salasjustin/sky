@@ -29,8 +29,9 @@
  * The base profile's MCP servers are written into Codex's config by name only (the values stay in
  * Codex's env), and each MCP tool call asks, so Sky's approval policy answers it as on Claude Code.
  *
- * Not carried over from the Claude Code session: background tasks, the default git identity and the outside-read gate. Codex runs the commands it counts as read-only
- * (`cat`, `ls`, `grep` and the like) without asking, wherever they read.
+ * Not carried over from the Claude Code session: background tasks, the default git identity and the
+ * outside-read gate. Codex runs the commands it counts as read-only (`cat`, `ls`, `grep` and the like)
+ * without asking, wherever they read.
  */
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -1412,9 +1413,9 @@ export async function runCodexSession(
      * An MCP server's request through Codex. Codex asks before every MCP tool call (the config's
      * `prompt` mode), and that ask is the call's approval: the environment's policy answers as it does
      * for the same `mcp__<server>__<tool>` call on a Claude Code run, running one it doesn't name and
-     * holding one it does for the person. A tool-call ask the runner can't match to one call in flight,
-     * and a server's own ask (its url shown in full), is the person's to answer; nothing is accepted
-     * unasked. A server's form with fields is declined: Sky has no way to fill them in.
+     * holding one it does for the person. A tool-call ask that matches no call in flight goes to the
+     * person, as does a server's own ask (a url shown in full); nothing is accepted unasked. A server's
+     * form with fields is declined: Sky has no way to fill them in.
      */
     const answerElicitation = async (
       rpcId: string,

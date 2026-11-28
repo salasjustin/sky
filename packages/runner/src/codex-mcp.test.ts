@@ -30,7 +30,7 @@ const write = (profile: Record<string, BaseProfileMcpServer>) =>
     codexMcpTables(profile, env).tables,
   );
 
-/** Python's tomllib stands in for a TOML parser, which the repo has none of; absent off CI, only the text checks run. */
+/** Python's tomllib stands in for a TOML parser, which the repo has none of; where it's missing off CI, only the text checks run. */
 const python = (() => {
   try {
     execFileSync("python3", ["-c", "import tomllib"], { stdio: "ignore" });

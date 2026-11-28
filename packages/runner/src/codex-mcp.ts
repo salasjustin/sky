@@ -1,6 +1,6 @@
 import type { BaseProfileMcpServer } from "@sky/shared";
 
-/** A quote, backslash or control character: none can sit in a name or url written between TOML quotes. */
+/** A quote, backslash or control character: refused in a name or url, escaped in a command or arg. */
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
 const HOSTILE = /["\\\u0000-\u001f\u007f]/;
 
