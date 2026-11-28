@@ -98,7 +98,7 @@ async function main(): Promise<void> {
   // `claude` commands inherit, and the runner is put out of its commands' reach, so the repo's hooks and
   // config, which those run, find nothing; only the session's Claude process gets the credential back
   const credentialEnv = withdrawCredential(process.env);
-  // a Codex run's AI Gateway key leaves the env the same way, for the run's gateway proxy alone
+  // a Codex or pi run's AI Gateway key leaves the env the same way, for the run's gateway proxy alone
   const codexEnv =
     config.runtime === "codex" || config.runtime === "pi"
       ? withdrawGatewayKey(process.env)
@@ -198,7 +198,7 @@ async function main(): Promise<void> {
       syncStoreQuietly("pull", { ...process.env, ...connector }, warn),
     );
   // the environment's own refresh script, on every runtime, before the plugin refresh (which it may give
-  // a marketplace to update) and before a Codex session writes its config (so the session loads what the
+  // a marketplace to update) and before a Codex or pi session writes its config (so the session loads what the
   // script installed); bounded, never fails the run. What it did rides the run's `run.started`
   const envRefresh =
     controller.signal.aborted || !config.refresh
@@ -255,7 +255,7 @@ async function main(): Promise<void> {
       warn(`runner: ${message}`);
       warningReporter(post, config.runId)(message);
     }
-  // a Codex run skips the plugin refresh: it runs `claude`, whose plugins Codex doesn't load
+  // a Codex or pi run skips the plugin refresh: it runs `claude`, whose plugins neither loads
   const pluginRefresh =
     controller.signal.aborted || gatewayRuntime
       ? undefined

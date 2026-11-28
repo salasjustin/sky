@@ -27,7 +27,7 @@ export function envYaml(
   };
   const notes = [
     `# ${env.name} (${env.id}), exported by sky env show --yaml; sky apply takes it as is.`,
-    `# runtime: ${env.runtime ?? "default (the SKY_RUNTIME secret, else claude-code)"}; not a field of this file: set it with sky env set-runtime ${env.name} <claude-code|codex|default>`,
+    `# runtime: ${env.runtime ?? "default (the SKY_RUNTIME secret, else claude-code)"}; not a field of this file: set it with sky env set-runtime ${env.name} <claude-code|codex|pi|default>`,
     secrets === undefined
       ? "# secrets: not listed with this key; secret values are never exported"
       : `# secrets (names only; values are never exported; set one with sky secret set ${env.name} <NAME>): ${
