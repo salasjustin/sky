@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
@@ -241,18 +242,41 @@ describe("the budget", () => {
 });
 
 describe("the lock beside other runs'", () => {
-  test("a run that waited on another run's refresh skips its own, as skipped", async () => {
+  test("a run that waited on another run's refresh of the same script skips its own, as skipped", async () => {
     const marker = join(dir, "marker");
-    // a live holder: this process
+    const script = `touch '${marker}'`;
+    // a live holder: this process, which ran this same script
     writeFileSync(lockFile, String(process.pid));
+    writeFileSync(
+      `${lockFile}.sha256`,
+      createHash("sha256").update(script).digest("hex"),
+    );
     setTimeout(() => rmSync(lockFile), 400);
-    const record = await run(`touch '${marker}'`);
+    const record = await run(script);
     expect(record).toMatchObject({
       outcome: "skipped",
       reason: "another run refreshed",
     });
     expect(existsSync(marker)).toBe(false);
     expect(refreshWarning(record)).toBeUndefined();
+  });
+
+  test("a run that waited on another run's refresh of a different script runs its own, and records it for the next", async () => {
+    const marker = join(dir, "marker");
+    const script = `touch '${marker}'`;
+    // the holder ran the script the environment had before it was changed mid-run
+    writeFileSync(lockFile, String(process.pid));
+    writeFileSync(
+      `${lockFile}.sha256`,
+      createHash("sha256").update("the old script").digest("hex"),
+    );
+    setTimeout(() => rmSync(lockFile), 400);
+    const record = await run(script);
+    expect(record.outcome).toBe("ran");
+    expect(existsSync(marker)).toBe(true);
+    expect(readFileSync(`${lockFile}.sha256`, "utf8")).toBe(
+      createHash("sha256").update(script).digest("hex"),
+    );
   });
 
   test("a lock whose holder is gone is taken over and the script runs", async () => {

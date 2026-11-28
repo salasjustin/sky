@@ -98,8 +98,7 @@ const help = (io: Io) => `Usage:
       refresh in the README), without a whole env.yaml: @file reads it from
       a file, - from stdin; an empty one clears it. Never reprovisions, and
       is allowed while agents exist and while a run is active: a run keeps
-      the script it started with, and runs launched later get the new one
-      (one that waits on a run still running the old script skips its own).
+      the script it started with, and runs launched later get the new one.
       Needs the admin key.
   sky claude-credentials [options]
       Print "<name> <subscription|api-key>

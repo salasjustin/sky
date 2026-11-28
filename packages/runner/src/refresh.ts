@@ -1,4 +1,12 @@
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  closeSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EnvRefresh } from "@sky/shared";
@@ -202,7 +210,28 @@ export async function runEnvRefresh(options: {
   const lockFile = options.lockFile ?? join(tmpdir(), "sky-env-refresh.lock");
   // what the script did, set by the task under the lock
   let result: EnvRefresh | undefined;
+  // which script the last holder ran to an end: a run that waited on another skips its own only when
+  // that was this same script, since the script can change while a run is going
+  const ranFile = `${lockFile}.sha256`;
+  const scriptHash = createHash("sha256").update(script).digest("hex");
+  let sameAsHolder = false;
   const task = async () => {
+    await runScript();
+    if (result?.outcome === "ran" || result?.outcome === "failed") {
+      try {
+        writeFileSync(ranFile, scriptHash, { mode: 0o600 });
+      } catch {}
+    }
+  };
+  const afterHolder = async () => {
+    let ran = "";
+    try {
+      ran = readFileSync(ranFile, "utf8").trim();
+    } catch {}
+    if (ran === scriptHash) sameAsHolder = true;
+    else await task();
+  };
+  const runScript = async () => {
     try {
       // the file is the runner's user's alone, made before the shell appends to it
       closeSync(openSync(logFile, "a", 0o600));
@@ -247,8 +276,16 @@ export async function runEnvRefresh(options: {
     }
   };
   try {
-    const outcome = await withRefreshLock(lockFile, signal, task);
-    if (outcome === "done-by-holder") {
+    const outcome = await withRefreshLock(
+      lockFile,
+      signal,
+      task,
+      afterHolder,
+    );
+    if (
+      outcome === "done-by-holder" ||
+      (outcome === "after-holder" && sameAsHolder)
+    ) {
       warn(
         `runner: env refresh skipped, another run ran it (waited ${seconds(now() - started)}s)`,
       );
