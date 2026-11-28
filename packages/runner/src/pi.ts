@@ -630,13 +630,9 @@ export function piOutcome(
   if (call.targets.some((path) => outside(root, realPathOf(path))))
     return "hold";
   const outcomes = call.targets.map((path) =>
-    policyOutcome(
-      policy,
-      config.autoApprove,
-      scope,
-      call.toolName,
-      { file_path: path },
-    ),
+    policyOutcome(policy, config.autoApprove, scope, call.toolName, {
+      file_path: path,
+    }),
   );
   return outcomes.includes("hold")
     ? "hold"
@@ -1194,8 +1190,21 @@ export async function runPiSession(
       join(agentDir, "settings.json"),
       `${JSON.stringify(PI_SETTINGS, null, 2)}\n`,
     );
-    // the base profile's MCP servers; a file from an earlier run goes when this run has none
-    const mcp = piMcpConfig(config.mcpServers, sessionEnv);
+    // pi's env, which the agent's commands get whole (the project's secrets included, as Claude Code's
+    // commands get them) except the gateway token, which the extension clears: never the connector (the
+    // broker does the sending), the event token (the runner posts the run's events) or the gateway key
+    // (the proxy holds it), and its git runs no fsmonitor
+    const {
+      SKY_PI_HOME: _home,
+      AGENT_TOKEN: _token,
+      [CODEX_KEY_ENV]: _key,
+      [PI_GATEWAY_TOKEN_ENV]: _proxyToken,
+      ...childEnv
+    } = withoutConnector(withSessionGitConfig(sessionEnv));
+    // the base profile's MCP servers, by the secrets pi's own env holds: one naming a variable pi never
+    // gets (the event token, the connector, the gateway key or token) is left out, not written as a
+    // reference that would expand to nothing. A file from an earlier run goes when this run has none
+    const mcp = piMcpConfig(config.mcpServers, childEnv);
     const mcpFile = join(agentDir, "mcp.json");
     if (Object.keys(mcp.mcpServers).length > 0)
       writeWhole(
@@ -1249,17 +1258,6 @@ export async function runPiSession(
       { mode: 0o600 },
     );
     const sessionId = config.sessionId ?? randomUUID();
-    // pi's env, which the agent's commands get whole (the project's secrets included, as Claude Code's
-    // commands get them) except the gateway token, which the extension clears: never the connector (the
-    // broker does the sending), the event token (the runner posts the run's events) or the gateway key
-    // (the proxy holds it), and its git runs no fsmonitor
-    const {
-      SKY_PI_HOME: _home,
-      AGENT_TOKEN: _token,
-      [CODEX_KEY_ENV]: _key,
-      [PI_GATEWAY_TOKEN_ENV]: _proxyToken,
-      ...childEnv
-    } = withoutConnector(withSessionGitConfig(sessionEnv));
     // the seal's spawn ends the process with this signal; the run's own stop goes through `abort`
     child = deps.seal.spawn({
       command: launcher.command,

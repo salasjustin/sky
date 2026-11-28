@@ -1683,6 +1683,44 @@ describe("runPiSession", () => {
     ).toMatch(/lost \(NOT_SET\)/);
   });
 
+  test("a secret pi's env never holds (the event token, the connector, the gateway key or token) leaves its server out, and the rest are written", async () => {
+    const url = "https://doop.example/mcp";
+    config.mcpServers = {
+      events: { url, headers: { Authorization: "AGENT_TOKEN" } },
+      github: { url, headers: { Authorization: "GITHUB_CONNECTOR" } },
+      key: { url, headers: { Authorization: "AI_GATEWAY_API_KEY" } },
+      gateway: { url, headers: { Authorization: "SKY_PI_GATEWAY_TOKEN" } },
+      kept: { url, headers: { Authorization: "DOOP_KEY" } },
+    };
+    config.sessionEnv.AGENT_TOKEN = "event-token-value";
+    config.sessionEnv.GITHUB_CONNECTOR = "connector-id";
+    config.sessionEnv.AI_GATEWAY_API_KEY = "gateway-key-value";
+    config.sessionEnv.SKY_PI_GATEWAY_TOKEN = "gateway-token-value";
+    config.sessionEnv.DOOP_KEY = "fake-secret-value";
+    expect(await run()).toBe(0);
+    // the one resolvable server is written, so the others' absence is the runner's choice
+    const { mcp } = started();
+    expect(Object.keys(mcp.mcpServers)).toEqual(["kept"]);
+    expect(mcp.mcpServers.kept.headers).toEqual({
+      Authorization: ref("DOOP_KEY"),
+    });
+    const warnings = ofType("runner.warning").map((e) => e.payload.message);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(
+      "events (AGENT_TOKEN); github (GITHUB_CONNECTOR); key (AI_GATEWAY_API_KEY); gateway (SKY_PI_GATEWAY_TOKEN)",
+    );
+    // none of the values reached the file, an event or the warning
+    for (const value of [
+      "event-token-value",
+      "connector-id",
+      "gateway-key-value",
+      "gateway-token-value",
+    ]) {
+      expect(JSON.stringify(mcp)).not.toContain(value);
+      expect(JSON.stringify(events)).not.toContain(value);
+    }
+  });
+
   test("a run starts from a clean agent directory: what an earlier run left there never reaches pi", async () => {
     const agent = join(root, "pi-home/agent");
     mkdirSync(join(agent, "extensions"), { recursive: true });
