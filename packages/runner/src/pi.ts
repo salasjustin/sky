@@ -1013,7 +1013,8 @@ export async function runPiSession(
   const connectorEnv = deps.connector ?? {};
   const sessionEnv = { ...env, ...config.sessionEnv };
   let streamError: string | undefined;
-  // the errors pi reported for the run, and whether it failed on one rather than being stopped
+  // the errors pi reported since its last model call that succeeded, and whether the run failed on
+  // one rather than being stopped: a 429 pi got past says nothing about a later failure
   const modelErrors: { message: string }[] = [];
   let turnFailed = false;
   let heartbeat: ReturnType<typeof createHeartbeat> | undefined;
@@ -1457,6 +1458,7 @@ export async function runPiSession(
               modelErrors.push({
                 message: message.data.errorMessage ?? "the model call failed",
               });
+            else modelErrors.length = 0;
             const text = textOf(message.data.content);
             if (!text) return;
             lastText = text;
@@ -1477,7 +1479,8 @@ export async function runPiSession(
           }
           case "auto_retry_end": {
             const retry = RetryEnd.parse(raw);
-            if (!retry.success && retry.finalError)
+            if (retry.success) modelErrors.length = 0;
+            else if (retry.finalError)
               modelErrors.push({ message: retry.finalError });
             return;
           }

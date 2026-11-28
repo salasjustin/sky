@@ -935,6 +935,14 @@ const scenarios = {
     assistant({ content: [], stopReason: "error", errorMessage: "the model call failed", usage: usage(10, 1) });
     settle();
   },
+  // a 429 pi got past, by a call that succeeded or a retry that did, then a failure of another kind
+  async recovered() {
+    send({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 1, errorMessage: "429 Too Many Requests" });
+    if (process.env.FAKE_PI_RECOVERY === "retry") send({ type: "auto_retry_end", success: true });
+    else assistant({ content: [{ type: "text", text: "working" }], usage: usage(1, 1) });
+    assistant({ content: [], stopReason: "error", errorMessage: process.env.FAKE_PI_ERROR, usage: usage(10, 1) });
+    settle();
+  },
   async aborted() { assistant({ content: [], stopReason: "aborted", usage: usage(1, 1) }); settle(true); },
   async hang() { await tool("h1", "bash", { command: "touch hang.txt" }); },
   async quiet() { settle(); },
@@ -1456,6 +1464,27 @@ describe("runPiSession", () => {
         .map((e) => e.payload.message)
         .join("\n"),
     ).toMatch(/pi is retrying \(1\/3\): 429/);
+  });
+
+  test.each([
+    ["a model call that succeeded", "call"],
+    ["a retry that succeeded", "retry"],
+  ])("a 429 pi got past by %s doesn't name a later failure of another kind", async (_, recovery) => {
+    config.sessionEnv.FAKE_PI_RECOVERY = recovery;
+    config.sessionEnv.FAKE_PI_ERROR = "context window exceeded";
+    expect(await run("recovered")).toBe(1);
+    expect(ofType("run.failed")[0]?.payload.error).toBe(
+      "context window exceeded",
+    );
+  });
+
+  test("a 402 after a 429 pi got past is still out of credit", async () => {
+    config.sessionEnv.FAKE_PI_ERROR =
+      "402 Payment Required: insufficient credits";
+    expect(await run("recovered")).toBe(1);
+    expect(ofType("run.failed")[0]?.payload.error).toMatch(
+      /^pi_unavailable: the AI Gateway is out of credit/,
+    );
   });
 
   test("a bare failure after the proxy saw a 402 is out of credit", async () => {
