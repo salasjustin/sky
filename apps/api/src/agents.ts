@@ -437,8 +437,8 @@ const lastEventId = zValidator(
 const rebuiltNote = (branch: string | null) =>
   `The environment was rebuilt since your last run, so your worktree is new: it starts ${
     branch === null
-      ? "from the repository's default branch, because none of your work is on GitHub"
-      : `from the \`${branch}\` branch on GitHub, where your earlier work was published`
+      ? "from the repository's default branch, because Sky found no branch of yours on GitHub to start from"
+      : `from the \`${branch}\` branch on GitHub`
   }. Anything that existed only in the old worktree (uncommitted changes, commits that were never published) is gone, and so is your earlier session: you start a fresh one, so what you remember of the old session may no longer be true of the files. Read the worktree before you rely on it.\n\n`;
 
 /** The GitHub branch the agent's latest published run went to, as the runs recorded it. */
@@ -456,10 +456,11 @@ function publishedBranchOf(db: Db, id: AgentId): string | undefined {
 
 /**
  * For an agent whose environment was rebuilt, the GitHub branch its new worktree starts from: the
- * one it was started on, else the one it published to if GitHub still has it, else none (the
- * default branch). A `Response` when GitHub could not be asked: the follow-up is refused to retry,
- * since starting from the default branch because the question failed would drop the agent's work
- * unannounced. An agent that was not rebuilt has `branch: null` and nothing is checked.
+ * first GitHub still has of the one it was started on, the one its runs recorded publishing to, and
+ * its own (where a publish goes by default), else none (the default branch). A `Response` when
+ * GitHub could not be asked: the follow-up is refused to retry, since starting from the default
+ * branch because the question failed would drop the agent's work unannounced. An agent that was not
+ * rebuilt has `branch: null` and nothing is checked.
  */
 async function restartBranchOf(
   c: Context<AppEnv>,
@@ -467,7 +468,7 @@ async function restartBranchOf(
   checkBranch: BranchChecker,
   log: (line: string) => void,
   deadlineMs: number,
-): Promise<{ branch: string | null } | Response> {
+) {
   const found = c.var.db
     .select({ agent: agents, env: environments })
     .from(agents)
@@ -477,25 +478,30 @@ async function restartBranchOf(
   if (!found?.agent.rebuiltAt || found.agent.archivedAt)
     return { branch: null };
   const { agent, env } = found;
-  if (agent.remoteBranch) return { branch: agent.remoteBranch };
-  const candidate = publishedBranchOf(c.var.db, id);
   // the follow-up is refused below for an environment that isn't ready
-  if (!candidate || env.status !== "ready") return { branch: null };
-  const check = await within(deadlineMs, checkBranch(env, candidate), {
-    kind: "failed",
-    detail: `no answer within ${deadlineMs / 1000}s`,
-  } as BranchCheck);
-  if (check.kind === "exists") return { branch: candidate };
-  if (check.kind === "failed") {
-    log(`branch check of ${candidate} on ${env.id} failed: ${check.detail}`);
-    return apiError(
-      c,
-      502,
-      "branch_check_failed",
-      `the environment was rebuilt, and the agent's new worktree starts from its published branch ${candidate}; could not check that GitHub still has it (${check.detail}); retry`,
-    ) as unknown as Response;
+  if (env.status !== "ready") return { branch: null };
+  const candidates = new Set(
+    [agent.remoteBranch, publishedBranchOf(c.var.db, id), agent.branch].filter(
+      (branch): branch is string => Boolean(branch),
+    ),
+  );
+  for (const candidate of candidates) {
+    const check = await within(deadlineMs, checkBranch(env, candidate), {
+      kind: "failed",
+      detail: `no answer within ${deadlineMs / 1000}s`,
+    } as BranchCheck);
+    if (check.kind === "exists") return { branch: candidate };
+    if (check.kind === "failed") {
+      log(`branch check of ${candidate} on ${env.id} failed: ${check.detail}`);
+      return apiError(
+        c,
+        502,
+        "branch_check_failed",
+        `the environment was rebuilt, and the agent's new worktree starts from its branch ${candidate} if GitHub still has it; could not check (${check.detail}); retry`,
+      );
+    }
+    // gone from GitHub, the default branch, or no connector to look with: the next one
   }
-  // gone from GitHub, the default branch, or no connector to look with: nothing to start from
   return { branch: null };
 }
 
@@ -693,11 +699,9 @@ export function agentRoutes(
             .set({
               status: "running",
               // once the run exists the worktree is its to make; the branch it starts from is kept
-              // as a started-on branch, so a later rebuild finds it again
-              ...(fresh && {
-                rebuiltAt: null,
-                remoteBranch: rebuilt.branch ?? agent.remoteBranch,
-              }),
+              // as a started-on branch, so a later rebuild finds it again, and one GitHub no longer
+              // has is dropped, or the runner would make the worktree from it
+              ...(fresh && { rebuiltAt: null, remoteBranch: rebuilt.branch }),
             })
             .where(eq(agents.id, id))
             .returning()

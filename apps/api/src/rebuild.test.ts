@@ -9,6 +9,7 @@ import {
   migrate,
   openDb,
   previews,
+  runs,
 } from "@sky/db";
 import type { AgentId, EnvironmentId } from "@sky/shared";
 import { eq } from "drizzle-orm";
@@ -307,6 +308,32 @@ test("rebuild ends the env's preview first", async () => {
   expect(db.select().from(previews).all()).toEqual([]);
 });
 
+test("a run started while the sprite is checked refuses the rebuild and leaves the preview running", async () => {
+  const envId = readyEnv();
+  await previewOf(envId);
+  const { agent } = await agentWith(envId);
+  worktreeCheck({});
+  const answer = wire.exec;
+  // a launch admitted while the sprite is asked
+  wire.exec = (argv, sprite) => {
+    if (argv[0] === "bash" && argv[2] === WORK_CHECK) {
+      db.insert(runs)
+        .values({
+          id: "run_during_check" as never,
+          agentId: agent.id,
+          status: "running",
+        })
+        .run();
+    }
+    return answer(argv, sprite);
+  };
+  const res = await rebuild(envId);
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({ error: { code: "run_active" } });
+  expect(db.select().from(previews).all()).toMatchObject([{ state: "ready" }]);
+  expect(await getEnv(envId)).toMatchObject({ status: "ready" });
+});
+
 test("rebuild goes on when the sprite can't end the preview, leaving it for the sweep", async () => {
   const envId = readyEnv();
   await previewOf(envId);
@@ -384,8 +411,11 @@ test("a reachable sprite with nothing at risk rebuilds without asking for force"
   const envId = readyEnv();
   const { agent } = await agentWith(envId);
   const asked = worktreeCheck({ [agent.id]: "ok\t0\t0\t0\tfeature/done" });
-  expect((await rebuild(envId)).status).toBe(202);
+  const res = await rebuild(envId);
+  expect(res.status).toBe(202);
   expect(asked).toEqual([[agent.id]]);
+  // the sprite answered, so there is nothing to say about the check
+  expect(await res.json()).not.toHaveProperty("rebuildCheck");
   await settled(envId);
 });
 
@@ -455,7 +485,7 @@ test.each([
   },
 );
 
-test("a sprite that doesn't answer rebuilds when the records show everything published, or nothing committed", async () => {
+test("a sprite that doesn't answer rebuilds when the records show everything published, or nothing committed, and says the sprite couldn't be asked", async () => {
   const envId = readyEnv();
   await agentWith(
     envId,
@@ -466,6 +496,11 @@ test("a sprite that doesn't answer rebuilds when the records show everything pub
   sprite503();
   const res = await rebuild(envId);
   expect(res.status).toBe(202);
+  expect(await res.json()).toMatchObject({
+    id: envId,
+    status: "provisioning",
+    rebuildCheck: { checked: "records", unreachable: expect.any(String) },
+  });
 });
 
 test("the branch of an agent started on one is the one it publishes to in the records", async () => {
@@ -501,7 +536,10 @@ test("force works on a sprite that doesn't answer the check", async () => {
   const envId = readyEnv();
   await agentWith(envId, rollupOf(["1"]));
   sprite503();
-  expect((await rebuild(envId, { force: true })).status).toBe(202);
+  const res = await rebuild(envId, { force: true });
+  expect(res.status).toBe(202);
+  // force skips the check, so it never reached for the records
+  expect(await res.json()).not.toHaveProperty("rebuildCheck");
 });
 
 test("the body takes only force, as a boolean", async () => {
@@ -586,24 +624,100 @@ test("a follow-up after a rebuild starts a new worktree from the branch the agen
   });
 });
 
-test("a follow-up after a rebuild of an agent that never published starts from the default branch, and says so", async () => {
+test("a follow-up after a rebuild of an agent with no branch on GitHub starts from the default branch, and says so", async () => {
   const { agent } = await rebuilt(rollupOf(["1"]));
-  const checks = branchCheckAnswers({ exitCode: 0 });
+  const checks = branchCheckAnswers({
+    exitCode: 3,
+    stderr: `branch-check: claude/${agent.id} doesn't exist\n`,
+  });
   const res = await followUp(agent.id, "start over");
   expect(res.status).toBe(202);
   const { run } = (await res.json()) as Launched;
   await sessionOpened(2);
-  expect(checks).toHaveLength(0);
+  expect(checks.map((argv) => argv.at(-1))).toEqual([`claude/${agent.id}`]);
   const [, session] = wire.sessions;
   expect(session?.env).not.toHaveProperty("START_BRANCH");
   expect(session?.env).not.toHaveProperty("SESSION_ID");
   const prompt = promptOf(run.id);
   expect(prompt).toContain("The environment was rebuilt");
   expect(prompt).toContain("your worktree is new");
-  expect(prompt).toContain("from the repository's default branch");
+  expect(prompt).toContain(
+    "from the repository's default branch, because Sky found no branch of yours on GitHub to start from",
+  );
+  expect(prompt).not.toContain("none of your work is on GitHub");
   expect(agentRow(agent.id)).toMatchObject({
     remoteBranch: null,
     rebuiltAt: null,
+  });
+});
+
+test("a rebuilt agent whose runs recorded no publish starts from its own claude/<id> branch when GitHub has it", async () => {
+  // as an agent that published with a runner from before publishes were recorded
+  const { agent } = await rebuilt(rollupOf(["1"]));
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const res = await followUp(agent.id);
+  expect(res.status).toBe(202);
+  const { run } = (await res.json()) as Launched;
+  await sessionOpened(2);
+  expect(checks.map((argv) => argv.at(-1))).toEqual([`claude/${agent.id}`]);
+  expect(wire.sessions[1]?.env.START_BRANCH).toBe(`claude/${agent.id}`);
+  const prompt = promptOf(run.id);
+  expect(prompt).toContain(`\`claude/${agent.id}\` branch on GitHub`);
+  // a branch it was started on may hold none of its own work
+  expect(prompt).not.toContain("where your earlier work was published");
+  expect(agentRow(agent.id)?.remoteBranch).toBe(`claude/${agent.id}`);
+});
+
+/** An agent started on `remoteBranch`, whose env was then rebuilt and is ready again. */
+async function rebuiltOnBranch(remoteBranch: string) {
+  const envId = readyEnv();
+  await connect(envId);
+  const { agent } = await agentWith(envId, rollupOf(["1"]));
+  db.update(agents)
+    .set({ remoteBranch })
+    .where(eq(agents.id, agent.id))
+    .run();
+  expect((await rebuild(envId, { force: true })).status).toBe(202);
+  await settled(envId);
+  return agent;
+}
+
+test("a rebuilt agent whose started-on branch is gone from GitHub starts from the default branch, and says so", async () => {
+  const agent = await rebuiltOnBranch("feature/merged");
+  const checks = branchCheckAnswers({
+    exitCode: 3,
+    stderr: "branch-check: the branch doesn't exist\n",
+  });
+  const res = await followUp(agent.id);
+  expect(res.status).toBe(202);
+  const { run } = (await res.json()) as Launched;
+  await sessionOpened(2);
+  expect(checks.map((argv) => argv.at(-1))).toEqual([
+    "feature/merged",
+    `claude/${agent.id}`,
+  ]);
+  expect(wire.sessions[1]?.env).not.toHaveProperty("START_BRANCH");
+  expect(promptOf(run.id)).toContain(
+    "from the repository's default branch, because Sky found no branch of yours on GitHub to start from",
+  );
+  expect(agentRow(agent.id)?.remoteBranch).toBeNull();
+});
+
+test("a failed check of a rebuilt agent's started-on branch refuses the follow-up to retry", async () => {
+  const agent = await rebuiltOnBranch("feature/started");
+  const checks = branchCheckAnswers({
+    exitCode: 1,
+    stderr: "branch-check: GitHub is down\n",
+  });
+  const res = await followUp(agent.id);
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: { code: "branch_check_failed" },
+  });
+  expect(checks.map((argv) => argv.at(-1))).toEqual(["feature/started"]);
+  expect(agentRow(agent.id)).toMatchObject({
+    remoteBranch: "feature/started",
+    rebuiltAt: expect.any(String),
   });
 });
 
@@ -622,17 +736,11 @@ test("a published branch that is gone from GitHub starts from the default branch
 });
 
 test("an agent started on a branch starts its new worktree from it again", async () => {
-  const envId = readyEnv();
-  await connect(envId);
-  const { agent } = await agentWith(envId, rollupOf(["1"]));
-  db.update(agents)
-    .set({ remoteBranch: "feature/started" })
-    .where(eq(agents.id, agent.id))
-    .run();
-  expect((await rebuild(envId, { force: true })).status).toBe(202);
-  await settled(envId);
+  const agent = await rebuiltOnBranch("feature/started");
+  const checks = branchCheckAnswers({ exitCode: 0 });
   expect((await followUp(agent.id)).status).toBe(202);
   await sessionOpened(2);
+  expect(checks.map((argv) => argv.at(-1))).toEqual(["feature/started"]);
   expect(wire.sessions[1]?.env.START_BRANCH).toBe("feature/started");
 });
 

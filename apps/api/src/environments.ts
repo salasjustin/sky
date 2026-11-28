@@ -573,6 +573,9 @@ export function environmentRoutes(
           const refused = refuse(first);
           if (refused) return refused;
           if (first.kind !== "open") throw new Error("unreachable");
+          let rebuildCheck:
+            | { checked: "records"; unreachable: string }
+            | undefined;
           if (!force) {
             const work = await findUnpublishedWork(db, sprites, first.env, log);
             if (work.agents.length > 0) {
@@ -591,15 +594,13 @@ export function environmentRoutes(
                 409,
               );
             }
-          }
-          // the app runs in a worktree, so it and its public URL end with the rebuild; a sprite that
-          // can't be reached leaves the row for the sweep, as it does for an expiry
-          try {
-            await previews.stopForEnv(id);
-          } catch (err) {
-            log(
-              `stopping the preview of ${id} before its rebuild failed: ${err}`,
-            );
+            // the records can't show uncommitted changes, so the caller is told what was checked
+            if (work.unreachable !== undefined) {
+              rebuildCheck = {
+                checked: "records",
+                unreachable: work.unreachable,
+              };
+            }
           }
           // the checks run again where nothing can slip in between them and the update: a run may have
           // started while the sprite was asked
@@ -621,8 +622,24 @@ export function environmentRoutes(
           if (outcome.kind !== "rebuilding") {
             return refuse(outcome) ?? apiError(c, 409, "conflict", runActive);
           }
+          // after the transaction, so a rebuild refused there leaves the preview up. The app runs in
+          // a worktree, so it and its public URL end with the rebuild; a sprite that can't be reached
+          // leaves the row for the sweep, as it does for an expiry
+          try {
+            await previews.stopForEnv(id);
+          } catch (err) {
+            log(
+              `stopping the preview of ${id} before its rebuild failed: ${err}`,
+            );
+          }
           provisioner.start(outcome.row);
-          return c.json(present(outcome.row), 202);
+          return c.json(
+            {
+              ...present(outcome.row),
+              ...(rebuildCheck && { rebuildCheck }),
+            },
+            202,
+          );
         },
       )
       .delete("/:id", envParam, async (c) => {
