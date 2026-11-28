@@ -1,5 +1,5 @@
-import { HttpResponse, http } from "msw";
-import { beforeEach, expect, test } from "vitest";
+import { delay, HttpResponse, http } from "msw";
+import { beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { apiUrl, runCli } from "./testing.js";
 
@@ -33,7 +33,7 @@ beforeEach(() => {
 });
 
 const rebuild = (
-  respond: (body: { force: boolean }) => Response = () =>
+  respond: (body: { force: boolean }) => Response | Promise<Response> = () =>
     HttpResponse.json(rebuilding, { status: 202 }),
 ) =>
   http.post(`${apiUrl}/v1/environments/:id/rebuild`, async ({ request }) => {
@@ -189,22 +189,33 @@ test("env rebuild refused for unpublished work lists each agent, its branch and 
   expect(r.code).toBe(1);
   expect(r.stdout).toBe("");
   expect(r.stderr).toBe(
-    `sky: web (env_1) has work that exists only on its sprite, and a rebuild would lose it\n${lines.map((l) => `  ${l}`).join("\n")}\n  publish it first (the agent's own sky publish), or run sky env rebuild web --force to rebuild anyway and lose it\n`,
+    `sky: web (env_1) has work that exists only on its sprite, and a rebuild would lose it\n${lines.map((l) => `  ${l}`).join("\n")}\n  have each agent publish it first (for example sky agent follow-up agt_a --prompt="publish your work"), or run sky env rebuild web --force to rebuild anyway and lose it\n`,
   );
   // asked once, without force
   expect(bodies).toEqual([{ force: false }]);
 });
 
-test("env rebuild --json refused for unpublished work keeps the API's error", async () => {
-  server.use(
-    list,
-    rebuild(() => refused(atRisk)),
-  );
-  const r = await runCli(["env", "rebuild", "web", "--json", "--yes"]);
-  expect(r.code).toBe(1);
-  expect(JSON.parse(r.stderr)).toMatchObject({
-    error: { code: "unpublished_work" },
-  });
+test("env rebuild --json refused for unpublished work keeps the API's error, with the agents at risk and what was checked", async () => {
+  for (const extra of [
+    { checked: "sprite" },
+    { checked: "records", unreachable: "503 Storage not ready" },
+  ]) {
+    server.use(
+      list,
+      rebuild(() => refused(atRisk, extra)),
+    );
+    const r = await runCli(["env", "rebuild", "web", "--json", "--yes"]);
+    expect(r.code).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(JSON.parse(r.stderr)).toEqual({
+      error: {
+        code: "unpublished_work",
+        message: "the API's own words",
+        agents: atRisk,
+        ...extra,
+      },
+    });
+  }
 });
 
 test("a refusal from records says the sprite could not be reached and that uncommitted changes are unknown", async () => {
@@ -231,11 +242,11 @@ test("a refusal from records says the sprite could not be reached and that uncom
     "agt_a (claude/agt_a): 2 commits on a branch never published, uncommitted changes unknown",
   );
   expect(r.stderr).toContain(
-    "could not reach the sprite to look (503 Storage not ready); this is from what the agents' runs recorded, so uncommitted changes are not known",
+    "could not reach the sprite to look (503 Storage not ready); this is from what the agents' runs recorded, so uncommitted changes are not known and the list may be incomplete",
   );
 });
 
-test("env rebuild --force --yes lists exactly what is lost, then rebuilds with force", async () => {
+test("env rebuild --force --yes lists what is lost, then rebuilds with force", async () => {
   server.use(
     list,
     rebuild((body) =>
@@ -296,6 +307,76 @@ test("env rebuild --force on an env with nothing at risk rebuilds with no list a
   expect(bodies).toEqual([{ force: false }]);
 });
 
+test("env rebuild waits 3 minutes for the server's work check, so a slow answer still lands; the env lookup keeps 30 s", async () => {
+  // the server's check alone may take its 60 s sprite timeout; the clock here runs 100 times fast
+  const timeoutOf = AbortSignal.timeout.bind(AbortSignal);
+  const spy = vi
+    .spyOn(AbortSignal, "timeout")
+    .mockImplementation((ms) => timeoutOf(ms / 100));
+  server.use(
+    list,
+    rebuild(async () => {
+      await delay(600);
+      return HttpResponse.json(rebuilding, { status: 202 });
+    }),
+  );
+  try {
+    const r = await runCli(["env", "rebuild", "web", "--yes"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("env_1 provisioning acme/web web\n");
+    expect(spy.mock.calls.map(([ms]) => ms)).toEqual([30_000, 3 * 60_000]);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("a timed-out rebuild exits 1 and says it may still have started, and where to look", async () => {
+  server.use(list);
+  const fetchOf = globalThis.fetch;
+  const spy = vi.spyOn(globalThis, "fetch");
+  // what undici rejects with when the request's AbortSignal.timeout fires
+  spy.mockImplementation(async (input, init) => {
+    if (init?.method !== "POST") return fetchOf(input, init);
+    throw new DOMException(
+      "The operation was aborted due to timeout",
+      "TimeoutError",
+    );
+  });
+  try {
+    const r = await runCli(["env", "rebuild", "web", "--yes"]);
+    expect(r.code).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe(
+      "sky: cannot reach https://sky.test: no response in 3 min; the rebuild may still have started: check with sky env show env_1\n",
+    );
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("a rebuild whose check could only read the run records warns on stderr, and --json passes rebuildCheck through", async () => {
+  const rebuildCheck = {
+    checked: "records",
+    unreachable: "503 Storage not ready",
+  };
+  const warning =
+    "sky: warning: the sprite didn't answer (503 Storage not ready), so the check for unpublished work used what the agents' runs recorded and could not see uncommitted changes\n";
+  server.use(
+    list,
+    rebuild(() =>
+      HttpResponse.json({ ...rebuilding, rebuildCheck }, { status: 202 }),
+    ),
+  );
+  const plain = await runCli(["env", "rebuild", "web", "--yes"]);
+  expect(plain.code).toBe(0);
+  expect(plain.stdout).toBe("env_1 provisioning acme/web web\n");
+  expect(plain.stderr).toBe(warning);
+  const json = await runCli(["env", "rebuild", "web", "--json", "--yes"]);
+  expect(json.code).toBe(0);
+  expect(JSON.parse(json.stdout)).toEqual({ ...rebuilding, rebuildCheck });
+  expect(json.stderr).toBe(warning);
+});
+
 test("env rebuild refused while a run is active exits 1 with the API's message", async () => {
   server.use(
     list,
@@ -339,7 +420,7 @@ test("env show says the sprite isn't answering and what to run", async () => {
   const r = await runCli(["env", "show", "env_1"]);
   expect(r.code).toBe(0);
   expect(r.stdout).toBe(
-    "env_1 ready acme/web web\nruntime: default (the SKY_RUNTIME secret, else claude-code)\nhealth: unreachable since 2026-11-26T10:00:00.000Z: 503 Storage not ready\n  the environment's sprite isn't answering (503 Storage not ready); if it stays that way, sky env rebuild web rebuilds it\n",
+    "env_1 ready acme/web web\nruntime: default (the SKY_RUNTIME secret, else claude-code)\nhealth: unreachable (last error 2026-11-26T10:00:00.000Z): 503 Storage not ready\n  if it stays that way, sky env rebuild env_1 rebuilds it\n",
   );
 });
 

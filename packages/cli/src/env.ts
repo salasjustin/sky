@@ -47,9 +47,10 @@ function filteringWebhookIds(err: unknown): string[] | undefined {
     : undefined;
 }
 
-/** What a 409 `unpublished_work` refusal says is at risk; undefined for any other error. */
+/** What a 409 `unpublished_work` refusal says, and what is at risk; undefined for any other error. */
 function unpublishedWork(err: unknown):
   | {
+      message: string;
       agents: UnpublishedAgent[];
       checked: RebuildCheckSource;
       unreachable?: string | undefined;
@@ -69,7 +70,7 @@ function unpublishedWork(err: unknown):
       unreachable: z.string().optional(),
     })
     .safeParse(err.details);
-  return parsed.success ? parsed.data : undefined;
+  return parsed.success ? { message: err.message, ...parsed.data } : undefined;
 }
 
 /** Each agent at risk, one line each, and where the answer came from. */
@@ -80,7 +81,7 @@ function unpublishedLines(
     ...work.agents.map(describeUnpublished),
     ...(work.checked === "records"
       ? [
-          `could not reach the sprite to look (${work.unreachable ?? "no answer"}); this is from what the agents' runs recorded, so uncommitted changes are not known`,
+          `could not reach the sprite to look (${work.unreachable ?? "no answer"}); this is from what the agents' runs recorded, so uncommitted changes are not known and the list may be incomplete`,
         ]
       : []),
   ];
@@ -203,10 +204,11 @@ export const env: AgentCommand = {
         if (env.claudeCredential !== null || env.claudeFallback !== "api-key") {
           lines.push(claudeLine(env));
         }
+        // `at` moves on every failure; `message` repeats `error`, so only the next step is printed
         if (env.health) {
           lines.push(
-            `health: unreachable since ${env.health.at}: ${env.health.error}`,
-            `  ${env.health.message}`,
+            `health: unreachable (last error ${env.health.at}): ${env.health.error}`,
+            `  if it stays that way, sky env rebuild ${env.id} rebuilds it`,
           );
         }
         if (env.failure) {
@@ -297,11 +299,17 @@ export const env: AgentCommand = {
           if (work === undefined) throw err;
           const lines = unpublishedLines(work);
           if (!values.force) {
-            if (out.json) throw err;
+            if (out.json) {
+              // the agents at risk stay fields, not prose, for a script to read
+              io.stderr(
+                `${JSON.stringify({ error: { code: "unpublished_work", ...work } })}\n`,
+              );
+              return 1;
+            }
             return out.fail(
               "unpublished_work",
               `${target.name} (${envId}) has work that exists only on its sprite, and a rebuild would lose it`,
-              `${lines.join("\n")}\npublish it first (the agent's own sky publish), or run sky env rebuild ${ref} --force to rebuild anyway and lose it`,
+              `${lines.join("\n")}\nhave each agent publish it first (for example sky agent follow-up ${work.agents[0]?.agentId} --prompt="publish your work"), or run sky env rebuild ${ref} --force to rebuild anyway and lose it`,
             );
           }
           out.progress(
@@ -312,6 +320,11 @@ export const env: AgentCommand = {
             return 1;
           }
           rebuilt = await api.rebuildEnvironment(envId, true);
+        }
+        if (rebuilt.rebuildCheck) {
+          out.warn(
+            `the sprite didn't answer (${rebuilt.rebuildCheck.unreachable}), so the check for unpublished work used what the agents' runs recorded and could not see uncommitted changes`,
+          );
         }
         out.result(rebuilt.raw, envLine(rebuilt.env));
         return 0;

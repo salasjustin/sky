@@ -191,6 +191,14 @@ export class ApiError extends Error {
 const requestTimeoutMs = 30_000;
 /** A switch to Codex waits for the server to install it on the sandbox when it's missing. */
 const codexSwitchTimeoutMs = 15 * 60_000;
+/** A rebuild answers after its unpublished-work check (up to SPRITES_TIMEOUT_MS in apps/api/src/sprites.ts) and the preview stop, both sprite calls. */
+const rebuildTimeoutMs = 3 * 60_000;
+
+/** On a rebuild's 202 when the sprite didn't answer the work check and the run records showed nothing at risk. */
+const RebuildCheck = z.object({
+  checked: z.literal("records"),
+  unreachable: z.string(),
+});
 
 export type Api = ReturnType<typeof createApi>;
 
@@ -499,15 +507,27 @@ export function createApi(config: Config) {
     },
     /**
      * Reprovisions a ready or failed env and keeps its agents; 409 `run_active`, `provisioning`, or
-     * `unpublished_work` (with the agents at risk) unless `force`.
+     * `unpublished_work` (with the agents at risk) unless `force`. `rebuildCheck` is set when the
+     * check could only read the run records, so uncommitted changes went unseen.
      */
     async rebuildEnvironment(id: string, force: boolean) {
       const { status, json } = await request(
         "POST",
         `/v1/environments/${encodeURIComponent(id)}/rebuild`,
         { force },
+        {
+          timeoutMs: rebuildTimeoutMs,
+          // the server goes on with the rebuild after the CLI gives up
+          timeoutHint: `the rebuild may still have started: check with sky env show ${id}`,
+        },
       );
-      return env(status, json);
+      const check = z
+        .object({ rebuildCheck: RebuildCheck.optional().catch(undefined) })
+        .safeParse(json);
+      return {
+        ...env(status, json),
+        rebuildCheck: check.success ? check.data.rebuildCheck : undefined,
+      };
     },
     async createWebhook(body: unknown) {
       const { status, json } = await request("POST", "/v1/webhooks", body);
