@@ -11,10 +11,22 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import type { Decision, RequestId, RunnerEventPost } from "@sky/shared";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { build } from "esbuild";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from "vitest";
+import type { BrokerDeps } from "./broker.js";
 import {
   AppServer,
   CODEX_PROVIDER,
@@ -179,7 +191,7 @@ describe("codexConfigToml", () => {
     expect(toml).toContain('env_key = "SKY_CODEX_GATEWAY_TOKEN"');
     expect(toml).toContain('wire_api = "responses"');
     expect(toml).toContain(
-      'exclude = ["SKY_CODEX_GATEWAY_TOKEN", "AI_GATEWAY_API_KEY"]',
+      'exclude = ["SKY_CODEX_GATEWAY_TOKEN", "AI_GATEWAY_API_KEY", "SKY_TOOLS_SOCKET", "SKY_TOOLS_SECRET"]',
     );
     // the project's own secrets reach its commands, as Claude Code's do
     expect(toml).toContain("ignore_default_excludes = true");
@@ -345,7 +357,7 @@ const { appendFileSync, writeFileSync } = require("node:fs");
 const { createInterface } = require("node:readline");
 const { join } = require("node:path");
 const log = (entry) => appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify(entry) + "\\n");
-log({ env: { key: process.env.AI_GATEWAY_API_KEY ?? null, gatewayToken: process.env.SKY_CODEX_GATEWAY_TOKEN ? "set" : null, home: process.env.CODEX_HOME, connector: process.env.GITHUB_CONNECTOR ?? null, token: process.env.AGENT_TOKEN ?? null, lastGitConfig: process.env["GIT_CONFIG_KEY_" + (process.env.GIT_CONFIG_COUNT - 1)] + "=" + process.env["GIT_CONFIG_VALUE_" + (process.env.GIT_CONFIG_COUNT - 1)], doopKey: process.env.DOOP_KEY }, marker: require("node:fs").existsSync(join(process.env.CODEX_HOME ?? "", "plugins", "marker")) });
+log({ env: { key: process.env.AI_GATEWAY_API_KEY ?? null, gatewayToken: process.env.SKY_CODEX_GATEWAY_TOKEN ? "set" : null, home: process.env.CODEX_HOME, connector: process.env.GITHUB_CONNECTOR ?? null, token: process.env.AGENT_TOKEN ?? null, lastGitConfig: process.env["GIT_CONFIG_KEY_" + (process.env.GIT_CONFIG_COUNT - 1)] + "=" + process.env["GIT_CONFIG_VALUE_" + (process.env.GIT_CONFIG_COUNT - 1)], doopKey: process.env.DOOP_KEY, toolsSocket: process.env.SKY_TOOLS_SOCKET ?? null, toolsSecret: process.env.SKY_TOOLS_SECRET ?? null }, marker: require("node:fs").existsSync(join(process.env.CODEX_HOME ?? "", "plugins", "marker")) });
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
 const waiting = new Map();
 let nextId = 100;
@@ -426,6 +438,37 @@ const scenarios = {
     // the turn outlasts a denial's steer, as the command scenario's does
     setTimeout(() => finish("completed"), 50);
   },
+  // Codex as a client of the MCP servers its config.toml names: starts the sky server as Codex does (its
+  // env_vars from Codex's own env, nothing else of it), lists its tools, and makes FAKE_CODEX_SKY_CALLS
+  async skyTools() {
+    const toml = require("node:fs").readFileSync(join(process.env.CODEX_HOME, "config.toml"), "utf8");
+    const table = toml.match(/\\[mcp_servers\\.sky\\]\\n([\\s\\S]*?)(?:\\n\\[|$)/)?.[1];
+    if (!table) { log({ mcp: null }); usage(1, 1); return finish("completed"); }
+    const field = (name) => JSON.parse(table.match(new RegExp("^" + name + " = (.*)$", "m"))[1]);
+    const envVars = field("env_vars");
+    const env = { PATH: process.env.PATH };
+    for (const name of envVars) if (process.env[name] !== undefined) env[name] = process.env[name];
+    const server = require("node:child_process").spawn(field("command"), field("args"), { env, stdio: ["pipe", "pipe", "inherit"] });
+    const open = new Map();
+    let mid = 1;
+    createInterface({ input: server.stdout }).on("line", (l) => { const r = JSON.parse(l); open.get(r.id)?.(r); });
+    const rpc = (method, params) => new Promise((res) => { const id = mid++; open.set(id, res); server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\\n"); });
+    await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake", version: "1" } });
+    server.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\\n");
+    const tools = (await rpc("tools/list", {})).result.tools;
+    const replies = [];
+    for (const c of JSON.parse(process.env.FAKE_CODEX_SKY_CALLS ?? "[]")) {
+      const item = (status) => ({ type: "mcpToolCall", id: "sky_" + replies.length, server: "sky", tool: c.tool, status, arguments: c.arguments, result: null, error: null, durationMs: 5 });
+      note("item/started", { threadId: thread, turnId: turn, startedAtMs: Date.now(), item: item("inProgress") });
+      const reply = (await rpc("tools/call", { name: c.tool, arguments: c.arguments })).result;
+      replies.push(reply);
+      note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: item(reply.isError ? "failed" : "completed") });
+    }
+    log({ mcp: { tools: tools.map((t) => t.name), schemas: tools, replies, envVars } });
+    server.stdin.end();
+    usage(10, 1);
+    setTimeout(() => finish("completed"), 50);
+  },
   async publish() {
     const reply = await ask("item/tool/call", { threadId: thread, turnId: turn, callId: "call_1", namespace: null, tool: "sky_publish", arguments: { title: "T" } });
     note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { type: "agentMessage", id: "msg_2", text: reply.contentItems[0].text } });
@@ -451,7 +494,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (m.id === undefined) return;
   switch (m.method) {
     case "initialize": return send({ id: m.id, result: { userAgent: "fake" } });
-    case "thread/start": cwd = m.params.cwd; return send({ id: m.id, result: { thread: { id: thread } } });
+    case "thread/start": cwd = m.params.cwd; if (process.env.FAKE_CODEX_MCP_STATUS) note("mcpServer/startupStatus/updated", JSON.parse(process.env.FAKE_CODEX_MCP_STATUS)); return send({ id: m.id, result: { thread: { id: thread } } });
     case "thread/resume":
       if (m.params.threadId !== thread) return send({ id: m.id, error: { code: -32600, message: "no rollout found" } });
       cwd = m.params.cwd; return send({ id: m.id, result: { thread: { id: thread } } });
@@ -672,6 +715,9 @@ describe("runCodexSession", () => {
       // the event token stays with the runner, and the commands' git runs no fsmonitor
       token: null,
       lastGitConfig: "core.fsmonitor=false",
+      // no connector, so no tools channel
+      toolsSocket: null,
+      toolsSecret: null,
     });
     const toml = readFileSync(join(root, "codex-home", "config.toml"), "utf8");
     expect(toml).toMatch(/base_url = "http:\/\/127\.0\.0\.1:\d+\/codex\/v1"/);
@@ -1357,6 +1403,387 @@ describe("runCodexSession", () => {
     const reply = sent().find((m) => m.id === 100)?.result;
     expect(reply.success).toBe(false);
     expect(reply.contentItems[0].text).toMatch(/GitHub connector/);
+  });
+
+  describe("sky_publish and sky_sync as the sky MCP server's tools", () => {
+    // the runner's own `codex-tools` command, bundled as the sprite's runner.mjs is, so Codex's stand-in
+    // starts the very server a run does
+    let toolsDir: string;
+    let toolsCommand: { command: string; args: string[] };
+    beforeAll(async () => {
+      toolsDir = mkdtempSync(join(tmpdir(), "runner-codex-tools-"));
+      const entry = join(toolsDir, "entry.ts");
+      const source = join(
+        dirname(fileURLToPath(import.meta.url)),
+        "codex-tools.ts",
+      );
+      writeFileSync(
+        entry,
+        `import { codexToolsMain } from ${JSON.stringify(source)};\nprocess.exitCode = await codexToolsMain([], process.env, { stdout: (s) => process.stdout.write(s) });\n`,
+      );
+      const outfile = join(toolsDir, "tools.mjs");
+      await build({
+        entryPoints: [entry],
+        bundle: true,
+        platform: "node",
+        format: "esm",
+        outfile,
+        logLevel: "silent",
+      });
+      toolsCommand = { command: process.execPath, args: [outfile] };
+    });
+    afterAll(() => rmSync(toolsDir, { recursive: true, force: true }));
+
+    const plan = {
+      localBranch: "claude/agt_1",
+      branch: "claude/agt_1",
+      base: "main",
+      head: "a".repeat(40),
+      mergeBase: "b".repeat(40),
+      commits: [{ sha: "a".repeat(40), subject: "Add a" }],
+      files: [{ path: "a.txt", added: 1, removed: 0 }],
+    };
+    let publishRun: ReturnType<
+      typeof vi.fn<NonNullable<BrokerDeps["publishRun"]>>
+    >;
+    let syncRun: ReturnType<typeof vi.fn<NonNullable<BrokerDeps["syncRun"]>>>;
+    beforeEach(() => {
+      publishRun = vi.fn(async (_values, _env, io, hooks) => {
+        await hooks?.review?.(plan as never);
+        io.stdout("https://github.com/o/r/pull/9\n");
+        return 0;
+      });
+      syncRun = vi.fn(async (_argv, _env, io) => {
+        io.stdout("origin/main is already at GitHub's tip; nothing moved.\n");
+        return 0;
+      });
+    });
+
+    const CALLS: { tool: string; arguments: Record<string, string> }[] = [
+      { tool: "sky_publish", arguments: { title: "T", body: "B" } },
+      { tool: "sky_sync", arguments: {} },
+    ];
+    const withTools = (
+      options: {
+        connector?: boolean;
+        signal?: AbortSignal;
+        scenario?: string;
+      } = {},
+    ) => {
+      config.sessionEnv.FAKE_CODEX_SCENARIO = options.scenario ?? "skyTools";
+      config.sessionEnv.FAKE_CODEX_SKY_CALLS = JSON.stringify(CALLS);
+      return runCodexSession(config, {
+        post,
+        awaitDecision,
+        signal: options.signal ?? new AbortController().signal,
+        warn: () => {},
+        codexEnv: { AI_GATEWAY_API_KEY: "gw-key" },
+        ...(options.connector !== false && {
+          connector: { GITHUB_CONNECTOR: "connector-secret" },
+        }),
+        seal,
+        bin,
+        stopGraceMs: 2_000,
+        toolsCommand,
+        brokerRuns: { publishRun, syncRun },
+      });
+    };
+    const mcpLog = () => sent().find((m) => "mcp" in m)?.mcp;
+    const approvals = () =>
+      ofType("run.waiting").map((e) =>
+        "toolName" in e.payload.request ? e.payload.request.toolName : "",
+      );
+
+    test.each([
+      ["a first run", undefined],
+      ["a follow-up on a resumed thread", "thr_1"],
+    ])(
+      "%s lists both tools and each call opens exactly one approval",
+      async (_, sessionId) => {
+        config.sessionId = sessionId;
+        expect(await withTools()).toBe(0);
+        const log = sent();
+        const opened = log.find((m) =>
+          ["thread/start", "thread/resume"].includes(m.method),
+        );
+        expect(opened.method).toBe(
+          sessionId ? "thread/resume" : "thread/start",
+        );
+        // the tools are the server's alone: Codex isn't offered a second copy
+        expect(opened.params.dynamicTools).toBeUndefined();
+        const { tools, replies } = mcpLog();
+        expect(tools).toEqual(["sky_publish", "sky_sync"]);
+        expect(replies).toEqual([
+          {
+            content: [{ type: "text", text: "https://github.com/o/r/pull/9" }],
+            isError: false,
+          },
+          {
+            content: [
+              {
+                type: "text",
+                text: "origin/main is already at GitHub's tip; nothing moved.",
+              },
+            ],
+            isError: false,
+          },
+        ]);
+        // one inbox approval per call, the broker's: Codex's own ask never reaches the person
+        expect(approvals()).toEqual(["Publish", "Sync"]);
+        expect(publishRun).toHaveBeenCalledOnce();
+        expect(publishRun.mock.calls[0]?.[0]).toMatchObject({
+          title: "T",
+          body: "B",
+        });
+        expect(syncRun).toHaveBeenCalledOnce();
+        expect(
+          ofType("claude.PreToolUse").map((e) => e.payload.toolName),
+        ).toEqual(["mcp__sky__sky_publish", "mcp__sky__sky_sync"]);
+        const toml = readFileSync(
+          join(root, "codex-home", "config.toml"),
+          "utf8",
+        );
+        expect(toml).toContain("[mcp_servers.sky]");
+        expect(toml).toContain(
+          'env_vars = ["SKY_TOOLS_SOCKET","SKY_TOOLS_SECRET"]',
+        );
+        expect(toml).toContain('default_tools_approval_mode = "approve"');
+      },
+    );
+
+    test("a call is approved with a token issued for it alone: the same tool can be called again", async () => {
+      CALLS.push({ tool: "sky_publish", arguments: { title: "T2" } });
+      try {
+        expect(await withTools()).toBe(0);
+      } finally {
+        CALLS.pop();
+      }
+      expect(
+        mcpLog().replies.map((r: { isError: boolean }) => r.isError),
+      ).toEqual([false, false, false]);
+      expect(publishRun).toHaveBeenCalledTimes(2);
+      expect(approvals()).toEqual(["Publish", "Sync", "Publish"]);
+    });
+
+    test("a denial declines the call with the person's reason and sends nothing", async () => {
+      decide = () => "deny-with-reason";
+      expect(await withTools()).toBe(0);
+      const { replies } = mcpLog();
+      expect(replies.map((r: { isError: boolean }) => r.isError)).toEqual([
+        true,
+        true,
+      ]);
+      expect(replies[0].content[0].text).toContain(
+        "not that file; nothing was sent",
+      );
+      expect(syncRun).not.toHaveBeenCalled();
+      expect(approvals()).toEqual(["Publish", "Sync"]);
+    });
+
+    test("no command sees the socket, the secret or a token: config.toml holds names only and keeps both out of commands' env", async () => {
+      expect(await withTools()).toBe(0);
+      const toml = readFileSync(
+        join(root, "codex-home", "config.toml"),
+        "utf8",
+      );
+      const held = sent()[0].env;
+      // Codex's own env holds them, to pass to the sky server by name
+      expect(held.toolsSecret).toMatch(/^[0-9a-f]{64}$/);
+      expect(held.toolsSocket).toMatch(/tools\.sock$/);
+      expect(toml).not.toContain(held.toolsSecret);
+      expect(toml).not.toContain(held.toolsSocket);
+      // the policy for every command: the whole env but these
+      expect(toml).toMatch(
+        /exclude = \[[^\]]*"SKY_TOOLS_SOCKET"[^\]]*"SKY_TOOLS_SECRET"[^\]]*\]/,
+      );
+      expect(toml).not.toContain("connector-secret");
+      expect(held.connector).toBeNull();
+      expect(held.token).toBeNull();
+      // the server saw exactly the two names it is passed, and nothing of the broker's
+      expect(mcpLog().envVars).toEqual([
+        "SKY_TOOLS_SOCKET",
+        "SKY_TOOLS_SECRET",
+      ]);
+      expect(toml).not.toContain("SKY_BROKER");
+      expect(JSON.stringify(events)).not.toContain(held.toolsSecret);
+    });
+
+    test("an environment that gains the connector after its first run publishes on the next follow-up", async () => {
+      expect(await withTools({ connector: false })).toBe(0);
+      expect(mcpLog()).toBeNull();
+      expect(
+        readFileSync(join(root, "codex-home", "config.toml"), "utf8"),
+      ).not.toContain("mcp_servers.sky");
+      rmSync(logFile);
+      events.length = 0;
+      config.sessionId = "thr_1";
+      expect(await withTools()).toBe(0);
+      expect(mcpLog().tools).toEqual(["sky_publish", "sky_sync"]);
+      expect(publishRun).toHaveBeenCalledOnce();
+    });
+
+    test("a run with no connector warns at launch that publish and sync are unavailable, and offers neither", async () => {
+      expect(await withTools({ connector: false })).toBe(0);
+      expect(mcpLog()).toBeNull();
+      const warnings = ofType("runner.warning").map((e) => e.payload.message);
+      expect(warnings).toEqual([
+        expect.stringMatching(
+          /^sky_publish and sky_sync are unavailable in this run: the environment has no GITHUB_CONNECTOR secret/,
+        ),
+      ]);
+      expect(approvals()).toEqual([]);
+    });
+
+    test("Codex's own ask for a sky tool is never the policy's to answer or a second inbox request, even when the policy names the tool", async () => {
+      config.approvalPolicy = ["mcp__sky__sky_publish", "mcp__sky__sky_sync"];
+      const ask = (tool: string, params: object) => ({
+        serverName: "sky",
+        mode: "form",
+        message: `Allow the sky MCP server to run tool ${tool}?`,
+        requestedSchema: { type: "object", properties: {} },
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          tool_name: tool,
+          tool_params: params,
+        },
+      });
+      config.sessionEnv.FAKE_CODEX_MCP = JSON.stringify({
+        calls: [
+          {
+            id: "m1",
+            server: "sky",
+            tool: "sky_publish",
+            arguments: { title: "T" },
+          },
+          { id: "m2", server: "sky", tool: "sky_sync", arguments: {} },
+        ],
+        asks: [ask("sky_publish", { title: "T" }), ask("sky_sync", {})],
+      });
+      expect(await withTools({ scenario: "mcpAsks" })).toBe(0);
+      expect(approvals()).toEqual([]);
+      const answers = sent().filter((m) => m.id === 100 || m.id === 101);
+      expect(answers.map((m) => m.result.action)).toEqual(["accept", "accept"]);
+    });
+
+    test("the auto-accept is only for server sky's publish and sync: another server's sky_publish and sky's other tools still wait for a person", async () => {
+      config.approvalPolicy = [
+        "mcp__other__sky_publish",
+        "mcp__sky__sky_other",
+      ];
+      decide = () => "deny";
+      const ask = (server: string, tool: string) => ({
+        serverName: server,
+        mode: "form",
+        message: `Allow the ${server} MCP server to run tool ${tool}?`,
+        requestedSchema: { type: "object", properties: {} },
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          tool_name: tool,
+          tool_params: {},
+        },
+      });
+      config.sessionEnv.FAKE_CODEX_MCP = JSON.stringify({
+        calls: [
+          { id: "m1", server: "other", tool: "sky_publish", arguments: {} },
+          { id: "m2", server: "sky", tool: "sky_other", arguments: {} },
+        ],
+        asks: [ask("other", "sky_publish"), ask("sky", "sky_other")],
+      });
+      expect(await withTools({ scenario: "mcpAsks" })).toBe(0);
+      expect(approvals()).toEqual([
+        "mcp__other__sky_publish",
+        "mcp__sky__sky_other",
+      ]);
+      const answers = sent().filter((m) => m.id === 100 || m.id === 101);
+      expect(answers.map((m) => m.result.action)).toEqual([
+        "decline",
+        "decline",
+      ]);
+    });
+
+    test("a sky server that fails to start is a runner.warning, even when Codex reports it as the thread opens", async () => {
+      config.sessionEnv.FAKE_CODEX_MCP_STATUS = JSON.stringify({
+        name: "sky",
+        status: "failed",
+        error: "spawn node ENOENT",
+      });
+      expect(await withTools({ scenario: "command" })).toBe(0);
+      expect(ofType("runner.warning").map((e) => e.payload.message)).toEqual([
+        "the sky MCP server (sky_publish and sky_sync) failed to start, so this run can't publish or sync: spawn node ENOENT",
+      ]);
+    });
+
+    test("a failure of another server named sky, in a run that serves no sky tools, is not this run's warning", async () => {
+      config.sessionEnv.FAKE_CODEX_MCP_STATUS = JSON.stringify({
+        name: "sky",
+        status: "failed",
+      });
+      expect(await withTools({ scenario: "command", connector: false })).toBe(
+        0,
+      );
+      expect(
+        ofType("runner.warning").some((e) =>
+          /sky MCP server/.test(e.payload.message),
+        ),
+      ).toBe(false);
+    });
+
+    test("the accept is only for a run that serves its own sky tools: with no connector a plugin's sky_publish waits for a person", async () => {
+      config.approvalPolicy = ["mcp__sky__sky_publish"];
+      decide = () => "deny";
+      config.sessionEnv.FAKE_CODEX_MCP = JSON.stringify({
+        calls: [
+          { id: "m1", server: "sky", tool: "sky_publish", arguments: {} },
+        ],
+        asks: [
+          {
+            serverName: "sky",
+            mode: "form",
+            message: "Allow the sky MCP server to run tool sky_publish?",
+            requestedSchema: { type: "object", properties: {} },
+            _meta: {
+              codex_approval_kind: "mcp_tool_call",
+              tool_name: "sky_publish",
+              tool_params: {},
+            },
+          },
+        ],
+      });
+      expect(await withTools({ scenario: "mcpAsks", connector: false })).toBe(
+        0,
+      );
+      expect(approvals()).toEqual(["mcp__sky__sky_publish"]);
+      expect(sent().find((m) => m.id === 100)?.result.action).toBe("decline");
+    });
+
+    test("Codex's commands are told it is a Codex run, by a name that is no secret, and the instructions say to use the tools", async () => {
+      expect(await withTools()).toBe(0);
+      expect(spawned[0]?.env.SKY_CODEX_RUN).toBe("1");
+      const instructions = sent().find((m) => m.method === "thread/start")
+        .params.developerInstructions;
+      expect(instructions).toContain("never a shell command");
+      expect(instructions).toContain("runner.mjs publish");
+    });
+
+    test("a base-profile server can't take the sky name", async () => {
+      config.mcpServers = {
+        sky: { type: "http", url: "https://mcp.test/", headers: {} },
+      } as Config["mcpServers"];
+      expect(await withTools()).toBe(0);
+      expect(
+        ofType("runner.warning").some((e) =>
+          /sky \(its name, which Sky's own publish and sync tools hold\)/.test(
+            e.payload.message,
+          ),
+        ),
+      ).toBe(true);
+      const toml = readFileSync(
+        join(root, "codex-home", "config.toml"),
+        "utf8",
+      );
+      expect(toml.match(/\[mcp_servers\.sky\]/g)).toHaveLength(1);
+      expect(toml).not.toContain("mcp.test");
+    });
   });
 
   test("resumes the session's thread", async () => {

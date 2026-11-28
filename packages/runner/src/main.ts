@@ -15,6 +15,7 @@ import {
   runCodexSession,
   withdrawCodexKey,
 } from "./codex.js";
+import { codexToolsMain } from "./codex-tools.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { takeConnector } from "./connector.js";
 import { removeSkyLogin } from "./credentials.js";
@@ -322,6 +323,10 @@ const commands: Record<
   publish: (argv, env) =>
     brokerPublishMain(argv, env, { cwd: process.cwd(), ...io }),
   sync: (argv, env) => brokerSyncMain(argv, env, { cwd: process.cwd(), ...io }),
+  // the stdio MCP server a Codex run starts for `sky_publish` and `sky_sync`: it holds no connector,
+  // only the run's tools socket and secret that Codex passes it
+  "codex-tools": (argv, env) =>
+    codexToolsMain(argv, env, { stdout: io.stdout }),
   "store-sync": (argv, env) => storeSyncMain(argv, env, io),
   "repo-pull": (argv, env) => repoPullMain(argv, env, io),
   "branch-check": (argv, env) => branchCheckMain(argv, env, io),
