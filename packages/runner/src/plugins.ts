@@ -74,12 +74,18 @@ export class OutputExceeded extends Error {
  * past `OUTPUT_MAX_BYTES`: the group is sent SIGTERM, then SIGKILL after `graceMs`, and the promise
  * rejects with the abort's reason, or an error naming the limit, once the command has closed and its
  * group is gone. Something that still holds on is given up on `KILL_WAIT_MS` after the SIGKILL, its
- * pipes destroyed so it can't hold the runner. A command that isn't cut settles once it has closed.
+ * pipes destroyed so it can't hold the runner. A command that isn't cut settles once it has closed;
+ * with `endGroup`, what it left running in its group is sent SIGKILL first.
  */
 export function runInGroup(
   file: string,
   args: string[],
-  options: { env: NodeJS.ProcessEnv; signal: AbortSignal; cwd?: string },
+  options: {
+    env: NodeJS.ProcessEnv;
+    signal: AbortSignal;
+    cwd?: string;
+    endGroup?: boolean;
+  },
   graceMs: number = KILL_GRACE_MS,
 ): Promise<{ stdout: string }> {
   const { signal } = options;
@@ -158,6 +164,8 @@ export function runInGroup(
         settleCutIfGone();
         return;
       }
+      // still tracked only if `exit` found the group there: a job the command put in the background
+      if (options.endGroup) killGroup(pid, "SIGKILL");
       done(() => {
         if (code === 0) settle({ stdout: output.stdout });
         else

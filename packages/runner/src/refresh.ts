@@ -148,7 +148,9 @@ const WRAPPER = 'exec >>"$1" 2>&1 && eval "$2"';
  * It runs with `env` as given, which the caller builds with `refreshEnv`: no more than the agent's
  * own, since the paths it runs were writable by an earlier run's agent. It leads its own process
  * group, which a cut (the budget's end or `signal`, the run's stop) sends SIGTERM and then SIGKILL, and
- * is waited on until the group is gone, before this resolves. It holds `lockFile`, a sibling of the
+ * which is waited on, a few seconds at most, before this resolves; a script that ends by itself has
+ * what it left running in the group sent SIGKILL, so nothing it started outlives it into the session
+ * (a `setsid` child leaves the group, and escapes both). It holds `lockFile`, a sibling of the
  * plugin refresh's lock, so two runs on a sprite never run two scripts into one Codex home at once;
  * the wait counts against the budget, and a run that waited on another's script skips its own, the
  * holder having just run it: `skipped`. Its output goes to `logFile` only; the record's `tail`
@@ -210,6 +212,7 @@ export async function runEnvRefresh(options: {
         {
           env,
           signal,
+          endGroup: true,
           ...(options.cwd !== undefined && { cwd: options.cwd }),
         },
         options.graceMs ?? KILL_GRACE_MS,

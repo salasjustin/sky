@@ -164,6 +164,19 @@ describe("a script that ends", () => {
     expect(record.reason).toBe("killed by SIGKILL");
   });
 
+  test("what it put in the background is ended with it, so nothing runs on into the session", async () => {
+    const pids = join(dir, "pids");
+    const record = await run(
+      `sleep 300 & echo $! >> '${pids}'; (trap '' TERM; sleep 300) & echo $! >> '${pids}'; echo started`,
+    );
+    expect(record).toMatchObject({ outcome: "ran", tail: "started" });
+    const children = readFileSync(pids, "utf8").trim().split("\n").map(Number);
+    expect(children).toHaveLength(2);
+    // SIGKILL is delivered before the record comes back; the kernel reaps within moments
+    await new Promise((r) => setTimeout(r, 100));
+    for (const pid of children) expect(gone(pid)).toBe(true);
+  });
+
   test("cwd is where the script runs", async () => {
     const record = await run("pwd", { cwd: dir });
     expect(record.tail).toBe(readFileSync(logFile, "utf8").trim());
