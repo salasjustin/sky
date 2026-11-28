@@ -340,8 +340,16 @@ function buildServer(call: Call) {
     "rebuild_env",
     {
       description:
-        "Rebuild a ready or failed environment's sprite from its repo and setup, keeping its agents: each starts a new worktree on its next run, from the GitHub branch it published to if there is one, else from the default branch, and its prompt says so. Use it when status with envId shows health unreachable (its sprite isn't answering), or to rerun setup on an environment that has agents. Refused with 409 run_active while a run is active and provisioning while it provisions. Refused with 409 unpublished_work, listing each agent with its branch and what is at risk (uncommitted files, commits not on GitHub, a branch never published), when work exists only on the sprite; checked says whether the sprite was looked at (sprite) or the answer comes from what the runs recorded because it couldn't be reached (records). Tell a person what is at risk. force: true rebuilds anyway and loses that work, so send it only when a person has said to. Provisioning is asynchronous: poll status with envId until it is ready. Needs the admin key.",
-      inputSchema: { envId: EnvironmentId, force: z.boolean().optional() },
+        "Rebuild a ready or failed environment's sprite from its repo and setup, keeping its agents: each starts a fresh session in a new worktree on its next run, from the first GitHub still has of the branch it was started on, the branch its runs recorded publishing to and its own claude/<agentId> branch, else from the default branch, and its prompt says so. The environment's preview ends. Use it when status with envId shows health unreachable (its sprite isn't answering), or to rerun setup on an environment that has agents. Refused with 409 run_active while a run is active and provisioning while it provisions. Refused with 409 unpublished_work, listing each agent with its branch and what is at risk (uncommitted files, commits not on GitHub, a branch never published), when work exists only on the sprite; checked says whether the sprite was looked at (sprite) or the answer comes from what the runs recorded because it couldn't be reached (records). Tell a person what is at risk. force: true rebuilds anyway and loses that work, so send it only when a person has said to. An accepted rebuild answers 202 with the environment; when its sprite couldn't be reached and the runs' records showed nothing at risk, it also carries rebuildCheck: { checked: records, unreachable }, where unreachable says why the sprite couldn't be reached. Uncommitted changes on the sprite could not be checked then, and the rebuild loses any there were: tell the person. Provisioning is asynchronous: poll status with envId until it is ready. Needs the admin key.",
+      inputSchema: {
+        envId: EnvironmentId,
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            "true rebuilds even when work exists only on the sprite, losing it. Set it only when a person has said to, after seeing what will be lost.",
+          ),
+      },
       annotations: { destructiveHint: true },
     },
     ({ envId, force }) =>
@@ -368,7 +376,7 @@ function buildServer(call: Call) {
     "followup",
     {
       description:
-        "Start the agent's next run once its current run has ended, resuming its session.",
+        "Start the agent's next run once its current run has ended, resuming its session. After rebuild_env (or a retry of its environment), the next run starts a fresh session in a new worktree instead, and its prompt tells the agent so. Refused with 502 branch_check_failed when GitHub couldn't be asked which branch that worktree starts from (try again).",
       inputSchema: { agentId: AgentId, prompt: nonEmpty },
     },
     ({ agentId, prompt }) =>

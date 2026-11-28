@@ -1280,6 +1280,32 @@ test("rebuild_env posts the env's rebuild with force off unless asked, and is li
   expect(tool?.annotations?.destructiveHint).toBe(true);
   expect(tool?.description).toMatch(/unpublished_work/);
   expect(tool?.description).toMatch(/only when a person has said to/);
+  const force = (tool?.inputSchema.properties?.force ?? {}) as {
+    description?: string;
+  };
+  expect(force.description).toMatch(/only when a person has said to/);
+});
+
+test("rebuild_env passes on the rebuildCheck an accepted rebuild that only read the records carries", async () => {
+  const env = {
+    id: "env_1",
+    name: "web",
+    status: "provisioning",
+    rebuildCheck: { checked: "records", unreachable: "sprite timed out" },
+  };
+  route("post", "/v1/environments/env_1/rebuild", 202, env);
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "rebuild_env",
+    arguments: { envId: "env_1" },
+  });
+  const { tools } = await client.listTools();
+
+  expect(result.isError).toBeFalsy();
+  expect(textOf(result)).toEqual(env);
+  const tool = tools.find((t) => t.name === "rebuild_env");
+  expect(tool?.description).toMatch(/rebuildCheck/);
 });
 
 test("rebuild_env hands back the refusal that names the work at risk", async () => {
