@@ -207,6 +207,24 @@ test("env delete refused by the API exits 1 with its message", async () => {
   expect(r.stderr).toBe("sky: a run is active (run_active)\n");
 });
 
+test("env delete refused by the API under --json prints only code and message", async () => {
+  server.use(
+    list,
+    deleteEnv(() =>
+      HttpResponse.json(
+        { error: { code: "run_active", message: "a run is active" } },
+        { status: 409 },
+      ),
+    ),
+  );
+  const r = await runCli(["env", "delete", "env_1", "--yes", "--json"]);
+  expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
+  expect(JSON.parse(r.stderr)).toEqual({
+    error: { code: "run_active", message: "a run is active" },
+  });
+});
+
 const webhooksFilter = (extra: Record<string, unknown>) =>
   deleteEnv(() =>
     HttpResponse.json(

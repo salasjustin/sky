@@ -323,6 +323,32 @@ test("env rebuild --json --yes --force carries the loss list in the JSON, and wr
   });
 });
 
+test("env rebuild --json --yes --force on a sprite-checked refusal carries the agents with their counts, checked on the sprite and no unreachable", async () => {
+  server.use(
+    list,
+    rebuild((body) =>
+      body.force
+        ? HttpResponse.json(rebuilding, { status: 202 })
+        : refused(atRisk),
+    ),
+  );
+  const r = await runCli([
+    "env",
+    "rebuild",
+    "web",
+    "--json",
+    "--yes",
+    "--force",
+  ]);
+  expect(r.code).toBe(0);
+  expect(r.stderr).toBe("");
+  const { lost } = JSON.parse(r.stdout);
+  expect(lost).toEqual({ agents: atRisk, checked: "sprite" });
+  expect(lost).not.toHaveProperty("unreachable");
+  expect(lost).not.toHaveProperty("message");
+  expect(bodies).toEqual([{ force: false }, { force: true }]);
+});
+
 test("env rebuild --force --yes lists what is lost, then rebuilds with force", async () => {
   server.use(
     list,

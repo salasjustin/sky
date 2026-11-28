@@ -1116,3 +1116,29 @@ test("a publish to a named branch notes that branch", async () => {
     branch: "feature/named",
   });
 });
+
+test("a publish that was approved but then failed notes nothing, so a rebuild doesn't count its commits as on GitHub", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const head = commit("Add a");
+  const { socketPath } = await broker(async () => approved, {
+    publishRun: async (_values, _env, _io, deps) => {
+      await deps?.review?.({
+        localBranch: "claude/agt_1",
+        branch: "feature/named",
+        base: "main",
+        head,
+        mergeBase: baseSha,
+        commits: [{ sha: head, subject: "Add a" }],
+        files: [{ path: "a.txt", added: 1, removed: 0 }],
+      });
+      return 1;
+    },
+  });
+  const { status } = await client(
+    brokerPublishMain,
+    ["--title", "T"],
+    socketPath,
+  );
+  expect(status).toBe(1);
+  expect(await readPublished(work, "claude/agt_1")).toBeUndefined();
+});
