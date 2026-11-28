@@ -50,9 +50,10 @@ const PROXY_TOKEN = /^SKY_[A-Z0-9_]*GATEWAY_TOKEN$/;
 
 /**
  * The env the script gets: the agent session's own (the runner's, once its credentials are taken out,
- * under the profile's `sessionEnv`), less what the session's commands don't hold either: the run's event token,
- * the Claude credential, the GitHub connector, the AI Gateway key and a model proxy's token. The script
- * runs from paths an earlier run's agent could have written, so it holds nothing the agent does not.
+ * under the profile's `sessionEnv`), less the run's event token, the Claude credential, the GitHub
+ * connector, the AI Gateway key and a model proxy's token. The session's commands hold none of them
+ * but the gateway key on a Claude Code run, which the script doesn't get either. The script runs from
+ * paths an earlier run's agent could have written, so it holds nothing the agent does not.
  */
 export function refreshEnv(
   env: NodeJS.ProcessEnv,

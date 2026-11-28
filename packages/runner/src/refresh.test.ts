@@ -83,7 +83,7 @@ describe("the env the script gets", () => {
     expect(env).toEqual({
       PATH: "/usr/bin",
       HOME: "/home/agent",
-      // what a Bash call of the session sees, the project's own secrets and the profile's variables included
+      // what the session's commands start from, the project's own secrets and the profile's variables included
       PROJECT_SECRET: "the-projects-own",
       SESSION_VAR: "from the profile",
     });

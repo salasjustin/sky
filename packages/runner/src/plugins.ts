@@ -164,7 +164,7 @@ export function runInGroup(
         settleCutIfGone();
         return;
       }
-      // still tracked only if `exit` found the group there: a job the command put in the background
+      // tracked still only when `exit` found the group alive, with a job the command left in the background
       if (options.endGroup) killGroup(pid, "SIGKILL");
       done(() => {
         if (code === 0) settle({ stdout: output.stdout });
