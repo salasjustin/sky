@@ -51,8 +51,8 @@ const help = (io: Io) => `Usage:
       Print "<id> <status> <repo> <name>" per environment.
   sky env show <env> [--yaml] [options]
       Print the same line for one environment (<env> is its id or name),
-      then its runtime, and a refresh line when it has a script; a failed one
-      adds the step it failed at and that step's stderr. --yaml prints
+      then its runtime, and a refresh line when it has a script; a failed
+      environment adds the step it failed at and that step's stderr. --yaml prints
       the environment as an env.yaml that sky apply takes as a no-op
       (every field, scripts as block scalars), with the runtime and the
       secrets' names, never their values, as comments.
