@@ -1879,15 +1879,24 @@ export class PiRpc {
     this.open.clear();
   }
 
-  /** Ends the process: closes its stdin, then SIGTERM, then SIGKILL 5 s later if it is still running. */
-  async close(): Promise<void> {
+  /**
+   * Ends the process the way pi asks to be ended: closes its stdin, which pi reads after everything
+   * already written (an `abort`, the answers to its open dialogs), and waits up to `graceMs` for it to
+   * exit on its own; then SIGTERM, then SIGKILL 5 s later if it is still running. Signalling at once
+   * could kill pi before it read those last writes, so the run would end with its blocked call unanswered.
+   */
+  async close(graceMs = 3_000): Promise<void> {
     const child = this.child;
     if (child.exitCode !== null || child.signalCode !== null) return;
     child.stdin?.end();
-    child.kill("SIGTERM");
-    const timer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    let kill: NodeJS.Timeout | undefined;
+    const term = setTimeout(() => {
+      child.kill("SIGTERM");
+      kill = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    }, graceMs);
     await this.exited;
-    clearTimeout(timer);
+    clearTimeout(term);
+    clearTimeout(kill);
   }
 
   private send(message: object): void {
