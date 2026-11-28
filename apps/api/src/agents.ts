@@ -776,9 +776,7 @@ export function agentRoutes(
         spriteName: outcome.env.spriteName,
         agentId: id,
         runId,
-        prompt: outcome.fresh
-          ? `${rebuiltNote(rebuilt)}${prompt}`
-          : prompt,
+        prompt: outcome.fresh ? `${rebuiltNote(rebuilt)}${prompt}` : prompt,
         sessionId: outcome.agent.sessionId,
         approvalPolicy: outcome.env.approvalPolicy,
         autoApprove: outcome.env.autoApprove,

@@ -1307,7 +1307,9 @@ test("rebuild_env passes on the rebuildCheck an accepted rebuild that only read 
   const tool = tools.find((t) => t.name === "rebuild_env");
   expect(tool?.description).toMatch(/rebuildCheck/);
   expect(tool?.description).toMatch(/records, with unreachable saying why/);
-  expect(tool?.description).toMatch(/every unarchived agent that has had a run/);
+  expect(tool?.description).toMatch(
+    /every unarchived agent that has had a run/,
+  );
   expect(tool?.description).toMatch(
     /uncommitted, unpublishedCommits and neverPublished null/,
   );
