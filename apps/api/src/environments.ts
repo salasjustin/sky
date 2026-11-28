@@ -40,6 +40,7 @@ const {
   name,
   repo,
   setup,
+  refresh,
   base,
   concurrency,
   approvalPolicy,
@@ -52,6 +53,7 @@ const EnvironmentInput = z.strictObject({
   name,
   repo,
   setup,
+  refresh,
   base,
   concurrency,
   approvalPolicy,
@@ -67,6 +69,7 @@ const EnvironmentPatch = z.strictObject({
   name: name.optional(),
   repo: repo.optional(),
   setup: setup.optional(),
+  refresh: refresh.unwrap().optional(),
   base: base.unwrap().optional(),
   concurrency: concurrency.unwrap().optional(),
   approvalPolicy: approvalPolicy.unwrap().optional(),
@@ -92,6 +95,7 @@ const present = (row: EnvRow) => ({
     name: row.name,
     repo: row.repo,
     setup: row.setup,
+    refresh: row.refresh,
     base: row.base,
     status: row.status,
     spriteName: row.spriteName,
@@ -319,6 +323,7 @@ export function environmentRoutes(
               const env = findEnv(tx, id);
               if (!env) return { kind: "not_found" } as const;
               if (hasActiveRun(tx, id)) return { kind: "run_active" } as const;
+              // `refresh` is not here: it runs before each run, so a change reaches the next one as it is
               const reprovision =
                 (patch.repo !== undefined && patch.repo !== env.repo) ||
                 (patch.setup !== undefined && patch.setup !== env.setup) ||

@@ -2,6 +2,7 @@ import { zValidator } from "@hono/zod-validator";
 import { agents, type Db, events, runRequests, runs } from "@sky/db";
 import {
   canTransition,
+  EnvRefresh,
   EVENT_TEXT_MAX,
   type EventType,
   type PendingRequest,
@@ -131,21 +132,28 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
- * `RunnerEventPost`, except a rollup that fails `RunRollup`, or a `run.started`'s plugin record that
- * fails `PluginRefresh`, is dropped with a log line rather than failing the event.
+ * `RunnerEventPost`, except a rollup that fails `RunRollup`, or a `run.started`'s plugin or refresh
+ * record that fails `PluginRefresh` or `EnvRefresh`, is dropped with a log line rather than failing the event.
  */
 const eventPost = (log: (line: string) => void) =>
   z.preprocess((raw) => {
     if (!isRecord(raw) || !isRecord(raw.payload)) return raw;
     if (raw.type === "run.started") {
-      const { plugins, ...payload } = raw.payload;
-      if (plugins === undefined) return raw;
-      const parsed = PluginRefresh.safeParse(plugins);
-      if (parsed.success) return raw;
-      log(
-        `dropped unparseable plugin record on run.started for ${JSON.stringify(raw.runId)}: ${z.prettifyError(parsed.error)}`,
-      );
-      return { ...raw, payload };
+      const { plugins, refresh, ...payload } = raw.payload;
+      const kept: Record<string, unknown> = { ...payload };
+      for (const [name, label, value, schema] of [
+        ["plugins", "plugin", plugins, PluginRefresh],
+        ["refresh", "env refresh", refresh, EnvRefresh],
+      ] as const) {
+        if (value === undefined) continue;
+        const parsed = schema.safeParse(value);
+        if (parsed.success) kept[name] = value;
+        else
+          log(
+            `dropped unparseable ${label} record on run.started for ${JSON.stringify(raw.runId)}: ${z.prettifyError(parsed.error)}`,
+          );
+      }
+      return { ...raw, payload: kept };
     }
     if (raw.type !== "run.finished" && raw.type !== "run.failed") return raw;
     const { rollup, ...payload } = raw.payload;

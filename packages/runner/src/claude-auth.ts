@@ -138,7 +138,10 @@ export function claudeProcessEnv(
 
 // what the API launches the runner with to hand the session its credential: the subscription token, or
 // Sky's API key under a name of its own
-const CREDENTIAL_VARIABLES = ["SKY_CLAUDE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
+export const CREDENTIAL_VARIABLES = [
+  "SKY_CLAUDE_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+];
 
 /**
  * Takes the run's Claude credential out of `env` and returns it, so the runner's own children, such as

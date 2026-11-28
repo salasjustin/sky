@@ -119,6 +119,7 @@ test("a spec's hash changes with its base", () => {
     name: "web",
     repo: "acme/web",
     setup: "x",
+    refresh: "",
     concurrency: 3,
     approvalPolicy: [],
     autoApprove: { defaults: true, commands: [] },
@@ -126,6 +127,19 @@ test("a spec's hash changes with its base", () => {
   expect(specHash({ ...base, base: null })).not.toBe(
     specHash({ ...base, base: "acme" }),
   );
+});
+
+test("refresh stays absent when the file omits it, and an empty one is kept", () => {
+  const omitted = parseSpec(
+    "name: web\nrepo: acme/web\nsetup: x\n",
+    "env.yaml",
+  );
+  expect(omitted.ok && "refresh" in omitted.spec).toBe(false);
+  const empty = parseSpec(
+    'name: web\nrepo: acme/web\nsetup: x\nrefresh: ""\n',
+    "env.yaml",
+  );
+  expect(empty.ok && empty.spec.refresh).toBe("");
 });
 
 test("the Claude fields stay absent when the file omits them, and are read when it names them", () => {

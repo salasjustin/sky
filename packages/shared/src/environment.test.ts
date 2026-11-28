@@ -14,6 +14,7 @@ const env = {
 test("accepts an environment and defaults its cap and approval policy", () => {
   expect(Environment.parse(env)).toEqual({
     ...env,
+    refresh: "",
     base: null,
     concurrency: 3,
     approvalPolicy: [],

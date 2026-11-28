@@ -20,6 +20,7 @@ const spec = {
 const env = (over: Record<string, unknown> = {}) => ({
   id: "env_1",
   ...spec,
+  refresh: "",
   claudeCredential: null,
   claudePool: null,
   claudeFallback: "api-key",
@@ -134,6 +135,68 @@ test("patches only the changed fields", async () => {
   expect(writes).toEqual([{ method: "PATCH", body: { concurrency: 5 } }]);
   expect(r.sleeps).toEqual([]);
   expect(lock().specHash).toBe(specHash({ ...spec, concurrency: 5 }));
+});
+
+test("a changed refresh is patched alone, a change that never reprovisions", async () => {
+  writeFileSync(file, `${yaml}refresh: |\n  git -C ~/k pull --ff-only\n`);
+  server.use(
+    list(env()),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, env({ refresh: "git -C ~/k pull --ff-only\n" })),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([
+    { method: "PATCH", body: { refresh: "git -C ~/k pull --ff-only\n" } },
+  ]);
+  expect(r.sleeps).toEqual([]);
+});
+
+test('a file that omits refresh keeps the one the env has, and refresh: "" in the file clears it', async () => {
+  server.use(
+    list(env({ refresh: "git pull" })),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, env({ refresh: "" })),
+    ),
+  );
+  // no refresh in the file: nothing to change, so no write
+  writeFileSync(
+    lockFile,
+    JSON.stringify({
+      envId: "env_1",
+      spriteName: "x",
+      checkpointId: "y",
+      specHash: "z",
+    }),
+  );
+  server.use(getSequence(env({ refresh: "git pull" })));
+  const kept = await runCli(["apply", file]);
+  expect(kept.stdout).toBe("up to date web env_1\n");
+  expect(writes).toEqual([]);
+  // an explicit empty one clears it
+  writeFileSync(file, `${yaml}refresh: ""\n`);
+  const cleared = await runCli(["apply", file]);
+  expect(cleared.code).toBe(0);
+  expect(writes).toEqual([{ method: "PATCH", body: { refresh: "" } }]);
+});
+
+test("an unchanged refresh is up to date", async () => {
+  writeFileSync(file, `${yaml}refresh: x\n`);
+  writeFileSync(
+    lockFile,
+    JSON.stringify({
+      envId: "env_1",
+      spriteName: "x",
+      checkpointId: "y",
+      specHash: "z",
+    }),
+  );
+  server.use(getSequence(env({ refresh: "x" })));
+  const r = await runCli(["apply", file]);
+  expect(r.stdout).toBe("up to date web env_1\n");
 });
 
 const poolSetByHand = {
