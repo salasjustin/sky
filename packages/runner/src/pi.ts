@@ -1430,8 +1430,14 @@ export async function runPiSession(
     const scope = {
       root: cwd,
       cwd,
-      realpath: (p: string) => p,
-      isSymlink: () => false,
+      realpath: realpathSync.native,
+      isSymlink: (path: string) => {
+        try {
+          return lstatSync(path).isSymbolicLink();
+        } catch {
+          return false;
+        }
+      },
       home: sessionEnv.HOME ?? "/",
       storeHome: config.storeHome,
       scratch,

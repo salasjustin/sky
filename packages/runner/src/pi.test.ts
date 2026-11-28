@@ -1671,6 +1671,41 @@ describe("runPiSession", () => {
     });
   });
 
+  test("a write through a link out of the worktree is held, and the same write in a directory of its own self-approves", async () => {
+    const origin = join(root, "origin");
+    mkdirSync(join(root, "outside"));
+    symlinkSync(join(root, "outside"), join(origin, "out"));
+    mkdirSync(join(origin, "inside"));
+    writeFileSync(join(origin, "inside/.keep"), "");
+    git(origin, "add", ".");
+    git(
+      origin,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "commit",
+      "-qm",
+      "link",
+    );
+    git(config.repoDir, "fetch", "-q", "origin");
+    config.sessionEnv.FAKE_PI_COMMANDS = JSON.stringify([
+      "mkdir out/x",
+      "mkdir inside/x",
+    ]);
+    expect(await run("commands")).toBe(0);
+    const asked = ofType("run.waiting").map((e) => e.payload.request);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({
+      toolName: "Bash",
+      toolSummary: "mkdir out/x",
+    });
+    const inside = ofType("claude.PreToolUse").find(
+      (e) => e.payload.toolUseId === "t1",
+    );
+    expect(inside?.payload.autoApproved).toMatchObject({ verdict: "approved" });
+  });
+
   test("a held command opens one approval with the real command, and runs when approved", async () => {
     expect(await run()).toBe(0);
     const waiting = ofType("run.waiting");
