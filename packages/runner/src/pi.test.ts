@@ -549,6 +549,18 @@ describe("piOutcome", () => {
     expect(outcome(["Bash"], "bash", { command: "ls; rm x" })).toBe("hold");
   });
 
+  test.each([
+    "wc -l src/*.ts",
+    "grep -rn foo src",
+    "bash -lc 'cat *'",
+    "timeout 5 grep -r foo .",
+  ])(
+    "a bare Bash pattern holds %s, since this scope has no directory hook",
+    (command) => {
+      expect(outcome(["Bash"], "bash", { command })).toBe("hold");
+    },
+  );
+
   test("a read-only command inside the shell wrapper still self-approves", () => {
     expect(
       outcome(["Bash"], "bash", { command: "bash -lc 'git status'" }),
@@ -1728,6 +1740,55 @@ describe("runPiSession", () => {
       (e) => e.payload.toolUseId === "t1",
     );
     expect(inside?.payload.autoApproved).toMatchObject({ verdict: "approved" });
+    const through = ofType("claude.PreToolUse").find(
+      (e) => e.payload.toolUseId === "t0",
+    );
+    expect(through).toBeDefined();
+    expect(through?.payload.autoApproved).toBeUndefined();
+  });
+
+  test("a glob and grep -r are held, since pi's scope has no directory hook", async () => {
+    const origin = join(root, "origin");
+    mkdirSync(join(origin, "src"));
+    writeFileSync(join(origin, "src/a.ts"), "foo\n");
+    git(origin, "add", ".");
+    git(
+      origin,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "commit",
+      "-qm",
+      "src",
+    );
+    git(config.repoDir, "fetch", "-q", "origin");
+    config.sessionEnv.FAKE_PI_COMMANDS = JSON.stringify([
+      "wc -l src/*.ts",
+      "grep -rn foo src",
+      "cat src/a.ts",
+    ]);
+    expect(await run("commands")).toBe(0);
+    const asked = ofType("run.waiting").map((e) => e.payload.request);
+    expect(asked).toHaveLength(2);
+    expect(asked[0]).toMatchObject({
+      toolName: "Bash",
+      toolSummary: "wc -l src/*.ts",
+    });
+    expect(asked[1]).toMatchObject({
+      toolName: "Bash",
+      toolSummary: "grep -rn foo src",
+    });
+    const pre = ofType("claude.PreToolUse");
+    for (const id of ["t0", "t1"]) {
+      const call = pre.find((e) => e.payload.toolUseId === id);
+      expect(call).toBeDefined();
+      expect(call?.payload.autoApproved).toBeUndefined();
+    }
+    const control = pre.find((e) => e.payload.toolUseId === "t2");
+    expect(control?.payload.autoApproved).toMatchObject({
+      verdict: "approved",
+    });
   });
 
   test("a held command opens one approval with the real command, and runs when approved", async () => {
