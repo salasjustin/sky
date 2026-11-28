@@ -334,6 +334,58 @@ describe("the env's refresh script", () => {
     30_000,
   );
 
+  test.each([
+    ["installed", true, 0],
+    ["missing", false, 1],
+  ])(
+    "a Codex run whose plugin is %s posts the warning once, or none, and goes on",
+    async (_, installed, warnings) => {
+      const runs = mkdtempSync(join(tmpdir(), "runner-main-plugin-"));
+      const codexHome = join(runs, "codex");
+      if (installed)
+        mkdirSync(join(codexHome, "plugins/cache/kru/kru/0.1.0"), {
+          recursive: true,
+        });
+      const bodies: { type: string; payload: { message?: string } }[] = [];
+      const api = createServer((req, res) => {
+        let body = "";
+        req.on("data", (d) => (body += d));
+        req.on("end", () => {
+          bodies.push(JSON.parse(body));
+          res.writeHead(204).end();
+        });
+      });
+      api.listen(0, "127.0.0.1");
+      await once(api, "listening");
+      const { port } = api.address() as AddressInfo;
+      try {
+        const { code } = await runBundle({
+          ...runEnv(`http://127.0.0.1:${port}`, join(runs, "p.prompt")),
+          SKY_RUNTIME: "codex",
+          AI_GATEWAY_API_KEY: "gateway-secret",
+          SKY_CODEX_HOME: codexHome,
+          SKY_CODEX_PLUGINS: "kru@kru",
+        });
+        // the run goes on to its own end: no worktree here
+        expect(code).toBe(1);
+        const posted = bodies
+          .filter((b) => b.type === "runner.warning")
+          .map((b) => b.payload.message)
+          .filter((m) => m?.startsWith("codex plugin"));
+        expect(posted).toHaveLength(warnings);
+        if (!installed)
+          expect(posted[0]).toMatch(
+            /^codex plugin kru@kru is not installed in .*codex; the session runs without it$/,
+          );
+      } finally {
+        api.closeAllConnections();
+        api.close();
+        rmSync(runs, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
   test("a run whose env has none runs no refresh", async () => {
     const runs = mkdtempSync(join(tmpdir(), "runner-main-none-"));
     const api = createServer((req, res) => {

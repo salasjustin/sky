@@ -8,7 +8,11 @@ import {
   sweepCredentialFiles,
   withdrawCredential,
 } from "./claude-auth.js";
-import { runCodexSession, withdrawCodexKey } from "./codex.js";
+import {
+  missingCodexPluginWarnings,
+  runCodexSession,
+  withdrawCodexKey,
+} from "./codex.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { takeConnector } from "./connector.js";
 import { removeSkyLogin } from "./credentials.js";
@@ -216,6 +220,15 @@ async function main(): Promise<void> {
           if (warning) warningReporter(post, config.runId)(warning);
           return record;
         });
+  // Codex skips an enabled plugin that isn't installed and only logs it, so the run says so; it goes on
+  if (codex && !controller.signal.aborted && config.codexPlugins)
+    for (const message of missingCodexPluginWarnings(config.codexPlugins, {
+      ...process.env,
+      ...config.sessionEnv,
+    })) {
+      warn(`runner: ${message}`);
+      warningReporter(post, config.runId)(message);
+    }
   // a Codex run skips the plugin refresh: it runs `claude`, whose plugins Codex doesn't load
   const pluginRefresh =
     controller.signal.aborted || codex

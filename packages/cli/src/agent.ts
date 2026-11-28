@@ -38,6 +38,7 @@ type Values = {
   port?: string;
   ttl?: string;
   stop?: boolean;
+  yaml?: boolean;
 };
 /** Makes the command's requests; everything argv can get wrong is already rejected. */
 type Action = (api: Api, io: Io, out: Output) => Promise<number>;

@@ -94,7 +94,8 @@ Creates or updates the environment `env.yaml` describes, waits until it's provis
 name: web
 repo: owner/name # GitHub repo, cloned once per environment
 setup: pnpm install # shell script run once after the clone
-refresh: "" # optional: shell script every run runs first (see Per-run refresh)
+refresh: | # optional: shell script every run runs first (see Per-run refresh)
+  git -C "$HOME/tools" pull --ff-only
 base: team # optional: a base profile the server defines (see Base profiles)
 concurrency: 3 # agents running at once (default 3)
 approvalPolicy: [Bash] # tool names whose calls wait for your approval
@@ -106,7 +107,7 @@ claudePool: [work, personal] # optional, with claudeCredential: pool: the subscr
 claudeFallback: api-key # optional: api-key or none, what a run does while its subscription is at its limit
 ```
 
-The Claude fields are optional. A field the file omits keeps the environment's current value, so `sky apply` never undoes a `sky env set-claude`, and deleting `claudeCredential` from the file doesn't move an environment back to the default token: write `claudeCredential: default` for that. A new environment gets the defaults (the default token, every subscription if it is a pool, `api-key`).
+The Claude fields and `refresh` are optional. A field the file omits keeps the environment's current value, so `sky apply` never undoes a `sky env set-claude` or a `sky env set-refresh`; `refresh: ""` in the file clears the script, and deleting `claudeCredential` from the file doesn't move an environment back to the default token: write `claudeCredential: default` for that. A new environment gets the defaults (the default token, every subscription if it is a pool, `api-key`).
 
 `setup` runs in the clone with bash, with pnpm and yarn on `PATH` and `SKY_CLAUDE` set to the `claude` binary agents run. After it, Sky installs the plugins the repo's `.claude/settings.json` enables in `enabledPlugins`, from the marketplaces its `extraKnownMarketplaces` declares. If a plugin comes from a marketplace that isn't declared there, add the marketplace in `setup`:
 
@@ -131,6 +132,8 @@ sky secret list web             # names and kinds; values are never printed
 sky secret delete web NPM_TOKEN
 sky env list                    # id, status, repo and name per environment
 sky env show web                # one env; a failed one shows its step and stderr
+sky env show web --yaml         # the env as an env.yaml sky apply takes as a no-op
+sky env set-refresh web @refresh.sh  # the script every run runs first; - reads stdin, empty clears
 sky env retry web               # provision a failed env again
 sky env set-runtime web codex   # admin only: run web on Codex (or claude-code); see "Switching runtime"
 sky env delete web              # destroy its sandbox, agents, runs and events; asks first
@@ -262,15 +265,13 @@ A run on Codex runs OpenAI's Codex CLI instead of Claude Code, with the model se
 - **Plugins.** `SKY_CODEX_PLUGINS` lists the Codex plugins a run turns on, as `<plugin>@<marketplace>` separated by commas. The environment's `setup` installs them under the run's Codex home, `$HOME/.sky/codex` (or `SKY_CODEX_HOME`): before each run Sky rewrites `config.toml` there and deletes `hooks.json`, and other files a setup puts there, such as plugins under `plugins/cache/` and agent roles under `agents/`, stay. With plugins named, Codex runs hooks without its one-time trust prompt, which a run has no one to answer, so a setup's hooks go in a plugin: a `hooks.json` in the Codex home could have been written by an earlier run's agent. A plugin that changes upstream stays current through the environment's `refresh` script (see [Per-run refresh](#per-run-refresh)), which runs before that rewrite. For [kru-codex](https://github.com/salasjustin/kru-codex), Kru packaged for Codex:
 
   ```yaml
-  setup: |
-    git clone https://github.com/salasjustin/kru-codex "$HOME/.sky/kru-codex"
-    bash "$HOME/.sky/kru-codex/scripts/build-codex.sh" --install "$HOME/.sky/codex"
   refresh: |
+    [ -d "$HOME/.sky/kru-codex/.git" ] || git clone https://github.com/salasjustin/kru-codex "$HOME/.sky/kru-codex"
     git -C "$HOME/.sky/kru-codex" pull --ff-only
     bash "$HOME/.sky/kru-codex/scripts/build-codex.sh" --install "$HOME/.sky/codex"
   ```
 
-  with the environment secret `SKY_CODEX_PLUGINS=kru@kru`. A change merged to kru-codex reaches the next run, with no reprovisioning. Without a `refresh` it would reach none until the environment is reprovisioned, which `sky apply` refuses while an unarchived agent exists.
+  with the environment secret `SKY_CODEX_PLUGINS=kru@kru`. No `setup` line is needed: the refresh makes the first install and every update, so an environment that already has agents gets the plugin this way, with no reprovisioning (a `setup` change is refused with `agents_exist` while an unarchived agent exists, since it removes every worktree), and a change merged to kru-codex reaches the next run. Set it on a running environment with `sky env set-refresh <env> @refresh.sh`. If a plugin named in `SKY_CODEX_PLUGINS` isn't installed (nothing under `plugins/cache/<marketplace>/<plugin>/` in the Codex home) after the refresh, the run posts one `runner.warning` per plugin (`codex plugin kru@kru is not installed in $HOME/.sky/codex; the session runs without it`) and goes on: Codex itself skips an enabled plugin that isn't installed and only logs it.
 - **Not carried over** from Claude Code runs: the base profile's MCP servers, background tasks, the default git identity, and the outside-read gate (Codex runs commands it counts as read-only, such as `cat` and `ls`, without asking).
 - **No Claude credential.** A Codex launch never picks a Claude credential, so a limited subscription, a pool with nothing left or `claudeFallback: none` doesn't stop it, and its failures are never retried on another credential.
 
@@ -296,7 +297,7 @@ sky env show web                       # shows `runtime: …`
 
 ### Per-run refresh
 
-`refresh` is a shell script on the environment, in `env.yaml`, `POST` and `PATCH /v1/environments/:id`, and the `create_env` MCP tool. Where `setup` runs once, at provisioning, `refresh` runs before every run, on every runtime (Claude Code and Codex), so what `setup` installed can follow its upstream without a reprovision. Empty, the default, is none. Changing it never reprovisions: it takes effect for the next run, it is allowed while agents exist, and it is refused only while a run on the environment is active. `sky env show` says whether one is set, without printing it.
+`refresh` is a shell script on the environment, in `env.yaml`, `POST` and `PATCH /v1/environments/:id`, and the `create_env` MCP tool. Where `setup` runs once, at provisioning, `refresh` runs before every run, on every runtime (Claude Code and Codex), so what `setup` installed can follow its upstream without a reprovision. Empty, the default, is none. Changing it never reprovisions: it takes effect for the next run, it is allowed while agents exist (those holding unpublished commits included: no worktree is touched), and it is refused only while a run on the environment is active. A file that leaves `refresh` out keeps the environment's script; `refresh: ""` clears it. `sky env set-refresh <env> <@file|->` sets just this field, reading a file or stdin; an empty one clears it. `sky env show` says whether one is set, without printing it, and `sky env show <env> --yaml` prints the whole environment as an `env.yaml` that `sky apply` takes as a no-op (every field, scripts as block scalars, the runtime and the secrets' names, never their values, as comments), so a PM can export the config of an environment nobody has the file for.
 
 - **When.** After the sprite is held and the Kru store pulled, before the Claude plugin refresh below (so a refresh that adds a marketplace or plugin gets it updated in the same run) and before Codex's `config.toml` is rewritten (so the plugin it installs is the one the session loads). A stop before or during it ends it.
 - **Rights.** It runs as the sprite's agent user, from paths an earlier run's agent could have written (`$HOME/.sky/kru-codex` is the agent's), so the refresh runs with the agent's own rights and can't be used to lift anything past them. It gets the env a Bash call of the session has, the base profile's `sessionEnv` included, and not the Claude credential, `GITHUB_CONNECTOR` and `GITHUB_GATEWAY_URL`, `AI_GATEWAY_API_KEY`, the run's event token, or the Codex proxy token, as with the plugin refresh and the store's `setup.sh` (see [Pull requests](#pull-requests)). It is neither sealed nor pinned.

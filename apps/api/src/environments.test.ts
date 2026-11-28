@@ -1700,6 +1700,47 @@ test("POST stores a refresh script, which GET returns, and a PATCH of it changes
   });
 });
 
+test("a PATCH of refresh alone succeeds on an env with many agents, one holding unpublished commits, and touches no sprite", async () => {
+  const id = await ready();
+  for (let i = 0; i < 27; i++) {
+    db.$client
+      .prepare(
+        "insert into agents (id, env_id, branch, status) values (?, ?, ?, 'idle')",
+      )
+      .run(`agt_many${i}`, id, `claude/agt_many${i}`);
+  }
+  // a finished run whose commits were never published: nothing but this sprite holds them
+  db.$client
+    .prepare(
+      "insert into runs (id, agent_id, status, rollup) values (?, ?, 'finished', ?)",
+    )
+    .run(
+      "run_unpublished",
+      "agt_many0",
+      JSON.stringify({
+        base: "b".repeat(40),
+        run: { commits: [{ sha: "1".repeat(40), subject: "fix" }] },
+      }),
+    );
+  // the same env refuses a setup change, which would remove those worktrees
+  expect((await patch(id, { setup: "make" })).status).toBe(409);
+  const script = `[ -d "$HOME/.sky/kru-codex/.git" ] || git clone https://github.com/salasjustin/kru-codex "$HOME/.sky/kru-codex"\ngit -C "$HOME/.sky/kru-codex" pull --ff-only\n`;
+  const res = await patch(id, { refresh: script });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({
+    status: "ready",
+    checkpointId: "v1",
+    refresh: script,
+  });
+  expect(wire.calls).toEqual([]);
+  const agents = db.$client
+    .prepare(
+      "select count(*) as n from agents where env_id = ? and archived_at is null",
+    )
+    .get(id) as { n: number };
+  expect(agents.n).toBe(27);
+});
+
 test("PATCH of refresh is 409 while a run is active, and a refresh over its bound is 400", async () => {
   const id = await ready();
   expect((await patch(id, { refresh: "x".repeat(20_001) })).status).toBe(400);

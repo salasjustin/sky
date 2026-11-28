@@ -34,6 +34,7 @@ import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   mkdirSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -145,6 +146,48 @@ export function withdrawCodexKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     delete env[CODEX_KEY_ENV];
   }
   return held;
+}
+
+/** The run's Codex home: `SKY_CODEX_HOME`, else `$HOME/.sky/codex`. */
+export function codexHomeOf(env: NodeJS.ProcessEnv): string {
+  return env.SKY_CODEX_HOME || join(env.HOME || homedir(), ".sky", "codex");
+}
+
+/**
+ * The warnings for plugins `SKY_CODEX_PLUGINS` turns on that the Codex home doesn't hold. Codex skips an
+ * enabled plugin that isn't installed and only logs `failed to load plugin: plugin is not installed`,
+ * which nobody reads, so the run says so. A plugin `<plugin>@<marketplace>` is installed when
+ * `plugins/cache/<marketplace>/<plugin>/` holds anything (its version directory).
+ */
+export function missingCodexPluginWarnings(
+  plugins: readonly string[],
+  env: NodeJS.ProcessEnv,
+): string[] {
+  const codexHome = codexHomeOf(env);
+  const home = env.HOME || homedir();
+  const shown =
+    codexHome === home || codexHome.startsWith(`${home}/`)
+      ? `$HOME${codexHome.slice(home.length)}`
+      : codexHome;
+  return plugins.flatMap((id) => {
+    const at = id.lastIndexOf("@");
+    const dir = join(
+      codexHome,
+      "plugins",
+      "cache",
+      id.slice(at + 1),
+      id.slice(0, at),
+    );
+    let installed = false;
+    try {
+      installed = readdirSync(dir).length > 0;
+    } catch {}
+    return installed
+      ? []
+      : [
+          `codex plugin ${id} is not installed in ${shown}; the session runs without it`,
+        ];
+  });
 }
 
 /** Where Codex finds the run's gateway proxy token: the name its provider's `env_key` gives. */
@@ -853,8 +896,7 @@ export async function runCodexSession(
       key,
       warn: warning,
     });
-    const home = sessionEnv.HOME || homedir();
-    const codexHome = sessionEnv.SKY_CODEX_HOME || join(home, ".sky", "codex");
+    const codexHome = codexHomeOf(sessionEnv);
     const plugins = config.codexPlugins ?? [];
     writeCodexConfig(codexHome, codexConfigToml(proxy.baseUrl, plugins));
     const bin = deps.bin ?? env.SKY_CODEX_BIN ?? CODEX_BIN;

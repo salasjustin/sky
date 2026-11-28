@@ -22,6 +22,7 @@ import {
   codexInstructions,
   DEFAULT_CODEX_MODEL,
   gatewayUnavailable,
+  missingCodexPluginWarnings,
   resolveCodexExecutable,
   runCodexSession,
   toolCallOf,
@@ -1081,5 +1082,59 @@ describe("AppServer", () => {
     } finally {
       child.kill("SIGKILL");
     }
+  });
+});
+
+describe("a Codex plugin the run turns on but the Codex home doesn't hold", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "runner-codex-plugins-"));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  test("an installed plugin, a version directory under plugins/cache/<marketplace>/<plugin>, draws no warning", () => {
+    mkdirSync(join(home, ".sky/codex/plugins/cache/kru/kru/0.1.0"), {
+      recursive: true,
+    });
+    expect(missingCodexPluginWarnings(["kru@kru"], { HOME: home })).toEqual([]);
+  });
+
+  test("a missing one, or an empty directory, or one under another marketplace, gets a warning each, naming it and the home", () => {
+    mkdirSync(join(home, ".sky/codex/plugins/cache/kru/empty"), {
+      recursive: true,
+    });
+    mkdirSync(join(home, ".sky/codex/plugins/cache/other/review/1"), {
+      recursive: true,
+    });
+    expect(
+      missingCodexPluginWarnings(["kru@kru", "empty@kru", "review@kru"], {
+        HOME: home,
+      }),
+    ).toEqual([
+      "codex plugin kru@kru is not installed in $HOME/.sky/codex; the session runs without it",
+      "codex plugin empty@kru is not installed in $HOME/.sky/codex; the session runs without it",
+      "codex plugin review@kru is not installed in $HOME/.sky/codex; the session runs without it",
+    ]);
+  });
+
+  test("SKY_CODEX_HOME moves where it looks, and the warning names that path", () => {
+    const codexHome = join(home, "elsewhere");
+    mkdirSync(join(codexHome, "plugins/cache/kru/kru/1"), { recursive: true });
+    expect(
+      missingCodexPluginWarnings(["kru@kru", "x@y"], {
+        HOME: home,
+        SKY_CODEX_HOME: codexHome,
+      }),
+    ).toEqual([
+      "codex plugin x@y is not installed in $HOME/elsewhere; the session runs without it",
+    ]);
+    expect(
+      missingCodexPluginWarnings(["x@y"], {
+        HOME: home,
+        SKY_CODEX_HOME: "/srv/codex",
+      }),
+    ).toEqual([
+      "codex plugin x@y is not installed in /srv/codex; the session runs without it",
+    ]);
   });
 });
