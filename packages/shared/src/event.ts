@@ -143,11 +143,19 @@ export const Rollup = z.object({
 });
 export type Rollup = z.infer<typeof Rollup>;
 
-/** What the agent branch holds at run end: `run` since the run started, `cumulative` since `base`, its merge-base with `origin/HEAD`. */
+/** What the agent branch holds at run end: `run` since the run started, `cumulative` since `base`, its merge-base with `origin/HEAD`; `published` is what a rebuild checks the commits against. */
 export const RunRollup = z.object({
   base: GitSha,
   run: Rollup,
   cumulative: Rollup,
+  /**
+   * The last commit of this worktree a `publish` sent, and the GitHub branch it went to, as the
+   * sprite recorded it; absent when none was, and from an older runner. A branch started from an
+   * existing GitHub branch counts as published up to where it started.
+   */
+  published: z
+    .object({ head: GitSha, branch: z.string().min(1).max(255) })
+    .optional(),
 });
 export type RunRollup = z.infer<typeof RunRollup>;
 

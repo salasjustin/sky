@@ -10,6 +10,8 @@ import {
   type Rollup,
   type RunRollup,
 } from "@sky/shared";
+import { REMOTE_BRANCH_KEY } from "./publish.js";
+import { readPublished, STARTS } from "./published.js";
 
 const run = promisify(execFile);
 
@@ -213,7 +215,44 @@ export async function diffRollup(options: {
     rollupSince(cwd, options.since),
     rollupSince(cwd, base),
   ]);
-  return { base, run, cumulative };
+  const published = await publishedOf(cwd);
+  return { base, run, cumulative, ...(published && { published }) };
+}
+
+/**
+ * What of the worktree's branch is on GitHub, as the sprite knows it: the last `publish`'s head and
+ * branch, else the tip of the branch the agent was started on, which GitHub has by definition.
+ */
+async function publishedOf(
+  cwd: string,
+): Promise<RunRollup["published"] | undefined> {
+  const local = await git(
+    cwd,
+    "symbolic-ref",
+    "--quiet",
+    "--short",
+    "HEAD",
+  ).catch(() => "");
+  if (!local) return undefined;
+  const recorded = await readPublished(cwd, local);
+  if (recorded) return recorded;
+  // a worktree made from an existing branch records the tip it started at
+  const agentId = local.startsWith("claude/") ? local.slice(7) : undefined;
+  if (!agentId) return undefined;
+  const start = await git(
+    cwd,
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    `${STARTS}${agentId}`,
+  ).catch(() => "");
+  const branch = await git(
+    cwd,
+    "config",
+    "--get",
+    `branch.${local}.${REMOTE_BRANCH_KEY}`,
+  ).catch(() => "");
+  return start && branch ? { head: start, branch } : undefined;
 }
 
 async function rollupSince(cwd: string, from: string): Promise<Rollup> {

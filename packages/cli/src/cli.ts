@@ -51,7 +51,9 @@ const help = (io: Io) => `Usage:
       Print "<id> <status> <repo> <name>" per environment.
   sky env show <env> [--yaml] [options]
       Print the same line for one environment (<env> is its id or name),
-      then its runtime, and a refresh line when it has a script; a failed
+      then its runtime, and a refresh line when it has a script; a sandbox
+      that stopped answering adds a health line with its last error and the
+      sky env rebuild that fixes it; a failed
       environment adds the step it failed at and that step's stderr. --yaml prints
       the environment as an env.yaml that sky apply takes as a no-op
       (every field, scripts as block scalars), with the runtime and the
@@ -64,6 +66,21 @@ const help = (io: Io) => `Usage:
   sky env retry <env> [options]
       Provision a failed environment again. Prints its line, now
       provisioning; sky env show reports when it's ready.
+  sky env rebuild <env> [--yes] [--force] [options]
+      Reprovision a ready or failed environment (clone, setup, checkpoint)
+      and keep its agents: each starts a new worktree on its next run, from
+      the GitHub branch it published to when there is one, else from the
+      default branch, and says so in its prompt. Every agent's session is
+      dropped, since the sandbox's sessions are gone. Refused while a run
+      is active or it is provisioning. Refused with unpublished_work, naming
+      each agent, its branch and what is at risk (uncommitted files, commits
+      not on GitHub, a branch never published), when work exists only on the
+      sandbox; if the sandbox doesn't answer, this comes from what the runs
+      recorded, and says so. --force rebuilds anyway after listing exactly
+      what is lost. Asks to confirm on a terminal; anywhere else, or with
+      --json, it needs --yes. Use it when sky env show reports the sandbox
+      unreachable, or to rerun setup on an environment that has agents.
+      Needs the admin key.
   sky env set-claude <env> <name|api-key|api-key:<name>|pool|default>
       [--pool=<name,...>] [--fallback=api-key|none] [options]
       Choose the Claude credential the environment's runs use: the name of
@@ -524,6 +541,7 @@ async function runCommand(
     timeout: text(values.timeout),
     reason: text(values.reason),
     yes: values.yes === true,
+    force: values.force === true,
     branch: text(values.branch),
     events: text(values.events),
     format: text(values.format),

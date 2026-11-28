@@ -1,0 +1,356 @@
+import { HttpResponse, http } from "msw";
+import { beforeEach, expect, test } from "vitest";
+import { server } from "../../../test/msw.js";
+import { apiUrl, runCli } from "./testing.js";
+
+const envJson = (over: Record<string, unknown> = {}) => ({
+  id: "env_1",
+  name: "web",
+  repo: "acme/web",
+  setup: "",
+  status: "ready",
+  spriteName: "sky-env-1",
+  checkpointId: "cp_1",
+  concurrency: 3,
+  approvalPolicy: [],
+  autoApprove: { defaults: true, commands: [] },
+  failure: null,
+  health: null,
+  createdAt: "2026-10-30T12:00:00.000Z",
+  ...over,
+});
+
+const web = envJson();
+const rebuilding = envJson({ status: "provisioning", checkpointId: null });
+
+const list = http.get(`${apiUrl}/v1/environments`, () =>
+  HttpResponse.json({ data: [web] }),
+);
+
+const bodies: unknown[] = [];
+beforeEach(() => {
+  bodies.length = 0;
+});
+
+const rebuild = (
+  respond: (body: { force: boolean }) => Response = () =>
+    HttpResponse.json(rebuilding, { status: 202 }),
+) =>
+  http.post(`${apiUrl}/v1/environments/:id/rebuild`, async ({ request }) => {
+    const body = (await request.json()) as { force: boolean };
+    bodies.push(body);
+    return respond(body);
+  });
+
+const refused = (
+  agents: unknown[],
+  extra: Record<string, unknown> = { checked: "sprite" },
+) =>
+  HttpResponse.json(
+    {
+      error: {
+        code: "unpublished_work",
+        message: "the API's own words",
+        agents,
+        ...extra,
+      },
+    },
+    { status: 409 },
+  );
+
+const atRisk = [
+  {
+    agentId: "agt_a",
+    branch: "claude/agt_a",
+    uncommitted: 2,
+    unpublishedCommits: 0,
+    neverPublished: false,
+  },
+  {
+    agentId: "agt_b",
+    branch: "feature/login",
+    uncommitted: 0,
+    unpublishedCommits: 3,
+    neverPublished: false,
+  },
+  {
+    agentId: "agt_c",
+    branch: "claude/agt_c",
+    uncommitted: 0,
+    unpublishedCommits: 1,
+    neverPublished: true,
+  },
+];
+const lines = [
+  "agt_a (claude/agt_a): 2 uncommitted files",
+  "agt_b (feature/login): 3 commits not on GitHub",
+  "agt_c (claude/agt_c): 1 commit on a branch never published",
+];
+
+const terminal = (answers: string[], prompts: string[]) => ({
+  stderrIsTTY: true,
+  stdin: {
+    isTTY: true,
+    prompt: async (text: string) => {
+      prompts.push(text);
+      return answers.shift() ?? "";
+    },
+  },
+});
+
+test("env rebuild --yes rebuilds by name and prints the provisioning environment", async () => {
+  server.use(list, rebuild());
+  const r = await runCli(["env", "rebuild", "web", "--yes"]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("env_1 provisioning acme/web web\n");
+  expect(bodies).toEqual([{ force: false }]);
+});
+
+test("env rebuild --json --yes prints the API's environment object", async () => {
+  server.use(list, rebuild());
+  const r = await runCli(["env", "rebuild", "env_1", "--json", "--yes"]);
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.stdout)).toEqual(rebuilding);
+});
+
+// no POST handler is registered in these: a request would be reported as a leak
+test("env rebuild without --yes and no terminal is refused before any request", async () => {
+  for (const opts of [
+    {},
+    { ...terminal(["y"], []), env: { CI: "true" } },
+    { stderrIsTTY: true, stdin: { isTTY: false } },
+  ]) {
+    const r = await runCli(["env", "rebuild", "web"], opts);
+    expect(r.code).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("sky: refusing to rebuild web without --yes\n");
+  }
+});
+
+test("env rebuild --json without --yes is refused even on a terminal", async () => {
+  const prompts: string[] = [];
+  const r = await runCli(
+    ["env", "rebuild", "web", "--json"],
+    terminal(["y"], prompts),
+  );
+  expect(r.code).toBe(2);
+  expect(prompts).toEqual([]);
+});
+
+test("env rebuild on a terminal asks, and rebuilds after a yes", async () => {
+  for (const answer of ["y", "YES", " y "]) {
+    bodies.length = 0;
+    const prompts: string[] = [];
+    server.use(list, rebuild());
+    const r = await runCli(
+      ["env", "rebuild", "web"],
+      terminal([answer], prompts),
+    );
+    expect(r.code, answer).toBe(0);
+    expect(prompts).toEqual([
+      "rebuild web (env_1) from its repo and setup? Its agents are kept and start new worktrees on their next run [y/N] ",
+    ]);
+    expect(bodies).toEqual([{ force: false }]);
+  }
+});
+
+test("env rebuild on a terminal aborts on anything but yes, sending nothing", async () => {
+  for (const answer of ["", "n", "no", "yep"]) {
+    server.use(list);
+    const r = await runCli(["env", "rebuild", "web"], terminal([answer], []));
+    expect(r.code, answer).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("nothing rebuilt\n");
+  }
+  expect(bodies).toEqual([]);
+});
+
+test("env rebuild of an unknown env exits 1 without a request", async () => {
+  server.use(list);
+  const r = await runCli(["env", "rebuild", "nope", "--yes"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toBe("sky: no environment named nope\n");
+});
+
+test("--force goes only with env rebuild, and --yes only with delete and rebuild", async () => {
+  const r = await runCli(["env", "delete", "web", "--force", "--yes"]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toBe(
+    "sky: --force only goes with env rebuild\nRun 'sky --help' for usage.\n",
+  );
+});
+
+test("env rebuild refused for unpublished work lists each agent, its branch and what is at risk, and exits 1", async () => {
+  server.use(
+    list,
+    rebuild(() => refused(atRisk)),
+  );
+  const r = await runCli(["env", "rebuild", "web", "--yes"]);
+  expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toBe(
+    `sky: web (env_1) has work that exists only on its sprite, and a rebuild would lose it\n${lines.map((l) => `  ${l}`).join("\n")}\n  publish it first (the agent's own sky publish), or run sky env rebuild web --force to rebuild anyway and lose it\n`,
+  );
+  // asked once, without force
+  expect(bodies).toEqual([{ force: false }]);
+});
+
+test("env rebuild --json refused for unpublished work keeps the API's error", async () => {
+  server.use(
+    list,
+    rebuild(() => refused(atRisk)),
+  );
+  const r = await runCli(["env", "rebuild", "web", "--json", "--yes"]);
+  expect(r.code).toBe(1);
+  expect(JSON.parse(r.stderr)).toMatchObject({
+    error: { code: "unpublished_work" },
+  });
+});
+
+test("a refusal from records says the sprite could not be reached and that uncommitted changes are unknown", async () => {
+  server.use(
+    list,
+    rebuild(() =>
+      refused(
+        [
+          {
+            agentId: "agt_a",
+            branch: "claude/agt_a",
+            uncommitted: null,
+            unpublishedCommits: 2,
+            neverPublished: true,
+          },
+        ],
+        { checked: "records", unreachable: "503 Storage not ready" },
+      ),
+    ),
+  );
+  const r = await runCli(["env", "rebuild", "web", "--yes"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "agt_a (claude/agt_a): 2 commits on a branch never published, uncommitted changes unknown",
+  );
+  expect(r.stderr).toContain(
+    "could not reach the sprite to look (503 Storage not ready); this is from what the agents' runs recorded, so uncommitted changes are not known",
+  );
+});
+
+test("env rebuild --force --yes lists exactly what is lost, then rebuilds with force", async () => {
+  server.use(
+    list,
+    rebuild((body) =>
+      body.force
+        ? HttpResponse.json(rebuilding, { status: 202 })
+        : refused(atRisk),
+    ),
+  );
+  const r = await runCli(["env", "rebuild", "web", "--force", "--yes"]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("env_1 provisioning acme/web web\n");
+  expect(r.stderr).toBe(
+    `rebuilding web (env_1) loses this work:\n${lines.map((l) => `  ${l}`).join("\n")}\n`,
+  );
+  expect(bodies).toEqual([{ force: false }, { force: true }]);
+});
+
+test("env rebuild --force on a terminal asks again, after the list, and sends force only after a yes", async () => {
+  const prompts: string[] = [];
+  server.use(
+    list,
+    rebuild((body) =>
+      body.force
+        ? HttpResponse.json(rebuilding, { status: 202 })
+        : refused(atRisk),
+    ),
+  );
+  const r = await runCli(
+    ["env", "rebuild", "web", "--force"],
+    terminal(["y", "y"], prompts),
+  );
+  expect(r.code).toBe(0);
+  expect(prompts).toHaveLength(2);
+  expect(prompts[1]).toBe("lose it and rebuild? [y/N] ");
+  expect(bodies).toEqual([{ force: false }, { force: true }]);
+});
+
+test("env rebuild --force on a terminal stops at a no to the second question, losing nothing", async () => {
+  server.use(
+    list,
+    rebuild(() => refused(atRisk)),
+  );
+  const r = await runCli(
+    ["env", "rebuild", "web", "--force"],
+    terminal(["y", "n"], []),
+  );
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("loses this work");
+  expect(r.stderr.endsWith("nothing rebuilt\n")).toBe(true);
+  expect(bodies).toEqual([{ force: false }]);
+});
+
+test("env rebuild --force on an env with nothing at risk rebuilds with no list and no second question", async () => {
+  server.use(list, rebuild());
+  const r = await runCli(["env", "rebuild", "web", "--force", "--yes"]);
+  expect(r.code).toBe(0);
+  expect(r.stderr).toBe("");
+  expect(bodies).toEqual([{ force: false }]);
+});
+
+test("env rebuild refused while a run is active exits 1 with the API's message", async () => {
+  server.use(
+    list,
+    rebuild(() =>
+      HttpResponse.json(
+        {
+          error: {
+            code: "run_active",
+            message:
+              "a run on this environment is active; wait for it or stop it",
+          },
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  const r = await runCli(["env", "rebuild", "web", "--yes"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toBe(
+    "sky: a run on this environment is active; wait for it or stop it (run_active)\n",
+  );
+});
+
+test("env show says the sprite isn't answering and what to run", async () => {
+  server.use(
+    http.get(`${apiUrl}/v1/environments/env_1`, () =>
+      HttpResponse.json(
+        envJson({
+          health: {
+            status: "unreachable",
+            error: "503 Storage not ready",
+            at: "2026-11-26T10:00:00.000Z",
+            message:
+              "the environment's sprite isn't answering (503 Storage not ready); if it stays that way, sky env rebuild web rebuilds it",
+          },
+        }),
+      ),
+    ),
+    list,
+  );
+  const r = await runCli(["env", "show", "env_1"]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe(
+    "env_1 ready acme/web web\nruntime: default (the SKY_RUNTIME secret, else claude-code)\nhealth: unreachable since 2026-11-26T10:00:00.000Z: 503 Storage not ready\n  the environment's sprite isn't answering (503 Storage not ready); if it stays that way, sky env rebuild web rebuilds it\n",
+  );
+});
+
+test("env show of a healthy env has no health line, and --json passes health through", async () => {
+  server.use(
+    http.get(`${apiUrl}/v1/environments/env_1`, () => HttpResponse.json(web)),
+    list,
+  );
+  expect((await runCli(["env", "show", "env_1"])).stdout).not.toContain(
+    "health",
+  );
+  const json = await runCli(["env", "show", "env_1", "--json"]);
+  expect(JSON.parse(json.stdout).health).toBeNull();
+});

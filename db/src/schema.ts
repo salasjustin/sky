@@ -99,6 +99,10 @@ export const environments = sqliteTable(
       .default("api-key"),
     // "claude-code" or "codex", set by `sky env set-runtime`; null follows the env's SKY_RUNTIME secret. No CHECK, for the same reason as claude_fallback
     runtime: text({ enum: ["claude-code", "codex"] }),
+    // set when the sprite stopped answering ("unreachable"), with the last error and when; cleared by the next call that gets through. status stays the provisioning status. No CHECK, for the same reason as claude_fallback
+    health: text({ enum: ["unreachable"] }),
+    healthError: text("health_error"),
+    healthAt: text("health_at"),
     failureStep: text("failure_step", { enum: environmentFailureSteps }),
     // redacted and truncated by the API before it lands here
     failureStderr: text("failure_stderr"),
@@ -179,6 +183,8 @@ export const agents = sqliteTable(
     // the existing GitHub branch the agent started from and publishes to; null means it uses `branch`.
     // no CHECK, for the same reason as archivedAt; the API validates the name
     remoteBranch: text("remote_branch"),
+    // when a rebuild of the environment kept this agent and dropped its worktree; the next run starts a new one and says so, then clears it. No CHECK, for the same reason as archivedAt
+    rebuiltAt: text("rebuilt_at"),
     // the key that started the agent; null means an admin did
     ownerKeyId: text("owner_key_id")
       .$type<ApiKeyId>()

@@ -6,6 +6,7 @@ import {
   CreatedApiKey,
   DrainStatus,
   Environment,
+  EnvironmentHealth,
   EnvRefresh,
   type KeyInput,
   PluginRefresh,
@@ -19,6 +20,8 @@ import type { Config } from "./config.js";
 /** An env as the API returns it; loose so `--json` passes through fields this CLI doesn't read. */
 export const ApiEnvironment = Environment.extend({
   failure: z.object({ step: z.string(), stderr: z.string() }).nullable(),
+  /** Set while the env's sprite isn't answering; absent from an older API. A shape this CLI can't read is dropped, not an error. */
+  health: EnvironmentHealth.nullish().catch(undefined),
 }).loose();
 export type ApiEnvironment = z.infer<typeof ApiEnvironment>;
 
@@ -491,6 +494,18 @@ export function createApi(config: Config) {
       const { status, json } = await request(
         "POST",
         `/v1/environments/${encodeURIComponent(id)}/retry`,
+      );
+      return env(status, json);
+    },
+    /**
+     * Reprovisions a ready or failed env and keeps its agents; 409 `run_active`, `provisioning`, or
+     * `unpublished_work` (with the agents at risk) unless `force`.
+     */
+    async rebuildEnvironment(id: string, force: boolean) {
+      const { status, json } = await request(
+        "POST",
+        `/v1/environments/${encodeURIComponent(id)}/rebuild`,
+        { force },
       );
       return env(status, json);
     },

@@ -15,9 +15,11 @@ import {
   apiKeyNameOf,
   CODEX_GATEWAY_SECRET,
   DEFAULT_CLAUDE_CREDENTIAL,
+  describeUnpublished,
   Environment,
   EnvironmentId,
   POOL_CREDENTIAL,
+  RebuildInput,
   Runtime,
 } from "@sky/shared";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
@@ -34,6 +36,7 @@ import { redact } from "./redact.js";
 import { activeRunStatuses, type Tx } from "./runs.js";
 import { hasSecret } from "./secrets.js";
 import { destroySprite, type SpriteOps, spriteNameFor } from "./sprites.js";
+import { findUnpublishedWork, type UnpublishedWork } from "./unpublished.js";
 import { body, jsonBody } from "./validation.js";
 
 const {
@@ -108,6 +111,16 @@ const present = (row: EnvRow) => ({
     claudeFallback: row.claudeFallback,
     runtime: row.runtime ?? null,
   } satisfies Environment),
+  // set while the env's sprite isn't answering; `status` stays what provisioning left it
+  health:
+    row.health === null
+      ? null
+      : {
+          status: row.health,
+          error: row.healthError ?? "",
+          at: row.healthAt ?? row.createdAt,
+          message: `the environment's sprite isn't answering (${row.healthError ?? "no detail"}); if it stays that way, sky env rebuild ${row.name} rebuilds it`,
+        },
   // while provisioning, failure_step holds the step in progress
   failure:
     row.status !== "failed" || row.failureStep === null
@@ -178,8 +191,27 @@ const unarchivedAgentIds = (tx: Tx, id: EnvironmentId) =>
     .all()
     .map((a) => a.id);
 
+/** What a reprovision leaves the env's agents with: no session to resume and no worktree, which their next run makes. */
+const dropWorktrees = (tx: Tx, id: EnvironmentId) => {
+  tx.update(agents).set({ sessionId: null }).where(eq(agents.envId, id)).run();
+  tx.update(agents)
+    .set({ rebuiltAt: new Date().toISOString() })
+    .where(and(eq(agents.envId, id), isNull(agents.archivedAt)))
+    .run();
+};
+
 const notFound = "no such environment";
 const runActive = "a run on this environment is active; wait for it or stop it";
+/** The 409's message: each agent, its branch and what is at risk, and how to go on. */
+function unpublishedMessage(work: UnpublishedWork): string {
+  const lines = work.agents.map(describeUnpublished);
+  const where =
+    work.source === "sprite"
+      ? "found in the agents' worktrees"
+      : `from what the runs recorded; the sprite could not be asked (${work.unreachable})`;
+  return `rebuilding removes every worktree, and these agents have work that exists only on the sprite (${where}): ${lines.join("; ")}. Publish it first, or send force: true to rebuild anyway and lose it`;
+}
+
 const nameTakenMessage = "an environment with this name already exists";
 const stillProvisioning =
   "environment is still provisioning; wait for it to finish";
@@ -189,6 +221,10 @@ const reprovisioning = {
   checkpointId: null,
   failureStep: null,
   failureStderr: null,
+  // the rebuild is the answer to a sprite that wasn't answering
+  health: null,
+  healthError: null,
+  healthAt: null,
 } as const;
 
 const envParam = zValidator(
@@ -211,7 +247,7 @@ export function environmentRoutes(
   return (
     factory
       .createApp()
-      .on("POST", ["/", "/:id/retry"], adminOnly)
+      .on("POST", ["/", "/:id/retry", "/:id/rebuild"], adminOnly)
       .on(["PATCH", "DELETE"], "/:id", adminOnly)
       .on("PUT", "/:id/runtime", adminOnly)
       .get("/", (c) => {
@@ -480,11 +516,9 @@ export function environmentRoutes(
               .where(eq(environments.id, id))
               .returning()
               .get();
-            // reprovisioning wipes the sprite's sessions, so a resume would name one that is gone
-            tx.update(agents)
-              .set({ sessionId: null })
-              .where(eq(agents.envId, id))
-              .run();
+            // reprovisioning wipes the sprite's sessions and worktrees, so a resume would name a
+            // session that is gone, and the next run makes a worktree anew
+            dropWorktrees(tx, id);
             return { kind: "retrying", row } as const;
           },
           { behavior: "immediate" },
@@ -503,6 +537,94 @@ export function environmentRoutes(
         provisioner.start(outcome.row);
         return c.json(present(outcome.row), 202);
       })
+      // reprovisions a ready or failed env and keeps its agents: each starts a new worktree on its
+      // next run (`agents.ts`), so work that exists only on the sprite is refused unless `force`
+      .post(
+        "/:id/rebuild",
+        envParam,
+        jsonBody,
+        body(RebuildInput),
+        async (c) => {
+          const { id } = c.req.valid("param");
+          const { force } = c.req.valid("json");
+          const db = c.var.db;
+          const gate = (tx: Db | Tx) => {
+            const env = findEnv(tx, id);
+            if (!env) return { kind: "not_found" } as const;
+            if (env.status === "provisioning") {
+              return { kind: "provisioning" } as const;
+            }
+            if (hasActiveRun(tx, id)) return { kind: "run_active" } as const;
+            return { kind: "open", env } as const;
+          };
+          const refuse = (outcome: ReturnType<typeof gate>) => {
+            switch (outcome.kind) {
+              case "not_found":
+                return apiError(c, 404, "not_found", notFound);
+              case "provisioning":
+                return apiError(c, 409, "provisioning", stillProvisioning);
+              case "run_active":
+                return apiError(c, 409, "run_active", runActive);
+              case "open":
+                return undefined;
+            }
+          };
+          const first = gate(db);
+          const refused = refuse(first);
+          if (refused) return refused;
+          if (first.kind !== "open") throw new Error("unreachable");
+          if (!force) {
+            const work = await findUnpublishedWork(db, sprites, first.env, log);
+            if (work.agents.length > 0) {
+              return c.json(
+                {
+                  error: {
+                    code: "unpublished_work",
+                    message: unpublishedMessage(work),
+                    checked: work.source,
+                    ...(work.unreachable !== undefined && {
+                      unreachable: work.unreachable,
+                    }),
+                    agents: work.agents,
+                  },
+                },
+                409,
+              );
+            }
+          }
+          // the app runs in a worktree, so it and its public URL end with the rebuild; a sprite that
+          // can't be reached leaves the row for the sweep, as it does for an expiry
+          try {
+            await previews.stopForEnv(id);
+          } catch (err) {
+            log(
+              `stopping the preview of ${id} before its rebuild failed: ${err}`,
+            );
+          }
+          // the checks run again where nothing can slip in between them and the update: a run may have
+          // started while the sprite was asked
+          const outcome = db.transaction(
+            (tx) => {
+              const again = gate(tx);
+              if (again.kind !== "open") return again;
+              const row = tx
+                .update(environments)
+                .set(reprovisioning)
+                .where(eq(environments.id, id))
+                .returning()
+                .get();
+              dropWorktrees(tx, id);
+              return { kind: "rebuilding", row } as const;
+            },
+            { behavior: "immediate" },
+          );
+          if (outcome.kind !== "rebuilding") {
+            return refuse(outcome) ?? apiError(c, 409, "conflict", runActive);
+          }
+          provisioner.start(outcome.row);
+          return c.json(present(outcome.row), 202);
+        },
+      )
       .delete("/:id", envParam, async (c) => {
         const { id } = c.req.valid("param");
         const db = c.var.db;

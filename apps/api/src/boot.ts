@@ -20,6 +20,7 @@ import {
   spritesOfRuns,
 } from "./runs.js";
 import { purgeExpiredEnvVars } from "./secrets.js";
+import { createSpriteHealth } from "./sprite-health.js";
 import { SPRITES_TIMEOUT_MS, type SpriteOps } from "./sprites.js";
 
 const SWEEP_EVERY_MS = 60_000;
@@ -103,6 +104,7 @@ export function boot(
     timeoutMs: SPRITES_TIMEOUT_MS,
     longTimeoutMs: config.spritesLongTimeoutMs,
     onExecKilled: (spriteName) => void prober.probeSprite(spriteName),
+    health: createSpriteHealth({ db, secrets, log }),
   };
   const prober = createRunProber({
     db,
@@ -173,6 +175,7 @@ export function boot(
       log,
       nudgeDeliveries: dispatcher.nudge,
       onExecKilled: spriteOps.onExecKilled,
+      health: spriteOps.health,
       secrets,
       closing: closing.signal,
     }),

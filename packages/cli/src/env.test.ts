@@ -320,11 +320,11 @@ test("env delete on a terminal aborts on anything but yes", async () => {
   }
 });
 
-test("--yes goes only with env delete", async () => {
+test("--yes goes only with env delete or env rebuild", async () => {
   const r = await runCli(["env", "show", "web", "--yes"]);
   expect(r.code).toBe(2);
   expect(r.stderr).toBe(
-    "sky: --yes only goes with env delete\nRun 'sky --help' for usage.\n",
+    "sky: --yes only goes with env delete or env rebuild\nRun 'sky --help' for usage.\n",
   );
 });
 
