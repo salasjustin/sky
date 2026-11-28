@@ -1,5 +1,8 @@
 import type { BaseProfileMcpServer } from "@sky/shared";
 
+/** The MCP server name Sky's own publish and sync tools hold in `config.toml`; a base-profile server can't take it. */
+export const SKY_TOOLS_SERVER = "sky";
+
 /** A quote, backslash or control character: refused in a name or url, escaped in a command or arg. */
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
 const HOSTILE = /["\\\u0000-\u001f\u007f]/;
@@ -21,7 +24,7 @@ const ESCAPES: Record<string, string> = {
 };
 
 /** `value` as a TOML basic string; the caller refuses a lone surrogate first. */
-const tomlString = (value: string): string =>
+export const tomlString = (value: string): string =>
   `"${value.replace(
     new RegExp(HOSTILE.source, "g"),
     (char) =>
@@ -57,6 +60,13 @@ export function codexMcpTables(
     const refs = isStdio ? server.env : server.headers;
     if (unsafeName(name)) {
       refused.push({ server: JSON.stringify(name), why: "its name" });
+      continue;
+    }
+    if (name === SKY_TOOLS_SERVER) {
+      refused.push({
+        server: name,
+        why: "its name, which Sky's own publish and sync tools hold",
+      });
       continue;
     }
     if (!isStdio && unsafeName(server.url)) {

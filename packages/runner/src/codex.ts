@@ -11,9 +11,11 @@
  * change (approval policy `untrusted`); the runner answers each from the environment's approval
  * policy, as it does for Claude Code, and opens a request for the person when the policy holds the
  * call. Codex's own sandbox is off (`danger-full-access`): the sprite is the sandbox, as it is for
- * Claude Code. The agent's `publish` and `sync` are tools the runner serves itself
- * (`sky_publish`, `sky_sync`), through the same broker and the same one approval, so the GitHub
- * connector never reaches the agent's commands.
+ * Claude Code. The agent's `publish` and `sync` are tools (`sky_publish`, `sky_sync`) of a stdio MCP
+ * server the runner writes into every run's `config.toml` (`codex-tools.ts`), first run or follow-up,
+ * since a resumed thread takes no tool list. The server forwards each call to the runner over a socket
+ * only it is told of, and the runner serves it through the same broker and the same one approval, so
+ * neither the GitHub connector nor a broker token reaches the agent's commands.
  *
  * The gateway key stays in the runner: Codex reaches the gateway through a proxy the runner starts
  * on the loopback interface for the run (`codex-proxy.ts`), with a token made for the run, so nothing
@@ -34,7 +36,7 @@
  * without asking, wherever they read.
  */
 import type { ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   mkdirSync,
   readdirSync,
@@ -69,6 +71,7 @@ import {
   BROKER_SOCKET_ENV,
   BROKER_TOKEN_ENV,
   type Broker,
+  type BrokerDeps,
   brokerSocketIn,
   startBroker,
 } from "./broker.js";
@@ -77,12 +80,23 @@ import {
   codexMcpTables,
   codexRefusedWarning,
   codexUnresolvedWarning,
+  SKY_TOOLS_SERVER,
 } from "./codex-mcp.js";
 import {
   type GatewayProxy,
   type GatewayProxyOptions,
   startGatewayProxy,
 } from "./codex-proxy.js";
+import {
+  PUBLISH_TOOL,
+  SYNC_TOOL,
+  skyToolsTable,
+  startToolsChannel,
+  TOOLS_SECRET_ENV,
+  TOOLS_SOCKET_ENV,
+  type ToolReply,
+  toolsSocketIn,
+} from "./codex-tools.js";
 import { CODEX_KEY_ENV, type Config } from "./config.js";
 import { CONNECTOR_ENV, withoutConnector } from "./connector.js";
 import { type PostEvent, RunEndedError } from "./events.js";
@@ -107,9 +121,6 @@ export const CODEX_PROVIDER = "sky-gateway";
 export const GATEWAY_CODEX_URL = "https://ai-gateway.vercel.sh/codex/v1";
 /** Where `provision.ts` installs Codex; `SKY_CODEX_BIN` overrides it. */
 export const CODEX_BIN = "/opt/sky/node_modules/.bin/codex";
-
-const PUBLISH_TOOL = "sky_publish";
-const SYNC_TOOL = "sky_sync";
 
 const PLATFORM_PACKAGES: Record<string, { pkg: string; triple: string }> = {
   x64: {
@@ -228,7 +239,8 @@ export function codexConfigToml(
     "[shell_environment_policy]",
     'inherit = "all"',
     "ignore_default_excludes = true",
-    `exclude = ["${CODEX_PROXY_TOKEN_ENV}", "${CODEX_KEY_ENV}"]`,
+    // the tools channel's socket and secret are Codex's own, passed to the `sky` MCP server alone
+    `exclude = ["${CODEX_PROXY_TOKEN_ENV}", "${CODEX_KEY_ENV}", "${TOOLS_SOCKET_ENV}", "${TOOLS_SECRET_ENV}"]`,
     "",
     // ids are `<plugin>@<marketplace>` of letters, digits, `.`, `_` and `-` (`config.ts`)
     ...plugins.flatMap((id) => [`[plugins."${id}"]`, "enabled = true", ""]),
@@ -359,55 +371,6 @@ export function codexInstructions(options: {
     );
   return parts.join("\n\n");
 }
-
-/** The tools the runner serves itself: the agent's `publish` and `sync`, through the broker. */
-const DYNAMIC_TOOLS = [
-  {
-    type: "function",
-    name: PUBLISH_TOOL,
-    description:
-      "Publish this worktree's branch to GitHub and open (or update) its pull request, after the person approves. Returns the pull request's URL.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        title: { type: "string", description: "The pull request's title." },
-        body: {
-          type: "string",
-          description: "The pull request's description, in Markdown.",
-        },
-        base: {
-          type: "string",
-          description:
-            "The branch to merge into; the default branch when absent.",
-        },
-        branch: {
-          type: "string",
-          description:
-            "A GitHub branch to publish to instead of the worktree's own.",
-        },
-      },
-      required: ["title"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: SYNC_TOOL,
-    description:
-      "Refresh origin/<default> from GitHub and bring commits pushed to your GitHub branch into the worktree, after the person approves.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        branch: {
-          type: "string",
-          description:
-            "The GitHub branch you publish to, if not the worktree's own.",
-        },
-      },
-      additionalProperties: false,
-    },
-  },
-];
 
 const PublishArgs = z.object({
   title: z.string().min(1),
@@ -681,6 +644,10 @@ export type CodexDeps = {
   seal: Seal;
   /** The Codex binary; `SKY_CODEX_BIN`, else `CODEX_BIN`. */
   bin?: string;
+  /** What Codex starts as the `sky` tools server: this runner's own bundle, `codex-tools`, when absent. */
+  toolsCommand?: { command: string; args: string[] };
+  /** What runs a publish or sync once approved; the broker's own unless a test stands in. */
+  brokerRuns?: Pick<BrokerDeps, "publishRun" | "syncRun">;
   /** How long a stopped turn gets to end before Codex is killed. */
   stopGraceMs?: number;
 };
@@ -907,6 +874,62 @@ export async function runCodexSession(
   let heartbeat: ReturnType<typeof createHeartbeat> | undefined;
   const startedAt = Date.now();
   const progress = { giveUp: abortController.signal };
+  let toolsChannel: { close: () => Promise<void> } | undefined;
+  // the socket and secret only the `sky` tools server is passed; never in the agent's commands' env
+  let toolsEnv: NodeJS.ProcessEnv = {};
+
+  /**
+   * One `sky_publish` or `sky_sync` call, from the `sky` MCP server's channel (or a dynamic tool call a
+   * thread started before the tools moved there still makes): the runner asks its own broker, which
+   * opens the one approval and does the sending, with a token issued for this call alone.
+   */
+  const callSkyTool = async (
+    tool: string,
+    rawArgs: unknown,
+  ): Promise<ToolReply> => {
+    if (tool !== PUBLISH_TOOL && tool !== SYNC_TOOL)
+      return { text: `No tool named ${tool} here.`, success: false };
+    if (!broker)
+      return {
+        text: `${tool} needs the environment's GitHub connector, which this run doesn't have: nothing was sent.`,
+        success: false,
+      };
+    const op = tool === PUBLISH_TOOL ? "publish" : "sync";
+    const parsed =
+      op === "publish"
+        ? PublishArgs.safeParse(rawArgs)
+        : SyncArgs.safeParse(rawArgs);
+    if (!parsed.success)
+      return {
+        text: `Invalid arguments: ${parsed.error.message}`,
+        success: false,
+      };
+    const callId = `tool_${randomUUID().replaceAll("-", "")}`;
+    const token = broker.issue(callId, op);
+    let out = "";
+    try {
+      const code = await askBroker(
+        `sky ${op}`,
+        { op, ...parsed.data },
+        {
+          [BROKER_SOCKET_ENV]: brokerSocketIn(scratch),
+          [BROKER_TOKEN_ENV]: token,
+        },
+        {
+          cwd,
+          stdout: (s) => {
+            out += s;
+          },
+          stderr: (s) => {
+            out += s;
+          },
+        },
+      );
+      return { text: out.trim() || "(no output)", success: code === 0 };
+    } finally {
+      broker.release(callId);
+    }
+  };
 
   try {
     mkdirSync(scratch, { recursive: true, mode: 0o700 });
@@ -918,8 +941,22 @@ export async function runCodexSession(
         sealProblem: () => deps.seal.problem ?? deps.seal.check(),
         approve: approveBrokered,
         warn: warning,
+        ...deps.brokerRuns,
       });
-    }
+      const secret = randomBytes(32).toString("hex");
+      toolsChannel = await startToolsChannel({
+        socketPath: toolsSocketIn(scratch),
+        secret,
+        call: callSkyTool,
+      });
+      toolsEnv = {
+        [TOOLS_SOCKET_ENV]: toolsSocketIn(scratch),
+        [TOOLS_SECRET_ENV]: secret,
+      };
+    } else
+      warning(
+        `sky_publish and sky_sync are unavailable in this run: the environment has no ${CONNECTOR_ENV} secret, so nothing can be published or synced from it. Set one with sky secret set <env> ${CONNECTOR_ENV} --connector=<connection id>.`,
+      );
     const key = deps.codexEnv[CODEX_KEY_ENV];
     if (!key) throw new Error(`${CODEX_KEY_ENV} is not set for this run`);
     proxy = await (deps.startProxy ?? startGatewayProxy)({
@@ -945,9 +982,26 @@ export async function runCodexSession(
     if (mcp.unresolved.length > 0)
       warning(codexUnresolvedWarning(mcp.unresolved));
     if (mcp.refused.length > 0) warning(codexRefusedWarning(mcp.refused));
+    // publish and sync are tools of the runner's own MCP server, written on every run so a resumed
+    // thread has them as a new one does; with no connector there is nothing to offer
+    const toolsCommand = deps.toolsCommand ?? {
+      command: process.execPath,
+      args: [process.argv[1] ?? "", "codex-tools"],
+    };
+    const tables = [
+      ...mcp.tables,
+      ...(toolsChannel
+        ? [
+            skyToolsTable({
+              ...toolsCommand,
+              toolTimeoutSec: config.waitTimeoutMs / 1000 + 600,
+            }),
+          ]
+        : []),
+    ];
     writeCodexConfig(
       codexHome,
-      codexConfigToml(proxy.baseUrl, plugins, mcp.tables),
+      codexConfigToml(proxy.baseUrl, plugins, tables),
     );
     // the seal's spawn ends the process with this signal; the run's own stop goes through the turn
     child = deps.seal.spawn({
@@ -959,6 +1013,7 @@ export async function runCodexSession(
       cwd,
       env: {
         ...childEnv,
+        ...toolsEnv,
         [CODEX_PROXY_TOKEN_ENV]: proxy.token,
         CODEX_HOME: codexHome,
       },
@@ -1010,14 +1065,10 @@ export async function runCodexSession(
               `Codex has no thread ${config.sessionId} to resume: ${messageOf(error)}`,
             );
           })
-      : await app.request(
-          "thread/start",
-          {
-            ...threadParams,
-            ...(broker && { dynamicTools: DYNAMIC_TOOLS }),
-          },
-          { timeoutMs: 60_000, signal: abortController.signal },
-        );
+      : await app.request("thread/start", threadParams, {
+          timeoutMs: 60_000,
+          signal: abortController.signal,
+        });
     const thread = z
       .object({ thread: z.looseObject({ id: z.string() }) })
       .parse(opened).thread.id;
@@ -1459,6 +1510,16 @@ export async function runCodexSession(
       }
       const toolName =
         tool === undefined ? `mcp__${server}` : `mcp__${server}__${tool}`;
+      // Sky's own publish and sync tools: the approval a person answers is the broker's, one per call,
+      // showing what goes out, so Codex's ask is answered here, never by the environment's policy and
+      // never with a second inbox request. No base-profile server can hold the `sky` name
+      if (
+        server === SKY_TOOLS_SERVER &&
+        (tool === PUBLISH_TOOL || tool === SYNC_TOOL)
+      ) {
+        if (itemId) emitPre(itemId);
+        return reply("accept");
+      }
       if (
         itemId &&
         !matchesPolicy(config.approvalPolicy, toolName, toolParams)
@@ -1525,51 +1586,14 @@ export async function runCodexSession(
       };
     };
 
-    /** The agent's `sky_publish` or `sky_sync`: the runner asks its own broker, which opens the approval and does the sending. */
+    /** A dynamic tool call, which only a thread started before the tools moved to the `sky` server still makes. */
     const runTool = async (raw: unknown): Promise<unknown> => {
       const call = ToolCallParams.parse(raw);
-      const reply = (text: string, success: boolean) => ({
-        contentItems: [{ type: "inputText", text: text || "(no output)" }],
-        success,
-      });
-      if (call.tool !== PUBLISH_TOOL && call.tool !== SYNC_TOOL)
-        return reply(`No tool named ${call.tool} here.`, false);
-      if (!broker)
-        return reply(
-          `${call.tool} needs the environment's GitHub connector, which this run doesn't have: nothing was sent.`,
-          false,
-        );
-      const op = call.tool === PUBLISH_TOOL ? "publish" : "sync";
-      const parsed =
-        op === "publish"
-          ? PublishArgs.safeParse(call.arguments)
-          : SyncArgs.safeParse(call.arguments);
-      if (!parsed.success)
-        return reply(`Invalid arguments: ${parsed.error.message}`, false);
-      const token = broker.issue(call.callId, op);
-      let out = "";
-      try {
-        const code = await askBroker(
-          `sky ${op}`,
-          { op, ...parsed.data },
-          {
-            [BROKER_SOCKET_ENV]: brokerSocketIn(scratch),
-            [BROKER_TOKEN_ENV]: token,
-          },
-          {
-            cwd,
-            stdout: (s) => {
-              out += s;
-            },
-            stderr: (s) => {
-              out += s;
-            },
-          },
-        );
-        return reply(out.trim(), code === 0);
-      } finally {
-        broker.release(call.callId);
-      }
+      const reply = await callSkyTool(call.tool, call.arguments);
+      return {
+        contentItems: [{ type: "inputText", text: reply.text }],
+        success: reply.success,
+      };
     };
 
     app.onNotification = (method, params) => {
@@ -1715,6 +1739,7 @@ export async function runCodexSession(
   } finally {
     deps.signal.removeEventListener("abort", forward);
     heartbeat?.stop();
+    await toolsChannel?.close().catch(() => {});
     await broker?.close().catch(() => {});
     await server?.close();
     // after Codex: its last model call may still be streaming until it exits
