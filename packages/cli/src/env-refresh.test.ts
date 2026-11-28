@@ -67,7 +67,7 @@ test("env set-refresh @file sends the file's script as it is", async () => {
   expect(r.code).toBe(0);
   expect(patches).toEqual([{ refresh: script }]);
   expect(r.stdout).toBe(
-    "env_1 ready acme/web web\nrefresh: set (4 lines, runs before every run)\n",
+    "env_1 ready acme/web web\nrefresh: set (3 lines, runs before every run)\n",
   );
 });
 

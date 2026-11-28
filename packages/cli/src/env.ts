@@ -85,11 +85,11 @@ const claudeLine = (env: ApiEnvironment) =>
 const runtimeLine = (env: ApiEnvironment) =>
   `runtime: ${env.runtime ?? "default (the SKY_RUNTIME secret, else claude-code)"}`;
 
-/** `env show` says whether a refresh script is set, never the script. */
+/** `env show` says whether a refresh script is set, never the script; a final newline starts no line. */
 const refreshLine = (env: ApiEnvironment) =>
   env.refresh === ""
     ? "refresh: none"
-    : `refresh: set (${env.refresh.split("\n").length} lines, runs before every run)`;
+    : `refresh: set (${env.refresh.replace(/\n+$/, "").split("\n").length} lines, runs before every run)`;
 
 export const env: AgentCommand = {
   options: {
