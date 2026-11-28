@@ -1847,7 +1847,7 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     expect(run("cat *", bare)).toBe("syntax");
     expect(run("grep -rn foo src", bare)).toBe("unsafe-option");
     expect(run("grep --recursive foo src", bare)).toBe("unsafe-option");
-    // a named path is as before
+    // a named path doesn't need the hook
     expect(run("grep -n foo src/a.ts", bare)).toBe("approved");
     expect(
       isAutoApproved("cat *", DEFAULTS, { root: CWD, realpath: (p) => p }),

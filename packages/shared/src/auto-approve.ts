@@ -1268,7 +1268,7 @@ type GlobPart =
 /** A class holds plain characters only: a range, `!`, `^` or a nested class would match what the text doesn't say. */
 const CLASS_BODY = /^[A-Za-z0-9_.@%+,:=]+$/;
 
-/** The parts of a glob segment (no `/`), or undefined on a class this doesn't read. */
+/** The parts of a glob segment (no `/`), or undefined on a class this doesn't read or a stray `]`. */
 function globParts(segment: string): GlobPart[] | undefined {
   const parts: GlobPart[] = [];
   for (let i = 0; i < segment.length; i++) {
@@ -1316,7 +1316,7 @@ const errorCode = (error: unknown) =>
 
 /**
  * The words of `words` with each glob flagged in `globs` replaced by the paths it matches in
- * `cwd`, as the shell expands it: `*` and `?` never match a leading dot unless the pattern starts
+ * `cwd`, as the shell expands it: no wildcard matches a leading dot unless its path segment starts
  * with one, nothing matches across `/`, and a glob with no match stays its own text (bash passes
  * it on, zsh fails the command, and neither reads a file). `from` is the index each result word
  * came from. Undefined when it can't be sure: an unreadable directory, more than the caps allow,
@@ -1450,7 +1450,8 @@ const GLOB_PROGRAMS = new Set([
 ]);
 const GLOB_GIT = new Set(["status", "log", "diff", "show", "rev-parse"]);
 
-// short options of GNU grep: the ones with no value, and the ones that take one
+// the short options of GNU grep that `grepRecursion` reads, `-R` and `-d` aside: the ones with
+// no value, and the ones that take one
 const GREP_FLAG_LETTERS = /^[EFGPHhIiLlnoqsUuvwxzabcrtTVyZ0-9]$/;
 const GREP_VALUE_LETTERS = /^[efmABCD]$/;
 // long options that take their value as the next word when written without `=`
@@ -1497,7 +1498,7 @@ function grepRecursion(
       }
     } else operands.push(i);
   }
-  // the first operand is the pattern unless `-e` gave one
+  // the first operand is the pattern unless `-e` or `--regexp` gave one
   const fileAt = operands.slice(patterns > 0 ? 0 : 1);
   return { recursive, files: fileAt.map((at) => args[at] ?? ""), fileAt };
 }
@@ -1617,7 +1618,8 @@ export type AutoApproveScope = {
    * The entries of a directory with `lstat` kinds, following no link among them (`fs.readdirSync`
    * with `withFileTypes` fits); it throws, with the code `ENOENT` or `ENOTDIR` for a path that
    * isn't a directory. With it, an unquoted glob in a read-only command is expanded and each match
-   * checked like a named path, and `grep -r` walks the directories it names; without it both ask.
+   * checked like a named path, and `grep -r` walks the directories it names (the working directory
+   * when it names none); without it both ask.
    */
   readDir?: (path: string) => DirEntry[];
   /**
@@ -1775,8 +1777,8 @@ function stepVerdict(
   }
   if (step.globs.some(Boolean)) {
     const [program = "", sub] = raw;
-    // the program, a `cd` and anything that writes keep asking, as does a glob where git
-    // names its subcommand
+    // a glob keeps asking as the program, for a program off `GLOB_PROGRAMS` (`cd` among them),
+    // in anything that writes, and where git names its subcommand
     if (
       step.globs[0] ||
       !readDir ||

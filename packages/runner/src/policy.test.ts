@@ -191,7 +191,7 @@ describe("globs and recursive grep against a real worktree", () => {
       mkdirSync(dirname(join(root, file)), { recursive: true });
       writeFileSync(join(root, file), "x");
     }
-    // the hooks the runner wires into a session
+    // hooks like the ones the runner wires into a session
     const scope: AutoApproveScope = {
       root,
       realpath: realpathSync.native,
