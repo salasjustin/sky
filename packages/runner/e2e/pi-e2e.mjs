@@ -593,11 +593,11 @@ check(
   gh.calls.slice(-4).join(", "),
 );
 check(
-  "run.finished has token usage (and the cost pi gives: none) and a rollup",
+  "run.finished has token usage (and pi's cost estimate) and a rollup",
   finished?.payload.usage.turns > 0 &&
     finished?.payload.usage.inputTokens > 0 &&
     finished?.payload.usage.outputTokens > 0 &&
-    finished?.payload.usage.costUsd === 0 &&
+    finished?.payload.usage.costUsd >= 0 &&
     finished?.payload.rollup?.run.commits.length >= 1,
   JSON.stringify(finished?.payload.usage),
 );
