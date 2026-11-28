@@ -9,6 +9,7 @@ import {
   withdrawCredential,
 } from "./claude-auth.js";
 import {
+  codexHomeOf,
   missingCodexPluginWarnings,
   runCodexSession,
   withdrawCodexKey,
@@ -198,12 +199,26 @@ async function main(): Promise<void> {
     controller.signal.aborted || !config.refresh
       ? undefined
       : await step("env refresh", async () => {
-          const worktree = join(config.worktreesDir, config.agentId);
-          const cwd = [worktree, config.repoDir].find((dir) => existsSync(dir));
+          // what the agent's own commands hold, and no more: see `refreshEnv`. A Codex session's
+          // commands find the run's Codex home as CODEX_HOME, so the script does too
+          const env = {
+            ...refreshEnv(process.env, config.sessionEnv),
+            ...(codex && {
+              CODEX_HOME: codexHomeOf({
+                ...process.env,
+                ...config.sessionEnv,
+              }),
+            }),
+          };
+          // one place for every run, not the agent's worktree: a run that waited on another's script
+          // skips its own, so what the script does has to be the sprite's, not one agent's
+          const cwd =
+            env.HOME !== undefined && existsSync(env.HOME)
+              ? env.HOME
+              : undefined;
           const record = await runEnvRefresh({
             script: config.refresh as string,
-            // what the agent's own commands hold, and no more: see `refreshEnv`
-            env: refreshEnv(process.env, config.sessionEnv),
+            env,
             warn,
             signal: controller.signal,
             timeoutMs: envRefreshBudgetMs(

@@ -278,10 +278,12 @@ describe("the env's refresh script", () => {
       const { port } = api.address() as AddressInfo;
       const runId = newRunId();
       const seen = join(runs, "env.seen");
+      const ranIn = join(runs, "cwd.seen");
       try {
         const { code, stderr } = await runBundle({
           ...runEnv(`http://127.0.0.1:${port}`, join(runs, `${runId}.prompt`)),
           RUN_ID: runId,
+          HOME: runs,
           ...runtime,
           // the credential variables, the connector and the gateway key, as the API's env file holds them
           SKY_CLAUDE_AUTH: "oauth",
@@ -291,7 +293,7 @@ describe("the env's refresh script", () => {
           GITHUB_GATEWAY_URL: "https://gateway.test",
           PROJECT_SECRET: "the-projects-own",
           SKY_SESSION_ENV: JSON.stringify({ FROM_PROFILE: "yes" }),
-          SKY_REFRESH: `env > '${seen}'\necho refreshing\nexit 7`,
+          SKY_REFRESH: `env > '${seen}'\npwd -P > '${ranIn}'\necho refreshing\nexit 7`,
         });
         // a failed script never fails the run for itself: this one ends at the missing worktree
         expect(code).toBe(1);
@@ -318,6 +320,12 @@ describe("the env's refresh script", () => {
           "SKY_REFRESH",
         ])
           expect(env).not.toContain(`${name}=`);
+        // a Codex session's commands get the run's Codex home, and so does the script
+        if (runtime.SKY_RUNTIME === "codex")
+          expect(env).toContain(`CODEX_HOME=${join(runs, ".sky", "codex")}\n`);
+        else expect(env).not.toContain("CODEX_HOME=");
+        // every run's script runs in the agent's home, whichever agent's run it is
+        expect(readFileSync(ranIn, "utf8").trim()).toBe(realpathSync(runs));
         // its output is in a file on the sprite, not the runner's own log
         expect(readFileSync(join(runs, `${runId}.refresh.log`), "utf8")).toBe(
           "refreshing\n",
