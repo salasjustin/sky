@@ -1648,6 +1648,11 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     "grep -rni foo src docs",
     "grep -r -e foo src",
     "grep -r foo src/a.ts",
+    "tail -n 5 src/*.ts",
+    "sed -n '1,5p' src/*.ts",
+    "rg -n foo src/*.ts",
+    "find docs/* -type f",
+    "git log --oneline -- src/*.ts",
     // no match: the shell passes the text on or fails, and reads nothing
     "cat src/*.nomatch",
     "ls nothing*/x",
@@ -1705,6 +1710,35 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     expect(run("cat links/ok*")).toBe("approved");
   });
 
+  test("`?`, a class and a mid-path wildcard each reach the secret they match", () => {
+    const { run } = tree([...project, ".env", "id_rsa", ".ssh/known"]);
+    // none of these texts names a secret; only what they match does
+    expect(run("cat .e?v")).toBe("sensitive-path");
+    expect(run("cat id_r[s]a")).toBe("sensitive-path");
+    expect(run("cat id_[xr]sa")).toBe("sensitive-path");
+    expect(run("cat .s?h/known")).toBe("sensitive-path");
+    expect(run("cat .s[s]h/known")).toBe("sensitive-path");
+    // what they don't match: a class without the letter, `?` is one character, and neither
+    // `?` nor a class meets a leading dot
+    expect(run("cat id_[xy]sa")).toBe("approved");
+    expect(run("cat id_rs??")).toBe("approved");
+    expect(run("cat ?env")).toBe("approved");
+    expect(run("cat [.]env")).toBe("approved");
+  });
+
+  test("a glob that matches nothing is judged as the text it leaves", () => {
+    const { run } = tree([...project, ".env.local"]);
+    expect(run("cat .env.nomatch*")).toBe("sensitive-path");
+    expect(run("cat ../outside/nope*")).toBe("outside-root");
+    expect(run("cat src/nope*")).toBe("approved");
+  });
+
+  test("an absolute glob lists the directory it names", () => {
+    const { root, run } = tree([...project, ".env.local"]);
+    expect(run(`cat ${root}/src/*.ts`)).toBe("approved");
+    expect(run(`cat ${root}/.e*`)).toBe("sensitive-path");
+  });
+
   test("a match on .git/config asks", () => {
     const { run } = tree([...project, ".git/config", ".git/HEAD"]);
     expect(run("cat .g*/c*")).toBe("sensitive-path");
@@ -1752,33 +1786,45 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     ["cat 'src'/*.ts", "syntax"],
     ["cat ~/*.ts", "syntax"],
     ["cat *~src", "syntax"],
-    // the first word, a cd target, an assignment, a redirect, and what writes
+    // the first word, a cd target and an assignment
     ["*.sh", "syntax"],
     ["src/*.sh", "syntax"],
     ["cd src/* && ls", "syntax"],
     ["A=src/*.ts cat a", "syntax"],
-    ["ls > src/*.ts", "syntax"],
+    // the readers' own writes, the only ones that reach `writes()`
     ["sed -i 's/a/b/' src/*.ts", "syntax"],
+    ["sed -ni 's/a/b/p' src/*.ts", "syntax"],
+    ["sed -n -i 's/a/b/' src/*.ts", "syntax"],
+    ["sed -i.bak 's/a/b/' src/*.ts", "syntax"],
+    ["sed --in-place 's/a/b/' src/*.ts", "syntax"],
+    ["timeout 5 sed -i s/a/b/ src/*.ts", "syntax"],
+    // programs outside the readers, the ones that write among them
+    ["echo src/*.ts", "syntax"],
+    ["pnpm test src/*.ts", "syntax"],
     ["biome format --write src/*.ts", "syntax"],
     ["pnpm exec biome format --write src/*.ts", "syntax"],
     ["git add src/*.ts", "syntax"],
     ["git commit -m x src/*.ts", "syntax"],
     ["mkdir -p src/*", "syntax"],
-    // programs outside the readers
-    ["echo src/*.ts", "syntax"],
-    ["pnpm test src/*.ts", "syntax"],
     ["git branch src/*.ts", "syntax"],
     ["git * status", "syntax"],
-    ["timeout 5 sed -i s/a/b/ src/*.ts", "syntax"],
   ] as const)("asks on %s", (command, reason) => {
     const { run } = tree(project);
     expect(run(command)).toBe(reason);
   });
 
-  test("a glob in a cd out of the worktree asks", () => {
-    const { run } = tree(project);
-    expect(run("cd ../outside && cat *.txt")).not.toBe("approved");
-    expect(run("cd ../outside && grep -r foo .")).not.toBe("approved");
+  test("a glob or grep -r after a cd is judged in the directory it entered", () => {
+    const { run } = tree([...project, "config/.env", "config/app.json"], {
+      "dir-out": "$OUT",
+    });
+    expect(run("cd config && cat .e*")).toBe("sensitive-path");
+    expect(run("cd config && grep -r foo")).toBe("sensitive-path");
+    expect(run("cd config && grep -r foo .")).toBe("sensitive-path");
+    expect(run("cd src && grep -r foo")).toBe("approved");
+    // the cd itself asks when it leaves the worktree, lexically or through a link
+    expect(run("cd ../outside && cat *.txt")).toBe("outside-root");
+    expect(run("cd ../outside && grep -r foo .")).toBe("outside-root");
+    expect(run("cd dir-out && cat *")).toBe("outside-root");
     expect(run("cat ../outside/*.txt")).toBe("outside-root");
   });
 
@@ -1835,6 +1881,62 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     const { run } = tree([...project, ".claude/skills/x/SKILL.md"]);
     expect(run("grep -rn foo .claude/skills")).toBe("approved");
     expect(run("grep -rn foo .")).toBe("approved");
+  });
+
+  // `$P` stands for the pattern; each form takes its value as the option's own text or the next word
+  const GREP_VALUE_FORMS = [
+    "-rA2 $P",
+    "-rA 2 $P",
+    "-re $P",
+    "-rm 5 $P",
+    "-r --regexp $P",
+    "-r --max-count 5 $P",
+    "-r -- $P",
+  ];
+
+  test.each(GREP_VALUE_FORMS)(
+    "grep %s walks the directory operand it names",
+    (form) => {
+      const { root, run } = tree(["clean/a.ts", "bad/.env", "src/a.ts"]);
+      const cwd = join(root, "clean");
+      const command = (operand: string) =>
+        `grep ${form.replace("$P", "foo")} ${operand}`;
+      // the working directory is clean, so only the operand can ask
+      expect(run(command("../bad"), { cwd })).toBe("sensitive-path");
+      expect(run(command("../clean"), { cwd })).toBe("approved");
+    },
+  );
+
+  test.each(GREP_VALUE_FORMS)(
+    "grep %s takes the pattern out of the operands",
+    (form) => {
+      const { run } = tree(["bad/.env", "src/a.ts"]);
+      // a pattern spelled like the secret directory is not walked
+      expect(run(`grep ${form.replace("$P", "bad")} src`)).toBe("approved");
+    },
+  );
+
+  test("grep -r reads operands after `--`, and a pattern that starts with a dash", () => {
+    const { root, run } = tree(["clean/a.ts", "bad/.env"]);
+    const cwd = join(root, "clean");
+    expect(run("grep -r foo -- ../bad", { cwd })).toBe("sensitive-path");
+    expect(run("grep -r -- -x ../bad", { cwd })).toBe("sensitive-path");
+    expect(run("grep -r -- -x ../clean", { cwd })).toBe("approved");
+  });
+
+  test("grep -r walks every directory operand, not only the first", () => {
+    const { run } = tree([...project, "docs/.env"]);
+    expect(run("grep -rni foo src docs")).toBe("sensitive-path");
+    expect(run("grep -r foo src/a.ts docs")).toBe("sensitive-path");
+    expect(run("grep -r foo docs src")).toBe("sensitive-path");
+    expect(run("grep -r foo src README.md")).toBe("approved");
+  });
+
+  test("grep -r on a directory operand that is a link inside the root walks its target", () => {
+    const clean = tree(project, { "src-link": "src" });
+    expect(clean.run("grep -r foo src-link")).toBe("approved");
+    const secret = tree([...project, "src/.env"], { "src-link": "src" });
+    expect(secret.run("grep -r foo src-link")).toBe("sensitive-path");
   });
 
   test("grep -r asks on any symlink met in the walk, to the inside or the outside", () => {
@@ -1922,7 +2024,14 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     expect(at("grep -r foo src", deeper)).toBe("unsafe-option");
     expect(at("cat src/*.ts", many(2000))).toBe("approved");
     expect(at("cat src/*.ts", many(2001))).toBe("syntax");
-    expect(at("cat src/*.ts", many(60_000))).toBe("syntax");
+    // names that don't match fill the listing cap without reaching the match cap
+    const others = (n: number) => () =>
+      Array.from({ length: n }, (_, i) => ({
+        name: `x${i}`,
+        kind: "file" as const,
+      }));
+    expect(at("cat src/*.ts", others(50_000))).toBe("approved");
+    expect(at("cat src/*.ts", others(50_001))).toBe("syntax");
     const fails = (code: string) => () => {
       throw Object.assign(new Error(code), { code });
     };
@@ -1931,6 +2040,24 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     expect(at("cat src/*.ts", fails("EIO"))).toBe("syntax");
     // a directory that isn't there leaves the text, which names nothing
     expect(at("cat src/*.ts", fails("ENOENT"))).toBe("approved");
+    // a failure below the first directory, not on the first listing
+    const failsBelow =
+      (leaf: string, code: string) =>
+      (path: string): DirEntry[] => {
+        if (path.endsWith(leaf)) throw Object.assign(new Error(code), { code });
+        return [{ name: leaf.split("/").pop() ?? "", kind: "dir" }];
+      };
+    expect(at("grep -r foo src", failsBelow("/src/a", "EACCES"))).toBe(
+      "unresolvable",
+    );
+    expect(at("grep -r foo src", failsBelow("/src/a", "ENOENT"))).toBe(
+      "unresolvable",
+    );
+    // the glob's last segment lists the directory a middle one matched
+    expect(at("cat src/*/d.ts", failsBelow("/src/a", "EACCES"))).toBe("syntax");
+    expect(at("cat src/*/d.ts", failsBelow("/src/a", "ENOENT"))).toBe(
+      "approved",
+    );
     // an entry that is no file, directory or link
     expect(
       at("grep -r foo src", () => [{ name: "pipe", kind: "other" as const }]),
