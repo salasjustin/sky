@@ -1119,7 +1119,7 @@ describe("PiRpc", () => {
         // pi's orderly shutdown: it exits once it has read what was written before the EOF
         child.emit("exit", 0, null);
       });
-      const closing = rpc.close(3_000);
+      const closing = rpc.close();
       await vi.advanceTimersByTimeAsync(0);
       await closing;
       expect(ended).toBe(true);
@@ -1134,7 +1134,7 @@ describe("PiRpc", () => {
     vi.useFakeTimers();
     try {
       const { child, rpc } = fakeChild();
-      const closing = rpc.close(3_000);
+      const closing = rpc.close();
       await vi.advanceTimersByTimeAsync(2_999);
       expect(child.kill).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
@@ -1145,6 +1145,22 @@ describe("PiRpc", () => {
       expect(child.kill.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"]]);
       child.emit("exit", null, "SIGKILL");
       await closing;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("close never SIGKILLs a pi that exits after the SIGTERM", async () => {
+    vi.useFakeTimers();
+    try {
+      const { child, rpc } = fakeChild();
+      const closing = rpc.close();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(child.kill.mock.calls).toEqual([["SIGTERM"]]);
+      child.emit("exit", null, "SIGTERM");
+      await closing;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(child.kill.mock.calls).toEqual([["SIGTERM"]]);
     } finally {
       vi.useRealTimers();
     }
