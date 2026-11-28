@@ -26,8 +26,10 @@
  * installs them under the run's Codex home. Their hooks run without Codex's per-hook trust, and get
  * Codex's env, proxy token included, so a hook can make model calls through the run while it lasts.
  *
- * Not carried over from the Claude Code session: the base profile's MCP servers, background tasks,
- * the default git identity and the outside-read gate. Codex runs the commands it counts as read-only
+ * The base profile's MCP servers are written into Codex's config by name only (the values stay in
+ * Codex's env), and each MCP tool call asks, so Sky's approval policy answers it as on Claude Code.
+ *
+ * Not carried over from the Claude Code session: background tasks, the default git identity and the outside-read gate. Codex runs the commands it counts as read-only
  * (`cat`, `ls`, `grep` and the like) without asking, wherever they read.
  */
 import type { ChildProcess } from "node:child_process";
@@ -70,6 +72,11 @@ import {
 } from "./broker.js";
 import { askBroker } from "./broker-client.js";
 import {
+  codexMcpTables,
+  codexRefusedWarning,
+  codexUnresolvedWarning,
+} from "./codex-mcp.js";
+import {
   type GatewayProxy,
   type GatewayProxyOptions,
   startGatewayProxy,
@@ -78,7 +85,7 @@ import { CODEX_KEY_ENV, type Config } from "./config.js";
 import { CONNECTOR_ENV, withoutConnector } from "./connector.js";
 import { type PostEvent, RunEndedError } from "./events.js";
 import { createHeartbeat } from "./heartbeat.js";
-import { policyOutcome } from "./policy.js";
+import { matchesPolicy, policyOutcome } from "./policy.js";
 import type { AwaitDecision } from "./requests.js";
 import type { Seal } from "./seal.js";
 import { scratchDirOf, withSessionGitConfig } from "./session.js";
@@ -199,11 +206,12 @@ export const CODEX_PROXY_TOKEN_ENV = "SKY_CODEX_GATEWAY_TOKEN";
  * included, as Claude Code's commands get them) except that token. The gateway key itself never
  * reaches Codex (`codex-proxy.ts`). The runner leaves its event token and the GitHub connector out of
  * that env, and pins git's `core.fsmonitor` off in it. Each plugin in `plugins` is turned on; the
- * environment's setup installs it.
+ * environment's setup installs it. `mcpTables` are the base profile's servers (`codexMcpTables`).
  */
 export function codexConfigToml(
   baseUrl: string,
   plugins: readonly string[] = [],
+  mcpTables: readonly (readonly string[])[] = [],
 ): string {
   return [
     "# written by Sky's runner on every Codex run; edits here are replaced",
@@ -222,6 +230,7 @@ export function codexConfigToml(
     "",
     // ids are `<plugin>@<marketplace>` of letters, digits, `.`, `_` and `-` (`config.ts`)
     ...plugins.flatMap((id) => [`[plugins."${id}"]`, "enabled = true", ""]),
+    ...mcpTables.flat(),
   ].join("\n");
 }
 
@@ -593,6 +602,12 @@ const ApprovalParams = z.looseObject({
   cwd: z.string().nullish(),
   reason: z.string().nullish(),
 });
+const ElicitationParams = z.looseObject({
+  threadId: z.string(),
+  serverName: z.string(),
+  message: z.string().nullish(),
+  _meta: z.looseObject({ codex_approval_kind: z.unknown() }).nullish(),
+});
 const ToolCallParams = z.looseObject({
   threadId: z.string(),
   callId: z.string(),
@@ -885,10 +900,6 @@ export async function runCodexSession(
         warn: warning,
       });
     }
-    if (Object.keys(config.mcpServers).length > 0)
-      warning(
-        "this Codex run doesn't load the base profile's MCP servers; only Claude Code runs do",
-      );
     const key = deps.codexEnv[CODEX_KEY_ENV];
     if (!key) throw new Error(`${CODEX_KEY_ENV} is not set for this run`);
     proxy = await (deps.startProxy ?? startGatewayProxy)({
@@ -898,7 +909,6 @@ export async function runCodexSession(
     });
     const codexHome = codexHomeOf(sessionEnv);
     const plugins = config.codexPlugins ?? [];
-    writeCodexConfig(codexHome, codexConfigToml(proxy.baseUrl, plugins));
     const bin = deps.bin ?? env.SKY_CODEX_BIN ?? CODEX_BIN;
     // Codex's env, which the agent's commands get whole and its hooks and MCP servers get no more than,
     // never holds the connector (the broker does the sending), the event token (the runner posts the
@@ -910,6 +920,15 @@ export async function runCodexSession(
       [CODEX_PROXY_TOKEN_ENV]: _proxyToken,
       ...childEnv
     } = withoutConnector(withSessionGitConfig(sessionEnv));
+    // the base profile's servers, by the names of the secrets Codex's env holds; never their values
+    const mcp = codexMcpTables(config.mcpServers, childEnv);
+    if (mcp.unresolved.length > 0)
+      warning(codexUnresolvedWarning(mcp.unresolved));
+    if (mcp.refused.length > 0) warning(codexRefusedWarning(mcp.refused));
+    writeCodexConfig(
+      codexHome,
+      codexConfigToml(proxy.baseUrl, plugins, mcp.tables),
+    );
     // the seal's spawn ends the process with this signal; the run's own stop goes through the turn
     child = deps.seal.spawn({
       command: resolveCodexExecutable(bin),
@@ -1357,6 +1376,78 @@ export async function runCodexSession(
       }
     };
 
+    /**
+     * An MCP server's request through Codex. Codex asks before every MCP tool call (the config's
+     * `prompt` mode), and that ask is the call's approval: the environment's policy answers as it does
+     * for the same `mcp__<server>__<tool>` call on a Claude Code run, running one it doesn't name and
+     * holding one it does for the person. A call the runner can't match to a tool, and any other ask
+     * from a server, is the person's to answer; nothing is accepted unasked.
+     */
+    const answerElicitation = async (
+      rpcId: string,
+      raw: unknown,
+    ): Promise<unknown> => {
+      const params = ElicitationParams.parse(raw);
+      const reply = (action: "accept" | "decline" | "cancel") => ({
+        action,
+        content: action === "accept" ? {} : null,
+        _meta: null,
+      });
+      if (params.threadId !== thread) return reply("decline");
+      const isToolCall = params._meta?.codex_approval_kind === "mcp_tool_call";
+      // the oldest call of this server not yet asked about is the one Codex is asking for
+      const prefix = `mcp__${params.serverName}__`;
+      const [itemId, tracked] =
+        (isToolCall
+          ? [...calls.entries()]
+              .filter(
+                ([, call]) =>
+                  call.name.startsWith(prefix) && !call.asked && !call.pre,
+              )
+              .sort(([, a], [, b]) => a.at - b.at)[0]
+          : undefined) ?? [];
+      if (tracked) {
+        tracked.asked = true;
+        clearTimeout(tracked.timer);
+      }
+      const toolName = tracked?.name ?? `mcp__${params.serverName}`;
+      const input: Record<string, unknown> = tracked
+        ? (JSON.parse(tracked.input) as Record<string, unknown>)
+        : { message: params.message ?? "" };
+      if (tracked && !matchesPolicy(config.approvalPolicy, toolName, input)) {
+        if (itemId) emitPre(itemId);
+        return reply("accept");
+      }
+      const withdraw = new AbortController();
+      pending.set(rpcId, withdraw);
+      try {
+        const decision = await decide(
+          {
+            kind: "approval",
+            toolName,
+            toolSummary: bound(
+              tracked ? toolName : (params.message ?? toolName),
+            ),
+            toolInput: JSON.stringify(input).slice(0, TOOL_INPUT_POST_MAX),
+          },
+          AbortSignal.any([abortController.signal, withdraw.signal]),
+        );
+        if (decision?.decision === "approve") {
+          if (itemId) emitPre(itemId);
+          return reply("accept");
+        }
+        if (decision?.decision === "deny" && decision.reason)
+          setTimeout(
+            () =>
+              tellReason(`The person denied ${toolName}: ${decision.reason}`),
+            0,
+          );
+        return reply(decision ? "decline" : "cancel");
+      } finally {
+        pending.delete(rpcId);
+      }
+    };
+
     const answerQuestion = async (raw: unknown): Promise<unknown> => {
       const ask = UserInputParams.parse(raw);
       const prompt = ask.questions
@@ -1491,7 +1582,7 @@ export async function runCodexSession(
         case "item/tool/call":
           return runTool(params);
         case "mcpServer/elicitation/request":
-          return { action: "decline", content: null, _meta: null };
+          return answerElicitation(id, params);
         case "item/permissions/requestApproval":
           // the sandbox is already off: there is nothing more to grant
           return { permissions: {}, scope: "turn" };

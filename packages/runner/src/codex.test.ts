@@ -392,6 +392,24 @@ const scenarios = {
     usage(10, 1);
     finish("completed");
   },
+  // an MCP tool call: Codex asks for its approval as an elicitation, as its prompt mode does
+  async mcp() {
+    const item = (status) => ({ type: "mcpToolCall", id: "mcp_1", server: "doop", tool: "draw", status, arguments: { shape: "box" }, result: null, error: null, durationMs: 5 });
+    note("item/started", { threadId: thread, turnId: turn, startedAtMs: Date.now(), item: item("inProgress") });
+    const answer = await ask("mcpServer/elicitation/request", { threadId: thread, turnId: turn, serverName: "doop", mode: "form", message: "Allow the doop MCP server to run tool draw?", requestedSchema: { type: "object", properties: {} }, _meta: { codex_approval_kind: "mcp_tool_call" } });
+    const accepted = answer.action === "accept";
+    note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: item(accepted ? "completed" : "failed") });
+    note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { type: "agentMessage", id: "msg_3", text: accepted ? "drew" : "not drawn" } });
+    usage(10, 1);
+    finish("completed");
+  },
+  // a server's own request for input, no tool call behind it
+  async elicit() {
+    const answer = await ask("mcpServer/elicitation/request", { threadId: thread, turnId: turn, serverName: "doop", mode: "form", message: "Which canvas?", requestedSchema: { type: "object", properties: {} } });
+    note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { type: "agentMessage", id: "msg_4", text: answer.action } });
+    usage(10, 1);
+    finish("completed");
+  },
   async publish() {
     const reply = await ask("item/tool/call", { threadId: thread, turnId: turn, callId: "call_1", namespace: null, tool: "sky_publish", arguments: { title: "T" } });
     note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { type: "agentMessage", id: "msg_2", text: reply.contentItems[0].text } });
@@ -695,6 +713,71 @@ describe("runCodexSession", () => {
     expect(existsSync(join(root, "worktrees", "agt_1", "made.txt"))).toBe(
       false,
     );
+  });
+
+  describe("MCP tool calls", () => {
+    const answerOf = () => sent().find((m) => m.id === 100 && m.result)?.result;
+
+    test("one the policy doesn't name runs without asking, as on a Claude Code run", async () => {
+      config.approvalPolicy = ["Bash", "Edit", "Write"];
+      expect(await run(undefined, "mcp")).toBe(0);
+      expect(ofType("run.waiting")).toEqual([]);
+      expect(answerOf()).toMatchObject({ action: "accept" });
+      expect(ofType("claude.PreToolUse")[0]?.payload).toMatchObject({
+        toolName: "mcp__doop__draw",
+        toolUseId: "mcp_1",
+      });
+    });
+
+    test("one the policy names waits for the person, and a denial declines it", async () => {
+      config.approvalPolicy = ["mcp__doop__draw"];
+      decide = () => "deny";
+      expect(await run(undefined, "mcp")).toBe(0);
+      expect(ofType("run.waiting").map((e) => e.payload.request)).toEqual([
+        expect.objectContaining({
+          kind: "approval",
+          toolName: "mcp__doop__draw",
+          toolInput: JSON.stringify({ shape: "box" }),
+        }),
+      ]);
+      expect(answerOf()).toMatchObject({ action: "decline" });
+    });
+
+    test("one the policy names runs once the person approves it", async () => {
+      config.approvalPolicy = ["mcp__doop__draw"];
+      decide = () => "approve";
+      expect(await run(undefined, "mcp")).toBe(0);
+      expect(ofType("run.waiting")).toHaveLength(1);
+      expect(answerOf()).toMatchObject({ action: "accept" });
+    });
+
+    test("a server's own request for input goes to the person, never accepted unasked", async () => {
+      config.approvalPolicy = [];
+      decide = () => "deny";
+      expect(await run(undefined, "elicit")).toBe(0);
+      expect(ofType("run.waiting")).toHaveLength(1);
+      expect(answerOf()).toMatchObject({ action: "decline" });
+    });
+
+    test("the base profile's servers are written by name, and no secret value reaches the file", async () => {
+      config.mcpServers = {
+        doop: {
+          url: "https://doop.example/mcp",
+          headers: { Authorization: "DOOP_KEY" },
+        },
+      };
+      config.sessionEnv.DOOP_KEY = "fake-secret-value";
+      expect(await run()).toBe(0);
+      const toml = readFileSync(
+        join(root, "codex-home", "config.toml"),
+        "utf8",
+      );
+      expect(toml).toContain('[mcp_servers."doop"]');
+      expect(toml).toContain(
+        'env_http_headers = { "Authorization" = "DOOP_KEY" }',
+      );
+      expect(toml).not.toContain("fake-secret-value");
+    });
   });
 
   test("a file change is held as the policy holds Write, with its diff shown", async () => {
