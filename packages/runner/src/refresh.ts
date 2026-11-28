@@ -5,6 +5,7 @@ import {
   openSync,
   readFileSync,
   readSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -162,8 +163,8 @@ const WRAPPER = 'exec >>"$1" 2>&1 && eval "$2"';
  * the session (a child that leaves the group, by `setsid`, `set -m` or daemonizing itself, escapes
  * both). It holds `lockFile`, a sibling of the
  * plugin refresh's lock, so two runs on a sprite never run two scripts into one Codex home at once;
- * the wait counts against the budget, and a run that waited on another's script skips its own, the
- * holder having just run it: `skipped`. Its output goes to `logFile` only; the record's `tail`
+ * the wait counts against the budget, and a run that waited on another's script skips its own,
+ * as `skipped`, only when the holder ran this same script to an end; otherwise it runs its own. Its output goes to `logFile` only; the record's `tail`
  * is the end of it, redacted.
  */
 export async function runEnvRefresh(options: {
@@ -216,6 +217,10 @@ export async function runEnvRefresh(options: {
   const scriptHash = createHash("sha256").update(script).digest("hex");
   let sameAsHolder = false;
   const task = async () => {
+    // an earlier run's note goes first, so a script cut or stopped here leaves none behind
+    try {
+      unlinkSync(ranFile);
+    } catch {}
     await runScript();
     if (result?.outcome === "ran" || result?.outcome === "failed") {
       try {

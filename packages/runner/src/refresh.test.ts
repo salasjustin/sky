@@ -279,6 +279,19 @@ describe("the lock beside other runs'", () => {
     );
   });
 
+  test("a run whose script is cut leaves no note, though an earlier run ran the same script to an end", async () => {
+    const script = "sleep 5";
+    // an earlier run ran this script to an end
+    writeFileSync(
+      `${lockFile}.sha256`,
+      createHash("sha256").update(script).digest("hex"),
+    );
+    const record = await run(script, { timeoutMs: 300 });
+    expect(record.outcome).toBe("timed_out");
+    // so a run that waited on this one runs its own
+    expect(existsSync(`${lockFile}.sha256`)).toBe(false);
+  });
+
   test("a lock whose holder is gone is taken over and the script runs", async () => {
     // pid 2^22+1 is past the default pid_max: no process
     writeFileSync(lockFile, "4194305");
