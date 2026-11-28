@@ -6,7 +6,9 @@ import {
   ClaudeFallback,
   ClaudeSubscriptionName,
 } from "./claude-credential.js";
-import { EnvironmentId } from "./ids.js";
+import { EventType } from "./event.js";
+import { EnvironmentId, WebhookId } from "./ids.js";
+import { Webhook } from "./webhook.js";
 
 export const EnvironmentStatus = z.enum(["provisioning", "ready", "failed"]);
 export type EnvironmentStatus = z.infer<typeof EnvironmentStatus>;
@@ -39,6 +41,33 @@ export const AutoApproveConfig = z.strictObject({
 
 /** The longest `refresh` script, in characters; it rides in the runner's env file. */
 export const REFRESH_MAX = 20_000;
+
+/** What an environment's webhook delivers when `events` is left out. */
+export const DEFAULT_ENVIRONMENT_WEBHOOK_EVENTS: [EventType, ...EventType[]] = [
+  "run.waiting",
+  "run.finished",
+  "run.failed",
+  "run.stopped",
+  "runner.warning",
+];
+
+/**
+ * The one webhook an environment owns, as `env.yaml` writes it. The signing secret is no field: it is
+ * the environment's `SKY_WEBHOOK_SECRET` secret, copied into the webhook when the environment is applied.
+ */
+export const EnvironmentWebhookSpec = z.strictObject({
+  /** https only, like any webhook: payloads carry tool input and output */
+  url: Webhook.shape.url,
+  format: z.enum(["openbot", "standard"]),
+  events: z
+    .array(EventType)
+    .nonempty()
+    .default(() => [...DEFAULT_ENVIRONMENT_WEBHOOK_EVENTS]),
+});
+export type EnvironmentWebhookSpec = z.infer<typeof EnvironmentWebhookSpec>;
+
+/** The env secret an environment's webhook is signed with. */
+export const WEBHOOK_SECRET_NAME = "SKY_WEBHOOK_SECRET";
 
 export const Environment = z.object({
   id: EnvironmentId,
@@ -89,5 +118,9 @@ export const Environment = z.object({
   claudeFallback: ClaudeFallback.default("api-key"),
   /** The runtime set by `PUT /v1/environments/:id/runtime`; null follows the env's `SKY_RUNTIME` secret, else Claude Code. */
   runtime: Runtime.nullable().default(null),
+  /** The environment's one webhook, kept by `sky apply`; null has none. Never carries the signing secret. */
+  webhook: EnvironmentWebhookSpec.extend({ id: WebhookId })
+    .nullable()
+    .default(null),
 });
 export type Environment = z.infer<typeof Environment>;

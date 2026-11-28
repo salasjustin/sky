@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Environment } from "@sky/shared";
+import { Environment, EnvironmentWebhookSpec } from "@sky/shared";
 import {
   type Document,
   isMap,
@@ -46,6 +46,8 @@ export const EnvSpec = z.strictObject({
   approvalPolicy,
   autoApprove,
   ...optionalClaude,
+  /** Absent means none: applying a file without it deletes the environment's webhook. The signing secret is no field. */
+  webhook: EnvironmentWebhookSpec.optional(),
 });
 export type EnvSpec = z.infer<typeof EnvSpec>;
 

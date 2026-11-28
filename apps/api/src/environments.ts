@@ -17,6 +17,7 @@ import {
   DEFAULT_CLAUDE_CREDENTIAL,
   Environment,
   EnvironmentId,
+  EnvironmentWebhookSpec,
   POOL_CREDENTIAL,
   Runtime,
 } from "@sky/shared";
@@ -25,6 +26,7 @@ import { z } from "zod";
 import { adminOnly, canUseEnv } from "./auth.js";
 import { assignmentProblem } from "./claude-credentials.js";
 import { poolProblem } from "./claude-pool.js";
+import { applyEnvWebhook } from "./environment-webhook.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
@@ -49,6 +51,8 @@ const {
   claudePool,
   claudeFallback,
 } = Environment.shape;
+// the same fields the environment presents, less the id the webhook row gets
+const webhookInput = EnvironmentWebhookSpec.nullable();
 const EnvironmentInput = z.strictObject({
   name,
   repo,
@@ -61,6 +65,7 @@ const EnvironmentInput = z.strictObject({
   claudeCredential,
   claudePool,
   claudeFallback,
+  webhook: webhookInput.default(null),
 });
 // unwrapped: zod 4 applies a default even inside .optional(), which would reset omitted fields;
 // autoApprove's own fields too, so the handler merges what was sent over the stored value
@@ -82,14 +87,37 @@ const EnvironmentPatch = z.strictObject({
   claudeCredential: claudeCredential.unwrap().optional(),
   claudePool: claudePool.unwrap().optional(),
   claudeFallback: claudeFallback.unwrap().optional(),
+  // null deletes the environment's webhook
+  webhook: webhookInput.optional(),
 });
+
+/** What a request changes by itself without reprovisioning, so one may land while a run is active: each run reads them as it launches. */
+const liveFields = new Set(["refresh", "webhook"]);
 
 /** `null` returns the environment to following its `SKY_RUNTIME` secret. */
 const RuntimeInput = z.strictObject({ runtime: Runtime.nullable() });
 
 type EnvRow = typeof environments.$inferSelect;
 
-const present = (row: EnvRow) => ({
+/** The environment's webhook as the spec writes it, with its id; never the signing secret. */
+const webhookOf = (db: Db | Tx, row: EnvRow): Environment["webhook"] => {
+  if (row.webhookId === null) return null;
+  const hook = db
+    .select()
+    .from(webhooks)
+    .where(eq(webhooks.id, row.webhookId))
+    .get();
+  return hook && hook.format !== "sky"
+    ? {
+        id: hook.id,
+        url: hook.url,
+        format: hook.format,
+        events: hook.eventTypes,
+      }
+    : null;
+};
+
+const present = (db: Db | Tx, row: EnvRow) => ({
   ...({
     id: row.id,
     name: row.name,
@@ -107,6 +135,7 @@ const present = (row: EnvRow) => ({
     claudePool: row.claudePool ?? null,
     claudeFallback: row.claudeFallback,
     runtime: row.runtime ?? null,
+    webhook: webhookOf(db, row),
   } satisfies Environment),
   // while provisioning, failure_step holds the step in progress
   failure:
@@ -227,12 +256,19 @@ export function environmentRoutes(
           // ties within a millisecond go by insert order (rowid); ids are random
           .orderBy(asc(environments.createdAt), asc(sql`rowid`))
           .all();
-        return c.json({ data: rows.map(present) }, 200);
+        return c.json({ data: rows.map((row) => present(c.var.db, row)) }, 200);
       })
       .post("/", jsonBody, body(EnvironmentInput), (c) => {
-        const input = {
-          ...c.req.valid("json"),
-        };
+        const { webhook: sentWebhook, ...input } = c.req.valid("json");
+        // the webhook is signed with an env secret, and a new environment has none yet
+        if (sentWebhook !== null) {
+          return apiError(
+            c,
+            400,
+            "webhook_secret_missing",
+            "a new environment has no SKY_WEBHOOK_SECRET secret yet; create it without a webhook, set the secret, then apply the webhook",
+          );
+        }
         input.claudeCredential = normalizeCredential(input.claudeCredential);
         const credentialProblem = assignmentProblem(
           c.var.config,
@@ -281,7 +317,7 @@ export function environmentRoutes(
         }
         provisioner.start(row);
         c.header("Location", `/v1/environments/${id}`);
-        return c.json(present(row), 202);
+        return c.json(present(c.var.db, row), 202);
       })
       .get("/:id", envParam, (c) => {
         const { id } = c.req.valid("param");
@@ -289,11 +325,11 @@ export function environmentRoutes(
           ? findEnv(c.var.db, id)
           : undefined;
         if (!row) return apiError(c, 404, "not_found", notFound);
-        return c.json(present(row), 200);
+        return c.json(present(c.var.db, row), 200);
       })
       .patch("/:id", envParam, jsonBody, body(EnvironmentPatch), (c) => {
         const { id } = c.req.valid("param");
-        const patch = c.req.valid("json");
+        const { webhook: sentWebhook, ...patch } = c.req.valid("json");
         if (patch.claudeCredential !== undefined) {
           patch.claudeCredential = normalizeCredential(patch.claudeCredential);
           const credentialProblem = assignmentProblem(
@@ -323,11 +359,15 @@ export function environmentRoutes(
               const env = findEnv(tx, id);
               if (!env) return { kind: "not_found" } as const;
               // a run takes `refresh` into its env file at launch, so one already going keeps the script it
-              // started with: a body carrying only `refresh` may land mid-run, and later launches take the new one
-              const refreshOnly =
-                patch.refresh !== undefined &&
-                Object.keys(patch).every((key) => key === "refresh");
-              if (!refreshOnly && hasActiveRun(tx, id))
+              // started with: a body carrying only `refresh` may land mid-run, and later launches take the new one.
+              // The webhook is read as each event is delivered, so it is as safe to change
+              const sent = [
+                ...Object.keys(patch),
+                ...(sentWebhook === undefined ? [] : ["webhook"]),
+              ];
+              const liveOnly =
+                sent.length > 0 && sent.every((key) => liveFields.has(key));
+              if (!liveOnly && hasActiveRun(tx, id))
                 return { kind: "run_active" } as const;
               // `refresh` is not here: it runs before each run, so a change reaches the next one as it is
               const reprovision =
@@ -365,6 +405,20 @@ export function environmentRoutes(
               );
               if (poolIssue)
                 return { kind: "invalid_pool", poolIssue } as const;
+              // checked before anything is written: a refusal leaves the whole patch unapplied
+              const webhook =
+                sentWebhook === undefined
+                  ? undefined
+                  : applyEnvWebhook(
+                      tx,
+                      c.var.config.secretEncryptionKey,
+                      c.var.principal,
+                      env,
+                      sentWebhook,
+                    );
+              if (webhook && !webhook.ok) {
+                return { kind: "webhook", problem: webhook } as const;
+              }
               const { autoApprove: sentAutoApprove, ...rest } = patch;
               if (credential !== POOL_CREDENTIAL) rest.claudePool = null;
               const fields =
@@ -378,16 +432,20 @@ export function environmentRoutes(
                 ? { ...fields, ...reprovisioning }
                 : fields;
               // drizzle refuses an update with nothing to set
-              const row =
-                Object.keys(changes).length === 0
-                  ? env
-                  : tx
-                      .update(environments)
-                      .set(changes)
-                      .where(eq(environments.id, id))
-                      .returning()
-                      .get();
-              return { kind: "updated", row, reprovision } as const;
+              if (Object.keys(changes).length > 0) {
+                tx.update(environments)
+                  .set(changes)
+                  .where(eq(environments.id, id))
+                  .run();
+              }
+              // read back: the webhook step may have set webhook_id
+              const row = findEnv(tx, id) ?? env;
+              return {
+                kind: "updated",
+                row,
+                reprovision,
+                webhookChange: webhook?.ok ? webhook.change : undefined,
+              } as const;
             },
             { behavior: "immediate" },
           ),
@@ -403,6 +461,13 @@ export function environmentRoutes(
             return apiError(c, 409, "name_taken", nameTakenMessage);
           case "invalid_pool":
             return apiError(c, 400, "invalid_pool", outcome.poolIssue);
+          case "webhook":
+            return apiError(
+              c,
+              outcome.problem.code === "webhook_owned" ? 409 : 400,
+              outcome.problem.code,
+              outcome.problem.message,
+            );
           case "agents_exist":
             return apiError(
               c,
@@ -411,11 +476,18 @@ export function environmentRoutes(
               `changing repo, setup or base replaces every agent's worktree and branch; archive agents ${outcome.agentIds.join(", ")} first`,
             );
         }
+        // what a webhook in the body did, so `sky apply` can tell a change from a no-op
+        const presented = {
+          ...present(c.var.db, outcome.row),
+          ...(outcome.webhookChange && {
+            webhookChange: outcome.webhookChange,
+          }),
+        };
         if (outcome.reprovision) {
           provisioner.start(outcome.row);
-          return c.json(present(outcome.row), 202);
+          return c.json(presented, 202);
         }
-        return c.json(present(outcome.row), 200);
+        return c.json(presented, 200);
       })
       // only later launches change: a run in progress keeps its runtime, and an agent whose session ran on
       // the other one starts its next run fresh (`launch.ts`)
@@ -464,7 +536,7 @@ export function environmentRoutes(
             .returning()
             .get();
           if (!row) return apiError(c, 404, "not_found", notFound);
-          return c.json(present(row), 200);
+          return c.json(present(c.var.db, row), 200);
         },
       )
       .post("/:id/retry", envParam, (c) => {
@@ -501,7 +573,7 @@ export function environmentRoutes(
             );
         }
         provisioner.start(outcome.row);
-        return c.json(present(outcome.row), 202);
+        return c.json(present(c.var.db, outcome.row), 202);
       })
       .delete("/:id", envParam, async (c) => {
         const { id } = c.req.valid("param");
@@ -518,7 +590,10 @@ export function environmentRoutes(
           .select({ id: webhooks.id, environmentIds: webhooks.environmentIds })
           .from(webhooks)
           .all()
-          .filter((w) => w.environmentIds?.includes(id));
+          // the environment's own webhook goes with it
+          .filter(
+            (w) => w.id !== env.webhookId && w.environmentIds?.includes(id),
+          );
         if (filtering.length > 0) {
           const webhookIds = filtering.map((w) => w.id);
           return c.json(
@@ -586,6 +661,10 @@ export function environmentRoutes(
             tx.delete(runs).where(inArray(runs.agentId, envAgents)).run();
             tx.delete(agents).where(eq(agents.envId, id)).run();
             tx.delete(environments).where(eq(environments.id, id)).run();
+            // after the env: a delivery pins its event, and the webhook's own deliveries cascade with it
+            if (env.webhookId !== null) {
+              tx.delete(webhooks).where(eq(webhooks.id, env.webhookId)).run();
+            }
           },
           { behavior: "immediate" },
         );

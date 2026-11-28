@@ -16,6 +16,7 @@ import type {
 } from "@sky/shared";
 import { type AnyColumn, sql } from "drizzle-orm";
 import {
+  type AnySQLiteColumn,
   blob,
   check,
   index,
@@ -99,6 +100,10 @@ export const environments = sqliteTable(
       .default("api-key"),
     // "claude-code" or "codex", set by `sky env set-runtime`; null follows the env's SKY_RUNTIME secret. No CHECK, for the same reason as claude_fallback
     runtime: text({ enum: ["claude-code", "codex"] }),
+    // the webhook `sky apply` keeps for this environment; null has none. The webhook row is deleted on its own, which clears this
+    webhookId: text("webhook_id")
+      .$type<WebhookId>()
+      .references((): AnySQLiteColumn => webhooks.id, { onDelete: "set null" }),
     failureStep: text("failure_step", { enum: environmentFailureSteps }),
     // redacted and truncated by the API before it lands here
     failureStderr: text("failure_stderr"),

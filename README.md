@@ -105,9 +105,19 @@ autoApprove: # optional: Bash commands that skip approvalPolicy
 claudeCredential: personal # optional: which Claude credential runs use (see Claude credentials)
 claudePool: [work, personal] # optional, with claudeCredential: pool: the subscriptions it may use, in order
 claudeFallback: api-key # optional: api-key or none, what a run does while its subscription is at its limit
+webhook: # optional: the environment's one event subscription (see Environment webhook)
+  url: https://signal.example.com/v1/webhooks/routine
+  format: openbot # openbot or standard
+  events: [run.waiting, run.finished, run.failed, run.stopped, runner.warning] # optional; these five are the default
 ```
 
 The Claude fields and `refresh` are optional. A field the file omits keeps the environment's current value, so `sky apply` never undoes a `sky env set-claude` or a `sky env set-refresh`; `refresh: ""` in the file clears the script, and deleting `claudeCredential` from the file doesn't move an environment back to the default token: write `claudeCredential: default` for that. A new environment gets the defaults (the default token, every subscription if it is a pool, `api-key`).
+
+### Environment webhook
+
+`webhook` in `env.yaml` (also `POST` and `PATCH /v1/environments/:id`) is the environment's one webhook, kept by `sky apply`, so the subscription is recorded beside the environment it belongs to instead of in a filter that stops matching when the environment is recreated. Its signing secret is never a field: it is the environment's `SKY_WEBHOOK_SECRET` secret (`sky secret set <env> SKY_WEBHOOK_SECRET`), copied into the webhook when the environment is applied, so a rotation lands on the next `sky apply`. An apply with no such secret fails and creates nothing; a new environment has no secrets yet, so the first apply creates it and then stops at the webhook until the secret is set.
+
+`sky apply` creates the webhook when there is none, updates it in place (url, format, events, secret) when there is, and says `up to date` when nothing changed, so a reprovision keeps exactly one record; the environment stores its id. A file without `webhook` deletes the environment's webhook, and deleting the environment deletes it too. A change to the webhook alone is allowed while a run is active. The webhook belongs to the key that applied it. Another webhook for this environment and url, made with `sky webhook add --env`, is taken over by an admin apply (its owner is rewritten and it is updated in place, so nothing delivers twice); any other key is refused with a message naming the owner. `sky env show <env> --yaml` exports `webhook` without its id or secret, and `sky env show` prints one line for it.
 
 `setup` runs in the clone with bash, with pnpm and yarn on `PATH` and `SKY_CLAUDE` set to the `claude` binary agents run. After it, Sky installs the plugins the repo's `.claude/settings.json` enables in `enabledPlugins`, from the marketplaces its `extraKnownMarketplaces` declares. If a plugin comes from a marketplace that isn't declared there, add the marketplace in `setup`:
 

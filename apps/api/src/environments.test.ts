@@ -180,6 +180,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     claudePool: null,
     claudeFallback: "api-key",
     runtime: null,
+    webhook: null,
     failure: null,
     createdAt: expect.stringMatching(
       /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/,

@@ -103,7 +103,7 @@ const sealedOf = (row: {
  * it to those names, so a step that needs two never decrypts the rest.
  */
 export function openEnvSecrets(
-  db: Db,
+  db: Db | Tx,
   key: Buffer,
   envId: EnvironmentId,
   only?: readonly string[],
@@ -135,7 +135,7 @@ export function hasSecret(db: Db, envId: EnvironmentId, name: string): boolean {
 
 /** Whether the env stores `name` as a connector secret, not a value. */
 export function hasConnectorSecret(
-  db: Db,
+  db: Db | Tx,
   envId: EnvironmentId,
   name: string,
 ): boolean {
