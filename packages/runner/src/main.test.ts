@@ -265,6 +265,7 @@ describe("the env's refresh script", () => {
   test.each([
     ["a Claude Code run", { SKY_RUNTIME: "claude-code" }],
     ["a Codex run", { SKY_RUNTIME: "codex" }],
+    ["a pi run", { SKY_RUNTIME: "pi" }],
   ])(
     "%s runs it before the plugin refresh and the session, with the agent's own env and no credential, connector or gateway key",
     async (_, runtime) => {
@@ -306,9 +307,9 @@ describe("the env's refresh script", () => {
         const order = [
           "runner: env refresh started",
           "runner: env refresh done",
-          ...(runtime.SKY_RUNTIME === "codex"
-            ? []
-            : ["runner: plugin refresh started"]),
+          ...(runtime.SKY_RUNTIME === "claude-code"
+            ? ["runner: plugin refresh started"]
+            : []),
           "runner: session starting",
         ].map((line) => stderr.indexOf(line));
         expect(order.every((at) => at >= 0)).toBe(true);
@@ -326,10 +327,17 @@ describe("the env's refresh script", () => {
           "SKY_REFRESH",
         ])
           expect(env).not.toContain(`${name}=`);
-        // a Codex session's commands get the run's Codex home, and so does the script
-        if (runtime.SKY_RUNTIME === "codex")
-          expect(env).toContain(`CODEX_HOME=${join(runs, ".sky", "codex")}\n`);
-        else expect(env).not.toContain("CODEX_HOME=");
+        // a Codex or pi session's commands get the run's agent home, and so does the script: the
+        // runtime's own variable, and not the other's
+        const agentHomes: Record<string, string> = {
+          codex: `CODEX_HOME=${join(runs, ".sky", "codex")}\n`,
+          pi: `PI_CODING_AGENT_DIR=${join(runs, ".sky", "pi", "agent")}\n`,
+        };
+        for (const [runtimeName, line] of Object.entries(agentHomes)) {
+          if (runtimeName === runtime.SKY_RUNTIME)
+            expect(env).toContain(line);
+          else expect(env).not.toContain(line.slice(0, line.indexOf("=") + 1));
+        }
         // every run's script runs in the agent's home, whichever agent's run it is
         expect(readFileSync(ranIn, "utf8").trim()).toBe(realpathSync(runs));
         // its output is in a file on the sprite, not the runner's own log
@@ -376,6 +384,97 @@ describe("the env's refresh script", () => {
       rmSync(runs, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("a pi run with SKY_PI_HOME set gives the script that home's agent directory as PI_CODING_AGENT_DIR", async () => {
+    const runs = mkdtempSync(join(tmpdir(), "runner-main-pihome-"));
+    const api = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => res.writeHead(204).end());
+    });
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    const { port } = api.address() as AddressInfo;
+    const seen = join(runs, "pi-dir.seen");
+    const override = join(runs, "elsewhere", "pi");
+    try {
+      await runBundle({
+        ...runEnv(`http://127.0.0.1:${port}`, join(runs, "pi.prompt")),
+        HOME: runs,
+        TMPDIR: runs,
+        SKY_RUNTIME: "pi",
+        AI_GATEWAY_API_KEY: "gateway-secret",
+        SKY_PI_HOME: override,
+        SKY_REFRESH: `printf '%s' "$PI_CODING_AGENT_DIR" > '${seen}'`,
+      });
+      expect(readFileSync(seen, "utf8")).toBe(join(override, "agent"));
+    } finally {
+      api.closeAllConnections();
+      api.close();
+      rmSync(runs, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // the session's own steps are what the runner hands it, seen where the run ends: at worktree setup,
+  // whose git is the runner's own and inherits the runner's env
+  test.each([
+    ["with", { GITHUB_CONNECTOR: "conn_1" }, true],
+    ["without", {}, false],
+  ])(
+    "a pi run %s a connector: its worktree setup refreshes from GitHub only with one, its git never gets the gateway key, and no plugin refresh runs",
+    async (_, connector, handed) => {
+      const runs = mkdtempSync(join(tmpdir(), "runner-main-pisession-"));
+      const api = createServer((req, res) => {
+        req.resume();
+        req.on("end", () => res.writeHead(204).end());
+      });
+      api.listen(0, "127.0.0.1");
+      await once(api, "listening");
+      const { port } = api.address() as AddressInfo;
+      const bin = join(runs, "bin");
+      mkdirSync(bin);
+      // failing, so worktree setup ends the run at its git
+      const git = recorder(bin, "git", "", 1);
+      const claude = recorder(bin, "claude", "[]", 0);
+      const runId = newRunId();
+      try {
+        const { code, stderr } = await runBundle({
+          ...runEnv(`http://127.0.0.1:${port}`, join(runs, `${runId}.prompt`)),
+          RUN_ID: runId,
+          HOME: runs,
+          TMPDIR: runs,
+          // a directory git can start in
+          REPO_DIR: runs,
+          WORKTREES_DIR: join(runs, "worktrees"),
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          SKY_CLAUDE: join(bin, "claude"),
+          SKY_RUNTIME: "pi",
+          AI_GATEWAY_API_KEY: "gateway-secret",
+          GITHUB_GATEWAY_URL: "https://gateway.test",
+          ...connector,
+        });
+        expect(code).toBe(1);
+        // session setup ran, and the runner's git was started
+        expect(stderr).toMatch(/runner: session starting/);
+        const seen = readFileSync(git, "utf8");
+        expect(seen).toMatch(new RegExp(`^RUN_ID=${runId}$`, "m"));
+        expect(seen).not.toMatch(/AI_GATEWAY_API_KEY|gateway-secret/);
+        // the connector is what sends the worktree setup to GitHub; with none it has nowhere to refresh from
+        if (handed)
+          expect(stderr).toMatch(
+            /runner: refresh from GitHub failed: origin\/HEAD names no branch/,
+          );
+        else expect(stderr).not.toMatch(/refresh from GitHub/);
+        // pi loads no Claude plugins, so the refresh that runs `claude` is not started
+        expect(stderr).not.toMatch(/plugin refresh/);
+        expect(existsSync(claude)).toBe(false);
+      } finally {
+        api.closeAllConnections();
+        api.close();
+        rmSync(runs, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 
   test.each([
     ["installed", true, 0],

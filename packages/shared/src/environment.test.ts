@@ -53,9 +53,10 @@ test("rejects a malformed repo, a zero cap and an unknown status", () => {
   );
 });
 
-test("a runtime is Claude Code or Codex and nothing else", () => {
+test("a runtime is Claude Code, Codex or pi and nothing else", () => {
   expect(Runtime.parse("claude-code")).toBe("claude-code");
   expect(Runtime.parse("codex")).toBe("codex");
+  expect(Runtime.parse("pi")).toBe("pi");
   expect(Runtime.safeParse("gpt").success).toBe(false);
 });
 
