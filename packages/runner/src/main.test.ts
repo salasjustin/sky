@@ -288,7 +288,7 @@ describe("the env's refresh script", () => {
           RUN_ID: runId,
           HOME: runs,
           WORKTREES_DIR: worktrees,
-          // the refresh lock is the test's own, not one another checkout's run of this suite holds
+          // its own refresh lock, not the machine's, which another checkout's run of this suite may hold
           TMPDIR: runs,
           ...runtime,
           // the credential variables, the connector and the gateway key, as the API's env file holds them

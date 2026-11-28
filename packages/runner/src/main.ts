@@ -213,7 +213,7 @@ async function main(): Promise<void> {
           };
           // one place for every run, not the agent's worktree: a run that waited on another's script
           // skips its own, so what the script does has to be the sprite's, not one agent's
-          // (the home the session and `codexHomeOf` resolve, `homedir()` when HOME is unset)
+          // the home the session and `codexHomeOf` resolve: HOME, or `homedir()` when it's unset or empty
           const home = env.HOME || homedir();
           const cwd = existsSync(home) ? home : undefined;
           const record = await runEnvRefresh({
