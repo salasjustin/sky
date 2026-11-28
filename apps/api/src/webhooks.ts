@@ -51,6 +51,31 @@ const WebhookInput = z.strictObject({
   environmentIds: z.tuple([EnvironmentId], EnvironmentId).optional(),
 });
 
+/** Why `secret` doesn't suit a webhook of `format`, or undefined when it does; the messages never quote it. */
+export function secretProblem(
+  format: WebhookFormat,
+  secret: string | undefined,
+): string | undefined {
+  if (format === "standard") {
+    return StandardWebhookSecret.safeParse(secret).success
+      ? undefined
+      : "a standard webhook needs a secret: whsec_ followed by the base64 of a 24-64 byte key";
+  }
+  if (format === "openbot") {
+    if (secret === undefined) {
+      return "an openbot webhook needs a secret: the routine's signing secret, up to 256 characters";
+    }
+    const parsed = OpenBotWebhookSecret.safeParse(secret);
+    // the schema's own fixed messages, which never quote the input
+    return parsed.success
+      ? undefined
+      : (parsed.error.issues[0]?.message ?? "invalid openbot secret");
+  }
+  return secret === undefined
+    ? undefined
+    : 'secret only goes with format "standard" or "openbot"';
+}
+
 /** What a webhook's stored deliveries say about it; nothing before its first attempt. */
 function health(
   db: Db,
@@ -186,39 +211,8 @@ export function webhookRoutes() {
         );
       }
       const { secret, ...fields } = input;
-      if (fields.format === "standard") {
-        if (!StandardWebhookSecret.safeParse(secret).success) {
-          return apiError(
-            c,
-            400,
-            "invalid_body",
-            "a standard webhook needs a secret: whsec_ followed by the base64 of a 24-64 byte key",
-          );
-        }
-      } else if (fields.format === "openbot") {
-        if (secret === undefined) {
-          return apiError(
-            c,
-            400,
-            "invalid_body",
-            "an openbot webhook needs a secret: the routine's signing secret, up to 256 characters",
-          );
-        }
-        const parsed = OpenBotWebhookSecret.safeParse(secret);
-        if (!parsed.success) {
-          // the schema's own fixed messages, which never quote the input
-          const message =
-            parsed.error.issues[0]?.message ?? "invalid openbot secret";
-          return apiError(c, 400, "invalid_body", message);
-        }
-      } else if (secret !== undefined) {
-        return apiError(
-          c,
-          400,
-          "invalid_body",
-          'secret only goes with format "standard" or "openbot"',
-        );
-      }
+      const problem = secretProblem(fields.format, secret);
+      if (problem) return apiError(c, 400, "invalid_body", problem);
       const environmentIds = fields.environmentIds && [
         ...new Set(fields.environmentIds),
       ];

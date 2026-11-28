@@ -91,6 +91,10 @@ const refreshLine = (env: ApiEnvironment) =>
     ? "refresh: none"
     : `refresh: set (${env.refresh.replace(/\n+$/, "").split("\n").length} lines, runs before every run)`;
 
+/** `env show` names the webhook's format, url and how many events; the signing secret is never printed. */
+const webhookLine = (webhook: NonNullable<ApiEnvironment["webhook"]>) =>
+  `webhook: ${webhook.format} ${webhook.url} (${webhook.events.length} events)`;
+
 export const env: AgentCommand = {
   options: {
     yes: { type: "boolean" },
@@ -150,6 +154,7 @@ export const env: AgentCommand = {
         }
         const lines = [envLine(env), runtimeLine(env)];
         if (env.refresh !== "") lines.push(refreshLine(env));
+        if (env.webhook) lines.push(webhookLine(env.webhook));
         if (env.claudeCredential !== null || env.claudeFallback !== "api-key") {
           lines.push(claudeLine(env));
         }

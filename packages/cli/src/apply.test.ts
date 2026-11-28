@@ -25,6 +25,7 @@ const env = (over: Record<string, unknown> = {}) => ({
   claudePool: null,
   claudeFallback: "api-key",
   runtime: null,
+  webhook: null,
   status: "ready",
   spriteName: "sky-env-1",
   checkpointId: "ckpt_1",

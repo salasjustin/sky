@@ -23,6 +23,7 @@ test("accepts an environment and defaults its cap and approval policy", () => {
     claudePool: null,
     claudeFallback: "api-key",
     runtime: null,
+    webhook: null,
   });
 });
 

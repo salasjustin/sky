@@ -56,13 +56,33 @@ export async function apply(
   }
   let changed = true;
   if (current === undefined) {
-    current = await api.createEnvironment(spec);
+    // the webhook is signed with an env secret, and a new environment has none: it follows the create
+    const { webhook, ...fields } = spec;
+    current = await api.createEnvironment(fields);
+    if (webhook !== undefined) {
+      const created = current.env;
+      try {
+        current = await api.patchEnvironment(created.id, { webhook });
+      } catch (err) {
+        out.progress(
+          `created ${created.name} (${created.id}); it keeps provisioning on the server. Its webhook was not applied`,
+        );
+        throw err;
+      }
+    }
   } else {
-    const patch = changedFields(spec, current.env);
+    const patch: Record<string, unknown> = changedFields(spec, current.env);
+    // the spec is the environment's whole webhook: sent every time so a rotated secret lands, and
+    // null, when the file drops it, to delete the one the environment has
+    const webhook = spec.webhook ?? (current.env.webhook ? null : undefined);
+    if (webhook !== undefined) patch.webhook = webhook;
     if (Object.keys(patch).length === 0) {
       changed = false;
     } else {
+      const others = Object.keys(patch).some((key) => key !== "webhook");
       current = await api.patchEnvironment(current.env.id, patch);
+      // a webhook the server found as it should be is no change
+      changed = others || current.env.webhookChange !== "unchanged";
     }
   }
 
@@ -95,6 +115,7 @@ export async function apply(
     envId: env.id,
     spriteName: env.spriteName,
     checkpointId: env.checkpointId,
+    ...(env.webhook && { webhookId: env.webhook.id }),
     specHash: specHash(spec),
   });
   out.result(
@@ -153,9 +174,11 @@ async function findEnv(
 const reprovisioningFields = (patch: Partial<EnvSpec>) =>
   (["repo", "setup", "base"] as const).filter((key) => key in patch);
 
+/** The fields of `spec` that differ from `env`; the webhook is the caller's. */
 function changedFields(spec: EnvSpec, env: ApiEnvironment): Partial<EnvSpec> {
   const patch: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(spec)) {
+    if (key === "webhook") continue;
     const stored = env[key as keyof EnvSpec];
     if (comparable(key, value) !== comparable(key, stored)) {
       patch[key] = value;

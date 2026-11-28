@@ -19,6 +19,10 @@ import type { Config } from "./config.js";
 /** An env as the API returns it; loose so `--json` passes through fields this CLI doesn't read. */
 export const ApiEnvironment = Environment.extend({
   failure: z.object({ step: z.string(), stderr: z.string() }).nullable(),
+  /** Only on a PATCH that carried a webhook: what it did. */
+  webhookChange: z
+    .enum(["created", "updated", "unchanged", "removed", "none"])
+    .optional(),
 }).loose();
 export type ApiEnvironment = z.infer<typeof ApiEnvironment>;
 

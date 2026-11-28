@@ -24,6 +24,14 @@ export function envYaml(
     claudeCredential: env.claudeCredential ?? "default",
     claudePool: env.claudePool,
     claudeFallback: env.claudeFallback,
+    // the id and the signing secret stay out: the secret is the SKY_WEBHOOK_SECRET secret, listed by name below
+    ...(env.webhook && {
+      webhook: {
+        url: env.webhook.url,
+        format: env.webhook.format,
+        events: env.webhook.events,
+      },
+    }),
   };
   const notes = [
     `# ${env.name} (${env.id}), exported by sky env show --yaml; sky apply takes it as is.`,

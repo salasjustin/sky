@@ -568,7 +568,10 @@ test("a connect failure naming an address is stored and served without it", asyn
   const { data } = (await (await getDeliveries(webhookIdOf())).json()) as Page;
   expect(data[0]?.lastError).toBe(stored?.lastError);
   expect(data[0]?.lastErrorKind).toBe("dns");
-  expect(JSON.stringify(data)).not.toMatch(/203\.0\.113\.9|:53\b/);
+  // the error alone: the row's timestamps carry seconds like ":53"
+  expect(JSON.stringify(data[0]?.lastError)).not.toMatch(
+    /203\.0\.113\.9|:53\b/,
+  );
 });
 
 test("a redirect is a failed attempt, never followed", async () => {
