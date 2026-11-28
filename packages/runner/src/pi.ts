@@ -581,6 +581,16 @@ export function realPathOf(path: string, links = 0): string {
     : join(realPathOf(parent, links), basename(path));
 }
 
+// pi names an MCP tool with every character of it that isn't a letter, digit or `_` written as `_`, so
+// a pattern spelled as the server spells it is matched the way pi spells it; two names that meet after
+// the rewrite are both held, which errs toward asking
+const piSpelling = (pattern: string) => {
+  if (!pattern.startsWith("mcp__")) return pattern;
+  const paren = pattern.indexOf("(");
+  const tool = paren === -1 ? pattern : pattern.slice(0, paren);
+  return `${tool.replace(/[^A-Za-z0-9_]/g, "_")}${pattern.slice(tool.length)}`;
+};
+
 /** How the environment's policy treats one of pi's tool calls; the same answer Codex's runs get. */
 export function piOutcome(
   config: Pick<Config, "approvalPolicy" | "autoApprove">,
@@ -606,9 +616,10 @@ export function piOutcome(
       call.input,
     );
   }
+  const policy = config.approvalPolicy.map(piSpelling);
   if (call.targets.length === 0)
     return policyOutcome(
-      config.approvalPolicy,
+      policy,
       config.autoApprove,
       scope,
       call.toolName,
@@ -621,7 +632,7 @@ export function piOutcome(
     return "hold";
   const outcomes = call.targets.map((path) =>
     policyOutcome(
-      config.approvalPolicy,
+      policy,
       config.autoApprove,
       scope,
       call.toolName,

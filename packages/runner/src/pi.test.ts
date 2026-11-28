@@ -653,6 +653,13 @@ describe("piOutcome", () => {
     expect(outcome(["mcp__doop__draw"], "mcp__doop__draw", {})).toBe("hold");
     expect(outcome(["mcp__doop__draw"], "mcp__doop__list", {})).toBe("run");
   });
+
+  test("an MCP pattern holds the call as pi spells it, whichever spelling it uses", () => {
+    expect(outcome(["mcp__my-srv__x"], "mcp__my_srv__x", {})).toBe("hold");
+    expect(outcome(["mcp__my.srv__x-y"], "mcp__my_srv__x_y", {})).toBe("hold");
+    expect(outcome(["mcp__my_srv__x"], "mcp__my_srv__x", {})).toBe("hold");
+    expect(outcome(["mcp__my-srv__x"], "mcp__my_srv__y", {})).toBe("run");
+  });
 });
 
 describe("piMcpConfig", () => {
