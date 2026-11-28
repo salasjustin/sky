@@ -17,6 +17,7 @@ import {
   codexToolsMain,
   skyToolsTable,
   startToolsChannel,
+  type ToolReply,
   TOOLS_SECRET_ENV,
   TOOLS_SOCKET_ENV,
   toolsSocketIn,
@@ -28,18 +29,21 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-const send = (socketPath: string, request: object) =>
+const sendLine = (socketPath: string, line: string) =>
   new Promise<string>((resolve, reject) => {
     const socket = net.createConnection(socketPath);
     let received = "";
     socket.setEncoding("utf8");
-    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on("connect", () => socket.write(`${line}\n`));
     socket.on("data", (chunk: string) => {
       received += chunk;
     });
     socket.on("error", reject);
     socket.on("close", () => resolve(received));
   });
+
+const send = (socketPath: string, request: object) =>
+  sendLine(socketPath, JSON.stringify(request));
 
 describe("the tools channel", () => {
   test("serves a request with the run's secret and refuses one without it, running nothing", async () => {
@@ -75,6 +79,78 @@ describe("the tools channel", () => {
       await channel.close();
     }
     expect(existsSync(socketPath)).toBe(false);
+  });
+
+  describe("a request it can't serve", () => {
+    const secret = "s".repeat(64);
+    const MAX_LINE = 4 * 1024 * 1024;
+    // `call` throws unless a test gives it a body: a refused request must never get that far
+    const refusing = async (
+      bad: (socketPath: string) => Promise<string>,
+      call: (tool: string, args: unknown) => Promise<ToolReply> = async () => {
+        throw new Error("called");
+      },
+    ) => {
+      const calls: string[] = [];
+      const socketPath = toolsSocketIn(dir);
+      const channel = await startToolsChannel({
+        socketPath,
+        secret,
+        call: (tool, args) => {
+          calls.push(tool);
+          return call(tool, args);
+        },
+      });
+      try {
+        const reply = JSON.parse(await bad(socketPath));
+        return { reply, calls };
+      } finally {
+        await channel.close();
+      }
+    };
+
+    test("an oversized line is refused as too large, running nothing", async () => {
+      const { reply, calls } = await refusing((socketPath) =>
+        send(socketPath, {
+          secret,
+          tool: "sky_sync",
+          arguments: { pad: "x".repeat(MAX_LINE) },
+        }),
+      );
+      expect(reply).toEqual({ text: "request too large", success: false });
+      expect(calls).toEqual([]);
+    });
+
+    test("unreadable JSON is refused, running nothing", async () => {
+      const { reply, calls } = await refusing((socketPath) =>
+        sendLine(socketPath, `{"secret":"${secret}","tool":`),
+      );
+      expect(reply).toEqual({ text: "unreadable request", success: false });
+      expect(calls).toEqual([]);
+    });
+
+    test.each([
+      ["no tool", { secret }],
+      ["a tool that isn't a string", { secret, tool: 7 }],
+    ])("%s is refused as naming none, running nothing", async (_, request) => {
+      const { reply, calls } = await refusing((socketPath) =>
+        send(socketPath, request),
+      );
+      expect(reply).toEqual({ text: "no tool named", success: false });
+      expect(calls).toEqual([]);
+    });
+
+    test("a call that rejects answers with its message, as a failure", async () => {
+      const { reply, calls } = await refusing(
+        (socketPath) =>
+          send(socketPath, { secret, tool: "sky_publish", arguments: {} }),
+        async () => {
+          throw new Error("the broker went away");
+        },
+      );
+      expect(reply).toEqual({ text: "the broker went away", success: false });
+      expect(calls).toEqual(["sky_publish"]);
+    });
   });
 });
 

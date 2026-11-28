@@ -1665,6 +1665,39 @@ describe("runCodexSession", () => {
       expect(answers.map((m) => m.result.action)).toEqual(["accept", "accept"]);
     });
 
+    test("the auto-accept is only for server sky's publish and sync: another server's sky_publish and sky's other tools still wait for a person", async () => {
+      config.approvalPolicy = ["mcp__other__sky_publish", "mcp__sky__sky_other"];
+      decide = () => "deny";
+      const ask = (server: string, tool: string) => ({
+        serverName: server,
+        mode: "form",
+        message: `Allow the ${server} MCP server to run tool ${tool}?`,
+        requestedSchema: { type: "object", properties: {} },
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          tool_name: tool,
+          tool_params: {},
+        },
+      });
+      config.sessionEnv.FAKE_CODEX_MCP = JSON.stringify({
+        calls: [
+          { id: "m1", server: "other", tool: "sky_publish", arguments: {} },
+          { id: "m2", server: "sky", tool: "sky_other", arguments: {} },
+        ],
+        asks: [ask("other", "sky_publish"), ask("sky", "sky_other")],
+      });
+      expect(await withTools({ scenario: "mcpAsks" })).toBe(0);
+      expect(approvals()).toEqual([
+        "mcp__other__sky_publish",
+        "mcp__sky__sky_other",
+      ]);
+      const answers = sent().filter((m) => m.id === 100 || m.id === 101);
+      expect(answers.map((m) => m.result.action)).toEqual([
+        "decline",
+        "decline",
+      ]);
+    });
+
     test("a base-profile server can't take the sky name", async () => {
       config.mcpServers = {
         sky: { type: "http", url: "https://mcp.test/", headers: {} },
