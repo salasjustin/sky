@@ -460,7 +460,13 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       setTimeout(() => scenarios[process.env.FAKE_CODEX_SCENARIO](), 10);
       return;
     case "turn/steer": return send({ id: m.id, result: { turnId: turn } });
-    case "turn/interrupt": send({ id: m.id, result: {} }); return finish("interrupted");
+    case "turn/interrupt": {
+      send({ id: m.id, result: {} });
+      // the runner answers an open ask as it stops the turn: the interrupt ends once those replies are read (500 ms at most), so the log holds them
+      const until = Date.now() + 500;
+      const poll = setInterval(() => { if (waiting.size === 0 || Date.now() > until) { clearInterval(poll); finish("interrupted"); } }, 5);
+      return;
+    }
     default: return send({ id: m.id, error: { code: -32601, message: "unknown " + m.method } });
   }
 });
