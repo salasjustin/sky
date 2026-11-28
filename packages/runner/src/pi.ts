@@ -581,9 +581,8 @@ export function realPathOf(path: string, links = 0): string {
     : join(realPathOf(parent, links), basename(path));
 }
 
-// pi names an MCP tool with every character of it that isn't a letter, digit or `_` written as `_`, so
-// a pattern spelled as the server spells it is matched the way pi spells it; two names that meet after
-// the rewrite are both held, which errs toward asking
+// pi writes each character of an MCP tool's name that isn't a letter, digit or `_` as `_`, so a pattern
+// is rewritten the same way before it is matched; names that meet after the rewrite are all held
 const piSpelling = (pattern: string) => {
   if (!pattern.startsWith("mcp__")) return pattern;
   const paren = pattern.indexOf("(");
