@@ -801,39 +801,48 @@ describe("runCodexSession", () => {
     // the reply to the n-th ask the fake sent
     const answerAt = (n: number) =>
       sent().find((m) => m.id === 100 + n && m.result)?.result;
-    const waitingFor = () => ofType("run.waiting").map((e) => e.payload.request);
+    const waitingFor = () =>
+      ofType("run.waiting").map((e) => e.payload.request);
 
     test.each([
       ["draw first", ["draw", "erase"]],
       ["erase first", ["erase", "draw"]],
-    ] as const)("two calls to one server, asked %s: each ask is answered for its own tool", async (_, order) => {
-      config.approvalPolicy = ["mcp__doop__draw"];
-      decide = () => "deny";
-      const args = { draw: { shape: "box" }, erase: { all: true } };
-      expect(
-        await mcpAsks(
-          [
-            { id: "mcp_draw", server: "doop", tool: "draw", arguments: args.draw },
-            {
-              id: "mcp_erase",
-              server: "doop",
-              tool: "erase",
-              arguments: args.erase,
-            },
-          ],
-          order.map((tool) => toolAsk("doop", tool, args[tool])),
-        ),
-      ).toBe(0);
-      expect(order.map((_tool, n) => answerAt(n)?.action)).toEqual(
-        order.map((tool) => (tool === "draw" ? "decline" : "accept")),
-      );
-      expect(waitingFor()).toEqual([
-        expect.objectContaining({
-          toolName: "mcp__doop__draw",
-          toolInput: JSON.stringify(args.draw),
-        }),
-      ]);
-    });
+    ] as const)(
+      "two calls to one server, asked %s: each ask is answered for its own tool",
+      async (_, order) => {
+        config.approvalPolicy = ["mcp__doop__draw"];
+        decide = () => "deny";
+        const args = { draw: { shape: "box" }, erase: { all: true } };
+        expect(
+          await mcpAsks(
+            [
+              {
+                id: "mcp_draw",
+                server: "doop",
+                tool: "draw",
+                arguments: args.draw,
+              },
+              {
+                id: "mcp_erase",
+                server: "doop",
+                tool: "erase",
+                arguments: args.erase,
+              },
+            ],
+            order.map((tool) => toolAsk("doop", tool, args[tool])),
+          ),
+        ).toBe(0);
+        expect(order.map((_tool, n) => answerAt(n)?.action)).toEqual(
+          order.map((tool) => (tool === "draw" ? "decline" : "accept")),
+        );
+        expect(waitingFor()).toEqual([
+          expect.objectContaining({
+            toolName: "mcp__doop__draw",
+            toolInput: JSON.stringify(args.draw),
+          }),
+        ]);
+      },
+    );
 
     test("an ask is matched to the call with its exact arguments, not the oldest of the tool", async () => {
       config.approvalPolicy = ["mcp__doop__draw"];
@@ -841,7 +850,12 @@ describe("runCodexSession", () => {
       expect(
         await mcpAsks(
           [
-            { id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } },
+            {
+              id: "mcp_1",
+              server: "doop",
+              tool: "draw",
+              arguments: { shape: "box" },
+            },
             {
               id: "mcp_2",
               server: "doop",
@@ -897,7 +911,14 @@ describe("runCodexSession", () => {
       decide = () => "approve";
       expect(
         await mcpAsks(
-          [{ id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } }],
+          [
+            {
+              id: "mcp_1",
+              server: "doop",
+              tool: "draw",
+              arguments: { shape: "box" },
+            },
+          ],
           [
             {
               serverName: "doop",
@@ -984,7 +1005,14 @@ describe("runCodexSession", () => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       try {
         const done = mcpAsks(
-          [{ id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } }],
+          [
+            {
+              id: "mcp_1",
+              server: "doop",
+              tool: "draw",
+              arguments: { shape: "box" },
+            },
+          ],
           [toolAsk("doop", "draw", { shape: "box" })],
         );
         // the 250 ms let-go fires on fake time; the ask waits on the gate until it has
@@ -1110,7 +1138,14 @@ describe("runCodexSession", () => {
       decide = () => "deny-with-reason";
       expect(
         await mcpAsks(
-          [{ id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } }],
+          [
+            {
+              id: "mcp_1",
+              server: "doop",
+              tool: "draw",
+              arguments: { shape: "box" },
+            },
+          ],
           [toolAsk("doop", "draw", { shape: "box" })],
         ),
       ).toBe(0);
@@ -1124,7 +1159,14 @@ describe("runCodexSession", () => {
       config.approvalPolicy = ["mcp__doop__draw"];
       decide = () => "nobody";
       await mcpAsks(
-        [{ id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } }],
+        [
+          {
+            id: "mcp_1",
+            server: "doop",
+            tool: "draw",
+            arguments: { shape: "box" },
+          },
+        ],
         [toolAsk("doop", "draw", { shape: "box" })],
       );
       expect(answerAt(0)).toMatchObject({ action: "cancel" });
@@ -1137,7 +1179,14 @@ describe("runCodexSession", () => {
       const own = toolAsk("doop", "draw", { shape: "box" });
       expect(
         await mcpAsks(
-          [{ id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } }],
+          [
+            {
+              id: "mcp_1",
+              server: "doop",
+              tool: "draw",
+              arguments: { shape: "box" },
+            },
+          ],
           [{ ...own, threadId: "thr_other" }, own],
         ),
       ).toBe(0);

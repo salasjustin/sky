@@ -118,7 +118,9 @@ describe("codexMcpTables", () => {
   test("a stdio server's command and args are escaped, DEL included", () => {
     const toml = write({ docs: escaped });
     expect(toml).toContain('command = "/bin/a\\"b\\\\c\\nd\\te\\u007ff"');
-    expect(toml).toContain('args = ["a\\"b\\\\c\\nd\\te\\u007ff","plain \u{1f642}"]');
+    expect(toml).toContain(
+      'args = ["a\\"b\\\\c\\nd\\te\\u007ff","plain \u{1f642}"]',
+    );
     expect(toml).not.toContain("\u007f");
   });
 

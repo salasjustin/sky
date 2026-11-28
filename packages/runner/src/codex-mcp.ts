@@ -25,8 +25,7 @@ const tomlString = (value: string): string =>
   `"${value.replace(
     new RegExp(HOSTILE.source, "g"),
     (char) =>
-      ESCAPES[char] ??
-      `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
+      ESCAPES[char] ?? `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
   )}"`;
 
 /**
@@ -71,9 +70,7 @@ export function codexMcpTables(
     }
     if (
       isStdio &&
-      [server.command, ...server.args].some((part) =>
-        LONE_SURROGATE.test(part),
-      )
+      [server.command, ...server.args].some((part) => LONE_SURROGATE.test(part))
     ) {
       refused.push({ server: name, why: "its command or an arg" });
       continue;

@@ -610,13 +610,13 @@ const ElicitationParams = z.looseObject({
   mode: z.string().nullish(),
   message: z.string().nullish(),
   url: z.string().nullish(),
-  requestedSchema: z.unknown(),
+  requestedSchema: z.unknown().optional(),
   _meta: z
     .looseObject({
-      codex_approval_kind: z.unknown(),
+      codex_approval_kind: z.unknown().optional(),
       // the raw MCP tool name and the call's exact arguments, on Codex's own tool-call ask
       tool_name: z.string().optional().catch(undefined),
-      tool_params: z.unknown(),
+      tool_params: z.unknown().optional(),
     })
     .nullish(),
 });
