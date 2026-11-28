@@ -172,8 +172,10 @@ describe("a script that ends", () => {
     expect(record).toMatchObject({ outcome: "ran", tail: "started" });
     const children = readFileSync(pids, "utf8").trim().split("\n").map(Number);
     expect(children).toHaveLength(2);
-    // SIGKILL is delivered before the record comes back; the kernel reaps within moments
-    await new Promise((r) => setTimeout(r, 100));
+    // SIGKILL is sent before the record comes back, but the orphans' reaping isn't waited on: poll for it
+    const deadline = Date.now() + 2_000;
+    while (children.some((pid) => !gone(pid)) && Date.now() < deadline)
+      await new Promise((r) => setTimeout(r, 20));
     for (const pid of children) expect(gone(pid)).toBe(true);
   });
 
