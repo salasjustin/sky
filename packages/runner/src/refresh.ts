@@ -281,12 +281,7 @@ export async function runEnvRefresh(options: {
     }
   };
   try {
-    const outcome = await withRefreshLock(
-      lockFile,
-      signal,
-      task,
-      afterHolder,
-    );
+    const outcome = await withRefreshLock(lockFile, signal, task, afterHolder);
     if (
       outcome === "done-by-holder" ||
       (outcome === "after-holder" && sameAsHolder)
