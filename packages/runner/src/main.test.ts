@@ -288,6 +288,8 @@ describe("the env's refresh script", () => {
           RUN_ID: runId,
           HOME: runs,
           WORKTREES_DIR: worktrees,
+          // the refresh lock is the test's own, not one another checkout's run of this suite holds
+          TMPDIR: runs,
           ...runtime,
           // the credential variables, the connector and the gateway key, as the API's env file holds them
           SKY_CLAUDE_AUTH: "oauth",
@@ -299,7 +301,7 @@ describe("the env's refresh script", () => {
           SKY_SESSION_ENV: JSON.stringify({ FROM_PROFILE: "yes" }),
           SKY_REFRESH: `env > '${seen}'\npwd -P > '${ranIn}'\necho refreshing\nexit 7`,
         });
-        // a failed script never fails the run for itself: this one ends at the missing worktree
+        // a failed script never fails the run for itself: this one ends at worktree setup, with no repo
         expect(code).toBe(1);
         const order = [
           "runner: env refresh started",
@@ -361,6 +363,7 @@ describe("the env's refresh script", () => {
       await runBundle({
         ...runEnv(`http://127.0.0.1:${port}`, join(runs, "c.prompt")),
         HOME: runs,
+        TMPDIR: runs,
         SKY_RUNTIME: "codex",
         AI_GATEWAY_API_KEY: "gateway-secret",
         SKY_CODEX_HOME: override,
