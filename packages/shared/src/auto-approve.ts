@@ -1252,7 +1252,10 @@ const MAX_GLOB_MATCHES = 2000;
 const MAX_GLOB_ENTRIES = 50_000;
 const MAX_WALK_ENTRIES = 5000;
 
-/** What a directory holds, as `lstat` sees each entry; `other` is a device, socket or pipe. */
+/**
+ * What a directory holds, each entry with its own kind (a link is `symlink`, never what it points
+ * to); `other` is a device, socket or pipe.
+ */
 export type DirEntry = {
   name: string;
   kind: "file" | "dir" | "symlink" | "other";
@@ -1518,11 +1521,11 @@ function grepRecursion(
 
 /**
  * Whether a glob in the expanded `words` (`globbed` marks each word a glob gave) fills a place
- * where which match lands there changes what the command does. The shell sorts matches by its
- * locale's collation or `GLOBSORT`, not by code unit, so the match it puts there may not be the
- * one checked there: `sed`'s option and script (a file named `1~2e cmd` runs `cmd`), the value of
- * `rg`'s `-g`, `--glob` or `--iglob`, and under `grep -r` anything but a file operand (a match
- * could trade places with a directory the walk never sees).
+ * where the match the shell puts there decides what the command does. The shell sorts matches by
+ * its locale's collation or `GLOBSORT`, not by code unit, so that match may not be the one checked
+ * there: `sed`'s option and script (a file named `1~2e cmd` runs `cmd`), the value of `rg`'s
+ * `-g`, `--glob` or `--iglob`, and under `grep -r` anything but a file operand (a match could
+ * trade places with a directory the walk never sees).
  */
 function globOutOfPlace(words: string[], globbed: boolean[]): boolean {
   const [program] = words;

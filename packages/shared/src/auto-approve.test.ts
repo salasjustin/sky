@@ -1729,7 +1729,7 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     expect(run("cat ??")).toBe("syntax");
     expect(run("cat ?secre?.txt")).toBe("syntax");
     expect(run("cat [x]")).toBe("syntax");
-    // another directory, or a `*` alone, is as before
+    // a directory of ASCII names, or a `*` alone, still expands
     expect(run("cat src/?.ts")).toBe("approved");
     const plain = tree([...project, "\u00e9"]);
     expect(plain.run("cat *")).toBe("approved");
@@ -1915,7 +1915,7 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
       });
     expect(run(["file", "file"])).toBe("approved");
     expect(run(["file", "other"])).toBe("syntax");
-    // only a match is judged: a pipe the pattern doesn't reach is no matter
+    // only a match is judged: a pipe the pattern doesn't reach doesn't count
     const apart = autoApproveVerdict("cat a*", DEFAULTS, {
       root: CWD,
       realpath: (p) => p,
@@ -1931,7 +1931,7 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     const { run } = tree(project);
     expect(run("wc -l src/*.ts", { realpath: undefined })).toBe("syntax");
     expect(run("cat docs/*.md | head", { realpath: undefined })).toBe("syntax");
-    // a named path is as before
+    // a named path doesn't need the hook
     expect(run("wc -l src/a.ts", { realpath: undefined })).toBe("approved");
   });
 
