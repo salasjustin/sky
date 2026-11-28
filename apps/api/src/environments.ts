@@ -323,7 +323,7 @@ export function environmentRoutes(
               const env = findEnv(tx, id);
               if (!env) return { kind: "not_found" } as const;
               // a run takes `refresh` into its env file at launch, so one already going keeps the script it
-              // started with: a change to `refresh` alone reaches the next launch and may land mid-run
+              // started with: a body carrying only `refresh` may land mid-run, and later launches take the new one
               const refreshOnly =
                 patch.refresh !== undefined &&
                 Object.keys(patch).every((key) => key === "refresh");
