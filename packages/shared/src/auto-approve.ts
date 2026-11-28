@@ -343,7 +343,7 @@ type Pipeline = { steps: Step[]; after?: Exclude<Operator, "|"> };
 const PLAIN_VALUE = /^[A-Za-z0-9_./@%+,:-][A-Za-z0-9_./@%+,:=-]*$/;
 // names the shell, the toolchain or the runner read from the environment: `PATH=… ls` runs another ls
 const SPECIAL_VARIABLE =
-  /^(PATH|HOME|IFS|CDPATH|ENV|SHELL|PWD|OLDPWD|USER|LOGNAME|TMPDIR|TERM|EDITOR|VISUAL|PAGER|PS\d|PROMPT.*|BASH.*|ZSH.*|ZDOTDIR|FPATH|FIGNORE|GLOBIGNORE|HIST.*|LANG|LC_.*|LD_.*|DYLD_.*|NODE.*|NPM_.*|PNPM_.*|GIT_.*|SSH_.*|GH_.*|GITHUB_.*|SKY_.*|CLAUDE.*|ANTHROPIC.*|.*PROXY|XDG_.*|SUDO.*|PYTHON.*|TZ|TIMEFMT|MANPATH|CC|CXX|CFLAGS|LDFLAGS)$/i;
+  /^(PATH|HOME|IFS|CDPATH|ENV|SHELL|PWD|OLDPWD|USER|LOGNAME|TMPDIR|TERM|EDITOR|VISUAL|PAGER|PS\d|PROMPT.*|BASH.*|ZSH.*|ZDOTDIR|FPATH|FIGNORE|GLOBIGNORE|GLOBSORT|HIST.*|LANG|LC_.*|LD_.*|DYLD_.*|NODE.*|NPM_.*|PNPM_.*|GIT_.*|SSH_.*|GH_.*|GITHUB_.*|SKY_.*|CLAUDE.*|ANTHROPIC.*|.*PROXY|XDG_.*|SUDO.*|PYTHON.*|TZ|TIMEFMT|MANPATH|CC|CXX|CFLAGS|LDFLAGS)$/i;
 // names bash or zsh sets on its own or ignores an assignment to, so a later `$NAME` doesn't read
 // what the command wrote: `$_` is the previous command's last argument, `FUNCNAME=src` has no effect
 const SHELL_SET_VARIABLE =
@@ -1314,13 +1314,17 @@ function validGlob(text: string): boolean {
 const errorCode = (error: unknown) =>
   (error as { code?: unknown } | null)?.code;
 
+const outsideAscii = (name: string) =>
+  [...name].some((c) => c.charCodeAt(0) > 127);
+
 /**
  * The words of `words` with each glob flagged in `globs` replaced by the paths it matches in
  * `cwd`, as the shell expands it: no wildcard matches a leading dot unless its path segment starts
  * with one, nothing matches across `/`, and a glob with no match stays its own text (bash passes
  * it on, zsh fails the command, and neither reads a file). `from` is the index each result word
  * came from. Undefined when it can't be sure: an unreadable directory, more than the caps allow,
- * a match that starts with `-` or holds a control character.
+ * a match that starts with `-` or holds a control character, a `?` or class in a segment whose
+ * directory lists a name outside ASCII.
  */
 function expandGlobs(
   words: string[],
@@ -1376,6 +1380,13 @@ function expandGlobs(
         const entries = list(dir);
         if (entries === undefined) return undefined;
         if (entries === "missing") continue;
+        // the shell's `?` and class match a byte in the C locale and a character under UTF-8,
+        // and the regex below a UTF-16 unit, so past ASCII none of them agree on a match
+        if (
+          parts.some((p) => "one" in p || "set" in p) &&
+          entries.some((e) => outsideAscii(e.name))
+        )
+          return undefined;
         const dotted = segment.startsWith(".");
         const regex = new RegExp(
           `^${parts
@@ -1454,7 +1465,7 @@ const GLOB_GIT = new Set(["status", "log", "diff", "show", "rev-parse"]);
 
 // the short options of GNU grep that `grepRecursion` reads, `-R` and `-d` aside: the ones with
 // no value, and the ones that take one
-const GREP_FLAG_LETTERS = /^[EFGPHhIiLlnoqsUuvwxzabcrtTVyZ0-9]$/;
+const GREP_FLAG_LETTERS = /^[EFGPHhIiLlnoqsUuvwxzabcrTVyZ0-9]$/;
 const GREP_VALUE_LETTERS = /^[efmABCD]$/;
 // long options that take their value as the next word when written without `=`
 const GREP_LONG_VALUE =
@@ -1503,6 +1514,28 @@ function grepRecursion(
   // the first operand is the pattern unless `-e` or `--regexp` gave one
   const fileAt = operands.slice(patterns > 0 ? 0 : 1);
   return { recursive, files: fileAt.map((at) => args[at] ?? ""), fileAt };
+}
+
+/**
+ * Whether a glob in the expanded `words` (`globbed` marks each word a glob gave) fills a place
+ * where which match lands there changes what the command does. The shell sorts matches by its
+ * locale's collation or `GLOBSORT`, not by code unit, so the match it puts there may not be the
+ * one checked there: `sed`'s option and script (a file named `1~2e cmd` runs `cmd`), the value of
+ * `rg`'s `-g`, `--glob` or `--iglob`, and under `grep -r` anything but a file operand (a match
+ * could trade places with a directory the walk never sees).
+ */
+function globOutOfPlace(words: string[], globbed: boolean[]): boolean {
+  const [program] = words;
+  if (program === "sed") return globbed.slice(0, 3).some(Boolean);
+  if (program === "rg")
+    return globbed.some(
+      (g, at) => g && ["-g", "--glob", "--iglob"].includes(words[at - 1] ?? ""),
+    );
+  if (program !== "grep") return false;
+  const recursion = grepRecursion(words.slice(1));
+  if (!recursion?.recursive) return false;
+  const files = new Set(recursion.fileAt.map((at) => at + 1));
+  return globbed.some((g, at) => g && !files.has(at));
 }
 
 /**
@@ -1617,12 +1650,13 @@ export type AutoApproveScope = {
    */
   isSymlink?: (path: string) => boolean;
   /**
-   * The entries of a directory with `lstat` kinds, following no link among them (`fs.readdirSync`
-   * with `withFileTypes` fits); it throws, with the code `ENOENT` or `ENOTDIR` for a path that
-   * isn't a directory. With it, an unquoted glob in a read-only command is expanded and each match
-   * checked like a named path, and `grep -r` walks the directories it names (the working directory
-   * when it names none); without it both ask, and both also ask without `realpath`, which tells
-   * where a match's links lead.
+   * The entries of a directory, each with its own kind: a link is `symlink`, never what it points
+   * to (`fs.readdirSync` with `withFileTypes` fits; Node takes the kind from the directory listing,
+   * and lstats an entry only when the listing has none). It throws, with the code `ENOENT` or
+   * `ENOTDIR` for a path that isn't a directory. With it, an unquoted glob in a read-only command
+   * is expanded and each match checked like a named path, and `grep -r` walks the directories it
+   * names (the working directory when it names none); without it both ask, and both also ask
+   * without `realpath`, which tells where a match's links lead.
    */
   readDir?: (path: string) => DirEntry[];
   /**
@@ -1791,25 +1825,22 @@ function stepVerdict(
       writes(raw, step)
     )
       return "syntax";
+    // the words as written, not `raw`: the call below expands each `~` once
     const expanded = (() => {
       try {
-        return expandGlobs(raw, step.globs, cwd, readDir);
+        return expandGlobs(step.words, step.globs, cwd, readDir);
       } catch {
         return undefined;
       }
     })();
-    if (!expanded) return "syntax";
-    // the shell sorts matches by its locale's collation, not code units, so under `grep -r` a
-    // glob may only fill file operands: as the pattern or an option's value, one of its matches
-    // could trade places with a directory the walk then never sees
-    if (program === "grep") {
-      const recursion = grepRecursion(expanded.words.slice(1));
-      if (recursion?.recursive) {
-        const files = new Set(recursion.fileAt.map((at) => at + 1));
-        if (expanded.from.some((src, at) => step.globs[src] && !files.has(at)))
-          return "syntax";
-      }
-    }
+    if (
+      !expanded ||
+      globOutOfPlace(
+        expanded.words,
+        expanded.from.map((src) => step.globs[src] === true),
+      )
+    )
+      return "syntax";
     // every match is now a word like any other, checked below
     return stepVerdict(
       {

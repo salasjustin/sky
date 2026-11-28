@@ -1684,6 +1684,57 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     expect(run("grep -r foo src/*.ts")).toBe("approved");
   });
 
+  test("sed asks on a glob as its option or script, whose matches the shell's locale may reorder", () => {
+    // code-unit order makes `1p` the script; under en_US.UTF-8 bash passes the other name first,
+    // and sed's `e` runs it
+    const { run } = tree(["1p", "1~2e echo X"]);
+    expect(run("sed -n *")).toBe("syntax");
+    expect(run("sed * 1p")).toBe("syntax");
+    expect(run("sed -n 1p *")).toBe("approved");
+  });
+
+  test("rg asks on a glob as the value of -g, --glob or --iglob", () => {
+    // code-unit order makes `*.go` the filter; the shell may pass `*.json` there instead
+    const { run } = tree(["*.go", "*.json", "src/a.ts"]);
+    expect(run("rg foo -g *")).toBe("syntax");
+    expect(run("rg foo --glob *")).toBe("syntax");
+    expect(run("rg foo --iglob *")).toBe("syntax");
+    expect(run("rg foo -g '*.ts' src/*.ts")).toBe("approved");
+  });
+
+  test("a command may not set GLOBSORT, which picks the order of the shell's matches", () => {
+    const { run } = tree(project);
+    expect(run("GLOBSORT=-name; cat src/*.ts")).toBe("program");
+    expect(run("S=x; cat src/*.ts")).toBe("approved");
+  });
+
+  test("a `~` beside a glob expands once", () => {
+    const { base, run } = tree(project);
+    const home = join(base, "home");
+    mkdirSync(join(home, ".claude/plugins/cache/p"), { recursive: true });
+    writeFileSync(join(home, ".claude/plugins/cache/p/R.md"), "x");
+    expect(run("cat ~/etc/passwd", { home: "/" })).toBe("outside-root");
+    expect(run("cat ~/etc/passwd src/*.ts", { home: "/" })).toBe(
+      "outside-root",
+    );
+    const cached = "cat ~/.claude/plugins/cache/p/R.md";
+    expect(run(cached, { home })).toBe("approved");
+    expect(run("cat src/*.ts", { home })).toBe("approved");
+    expect(run(`${cached} src/*.ts`, { home })).toBe("approved");
+  });
+
+  test("`?` or a class asks in a directory that lists a name outside ASCII", () => {
+    // the shell's `?` is a byte in the C locale and a character under UTF-8, not a UTF-16 unit
+    const { run } = tree([...project, "\u00e9", "\u{1F600}secret.txt"]);
+    expect(run("cat ??")).toBe("syntax");
+    expect(run("cat ?secre?.txt")).toBe("syntax");
+    expect(run("cat [x]")).toBe("syntax");
+    // another directory, or a `*` alone, is as before
+    expect(run("cat src/?.ts")).toBe("approved");
+    const plain = tree([...project, "\u00e9"]);
+    expect(plain.run("cat *")).toBe("approved");
+  });
+
   test("a glob expands in the directory the command runs in, after a cd", () => {
     const { run } = tree(project);
     expect(run("cd src && cat *.ts")).toBe("approved");
