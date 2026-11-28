@@ -17,6 +17,7 @@ import {
   DEFAULT_CLAUDE_CREDENTIAL,
   describeUnpublished,
   Environment,
+  type EnvironmentHealth,
   EnvironmentId,
   POOL_CREDENTIAL,
   RebuildInput,
@@ -115,12 +116,12 @@ const present = (row: EnvRow) => ({
   health:
     row.health === null
       ? null
-      : {
+      : ({
           status: row.health,
           error: row.healthError ?? "",
           at: row.healthAt ?? row.createdAt,
-          message: `the environment's sprite isn't answering (${row.healthError ?? "no detail"}); if it stays that way, sky env rebuild ${row.name} rebuilds it`,
-        },
+          message: `the environment's sprite isn't answering (${row.healthError ?? "no detail"}); if it stays that way, sky env rebuild ${row.name} rebuilds it, though while the sprite can't be read that is refused for any agent that has run unless --force, which loses whatever exists only on the sprite`,
+        } satisfies EnvironmentHealth),
   // while provisioning, failure_step holds the step in progress
   failure:
     row.status !== "failed" || row.failureStep === null
@@ -209,7 +210,8 @@ function unpublishedMessage(work: UnpublishedWork): string {
     work.source === "sprite"
       ? "found in the agents' worktrees"
       : `the sprite could not be read (${work.unreachable}), so every agent that has run is listed, its commits and uncommitted changes unknown`;
-  return `rebuilding removes every worktree, and these agents may have work that exists only on the sprite (${where}): ${lines.join("; ")}. Publish it first, or send force: true to rebuild anyway and lose it`;
+  const have = work.source === "sprite" ? "have" : "may have";
+  return `rebuilding removes every worktree, and these agents ${have} work that exists only on the sprite (${where}): ${lines.join("; ")}. Publish it first, or send force: true to rebuild anyway and lose it`;
 }
 
 const nameTakenMessage = "an environment with this name already exists";

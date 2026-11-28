@@ -13,22 +13,26 @@ import { execCapped, type SpriteOps } from "./sprites.js";
 // $1 the worktrees' directory, the rest agent ids. One tab-separated line per agent:
 //   <id> none                                         no worktree on the sprite
 //   <id> ok <dirty files> <commits> <never> <branch>  the worktree's state
+//   <id> error                                        a git step failed: the worktree can't be read
 // <commits> are those past what GitHub has: the last publish's head, else the tip the agent started
 // on, else the default branch; <never> is 1 when neither exists and the branch has commits; <branch>
-// is the GitHub branch the last publish went to, empty when there was none. Read-only git throughout
-// (`--no-optional-locks` keeps `status` from refreshing the index). The record is the runner's
-// `published.ts`, whose file name escapes `%` and `/` as this does.
+// is the GitHub branch the last publish went to, empty when there was none. A HEAD with none of
+// those to count from is an error, not 0 commits. Read-only git throughout (`--no-optional-locks`
+// keeps `status` from refreshing the index). The record is the runner's `published.ts`, whose file
+// name escapes `%` and `/` as this does.
 export const WORK_CHECK = String.raw`dir=$1; shift
 enc() { printf %s "$1" | sed 's/%/%25/g; s#/#%2F#g'; }
 for id in "$@"; do
   wt="$dir/$id"
   if [ ! -d "$wt" ]; then printf '%s\tnone\n' "$id"; continue; fi
   g() { git --no-optional-locks -C "$wt" "$@"; }
-  dirty=$(g status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  unreadable() { printf '%s\terror\n' "$id"; }
+  st=$(g status --porcelain 2>/dev/null) || { unreadable; continue; }
+  if [ -z "$st" ]; then dirty=0; else dirty=$(printf '%s\n' "$st" | wc -l | tr -d ' '); fi
   head=$(g rev-parse -q --verify HEAD 2>/dev/null) || head=
   local=$(g symbolic-ref -q --short HEAD 2>/dev/null) || local=
   base=$(g merge-base origin/HEAD HEAD 2>/dev/null) || base=
-  common=$(g rev-parse --git-common-dir 2>/dev/null)
+  common=$(g rev-parse --git-common-dir 2>/dev/null) || { unreadable; continue; }
   case $common in /*) ;; *) common="$wt/$common";; esac
   pub=; branch=
   if [ -n "$local" ] && [ -f "$common/sky-published/$(enc "$local")" ]; then
@@ -38,17 +42,21 @@ for id in "$@"; do
   n=0; never=0; from=
   if [ -n "$head" ]; then
     if [ -n "$pub" ] && g merge-base --is-ancestor "$pub" "$head" 2>/dev/null; then from=$pub
-    elif [ -n "$pub" ] && g diff --quiet "$pub" "$head" 2>/dev/null; then n=0; from=$head
+    elif [ -n "$pub" ] && g diff --quiet "$pub" "$head" 2>/dev/null; then from=$head
     elif [ -n "$pub" ]; then from=$(g merge-base "$pub" "$head" 2>/dev/null) || from=
     fi
     if [ -z "$from" ]; then from=$base; [ -z "$pub" ] && never=1; fi
-    [ -n "$from" ] && n=$(g rev-list --count "$from..$head" 2>/dev/null || echo 0)
+    if [ -z "$from" ]; then unreadable; continue; fi
+    n=$(g rev-list --count "$from..$head" 2>/dev/null) || { unreadable; continue; }
     [ "$n" -eq 0 ] && never=0
   fi
   printf '%s\tok\t%s\t%s\t%s\t%s\n' "$id" "$dirty" "$n" "$never" "$branch"
 done`;
 
 type AgentRow = { id: AgentId; branch: string; remoteBranch: string | null };
+
+// an empty or missing field is unreadable, never 0
+const count = (field: string) => (/^\d+$/.test(field) ? Number(field) : NaN);
 
 /** The agent's work on the sprite, read from its worktree; one a sprite answered for. */
 export function parseWorkCheck(
@@ -70,12 +78,14 @@ export function parseWorkCheck(
     if (!fields) throw new Error(`the check said nothing of ${row.id}`);
     const [state, dirty = "", commits = "", never = "", recorded = ""] = fields;
     if (state === "none") continue;
-    const uncommitted = Number(dirty);
-    const unpublishedCommits = Number(commits);
+    const uncommitted = count(dirty);
+    const unpublishedCommits = count(commits);
     if (
       state !== "ok" ||
+      fields.length !== 5 ||
       !Number.isSafeInteger(uncommitted) ||
-      !Number.isSafeInteger(unpublishedCommits)
+      !Number.isSafeInteger(unpublishedCommits) ||
+      (never !== "0" && never !== "1")
     ) {
       throw new Error(`the check's answer for ${row.id} is unreadable`);
     }
@@ -95,7 +105,9 @@ export function parseWorkCheck(
  * What the API recorded, for a sprite that can't be asked: every unarchived agent that has had a run,
  * as at risk with its commits and uncommitted changes unknown. The records can't clear an agent: a
  * run in flight when the sprite went down has no rollup, and a rollup says nothing of uncommitted
- * changes. The branch is the last publish's, else the one the agent was started on, else its own.
+ * changes. Nor can they say a branch was never published: a runner that predates publish records
+ * leaves none in its rollups. The branch is the last publish's, else the one the agent was started
+ * on, else its own.
  */
 export function recordedWork(db: Db, rows: AgentRow[]): UnpublishedAgent[] {
   const found: UnpublishedAgent[] = [];
@@ -122,10 +134,7 @@ export function recordedWork(db: Db, rows: AgentRow[]): UnpublishedAgent[] {
       branch: published?.branch || row.remoteBranch || row.branch,
       uncommitted: null,
       unpublishedCommits: null,
-      neverPublished:
-        rollup != null &&
-        rollup.cumulative.commits.length > 0 &&
-        published === undefined,
+      neverPublished: null,
     });
   }
   return found;

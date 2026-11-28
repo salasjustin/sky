@@ -181,13 +181,17 @@ const isStreamDecodeError = (err: unknown): err is Error =>
 
 /**
  * Tells `ops.health` how a call to the sprite went, and passes the call's outcome on untouched. A
- * call that ran out of a long bound (a clone, a setup) says nothing of the sprite, so only one under
- * the short bound counts a timeout as a failure to answer.
+ * call that ran out of a long bound (a clone, a setup), or that the caller's `signal` cut, says
+ * nothing of the sprite and is not told; one under the short bound counts its timeout as a failure
+ * to answer.
  */
 async function tracked<T>(
   ops: SpriteOps,
   name: string,
-  { timeoutMs }: Pick<CallOptions, "timeoutMs">,
+  {
+    timeoutMs = ops.timeoutMs,
+    signal,
+  }: Pick<CallOptions, "timeoutMs"> & { signal?: AbortSignal },
   call: Promise<T>,
 ): Promise<T> {
   try {
@@ -195,13 +199,10 @@ async function tracked<T>(
     ops.health?.contact(name);
     return value;
   } catch (err) {
+    const timedOut = err instanceof SpriteTimeoutError;
+    if ((timedOut && timeoutMs > ops.timeoutMs) || signal?.aborted) throw err;
     try {
-      ops.health?.failed(
-        name,
-        err,
-        err instanceof SpriteTimeoutError &&
-          (timeoutMs === undefined || timeoutMs <= ops.timeoutMs),
-      );
+      ops.health?.failed(name, err, timedOut);
     } catch {
       // a health record that can't be kept never changes how the call ended
     }
@@ -580,6 +581,8 @@ export function startDetached(
   return tracked(
     ops,
     name,
+    // the short bound, not the call's: the watch starts at the spawn, so running out means the
+    // sprite didn't start the session within `ops.timeoutMs`, a failure to answer
     {},
     spriteCall(
       ops,

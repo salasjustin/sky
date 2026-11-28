@@ -58,14 +58,19 @@ function recordPublished(id: string, head: string, branch: string) {
   writeFileSync(join(dir, `claude%2F${id}`), `${head}\n${branch}\n`);
 }
 
-function check(...ids: string[]) {
+/** The check's raw answer for `ids`. */
+function answer(...ids: string[]) {
   const out = spawnSync("bash", ["-c", WORK_CHECK, "_", trees, ...ids], {
     env,
     encoding: "utf8",
   });
   expect(out.status).toBe(0);
+  return out.stdout;
+}
+
+function check(...ids: string[]) {
   return Object.fromEntries(
-    out.stdout
+    answer(...ids)
       .split("\n")
       .filter(Boolean)
       .map((line) => {
@@ -214,4 +219,40 @@ test("parseWorkCheck refuses an answer that leaves an agent out or can't be read
   expect(() => parseWorkCheck("agt_a\tweird\n", rows("agt_a"))).toThrow(
     /unreadable/,
   );
+});
+
+// a git step that fails must leave the worktree unreadable, so the rebuild falls back to the records
+// and refuses; read as 0 it would rebuild over the work
+
+test("a worktree whose git status fails, as with a corrupt index, is unreadable rather than clean", () => {
+  const path = worktree("agt_corrupt");
+  writeFileSync(join(path, "new.txt"), "new\n");
+  writeFileSync(join(repo, ".git", "worktrees", "agt_corrupt", "index"), "x");
+  expect(check("agt_corrupt")).toEqual({ agt_corrupt: "error" });
+  expect(() =>
+    parseWorkCheck(answer("agt_corrupt"), rows("agt_corrupt")),
+  ).toThrow(/unreadable/);
+});
+
+test("commits with no publish record, no start ref and no origin/HEAD to count from are unreadable rather than clean", () => {
+  const path = worktree("agt_nobase");
+  commit(path, "b.txt");
+  git(repo, "remote", "set-head", "origin", "--delete");
+  expect(check("agt_nobase")).toEqual({ agt_nobase: "error" });
+  expect(() =>
+    parseWorkCheck(answer("agt_nobase"), rows("agt_nobase")),
+  ).toThrow(/unreadable/);
+});
+
+test("parseWorkCheck refuses an ok line with fields missing or empty, rather than reading them as 0", () => {
+  for (const line of [
+    "agt_a\tok",
+    "agt_a\tok\t0\t0",
+    "agt_a\tok\t\t\t0\t",
+    "agt_a\tok\t0\t0\t\t",
+  ]) {
+    expect(() => parseWorkCheck(`${line}\n`, rows("agt_a"))).toThrow(
+      /unreadable/,
+    );
+  }
 });

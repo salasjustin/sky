@@ -433,13 +433,38 @@ const lastEventId = zValidator(
   badCursor,
 );
 
+/**
+ * Where a rebuilt agent's new worktree starts: a branch GitHub has, else the default branch and why.
+ * `unasked` is an agent that was not rebuilt, or whose environment isn't ready.
+ */
+type RestartFrom =
+  | { branch: string }
+  | { branch: null; because: "unasked" | "not_found" }
+  | {
+      branch: null;
+      because: "needs_connector" | "is_default";
+      candidate: string;
+    };
+
+function startsFrom(from: RestartFrom): string {
+  if (from.branch !== null) {
+    return `from the \`${from.branch}\` branch on GitHub`;
+  }
+  switch (from.because) {
+    case "not_found":
+      return "from the repository's default branch, because Sky found no branch of yours on GitHub to start from";
+    case "needs_connector":
+      return `from the repository's default branch, because this environment has no GitHub connector, so Sky could not look on GitHub for your branch \`${from.candidate}\``;
+    case "is_default":
+      return `from \`${from.candidate}\`, which is both the repository's default branch and the branch you were started on or published to`;
+    case "unasked":
+      return "from the repository's default branch";
+  }
+}
+
 /** The note at the top of an agent's first run after its environment was rebuilt. */
-const rebuiltNote = (branch: string | null) =>
-  `The environment was rebuilt since your last run, so your worktree is new: it starts ${
-    branch === null
-      ? "from the repository's default branch, because Sky found no branch of yours on GitHub to start from"
-      : `from the \`${branch}\` branch on GitHub`
-  }. Anything that existed only in the old worktree (uncommitted changes, commits that were never published) is gone, and so is your earlier session: you start a fresh one, so what you remember of the old session may no longer be true of the files. Read the worktree before you rely on it.\n\n`;
+const rebuiltNote = (from: RestartFrom) =>
+  `The environment was rebuilt since your last run, so your worktree is new: it starts ${startsFrom(from)}. Anything that existed only in the old worktree (uncommitted changes, commits that were never published) is gone, and so is your earlier session: you start a fresh one, so what you remember of the old session may no longer be true of the files. Read the worktree before you rely on it.\n\n`;
 
 /** The GitHub branch the agent's latest published run went to, as the runs recorded it. */
 function publishedBranchOf(db: Db, id: AgentId): string | undefined {
@@ -457,10 +482,10 @@ function publishedBranchOf(db: Db, id: AgentId): string | undefined {
 /**
  * For an agent whose environment was rebuilt, the GitHub branch its new worktree starts from: the
  * first GitHub still has of the one it was started on, the one its runs recorded publishing to, and
- * its own (where a publish goes by default), else none (the default branch). A `Response` when
- * GitHub could not be asked: the follow-up is refused to retry, since starting from the default
+ * its own (where a publish goes by default), else none (the default branch) and why. A `Response`
+ * when GitHub could not be asked: the follow-up is refused to retry, since starting from the default
  * branch because the question failed would drop the agent's work unannounced. An agent that was not
- * rebuilt has `branch: null` and nothing is checked.
+ * rebuilt is `unasked` and nothing is checked.
  */
 async function restartBranchOf(
   c: Context<AppEnv>,
@@ -475,22 +500,25 @@ async function restartBranchOf(
     .innerJoin(environments, eq(agents.envId, environments.id))
     .where(and(eq(agents.id, id), ownAgents(c.var.principal)))
     .get();
-  if (!found?.agent.rebuiltAt || found.agent.archivedAt)
-    return { branch: null };
+  const unasked = { branch: null, because: "unasked" } satisfies RestartFrom;
+  if (!found?.agent.rebuiltAt || found.agent.archivedAt) return unasked;
   const { agent, env } = found;
   // the follow-up is refused below for an environment that isn't ready
-  if (env.status !== "ready") return { branch: null };
+  if (env.status !== "ready") return unasked;
   const candidates = new Set(
     [agent.remoteBranch, publishedBranchOf(c.var.db, id), agent.branch].filter(
       (branch): branch is string => Boolean(branch),
     ),
   );
+  let defaultBranch: string | undefined;
   for (const candidate of candidates) {
     const check = await within(deadlineMs, checkBranch(env, candidate), {
       kind: "failed",
       detail: `no answer within ${deadlineMs / 1000}s`,
     } as BranchCheck);
-    if (check.kind === "exists") return { branch: candidate };
+    if (check.kind === "exists") {
+      return { branch: candidate } satisfies RestartFrom;
+    }
     if (check.kind === "failed") {
       log(`branch check of ${candidate} on ${env.id} failed: ${check.detail}`);
       return apiError(
@@ -500,9 +528,24 @@ async function restartBranchOf(
         `the environment was rebuilt, and the agent's new worktree starts from its branch ${candidate} if GitHub still has it; could not check (${check.detail}); retry`,
       );
     }
-    // gone from GitHub, the default branch, or no connector to look with: the next one
+    // the connector is the environment's: no other candidate can be looked for either
+    if (check.kind === "needs_connector") {
+      return {
+        branch: null,
+        because: "needs_connector",
+        candidate,
+      } satisfies RestartFrom;
+    }
+    if (check.kind === "is_default") defaultBranch ??= candidate;
+    // gone from GitHub, or the default branch: the next one
   }
-  return { branch: null };
+  return defaultBranch === undefined
+    ? ({ branch: null, because: "not_found" } satisfies RestartFrom)
+    : ({
+        branch: null,
+        because: "is_default",
+        candidate: defaultBranch,
+      } satisfies RestartFrom);
 }
 
 export function agentRoutes(
@@ -734,7 +777,7 @@ export function agentRoutes(
         agentId: id,
         runId,
         prompt: outcome.fresh
-          ? `${rebuiltNote(outcome.agent.remoteBranch)}${prompt}`
+          ? `${rebuiltNote(rebuilt)}${prompt}`
           : prompt,
         sessionId: outcome.agent.sessionId,
         approvalPolicy: outcome.env.approvalPolicy,

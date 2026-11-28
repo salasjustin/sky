@@ -28,7 +28,7 @@ export type RebuildInput = z.infer<typeof RebuildInput>;
  * One agent whose work exists only on the sprite, and what of it is at risk: `uncommitted` files and
  * `unpublishedCommits` not on the GitHub branch the agent publishes to (each null when the sprite
  * couldn't be read: the agent has run, so either may exist), and whether that branch was never
- * published at all.
+ * published at all (null when the sprite couldn't be read).
  */
 export const UnpublishedAgent = z.object({
   agentId: AgentId,
@@ -36,7 +36,7 @@ export const UnpublishedAgent = z.object({
   branch: z.string(),
   uncommitted: z.int().nonnegative().nullable(),
   unpublishedCommits: z.int().nonnegative().nullable(),
-  neverPublished: z.boolean(),
+  neverPublished: z.boolean().nullable(),
 });
 export type UnpublishedAgent = z.infer<typeof UnpublishedAgent>;
 

@@ -17,7 +17,12 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
 import { KnownSecrets } from "./redact.js";
 import { createSpriteHealth } from "./sprite-health.js";
-import { execInSprite, type SpriteOps, spriteNameFor } from "./sprites.js";
+import {
+  execInSprite,
+  type SpriteOps,
+  SpriteTimeoutError,
+  spriteNameFor,
+} from "./sprites.js";
 import {
   envFileOf,
   type SpritesWire,
@@ -392,6 +397,10 @@ test("a reachable sprite's uncommitted changes, unpublished commits and never-pu
     ],
   });
   expect(error.unreachable).toBeUndefined();
+  // found in the worktrees, so not hedged
+  expect(String(error.message)).toContain(
+    "these agents have work that exists only on the sprite",
+  );
   expect(String(error.message)).toContain(
     `${dirty.agent.id} (claude/${dirty.agent.id}): 3 uncommitted files`,
   );
@@ -449,25 +458,20 @@ function sprite503() {
 }
 
 test.each([
-  [
-    "with a rollup that shows commits never published",
-    rollupOf(["2", "1"]),
-    true,
-  ],
+  // a runner from before publishes were recorded leaves this for a branch it did publish
+  ["with a rollup that records no publish", rollupOf(["2", "1"])],
   [
     "with a rollup that shows everything published",
     rollupOf(["2", "1"], { head: sha("2"), branch: "feature/login" }),
-    false,
   ],
-  ["with a rollup of no commits", rollupOf([]), false],
+  ["with a rollup of no commits", rollupOf([])],
   [
     "whose run left no rollup, as one in flight when the sprite went down",
     undefined,
-    false,
   ],
 ])(
-  "a sprite that doesn't answer refuses an agent that has run, its commits and uncommitted changes unknown, %s",
-  async (_, rollup, neverPublished) => {
+  "a sprite that doesn't answer refuses an agent that has run, its commits, uncommitted changes and whether it was ever published unknown, %s",
+  async (_, rollup) => {
     const envId = readyEnv();
     const { agent } = await agentWith(envId, rollup);
     const branch = rollup?.published?.branch ?? `claude/${agent.id}`;
@@ -485,10 +489,11 @@ test.each([
           branch,
           uncommitted: null,
           unpublishedCommits: null,
-          neverPublished,
+          neverPublished: null,
         },
       ],
     });
+    expect(String(error.message)).toContain("may have work");
     expect(String(error.message)).toContain("the sprite could not be read");
     expect(String(error.message)).toContain(
       `${agent.id} (${branch}): commits and uncommitted changes unknown`,
@@ -497,6 +502,46 @@ test.each([
     expect(agentRow(agent.id)?.sessionId).not.toBeNull();
   },
 );
+
+test.each([
+  ["an ok line with its fields missing", "ok"],
+  ["a git step that failed", "error"],
+  ["an ok line with empty counts", "ok\t\t\t0\t"],
+])(
+  "a check that answers %s is refused from the records, never read as clean",
+  async (_, line) => {
+    const envId = readyEnv();
+    const { agent } = await agentWith(envId);
+    worktreeCheck({ [agent.id]: line });
+    const res = await rebuild(envId);
+    expect(res.status).toBe(409);
+    const { error } = (await res.json()) as { error: Record<string, unknown> };
+    expect(error).toMatchObject({
+      code: "unpublished_work",
+      checked: "records",
+      unreachable: expect.stringMatching(/\S/),
+      agents: [{ agentId: agent.id, uncommitted: null }],
+    });
+    expect(await getEnv(envId)).toMatchObject({ status: "ready" });
+  },
+);
+
+test("a check that exits nonzero is refused from the records, saying why", async () => {
+  const envId = readyEnv();
+  const { agent } = await agentWith(envId);
+  const fallback = wire.exec;
+  wire.exec = (argv, sprite) =>
+    argv[2] === WORK_CHECK ? { exitCode: 2 } : fallback(argv, sprite);
+  const res = await rebuild(envId);
+  expect(res.status).toBe(409);
+  const { error } = (await res.json()) as { error: Record<string, unknown> };
+  expect(error).toMatchObject({
+    code: "unpublished_work",
+    checked: "records",
+    unreachable: expect.stringContaining("exited 2"),
+    agents: [{ agentId: agent.id }],
+  });
+});
 
 test("records name the branch the last publish went to, else the one the agent started on", async () => {
   const envId = readyEnv();
@@ -750,6 +795,51 @@ test("a rebuilt agent whose started-on branch is gone from GitHub starts from th
   expect(agentRow(agent.id)?.remoteBranch).toBeNull();
 });
 
+test("a rebuilt agent in an environment with no GitHub connector starts from the default branch, and says Sky couldn't look", async () => {
+  const envId = readyEnv();
+  const { agent } = await agentWith(envId, rollupOf(["1"]));
+  expect((await rebuild(envId, { force: true })).status).toBe(202);
+  await settled(envId);
+  const checks = branchCheckAnswers({ exitCode: 0 });
+  const res = await followUp(agent.id);
+  expect(res.status).toBe(202);
+  const { run } = (await res.json()) as Launched;
+  await sessionOpened(2);
+  // nothing to ask GitHub with
+  expect(checks).toHaveLength(0);
+  expect(wire.sessions[1]?.env).not.toHaveProperty("START_BRANCH");
+  const prompt = promptOf(run.id);
+  expect(prompt).toContain(
+    `from the repository's default branch, because this environment has no GitHub connector, so Sky could not look on GitHub for your branch \`claude/${agent.id}\``,
+  );
+  expect(prompt).not.toContain("Sky found no branch of yours");
+});
+
+test("a rebuilt agent started on the default branch starts from it again, and says so", async () => {
+  const agent = await rebuiltOnBranch("main");
+  const fallback = wire.exec;
+  const checked: string[] = [];
+  wire.exec = (argv, sprite) => {
+    if (!isBranchCheck(argv)) return fallback(argv, sprite);
+    const branch = argv.at(-1) ?? "";
+    checked.push(branch);
+    return branch === "main"
+      ? { exitCode: 4, stderr: "branch-check: main is the default branch\n" }
+      : { exitCode: 3, stderr: `branch-check: ${branch} doesn't exist\n` };
+  };
+  const res = await followUp(agent.id);
+  expect(res.status).toBe(202);
+  const { run } = (await res.json()) as Launched;
+  await sessionOpened(2);
+  expect(checked).toEqual(["main", `claude/${agent.id}`]);
+  expect(wire.sessions[1]?.env).not.toHaveProperty("START_BRANCH");
+  const prompt = promptOf(run.id);
+  expect(prompt).toContain(
+    "from `main`, which is both the repository's default branch and the branch you were started on or published to",
+  );
+  expect(prompt).not.toContain("Sky found no branch of yours");
+});
+
 test("a failed check of a rebuilt agent's started-on branch refuses the follow-up to retry", async () => {
   const agent = await rebuiltOnBranch("feature/started");
   const checks = branchCheckAnswers({
@@ -877,6 +967,10 @@ test("three failed calls in a row mark the env unreachable with the error and it
       message: expect.stringContaining(`sky env rebuild ${envId}`),
     },
   });
+  // the rebuild it points to is refused for an agent that has run while the sprite can't be read
+  expect((env.health as { message: string }).message).toContain(
+    "unless --force",
+  );
   expect(logs.some((l) => l.includes("stopped answering"))).toBe(true);
 
   wire.hangs = () => false;
@@ -919,6 +1013,47 @@ test("a mark outlives the process, and the first answer after a restart clears i
   });
   expect(await exec(opsWithHealth(), envId)).toBe("ok");
   expect(await getEnv(envId)).toMatchObject({ health: null });
+});
+
+const marked = () =>
+  readyEnv({
+    health: "unreachable",
+    healthError: "503 Storage not ready",
+    healthAt: "2026-11-26T10:00:00.000Z",
+  });
+
+test("a call that runs out of a long bound says nothing of the sprite, so a marked env stays marked", async () => {
+  const envId = marked();
+  const ops = { ...opsWithHealth(), timeoutMs: 20 };
+  wire.hangs = () => true;
+  const outcome = await execInSprite(ops, spriteNameFor(envId), ["true"], {
+    op: "clone",
+    timeoutMs: 60,
+  }).catch((err: unknown) => err);
+  expect(outcome).toBeInstanceOf(SpriteTimeoutError);
+  expect(await getEnv(envId)).toMatchObject({
+    health: { status: "unreachable", error: "503 Storage not ready" },
+  });
+});
+
+test("a call its caller cut says nothing of the sprite, so a marked env stays marked", async () => {
+  const envId = marked();
+  const ops = opsWithHealth();
+  wire.hangs = () => true;
+  const caller = new AbortController();
+  setTimeout(() => caller.abort(new Error("the client went away")), 20);
+  expect(
+    await execInSprite(ops, spriteNameFor(envId), ["true"], {
+      op: "probe",
+      signal: caller.signal,
+    }).then(
+      () => "ok",
+      () => "failed",
+    ),
+  ).toBe("failed");
+  expect(await getEnv(envId)).toMatchObject({
+    health: { status: "unreachable", error: "503 Storage not ready" },
+  });
 });
 
 test("a rebuild clears the mark: it is the answer to a sprite that wasn't answering", async () => {
