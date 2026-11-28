@@ -57,6 +57,7 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 import {
   type AutoApproved,
   type BaseProfileMcpServer,
@@ -170,13 +171,26 @@ const TOOL_NAMES: Record<string, string> = {
 };
 const eventToolName = (tool: string) => TOOL_NAMES[tool] ?? tool;
 
-const homePath = (home: string, path: string) => {
-  const bare = path.startsWith("@") ? path.slice(1) : path;
-  return bare === "~"
-    ? home
-    : bare.startsWith("~/")
-      ? join(home, bare.slice(2))
-      : bare;
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+/**
+ * The file pi's `write` and `edit` change for `path`: pi 1.6.1's `resolveToCwd` (`utils/paths.js`), which
+ * maps unicode spaces to spaces, strips a leading `@`, expands `~` and turns a `file://` URL into its
+ * path, and doesn't trim. Symlinks are not followed.
+ */
+const piWritePath = (cwd: string, home: string, path: string) => {
+  let bare = path.replace(UNICODE_SPACES, " ");
+  if (bare.startsWith("@")) bare = bare.slice(1);
+  if (bare === "~") return home;
+  if (bare.startsWith("~/")) return join(home, bare.slice(2));
+  if (bare.startsWith("file://")) {
+    try {
+      bare = fileURLToPath(bare);
+    } catch {
+      // pi's own call throws on this URL and writes nothing
+    }
+  }
+  return resolve(cwd, bare);
 };
 
 /** One tool call as the policy reads it: the Claude-shaped name and input, and the files a change writes. */
@@ -216,9 +230,10 @@ export function piToolCall(
     };
   }
   if (tool === "write" || tool === "edit") {
-    const path = resolve(
+    const path = piWritePath(
       cwd,
-      homePath(home, typeof input.path === "string" ? input.path : ""),
+      home,
+      typeof input.path === "string" ? input.path : "",
     );
     const { path: _path, ...rest } = input;
     return {
@@ -231,24 +246,99 @@ export function piToolCall(
 }
 
 const SEGMENTS = /&&|\|\||[;|&\n]/;
-// programs that run the command after their own arguments, and the short options of each that take one
+// programs that run the command after their own arguments, and the options of each that take one
 const WRAPPERS: Record<string, readonly string[]> = {
-  sudo: ["-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-r", "-t", "-U"],
+  sudo: [
+    "-u",
+    "-g",
+    "-h",
+    "-p",
+    "-C",
+    "-D",
+    "-R",
+    "-T",
+    "-r",
+    "-t",
+    "-U",
+    "--user",
+    "--group",
+    "--host",
+    "--prompt",
+    "--close-from",
+    "--chdir",
+    "--chroot",
+    "--command-timeout",
+    "--role",
+    "--type",
+    "--other-user",
+  ],
   doas: ["-u", "-C"],
-  env: ["-u", "-C", "-S"],
+  env: ["-u", "-C", "-S", "--unset", "--chdir", "--split-string"],
   command: [],
   builtin: [],
   exec: ["-a"],
   nohup: [],
-  time: ["-f", "-o"],
-  nice: ["-n"],
-  ionice: ["-c", "-n", "-p"],
+  time: ["-f", "-o", "--format", "--output"],
+  nice: ["-n", "--adjustment"],
+  ionice: ["-c", "-n", "-p", "--class", "--classdata", "--pid"],
   setsid: [],
-  stdbuf: ["-i", "-o", "-e"],
-  timeout: ["-s", "-k"],
-  xargs: ["-n", "-I", "-L", "-P", "-s", "-d", "-E"],
+  stdbuf: ["-i", "-o", "-e", "--input", "--output", "--error"],
+  timeout: ["-s", "-k", "--signal", "--kill-after"],
+  xargs: [
+    "-a",
+    "-n",
+    "-I",
+    "-L",
+    "-P",
+    "-s",
+    "-d",
+    "-E",
+    "--arg-file",
+    "--max-args",
+    "--max-lines",
+    "--max-procs",
+    "--max-chars",
+    "--delimiter",
+  ],
 };
+// `env -S 'git push'` splits its value into the command it runs
+const SPLIT_STRING = ["-S", "--split-string"];
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
+// bash's long options that take a value; the rest are flags
+const SHELL_WITH_ARGUMENT = ["--rcfile", "--init-file"];
+
+/**
+ * The option at `words[i]`: its name, the value it takes when `withArgument` names it (attached, as in
+ * `--user=a` and `-ua`, or the next word), and the index of the word after both. A short cluster such
+ * as `-iu a` is the first of its letters that takes a value.
+ */
+function option(
+  words: { value: string }[],
+  i: number,
+  withArgument: readonly string[],
+): { name: string; value?: string; next: number } {
+  const word = words[i]?.value ?? "";
+  if (word.startsWith("--")) {
+    const equals = word.indexOf("=");
+    if (equals >= 0)
+      return {
+        name: word.slice(0, equals),
+        value: word.slice(equals + 1),
+        next: i + 1,
+      };
+    return withArgument.includes(word)
+      ? { name: word, value: words[i + 1]?.value, next: i + 2 }
+      : { name: word, next: i + 1 };
+  }
+  for (let j = 1; j < word.length; j++) {
+    const name = `-${word[j]}`;
+    if (!withArgument.includes(name)) continue;
+    return j + 1 < word.length
+      ? { name, value: word.slice(j + 1), next: i + 1 }
+      : { name, value: words[i + 1]?.value, next: i + 2 };
+  }
+  return { name: word, next: i + 1 };
+}
 
 /** The words of a shell command line, quotes and backslashes resolved and nothing expanded, each with where it starts. */
 function shellWords(text: string): { value: string; start: number }[] {
@@ -291,11 +381,24 @@ function peel(text: string): string | undefined {
   const program = basename(at(first));
   if (first > 0 && program) return text.slice(words[first]?.start);
   if (SHELLS.has(program)) {
-    for (let i = first + 1; i < words.length; i++) {
-      if (/^-[A-Za-z]*c[A-Za-z]*$/.test(at(i))) return words[i + 1]?.value;
-      if (!at(i).startsWith("-") || at(i) === "--") return undefined;
+    // `-c` makes the first word that isn't an option the script, wherever it sits among the options
+    let script = false;
+    let i = first + 1;
+    for (; i < words.length; i++) {
+      const word = at(i);
+      if (word === "--" || word === "-") {
+        i++;
+        break;
+      }
+      if (/^[-+][A-Za-z]+$/.test(word)) {
+        if (word.startsWith("-") && word.includes("c")) script = true;
+        // `-o pipefail`, `+o history`, `-O extglob` and `-eo pipefail` each take the next word
+        i += word.match(/[oO]/g)?.length ?? 0;
+      } else if (word.startsWith("--")) {
+        if (SHELL_WITH_ARGUMENT.includes(word)) i++;
+      } else break;
     }
-    return undefined;
+    return script ? words[i]?.value : undefined;
   }
   const withArgument = WRAPPERS[program];
   if (!withArgument) return undefined;
@@ -309,7 +412,12 @@ function peel(text: string): string | undefined {
       break;
     }
     if (word.startsWith("-") && word.length > 1) {
-      i += withArgument.includes(word) ? 2 : 1;
+      const { name, value, next } = option(words, i, withArgument);
+      if (program === "env" && SPLIT_STRING.includes(name)) {
+        const rest = next < words.length ? text.slice(words[next]?.start) : "";
+        return `${value ?? ""} ${rest}`.trim() || undefined;
+      }
+      i = next;
     } else if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) i++;
     else if (positionals > 0) {
       positionals--;
@@ -397,12 +505,18 @@ export function piOutcome(
 const summaryOf = (call: PiCall) =>
   String(call.input.command ?? call.input.file_path ?? call.toolName);
 
-/** What the agent is told on every pi run: Codex's, and that pi has no subagents. */
+/**
+ * What the agent is told on every pi run: Codex's, with a denial's reason where pi puts it (the blocked
+ * call's result, not a message), and that pi has no subagents.
+ */
 export function piInstructions(
   options: Parameters<typeof runtimeInstructions>[0],
 ): string {
   return [
-    runtimeInstructions(options),
+    runtimeInstructions(options).replace(
+      "When the person gives a reason, it follows as a message: do what it says.",
+      "When the person gives a reason, it comes back as that step's result: do what it says.",
+    ),
     "You run on pi, which has no subagents: do the work yourself with your own tools.",
   ].join("\n\n");
 }

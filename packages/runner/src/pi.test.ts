@@ -191,6 +191,27 @@ describe("piToolCall", () => {
     expect(piToolCall("edit", { path: "~/x" }, "/w", "/h")?.targets).toEqual([
       "/h/x",
     ]);
+    expect(piToolCall("edit", { path: "@~/x" }, "/w", "/h")?.targets).toEqual([
+      "/h/x",
+    ]);
+  });
+
+  test.each([
+    ["file:///home/sprite/.bashrc", "/home/sprite/.bashrc"],
+    ["@file:///etc/hosts", "/etc/hosts"],
+    ["file:///w/a%20b.txt", "/w/a b.txt"],
+    ["a\u00A0b\u2009c.txt", "/w/a b c.txt"],
+    // pi doesn't trim a write's path, so neither does the check
+    [" /etc/x", "/w/ /etc/x"],
+  ])("write %j targets %s, the file pi writes", (path, target) => {
+    for (const tool of ["write", "edit"])
+      expect(piToolCall(tool, { path }, "/w", "/h")?.targets).toEqual([target]);
+  });
+
+  test("a file URL pi can't turn into a path is not an error here", () => {
+    expect(() =>
+      piToolCall("write", { path: "file://host/x" }, "/w"),
+    ).not.toThrow();
   });
 
   test("reads and the runner's own tools are not asked about", () => {
@@ -234,12 +255,46 @@ describe("commandViews", () => {
     ['sh -c "cd x; git push"', ["git push"]],
     ["sudo -u a bash -c 'env A=1 git push'", ["git push"]],
     ["xargs -n 1 git push", ["git push"]],
+    ["xargs -a list git push", ["git push"]],
+    ["sudo --user deploy git push", ["git push"]],
+    ["sudo --user=deploy git push", ["git push"]],
+    ["sudo -iu root git push", ["git push"]],
+    ["sudo -uroot git push", ["git push"]],
+    ["sudo --chdir /x --group staff git push", ["git push"]],
+    ["sudo --login --other-user a git push", ["git push"]],
+    ["timeout --signal KILL 10 git push", ["git push"]],
+    ["bash -o pipefail -c 'git push'", ["git push"]],
+    ["bash +o history -c 'git push'", ["git push"]],
+    ["bash -eo pipefail -c 'git push'", ["git push"]],
+    ["bash -O extglob -c 'git push'", ["git push"]],
+    ["bash -c -o pipefail 'git push'", ["git push"]],
+    ["bash --norc --rcfile x -c 'git push'", ["git push"]],
+    ["env -S 'git push origin'", ["git push origin"]],
+    ["env -S'git push'", ["git push"]],
+    ["env -i --split-string='FOO=1 git push'", ["git push"]],
+    ["env --split-string 'git push' origin", ["git push origin"]],
+    ["doas -u deploy git push", ["git push"]],
+    ["command git push", ["git push"]],
+    ["builtin git push", ["git push"]],
+    ["exec -a name git push", ["git push"]],
+    ["time -o out git push", ["git push"]],
+    ["ionice -c 3 git push", ["git push"]],
+    ["setsid -w git push", ["git push"]],
+    ["stdbuf -oL git push", ["git push"]],
+    ["stdbuf -o L git push", ["git push"]],
+    ["zsh -c 'git push'", ["git push"]],
+    ["dash -c 'git push'", ["git push"]],
+    ["ksh -c 'git push'", ["git push"]],
   ])("%s runs %j", (command, expected) => {
     expect(commandViews(command)).toEqual(expect.arrayContaining(expected));
   });
 
   test("a command with no wrapper has no extra view, and nesting is bounded", () => {
     expect(commandViews("ls -la")).toEqual(["ls -la"]);
+    expect(commandViews("bash script.sh")).toEqual(["bash script.sh"]);
+    expect(commandViews("sudo --user deploy git push")).not.toContain(
+      "deploy git push",
+    );
     const deep = `${"bash -c '".repeat(12)}git push${"'".repeat(12)}`;
     expect(() => commandViews(deep)).not.toThrow();
   });
@@ -324,6 +379,10 @@ describe("piOutcome", () => {
     "timeout 60 git push",
     "nohup git push &",
     "xargs -n 1 git push",
+    "sudo --user deploy git push",
+    "sudo --user=deploy git push",
+    "bash -o pipefail -c 'git push'",
+    "env -S 'git push'",
   ])("a pattern that names git push holds %s", (command) => {
     expect(outcome(["Bash(git push:*)"], "bash", { command })).toBe("hold");
   });
@@ -355,7 +414,16 @@ describe("piOutcome", () => {
     expect(outcome([], "write", { path: "/etc/x", content: "" })).toBe("hold");
     expect(outcome([], "edit", { path: "../up.txt", edits: [] })).toBe("hold");
     expect(outcome([], "write", { path: "~/x", content: "" })).toBe("hold");
+    expect(
+      outcome([], "write", { path: "file:///home/sprite/.bashrc", content: "" }),
+    ).toBe("hold");
+    expect(outcome([], "edit", { path: "@file:///etc/x", edits: [] })).toBe(
+      "hold",
+    );
     expect(outcome([], "write", { path: "in.txt", content: "" })).toBe("run");
+    expect(outcome([], "write", { path: "file:///w/in.txt", content: "" })).toBe(
+      "run",
+    );
   });
 
   test("another tool is held by a pattern that names it", () => {
@@ -411,6 +479,14 @@ describe("piInstructions", () => {
     expect(text).toContain("sky_publish");
     expect(text).toContain("- pnpm test");
     expect(text).toMatch(/no subagents/);
+  });
+
+  test("says a denial's reason comes back as the declined step's result", () => {
+    const text = piInstructions({ broker: false, checks: [], notes: [] });
+    expect(text).toContain(
+      "When the person gives a reason, it comes back as that step's result: do what it says.",
+    );
+    expect(text).not.toMatch(/follows as a message/);
   });
 });
 
