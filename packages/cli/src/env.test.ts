@@ -108,11 +108,37 @@ test("a switch whose response names an unknown runtime prints it, and an unset o
   const r = await runCli(["env", "set-runtime", "web", "claude-code"]);
   expect(r.code).toBe(0);
   expect(r.stdout).toBe("env_1 ready acme/web web\nruntime: gemini-cli\n");
-  // the CLI's own argument is still checked against the runtimes it knows
+  // an environment with no runtime, or a null one, still reads as the default
+  server.use(
+    http.get(`${apiUrl}/v1/environments/env_1`, () =>
+      HttpResponse.json(web),
+    ),
+  );
+  const unset = await runCli(["env", "show", "env_1"]);
+  expect(unset.code).toBe(0);
+  expect(unset.stdout).toBe(
+    "env_1 ready acme/web web\nruntime: default (the SKY_RUNTIME secret, else claude-code)\n",
+  );
+  server.use(
+    http.get(`${apiUrl}/v1/environments/env_1`, () =>
+      HttpResponse.json(envJson({ runtime: null })),
+    ),
+  );
+  const cleared = await runCli(["env", "show", "env_1"]);
+  expect(cleared.code).toBe(0);
+  expect(cleared.stdout).toBe(unset.stdout);
+  // the CLI's own argument is still checked against the runtimes it knows, before any request
+  let requests = 0;
+  server.use(
+    http.all(`${apiUrl}/*`, () => {
+      requests++;
+      return HttpResponse.json({}, { status: 500 });
+    }),
+  );
   const bad = await runCli(["env", "set-runtime", "web", "gemini-cli"]);
   expect(bad.code).toBe(2);
-  const unset = envJson();
-  expect(Object.hasOwn(unset, "runtime")).toBe(false);
+  expect(bad.stderr).toMatch(/use claude-code, codex, pi or default/);
+  expect(requests).toBe(0);
 });
 
 test("env show by id prints the environment", async () => {

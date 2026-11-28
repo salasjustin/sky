@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -482,6 +483,10 @@ describe("realPathOf", () => {
     expect(held("dangling-in")).toBe("run");
     // a loop resolves to nothing: it stays under its own directory, and the write fails there
     expect(held("loop-a")).toBe("run");
+    // and the walk stops: the cap on link hops ends it at a path under the worktree
+    const resolved = realPathOf(join(inside, "loop-a"));
+    expect(resolved.startsWith(`${inside}/`)).toBe(true);
+    expect(resolved).toMatch(/\/loop-[ab]$/);
   });
 
   test("a worktree that is itself reached through a link is judged by its real path", () => {
@@ -931,24 +936,40 @@ describe("the run's extension", () => {
 });
 
 describe("cleanAgentDir", () => {
+  let dir: string;
+  let precious: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "runner-pi-agent-"));
+    precious = join(dir, "precious");
+    mkdirSync(precious);
+    writeFileSync(join(precious, "sentinel.txt"), "keep");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
   test("keeps what Sky writes, removes the rest, and makes the directory when it is missing", () => {
-    const dir = mkdtempSync(join(tmpdir(), "runner-pi-agent-"));
-    try {
-      const agent = join(dir, "agent");
-      cleanAgentDir(agent);
-      expect(existsSync(agent)).toBe(true);
-      writeFileSync(join(agent, "settings.json"), "{}");
-      writeFileSync(join(agent, "mcp.json"), "{}");
-      writeFileSync(join(agent, "auth.json"), "{}");
-      mkdirSync(join(agent, "prompts/deep"), { recursive: true });
-      symlinkSync("/etc", join(agent, "skills"));
-      cleanAgentDir(agent);
-      expect(readdirSync(agent).sort()).toEqual(["mcp.json", "settings.json"]);
-      // a link's target is never emptied
-      expect(existsSync("/etc/passwd")).toBe(true);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    const agent = join(dir, "agent");
+    cleanAgentDir(agent);
+    expect(existsSync(agent)).toBe(true);
+    writeFileSync(join(agent, "settings.json"), "{}");
+    writeFileSync(join(agent, "mcp.json"), "{}");
+    writeFileSync(join(agent, "auth.json"), "{}");
+    mkdirSync(join(agent, "prompts/deep"), { recursive: true });
+    symlinkSync(precious, join(agent, "skills"));
+    cleanAgentDir(agent);
+    expect(readdirSync(agent).sort()).toEqual(["mcp.json", "settings.json"]);
+    // a link entry is removed without its target being emptied
+    expect(readdirSync(precious)).toEqual(["sentinel.txt"]);
+    expect(readFileSync(join(precious, "sentinel.txt"), "utf8")).toBe("keep");
+  });
+
+  test("an agent directory that is itself a link is replaced, and its target is left whole", () => {
+    const agent = join(dir, "agent");
+    symlinkSync(precious, agent);
+    cleanAgentDir(agent);
+    expect(lstatSync(agent).isSymbolicLink()).toBe(false);
+    expect(readdirSync(agent)).toEqual([]);
+    expect(readdirSync(precious)).toEqual(["sentinel.txt"]);
+    expect(readFileSync(join(precious, "sentinel.txt"), "utf8")).toBe("keep");
   });
 });
 
@@ -1487,10 +1508,12 @@ describe("runPiSession", () => {
   test("a model and skill directories the environment names are passed on", async () => {
     mkdirSync(join(root, "skills/one"), { recursive: true });
     mkdirSync(join(root, "home/.sky/pi/skills"), { recursive: true });
+    mkdirSync(join(root, "home/.sky/pi/skills2"), { recursive: true });
     config.piModel = "openai/gpt-5.4-mini";
     config.piSkills = [
       join(root, "skills/one"),
       "~/.sky/pi/skills",
+      "$HOME/.sky/pi/skills2",
       join(root, "skills/gone"),
     ];
     const warnings: string[] = [];
@@ -1503,6 +1526,7 @@ describe("runPiSession", () => {
     expect(skills).toEqual([
       join(root, "skills/one"),
       join(root, "home/.sky/pi/skills"),
+      join(root, "home/.sky/pi/skills2"),
     ]);
     expect(warnings.join("\n")).toMatch(
       /skill directory .*gone is not there; skipped/,
