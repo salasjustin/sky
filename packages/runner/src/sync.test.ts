@@ -713,6 +713,19 @@ test("start branch present: worktree is made from it and publish targets it", as
   expect(requests).not.toContain("GET /git/ref/heads/trunk");
 });
 
+test("a start branch that is the agent's own branch is recorded but not noted", async () => {
+  const tip = pushToGitHub("claude/agt_1", "own.txt", "1\n");
+
+  const { cwd, notes } = await prepare({ startBranch: "claude/agt_1" });
+
+  expect(git(cwd, "rev-parse", "HEAD")).toBe(tip);
+  expect(
+    git(repoDir, "config", "--get", "branch.claude/agt_1.sky-remote-branch"),
+  ).toBe("claude/agt_1");
+  expect(notes).toEqual([]);
+  expect((await prepare({ startBranch: "claude/agt_1" })).notes).toEqual([]);
+});
+
 test("a start branch cut before the clone, with the default branch merged in, fetches only its own commits", async () => {
   const cut = pushToGitHub("trunk", "cut.txt", "1\n");
   const older = bare("rev-parse", `${cut}^`);

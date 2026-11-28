@@ -1500,6 +1500,8 @@ async function prepareLocked(
     if (held !== startBranch) await g(["config", key, startBranch]);
     // `publish` reads the checked-out branch's key, which is not this one
     if (!onBranch) return { cwd, notes, refreshed };
+    // a rebuilt agent restarts from its own published branch: nothing to tell apart
+    if (startBranch === branch) return { cwd, notes, refreshed };
     notes.push(
       `This worktree continues the existing GitHub branch \`${startBranch}\`; \`publish\` updates that branch (and its open pull request), not \`${branch}\`.`,
     );
