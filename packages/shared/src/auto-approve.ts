@@ -1158,7 +1158,7 @@ function guard(words: string[], complete = true, piped = false): boolean {
           /^-[A-Za-z0-9]*[rRd]/.test(a) ||
           (a.startsWith("--") && a !== "--" && !GREP_LONG.test(a)),
       );
-      // `-r` and `--recursive` are left to `walkVerdict`, which reads every file they reach;
+      // `-r` and `--recursive` are left to `walkVerdict`, which checks every file they reach;
       // the other ways to recurse, and the options that change what is reached, ask
       return !refused || grepRecursion(args)?.recursive === true;
     }
@@ -1355,7 +1355,10 @@ function expandGlobs(
       if (!parts) return undefined;
       const next: string[] = [];
       for (const base of paths) {
-        const dir = posix.resolve(cwd, base === "" ? "." : base);
+        // joined, not resolved: the kernel applies `..` after following a link, so `link/..` lists
+        // the parent of the link's target, as the shell's own expansion does
+        const dir =
+          base === "" ? cwd : base.startsWith("/") ? base : `${cwd}/${base}`;
         if (!isGlobSegment(parts)) {
           // a literal after the last wildcard has to exist; `.` and `..` always do
           if (i > lastGlob && segment !== "." && segment !== "..") {
@@ -1458,18 +1461,19 @@ const GREP_LONG_VALUE =
  * What `grep -r` is asked to read: its file operands, or undefined for any option this doesn't
  * read exactly (`-R`, `-d`, `-f`, `--file`, `--include`, `--exclude*`, an unlisted long or short
  * option). No operand after the pattern means it reads the working directory, which the caller
- * walks. `recursive` says whether `-r` or `--recursive` was given.
+ * walks. `recursive` says whether `-r` or `--recursive` was given; `fileAt` is the index in
+ * `args` of each file operand.
  */
 function grepRecursion(
   args: string[],
-): { recursive: boolean; files: string[] } | undefined {
+): { recursive: boolean; files: string[]; fileAt: number[] } | undefined {
   let recursive = false;
   let patterns = 0;
-  const operands: string[] = [];
+  const operands: number[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i] ?? "";
     if (a === "--") {
-      operands.push(...args.slice(i + 1));
+      for (let j = i + 1; j < args.length; j++) operands.push(j);
       break;
     }
     if (a.startsWith("--")) {
@@ -1491,10 +1495,11 @@ function grepRecursion(
           break;
         } else if (!GREP_FLAG_LETTERS.test(c)) return undefined;
       }
-    } else operands.push(a);
+    } else operands.push(i);
   }
   // the first operand is the pattern unless `-e` gave one
-  return { recursive, files: operands.slice(patterns > 0 ? 0 : 1) };
+  const fileAt = operands.slice(patterns > 0 ? 0 : 1);
+  return { recursive, files: fileAt.map((at) => args[at] ?? ""), fileAt };
 }
 
 /**
@@ -1788,6 +1793,17 @@ function stepVerdict(
       }
     })();
     if (!expanded) return "syntax";
+    // the shell sorts matches by its locale's collation, not code units, so under `grep -r` a
+    // glob may only fill file operands: as the pattern or an option's value, one of its matches
+    // could trade places with a directory the walk then never sees
+    if (program === "grep") {
+      const recursion = grepRecursion(expanded.words.slice(1));
+      if (recursion?.recursive) {
+        const files = new Set(recursion.fileAt.map((at) => at + 1));
+        if (expanded.from.some((src, at) => step.globs[src] && !files.has(at)))
+          return "syntax";
+      }
+    }
     // every match is now a word like any other, checked below
     return stepVerdict(
       {

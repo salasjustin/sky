@@ -1669,6 +1669,16 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     );
   });
 
+  test("grep -r asks on a glob as the pattern or an option's value, whose matches the shell's locale may reorder", () => {
+    // code-unit order puts Bdir first, as the pattern; under en_US.UTF-8 bash passes adir
+    // first and grep walks Bdir
+    const { run } = tree(["adir/a.txt", "Bdir/.env", "src/a.ts"]);
+    expect(run("grep -r *dir")).toBe("syntax");
+    expect(run("grep -r -e *dir src")).toBe("syntax");
+    expect(run("grep -r foo *dir")).toBe("sensitive-path");
+    expect(run("grep -r foo src/*.ts")).toBe("approved");
+  });
+
   test("a glob expands in the directory the command runs in, after a cd", () => {
     const { run } = tree(project);
     expect(run("cd src && cat *.ts")).toBe("approved");
@@ -1709,6 +1719,19 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     });
     expect(run("cat inside*")).toBe("approved");
     expect(run("cat dir-out/*")).toBe("outside-root");
+  });
+
+  test("a glob after a link's .. lists the parent of the link's target, as the kernel does", () => {
+    const { base, run } = tree(project, {
+      "sub/link": "$OUT/cli",
+      "a/b/c/link": "../../../src",
+    });
+    mkdirSync(join(base, "outside", "cli"));
+    writeFileSync(join(base, "outside", "credentials"), "x");
+    expect(run("cat sub/link/../*")).not.toBe("approved");
+    // the link stays in the worktree, but two `..` from its target walk out of it
+    expect(run("cd a/b/c/link && cat ../../*")).not.toBe("approved");
+    expect(run("cd a/b/c/link && cat ../*.md")).toBe("approved");
   });
 
   test.each([
