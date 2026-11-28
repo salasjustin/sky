@@ -34,6 +34,27 @@ test("reads a run from env, defaulting the sprite paths", () => {
   });
 });
 
+test("reads the env's refresh script and its budget, and ignores a budget that isn't a positive number", () => {
+  expect(loadConfig(env)).not.toHaveProperty("refresh");
+  expect(loadConfig(env)).not.toHaveProperty("refreshTimeoutMs");
+  expect(
+    loadConfig({
+      ...env,
+      SKY_REFRESH: "git pull\nmake",
+      SKY_REFRESH_TIMEOUT_SECONDS: "45",
+    }),
+  ).toMatchObject({ refresh: "git pull\nmake", refreshTimeoutMs: 45_000 });
+  for (const bad of ["0", "-5", "soon", ""]) {
+    expect(
+      loadConfig({
+        ...env,
+        SKY_REFRESH: "x",
+        SKY_REFRESH_TIMEOUT_SECONDS: bad,
+      }),
+    ).not.toHaveProperty("refreshTimeoutMs");
+  }
+});
+
 test("reads the profile's session variables and checks, and refuses ones that aren't", () => {
   expect(
     loadConfig({

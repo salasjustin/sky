@@ -30,6 +30,7 @@ import {
 } from "./codex.js";
 import { type Config, loadConfig } from "./config.js";
 import type { PostEvent } from "./events.js";
+import { runEnvRefresh } from "./refresh.js";
 import type { AwaitDecision } from "./requests.js";
 import type { Seal } from "./seal.js";
 
@@ -341,7 +342,7 @@ const { appendFileSync, writeFileSync } = require("node:fs");
 const { createInterface } = require("node:readline");
 const { join } = require("node:path");
 const log = (entry) => appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify(entry) + "\\n");
-log({ env: { key: process.env.AI_GATEWAY_API_KEY ?? null, gatewayToken: process.env.SKY_CODEX_GATEWAY_TOKEN ? "set" : null, home: process.env.CODEX_HOME, connector: process.env.GITHUB_CONNECTOR ?? null, token: process.env.AGENT_TOKEN ?? null, lastGitConfig: process.env["GIT_CONFIG_KEY_" + (process.env.GIT_CONFIG_COUNT - 1)] + "=" + process.env["GIT_CONFIG_VALUE_" + (process.env.GIT_CONFIG_COUNT - 1)] } });
+log({ env: { key: process.env.AI_GATEWAY_API_KEY ?? null, gatewayToken: process.env.SKY_CODEX_GATEWAY_TOKEN ? "set" : null, home: process.env.CODEX_HOME, connector: process.env.GITHUB_CONNECTOR ?? null, token: process.env.AGENT_TOKEN ?? null, lastGitConfig: process.env["GIT_CONFIG_KEY_" + (process.env.GIT_CONFIG_COUNT - 1)] + "=" + process.env["GIT_CONFIG_VALUE_" + (process.env.GIT_CONFIG_COUNT - 1)] }, marker: require("node:fs").existsSync(join(process.env.CODEX_HOME ?? "", "plugins", "marker")) });
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
 const waiting = new Map();
 let nextId = 100;
@@ -565,6 +566,44 @@ describe("runCodexSession", () => {
     events.filter(
       (e): e is Extract<RunnerEventPost, { type: T }> => e.type === type,
     );
+
+  test("what the env's refresh script left in the Codex home is there when Codex starts, and the run.started carries its record", async () => {
+    const codexHome = join(root, "codex-home");
+    const record = await runEnvRefresh({
+      script: `mkdir -p "$CH/plugins" && echo kru > "$CH/plugins/marker"; echo refreshed`,
+      env: { PATH: process.env.PATH ?? "", HOME: root, CH: codexHome },
+      warn: () => {},
+      lockFile: join(root, "refresh.lock"),
+      logFile: join(root, "refresh.log"),
+    });
+    expect(record).toMatchObject({ outcome: "ran", tail: "refreshed" });
+    expect(
+      await runCodexSession(config, {
+        post,
+        awaitDecision,
+        signal: new AbortController().signal,
+        warn: () => {},
+        codexEnv: { AI_GATEWAY_API_KEY: "gw-key" },
+        seal,
+        bin,
+        stopGraceMs: 2_000,
+        envRefresh: record,
+      }),
+    ).toBe(0);
+    // Codex's own process saw it, and Sky's config write beside it left it
+    expect(sent()[0].marker).toBe(true);
+    expect(existsSync(join(codexHome, "plugins", "marker"))).toBe(true);
+    expect(existsSync(join(codexHome, "config.toml"))).toBe(true);
+    expect(ofType("run.started")[0]?.payload).toEqual({
+      sessionId: "thr_1",
+      refresh: record,
+    });
+  });
+
+  test("a run with no refresh posts the bare run.started", async () => {
+    await run();
+    expect(ofType("run.started")[0]?.payload).toEqual({ sessionId: "thr_1" });
+  });
 
   test("opens a thread on the gateway with Sky's approvals and reports a held command", async () => {
     vi.stubEnv("AGENT_TOKEN", "agent-secret");

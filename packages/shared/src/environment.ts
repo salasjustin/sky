@@ -37,6 +37,9 @@ export const AutoApproveConfig = z.strictObject({
     .default(() => []),
 });
 
+/** The longest `refresh` script, in characters; it rides in the runner's env file. */
+export const REFRESH_MAX = 20_000;
+
 export const Environment = z.object({
   id: EnvironmentId,
   name: z.string().trim().min(1).max(100),
@@ -49,6 +52,12 @@ export const Environment = z.object({
     ),
   /** Shell script run once after clone, before the checkpoint. */
   setup: z.string(),
+  /**
+   * Shell script the runner runs before every run, on every runtime, with the agent's own env and
+   * rights (see `runner/src/refresh.ts`): it brings what `setup` installed up to date without a
+   * reprovision. Empty is none; changing it never reprovisions.
+   */
+  refresh: z.string().max(REFRESH_MAX).default(""),
   /** Name of a server-side base profile applied before `setup`; null applies none. */
   base: BaseProfileName.nullable().default(null),
   status: EnvironmentStatus,

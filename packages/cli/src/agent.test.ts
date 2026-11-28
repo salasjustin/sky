@@ -420,6 +420,28 @@ const record = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
+test("status prints one line for the env refresh, and none when the run has none", async () => {
+  server.use(
+    runs(
+      run({
+        refresh: {
+          outcome: "failed",
+          exitCode: 1,
+          durationMs: 2300,
+          reason: "exited with code 1",
+          tail: "fatal: not a git repository",
+        },
+      }),
+    ),
+  );
+  const r = await runCli(["status", agentId]);
+  expect(r.stdout).toBe(
+    "run_1 running\nenv refresh: failed (exit 1): exited with code 1 (2.3s)\n",
+  );
+  server.use(runs(run({ refresh: null })));
+  expect((await runCli(["status", agentId])).stdout).toBe("run_1 running\n");
+});
+
 test("status shows the plugin refresh and each plugin's version before, after and loaded, without JSON", async () => {
   server.use(runs(run({ plugins: record() })));
   const r = await runCli(["status", agentId]);

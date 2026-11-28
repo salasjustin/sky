@@ -37,6 +37,8 @@ sky secret list web       # "<NAME> value" or "<NAME> connector" per secret
 sky secret delete web NPM_TOKEN
 ```
 
+An environment may carry a `refresh` script that runs before every run, on Claude Code and Codex alike, to keep what its `setup` installed current without a reprovision; `sky env show` says whether one is set, `sky status` prints what it did before the latest run (`env refresh: ran (3.2s)`), and a Codex run's `config.toml` is rewritten, and its `hooks.json` deleted, after the refresh, so a plugin the refresh installs is what the session loads. See the README's Per-run refresh.
+
 A bot must pass `--yes` to `env delete`: without a terminal to ask on, with `CI` set, or with `--json`, it otherwise makes no request and exits 2 (`refusing to delete web without --yes`). Nothing undoes the delete.
 
 `<env>` is a name or an id everywhere, and a name that looks like an id (`env_prod`) still works. `sky secret list` never prints a value, in either mode: `--json` gives `{"data": [{"name": …, "kind": …}]}`. The deletes answer `deleted <id or NAME>`, or `{"id"|"name": …, "deleted": true}` under `--json`. An unknown environment or secret exits 1 with `not_found`; `env delete` while a run is active or the env is provisioning, and `env retry` on an env that hasn't failed, exit 1 too, with the API's reason.

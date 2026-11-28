@@ -83,6 +83,10 @@ const claudeLine = (env: ApiEnvironment) =>
 const runtimeLine = (env: ApiEnvironment) =>
   `runtime: ${env.runtime ?? "default (the SKY_RUNTIME secret, else claude-code)"}`;
 
+/** `env show` says whether a refresh script is set, never the script. */
+const refreshLine = (env: ApiEnvironment) =>
+  `refresh: set (${env.refresh.split("\n").length} lines, runs before every run)`;
+
 export const env: AgentCommand = {
   options: {
     yes: { type: "boolean" },
@@ -121,6 +125,7 @@ export const env: AgentCommand = {
         if (envId === undefined) return 1;
         const { raw, env } = await api.getEnvironment(envId);
         const lines = [envLine(env), runtimeLine(env)];
+        if (env.refresh !== "") lines.push(refreshLine(env));
         if (env.claudeCredential !== null || env.claudeFallback !== "api-key") {
           lines.push(claudeLine(env));
         }

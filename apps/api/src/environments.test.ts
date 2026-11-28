@@ -168,6 +168,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
   expect(created).toEqual({
     id: expect.stringMatching(/^env_[0-9A-Za-z]+$/),
     ...kru,
+    refresh: "",
     base: null,
     status: "provisioning",
     spriteName: spriteNameFor(created.id),
@@ -1676,6 +1677,38 @@ test("PATCH of repo or setup is 409 agents_exist while an agent is unarchived, a
     .run("2026-10-29T12:00:00.000Z", agentId);
   expect((await patch(id, { setup: "make" })).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", setup: "make" });
+});
+
+test("POST stores a refresh script, which GET returns, and a PATCH of it changes it in place while agents exist", async () => {
+  const id = await ready({ ...kru, refresh: "git pull" } as typeof kru);
+  const got = await app.request(`/v1/environments/${id}`, { headers: auth });
+  expect(await got.json()).toMatchObject({ refresh: "git pull" });
+  seedRun(id, "finished");
+  wire.calls.length = 0;
+  const res = await patch(id, { refresh: "git pull --ff-only\nmake" });
+  // no reprovision (200, not 202), no sprite calls, though an agent exists
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({
+    status: "ready",
+    checkpointId: "v1",
+    refresh: "git pull --ff-only\nmake",
+  });
+  expect(wire.calls).toEqual([]);
+  // clearing it is a change too, and a resend of the stored one is a no-op
+  expect(await (await patch(id, { refresh: "" })).json()).toMatchObject({
+    refresh: "",
+  });
+});
+
+test("PATCH of refresh is 409 while a run is active, and a refresh over its bound is 400", async () => {
+  const id = await ready();
+  expect((await patch(id, { refresh: "x".repeat(20_001) })).status).toBe(400);
+  seedRun(id, "running");
+  const res = await patch(id, { refresh: "make" });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toEqual({
+    error: { code: "run_active", message: expect.any(String) },
+  });
 });
 
 test("PATCH of repo or setup is 409 while provisioning; a rename is not", async () => {

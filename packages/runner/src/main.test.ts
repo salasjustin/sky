@@ -261,6 +261,101 @@ const runEnv = (api: string, promptFile: string) => ({
   WORKTREES_DIR: "/nonexistent/worktrees",
 });
 
+describe("the env's refresh script", () => {
+  test.each([
+    ["a Claude Code run", { SKY_RUNTIME: "claude-code" }],
+    ["a Codex run", { SKY_RUNTIME: "codex" }],
+  ])(
+    "%s runs it before the plugin refresh and the session, with the agent's own env and no credential, connector or gateway key",
+    async (_, runtime) => {
+      const runs = mkdtempSync(join(tmpdir(), "runner-main-refresh-"));
+      const api = createServer((req, res) => {
+        req.resume();
+        req.on("end", () => res.writeHead(204).end());
+      });
+      api.listen(0, "127.0.0.1");
+      await once(api, "listening");
+      const { port } = api.address() as AddressInfo;
+      const runId = newRunId();
+      const seen = join(runs, "env.seen");
+      try {
+        const { code, stderr } = await runBundle({
+          ...runEnv(`http://127.0.0.1:${port}`, join(runs, `${runId}.prompt`)),
+          RUN_ID: runId,
+          ...runtime,
+          // the credential variables, the connector and the gateway key, as the API's env file holds them
+          SKY_CLAUDE_AUTH: "oauth",
+          CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+          AI_GATEWAY_API_KEY: "gateway-secret",
+          GITHUB_CONNECTOR: "conn_1",
+          GITHUB_GATEWAY_URL: "https://gateway.test",
+          PROJECT_SECRET: "the-projects-own",
+          SKY_SESSION_ENV: JSON.stringify({ FROM_PROFILE: "yes" }),
+          SKY_REFRESH: `env > '${seen}'\necho refreshing\nexit 7`,
+        });
+        // a failed script never fails the run for itself: this one ends at the missing worktree
+        expect(code).toBe(1);
+        const order = [
+          "runner: env refresh started",
+          "runner: env refresh done",
+          ...(runtime.SKY_RUNTIME === "codex"
+            ? []
+            : ["runner: plugin refresh started"]),
+          "runner: session starting",
+        ].map((line) => stderr.indexOf(line));
+        expect(order.every((at) => at >= 0)).toBe(true);
+        expect(order).toEqual([...order].sort((a, b) => a - b));
+        expect(stderr).toMatch(/env refresh failed \(exit 7\)/);
+        const env = readFileSync(seen, "utf8");
+        expect(env).toContain("PROJECT_SECRET=the-projects-own");
+        expect(env).toContain("FROM_PROFILE=yes");
+        for (const name of [
+          "CLAUDE_CODE_OAUTH_TOKEN",
+          "AI_GATEWAY_API_KEY",
+          "GITHUB_CONNECTOR",
+          "GITHUB_GATEWAY_URL",
+          "AGENT_TOKEN",
+          "SKY_REFRESH",
+        ])
+          expect(env).not.toContain(`${name}=`);
+        // its output is in a file on the sprite, not the runner's own log
+        expect(readFileSync(join(runs, `${runId}.refresh.log`), "utf8")).toBe(
+          "refreshing\n",
+        );
+        expect(readFileSync(join(runs, `${runId}.log`), "utf8")).not.toContain(
+          "refreshing\n",
+        );
+      } finally {
+        api.closeAllConnections();
+        api.close();
+        rmSync(runs, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test("a run whose env has none runs no refresh", async () => {
+    const runs = mkdtempSync(join(tmpdir(), "runner-main-none-"));
+    const api = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => res.writeHead(204).end());
+    });
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    const { port } = api.address() as AddressInfo;
+    try {
+      const { stderr } = await runBundle(
+        runEnv(`http://127.0.0.1:${port}`, join(runs, "none.prompt")),
+      );
+      expect(stderr).not.toMatch(/env refresh/);
+    } finally {
+      api.closeAllConnections();
+      api.close();
+      rmSync(runs, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
 describe("a stray runner.mjs started in a run's shell, which inherits PROMPT_FILE", () => {
   let runs: string;
   let promptFile: string;

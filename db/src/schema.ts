@@ -74,6 +74,8 @@ export const environments = sqliteTable(
     name: text().notNull(),
     repo: text().notNull(),
     setup: text().notNull(),
+    // the script every run's runner runs first; '' is none
+    refresh: text().notNull().default(""),
     // the name of a base profile in the API's config; null applies none
     base: text(),
     status: text().$type<EnvironmentStatus>().notNull(),

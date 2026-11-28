@@ -219,6 +219,29 @@ export const PluginRefresh = z.preprocess(
 );
 export type PluginRefresh = z.infer<typeof PluginRefresh>;
 
+/** How the start-of-run env refresh script ended; `skipped` is a stop, or another run's refresh having just run. */
+export const EnvRefreshOutcome = z.enum([
+  "ran",
+  "failed",
+  "timed_out",
+  "skipped",
+]);
+export type EnvRefreshOutcome = z.infer<typeof EnvRefreshOutcome>;
+
+/**
+ * What the environment's `refresh` script did before a run, as the run records it. `exitCode` is the
+ * script's own, for one that ran to an end; `reason` says why for any outcome but `ran`; `tail` is the
+ * last lines of its output, redacted and cut by the runner, and bounded again here.
+ */
+export const EnvRefresh = z.object({
+  outcome: EnvRefreshOutcome,
+  exitCode: z.number().int().optional(),
+  durationMs: z.number().int().nonnegative(),
+  reason: z.string().min(1).max(300).optional(),
+  tail: z.string().max(1000).optional(),
+});
+export type EnvRefresh = z.infer<typeof EnvRefresh>;
+
 const runPayloads = {
   /**
    * `sessionId` is the Claude session the API stores to resume the agent's next run. `plugins` is the
@@ -228,6 +251,8 @@ const runPayloads = {
   "run.started": z.object({
     sessionId: z.string().min(1),
     plugins: PluginRefresh.optional(),
+    /** The env's refresh script's record; absent when the env has none, and from an older runner. */
+    refresh: EnvRefresh.optional(),
   }),
   "run.waiting": z.object({ request: PendingRequest }),
   /** `requestId` closed before anyone answered it (`reason`: why); the run goes back to `running`, or finishes on `run_finished`. */

@@ -226,6 +226,7 @@ test("DELETE answers 204, then 404 once gone; GET and PUT on an unknown env are 
 test.each([
   ["PATH", 400, "reserved_name"],
   ["AGENT_TOKEN", 400, "reserved_name"],
+  ["SKY_REFRESH", 400, "reserved_name"],
   ["ENV_FILE", 400, "reserved_name"],
   ["AUTO_APPROVE", 400, "reserved_name"],
   ["1BAD", 400, "invalid_name"],

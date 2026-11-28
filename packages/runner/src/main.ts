@@ -21,6 +21,12 @@ import {
 } from "./plugins.js";
 import { previewProxyMain } from "./preview-proxy.js";
 import { endSessionProcesses } from "./reap.js";
+import {
+  envRefreshBudgetMs,
+  refreshEnv,
+  refreshWarning,
+  runEnvRefresh,
+} from "./refresh.js";
 import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
 import { claimRunLog, processAlive } from "./runlog.js";
@@ -174,20 +180,49 @@ async function main(): Promise<void> {
     signal: controller.signal,
   });
   await step("sprite hold", () => hold.ready);
-  // a stop while the hold was landing skips setup; the session reports it as run.failed. A Codex run
-  // only pulls the store: the plugin refresh runs `claude`, whose plugins Codex doesn't load
+  // a stop while the hold was landing skips setup; the session reports it as run.failed. Agents on one
+  // sprite share the Kru store; a failed sync is logged, never the run's failure
   const codex = config.runtime === "codex";
-  if (codex && !controller.signal.aborted)
+  if (!controller.signal.aborted)
     await step("store sync", () =>
       syncStoreQuietly("pull", { ...process.env, ...connector }, warn),
     );
+  // the environment's own refresh script, on every runtime, before the plugin refresh (which it may give
+  // a marketplace to update) and before a Codex session writes its config (so the session loads what the
+  // script installed); bounded, never fails the run. What it did rides the run's `run.started`
+  const envRefresh =
+    controller.signal.aborted || !config.refresh
+      ? undefined
+      : await step("env refresh", async () => {
+          const worktree = join(config.worktreesDir, config.agentId);
+          const cwd = [worktree, config.repoDir].find((dir) => existsSync(dir));
+          const record = await runEnvRefresh({
+            script: config.refresh as string,
+            // what the agent's own commands hold, and no more: see `refreshEnv`
+            env: refreshEnv(process.env, config.sessionEnv),
+            warn,
+            signal: controller.signal,
+            timeoutMs: envRefreshBudgetMs(
+              config.refreshTimeoutMs,
+              config.launchDeadlineMs,
+            ),
+            ...(cwd !== undefined && { cwd }),
+            // its output stays on the sprite, beside the run's own log
+            ...(process.env.PROMPT_FILE && {
+              logFile: `${process.env.PROMPT_FILE.replace(/\.prompt$/, "")}.refresh.log`,
+            }),
+          });
+          const warning = refreshWarning(record);
+          if (warning) warningReporter(post, config.runId)(warning);
+          return record;
+        });
+  // a Codex run skips the plugin refresh: it runs `claude`, whose plugins Codex doesn't load
   const pluginRefresh =
     controller.signal.aborted || codex
       ? undefined
       : await setUpSession(
           controller.signal,
           join(config.worktreesDir, config.agentId),
-          connector,
         );
   warn("runner: session starting");
   try {
@@ -200,6 +235,7 @@ async function main(): Promise<void> {
           codexEnv,
           seal,
           connector,
+          envRefresh,
         })
       : await runSession(config, {
           query,
@@ -210,6 +246,7 @@ async function main(): Promise<void> {
           credentialEnv,
           seal,
           pluginRefresh,
+          envRefresh,
           connector,
         });
   } finally {
@@ -227,12 +264,7 @@ async function main(): Promise<void> {
 async function setUpSession(
   signal: AbortSignal,
   worktree: string,
-  connector: NodeJS.ProcessEnv,
 ): Promise<PluginRefreshRecord> {
-  // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
-  await step("store sync", () =>
-    syncStoreQuietly("pull", { ...process.env, ...connector }, warn),
-  );
   // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails
   // the run. The marketplaces need no Claude login, and these `claude` processes are neither sealed nor
   // pinned, so they get the env with the credential taken out. What it did rides the run's `run.started`.

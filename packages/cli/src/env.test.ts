@@ -75,6 +75,23 @@ test("env show by id prints the environment", async () => {
   );
 });
 
+test("env show says a refresh script is set, without printing it", async () => {
+  const script = "git -C ~/k pull --ff-only\nmake build";
+  server.use(
+    http.get(`${apiUrl}/v1/environments`, () =>
+      HttpResponse.json({ data: [envJson({ refresh: script })] }),
+    ),
+    http.get(`${apiUrl}/v1/environments/env_1`, () =>
+      HttpResponse.json(envJson({ refresh: script })),
+    ),
+  );
+  const r = await runCli(["env", "show", "env_1"]);
+  expect(r.stdout).toBe(
+    "env_1 ready acme/web web\nruntime: default (the SKY_RUNTIME secret, else claude-code)\nrefresh: set (2 lines, runs before every run)\n",
+  );
+  expect(r.stdout).not.toContain("git -C");
+});
+
 test("env show by name resolves the id, and a failed env shows its step and stderr", async () => {
   server.use(list, getEnv);
   const r = await runCli(["env", "show", "api docs"]);

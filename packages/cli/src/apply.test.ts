@@ -12,6 +12,7 @@ const spec = {
   name: "web",
   repo: "acme/web",
   setup: "pnpm install",
+  refresh: "",
   base: null,
   concurrency: 3,
   approvalPolicy: [],
@@ -134,6 +135,39 @@ test("patches only the changed fields", async () => {
   expect(writes).toEqual([{ method: "PATCH", body: { concurrency: 5 } }]);
   expect(r.sleeps).toEqual([]);
   expect(lock().specHash).toBe(specHash({ ...spec, concurrency: 5 }));
+});
+
+test("a changed refresh is patched alone, a change that never reprovisions", async () => {
+  writeFileSync(file, `${yaml}refresh: |\n  git -C ~/k pull --ff-only\n`);
+  server.use(
+    list(env()),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, env({ refresh: "git -C ~/k pull --ff-only\n" })),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([
+    { method: "PATCH", body: { refresh: "git -C ~/k pull --ff-only\n" } },
+  ]);
+  expect(r.sleeps).toEqual([]);
+});
+
+test("an unchanged refresh is up to date", async () => {
+  writeFileSync(file, `${yaml}refresh: x\n`);
+  writeFileSync(
+    lockFile,
+    JSON.stringify({
+      envId: "env_1",
+      spriteName: "x",
+      checkpointId: "y",
+      specHash: "z",
+    }),
+  );
+  server.use(getSequence(env({ refresh: "x" })));
+  const r = await runCli(["apply", file]);
+  expect(r.stdout).toBe("up to date web env_1\n");
 });
 
 const poolSetByHand = {

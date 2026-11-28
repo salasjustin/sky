@@ -46,6 +46,7 @@ import { createInterface } from "node:readline";
 import {
   type AutoApproved,
   type Decision,
+  type EnvRefresh,
   type PendingRequest,
   parseCommandEntry,
   type RequestId,
@@ -592,6 +593,8 @@ export type CodexDeps = {
   gatewayUrl?: string;
   /** The GitHub connector variables `main` took out; publish and sync reach GitHub only through the broker. */
   connector?: NodeJS.ProcessEnv;
+  /** What the environment's refresh script did before the run; none when the env has none. */
+  envRefresh?: EnvRefresh;
   /** The runner's env for everything but the key; `process.env` when absent. */
   env?: NodeJS.ProcessEnv;
   /** How often a tool call in flight is reported. */
@@ -940,7 +943,13 @@ export async function runCodexSession(
     threadId = thread;
 
     startLanded = post(
-      { type: "run.started", payload: { sessionId: thread } },
+      {
+        type: "run.started",
+        payload: {
+          sessionId: thread,
+          ...(deps.envRefresh && { refresh: deps.envRefresh }),
+        },
+      },
       { deadline: Date.now() + 60_000, signal: abortController.signal },
     );
     await startLanded;
