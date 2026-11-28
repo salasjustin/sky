@@ -462,7 +462,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     case "turn/steer": return send({ id: m.id, result: { turnId: turn } });
     case "turn/interrupt": {
       send({ id: m.id, result: {} });
-      // the runner answers an open ask as it stops the turn: the interrupt ends once those replies are read (500 ms at most), so the log holds them
+      // the runner answers an open ask only after it sends the interrupt: the turn ends once every open ask is answered (500 ms at most), so the log holds the replies
       const until = Date.now() + 500;
       const poll = setInterval(() => { if (waiting.size === 0 || Date.now() > until) { clearInterval(poll); finish("interrupted"); } }, 5);
       return;
