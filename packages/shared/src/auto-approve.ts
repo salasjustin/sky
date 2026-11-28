@@ -1404,6 +1404,8 @@ function expandGlobs(
         for (const { name, kind } of names) {
           if (name.startsWith(".") && !dotted) continue;
           if (!regex.test(name)) continue;
+          // a pipe, socket or device would hang the command or read a device
+          if (kind === "other") return undefined;
           // a directory, or a link the shell may follow, to go on through
           if (i < segments.length - 1 && kind !== "dir" && kind !== "symlink")
             continue;
@@ -1619,7 +1621,8 @@ export type AutoApproveScope = {
    * with `withFileTypes` fits); it throws, with the code `ENOENT` or `ENOTDIR` for a path that
    * isn't a directory. With it, an unquoted glob in a read-only command is expanded and each match
    * checked like a named path, and `grep -r` walks the directories it names (the working directory
-   * when it names none); without it both ask.
+   * when it names none); without it both ask, and both also ask without `realpath`, which tells
+   * where a match's links lead.
    */
   readDir?: (path: string) => DirEntry[];
   /**
@@ -1782,6 +1785,7 @@ function stepVerdict(
     if (
       step.globs[0] ||
       !readDir ||
+      !realpath ||
       !GLOB_PROGRAMS.has(program) ||
       (program === "git" && (step.globs[1] || !GLOB_GIT.has(sub ?? ""))) ||
       writes(raw, step)

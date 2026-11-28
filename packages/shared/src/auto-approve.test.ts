@@ -1833,6 +1833,7 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     const run = (names: string[]) =>
       autoApproveVerdict("cat *", DEFAULTS, {
         root: CWD,
+        realpath: (p) => p,
         readDir: () => names.map((name) => ({ ...base, name })),
       });
     expect(run(["a.ts"])).toBe("approved");
@@ -1852,6 +1853,35 @@ describe("unquoted globs and recursive grep, judged by the files they reach", ()
     expect(
       isAutoApproved("cat *", DEFAULTS, { root: CWD, realpath: (p) => p }),
     ).toBe(false);
+  });
+
+  test("a glob match that is a pipe, socket or device asks", () => {
+    const run = (kinds: ("file" | "other")[]) =>
+      autoApproveVerdict("cat *", DEFAULTS, {
+        root: CWD,
+        realpath: (p) => p,
+        readDir: () => kinds.map((kind, i) => ({ name: `f${i}`, kind })),
+      });
+    expect(run(["file", "file"])).toBe("approved");
+    expect(run(["file", "other"])).toBe("syntax");
+    // only a match is judged: a pipe the pattern doesn't reach is no matter
+    const apart = autoApproveVerdict("cat a*", DEFAULTS, {
+      root: CWD,
+      realpath: (p) => p,
+      readDir: () => [
+        { name: "a.ts", kind: "file" as const },
+        { name: "fifo", kind: "other" as const },
+      ],
+    });
+    expect(apart).toBe("approved");
+  });
+
+  test("with readDir but no realpath hook, globs ask, since a match's links lead nowhere known", () => {
+    const { run } = tree(project);
+    expect(run("wc -l src/*.ts", { realpath: undefined })).toBe("syntax");
+    expect(run("cat docs/*.md | head", { realpath: undefined })).toBe("syntax");
+    // a named path is as before
+    expect(run("wc -l src/a.ts", { realpath: undefined })).toBe("approved");
   });
 
   test("grep -r without the realpath hook asks, since it can't tell where a link leads", () => {
