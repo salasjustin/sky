@@ -17,7 +17,9 @@ import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import type { Decision, RequestId, RunnerEventPost } from "@sky/shared";
+import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { server } from "../../../test/msw.js";
 import { gatewayUnavailable } from "./codex.js";
 import { type Config, loadConfig } from "./config.js";
 import type { PostEvent } from "./events.js";
@@ -920,7 +922,8 @@ describe("PiRpc", () => {
 // A stand-in for pi's RPC mode: a Node script that speaks pi's protocol, drives one scenario per prompt,
 // and logs what the runner sent it and started it with.
 const FAKE_PI = String.raw`
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 const log = (m) => appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify(m) + "\n");
 const argv = process.argv.slice(2);
 const flag = (name) => argv[argv.indexOf(name) + 1];
@@ -937,6 +940,8 @@ log({
     agentDir,
     offline: process.env.PI_OFFLINE,
     secret: process.env.PROJECT_SECRET,
+    connector: process.env.GITHUB_CONNECTOR,
+    gatewayUrl: process.env.GITHUB_GATEWAY_URL,
   },
   extension: existsSync(extension) ? readFileSync(extension, "utf8") : null,
   instructions: existsSync(flag("--append-system-prompt")) ? readFileSync(flag("--append-system-prompt"), "utf8") : null,
@@ -974,9 +979,26 @@ async function tool(id, name, args, run) {
   return { allow: true };
 }
 const settle = (aborted = false) => { send({ type: "agent_end", messages: [], willRetry: false }); send({ type: "agent_settled", aborted }); };
+// the agent's sky_publish or sky_sync: the runner's own tool, which asks the runner's broker and reports what it said
+async function brokered(id, name, args) {
+  let out;
+  await tool(id, name, args, async () => {
+    send({ type: "tool_execution_update", toolCallId: id, toolName: name, args: {}, partialResult: text("") });
+    const answer = result(await ask({ kind: "tool", id, tool: name, args }));
+    out = answer.text;
+    log({ published: answer });
+    return answer.text;
+  });
+  assistant({ content: [{ type: "text", text: out }], usage: usage(1, 1) });
+  settle();
+}
 const scenarios = {
   async bash() {
-    await tool("t1", "bash", { command: process.env.FAKE_PI_COMMAND ?? "touch made.txt" }, async () => "listing");
+    // what the command did to the worktree, whatever the command was
+    await tool("t1", "bash", { command: process.env.FAKE_PI_COMMAND ?? "touch made.txt" }, async () => {
+      writeFileSync("made.txt", "made\n");
+      return "listing";
+    });
     assistant({ content: [{ type: "text", text: "all done" }], usage: usage(100, 10, { cacheRead: 40, cost: { total: 0.0012 } }) });
     settle();
   },
@@ -993,16 +1015,25 @@ const scenarios = {
     assistant({ content: [{ type: "text", text: "edited" }], usage: usage(5, 5) });
     settle();
   },
-  async publish() {
-    let out;
-    await tool("p1", "sky_publish", { title: "T" }, async () => {
-      send({ type: "tool_execution_update", toolCallId: "p1", toolName: "sky_publish", args: {}, partialResult: text("") });
-      const answer = result(await ask({ kind: "tool", id: "p1", tool: "sky_publish", args: { title: "T" } }));
-      out = answer.text;
-      log({ published: answer });
-      return answer.text;
-    });
-    assistant({ content: [{ type: "text", text: out }], usage: usage(1, 1) });
+  async publish() { await brokered("p1", "sky_publish", { title: "T" }); },
+  async sync() { await brokered("s1", "sky_sync", {}); },
+  // a commit on the agent's branch and an origin GitHub names, which a publish needs before it asks for approval
+  async committed() {
+    execFileSync("git", ["remote", "set-url", "origin", "https://github.com/acme/widgets.git"]);
+    writeFileSync("feature.txt", "x\n");
+    execFileSync("git", ["add", "--all"]);
+    execFileSync("git", ["commit", "-qm", "add feature"]);
+    await brokered("p1", "sky_publish", { title: "T" });
+  },
+  // dialogs as the extension, or something else in pi, can put to the runner, answered one at a time
+  async dialogs() {
+    for (const dialog of JSON.parse(process.env.FAKE_PI_DIALOGS))
+      await new Promise((resolve) => {
+        const id = "ui" + ++n;
+        waiting.set(id, resolve);
+        send({ type: "extension_ui_request", id, ...dialog });
+      });
+    assistant({ content: [{ type: "text", text: "asked" }], usage: usage(1, 1) });
     settle();
   },
   async failing() {
@@ -1194,7 +1225,11 @@ describe("runPiSession", () => {
   const answers = () => sent().filter((m) => m.answered);
 
   test("starts pi on the gateway through the seal, with the proxy's token and not the key, and reports the run", async () => {
+    // each credential where its withdrawal acts: the runner's env, and the session's
     config.sessionEnv.AI_GATEWAY_API_KEY = "gw-key";
+    vi.stubEnv("AGENT_TOKEN", "event-token");
+    vi.stubEnv("GITHUB_CONNECTOR", "connector-id");
+    config.sessionEnv.GITHUB_GATEWAY_URL = "https://gateway.test/github";
     expect(await run()).toBe(0);
     expect(spawned).toHaveLength(1);
     const options = spawned[0];
@@ -1219,6 +1254,7 @@ describe("runPiSession", () => {
       "AI_GATEWAY_API_KEY",
       "AGENT_TOKEN",
       "GITHUB_CONNECTOR",
+      "GITHUB_GATEWAY_URL",
     ])
       expect(options?.env[name]).toBeUndefined();
     // the project's own secrets are pi's, and its commands', as Claude Code's commands get them
@@ -1227,9 +1263,11 @@ describe("runPiSession", () => {
       secret: "project-secret",
       offline: "1",
     });
-    // pi never saw the key or the event token (the log drops what is undefined)
+    // pi never saw the key, the event token or the connector (the log drops what is undefined)
     expect(started().env).not.toHaveProperty("key");
     expect(started().env).not.toHaveProperty("agentToken");
+    expect(started().env).not.toHaveProperty("connector");
+    expect(started().env).not.toHaveProperty("gatewayUrl");
     expect(started().env.agentDir).toBe(join(root, "pi-home", "agent"));
     expect(ofType("run.started")[0]?.payload.sessionId).toMatch(
       /^[0-9a-f-]{36}$/,
@@ -1273,6 +1311,11 @@ describe("runPiSession", () => {
     });
     expect(started().extension).toContain("registerProvider");
     expect(started().extension).not.toMatch(/[0-9a-f]{64}/);
+    // the file on disk holds neither the key nor the per-run token pi reads from its env
+    const proxyToken = spawned[0]?.env.SKY_PI_GATEWAY_TOKEN;
+    expect(proxyToken).toMatch(/^[0-9a-f]{64}$/);
+    expect(started().extension).not.toContain("gw-key");
+    expect(started().extension).not.toContain(proxyToken as string);
     expect(started().instructions).toContain("no subagents");
   });
 
@@ -1349,8 +1392,14 @@ describe("runPiSession", () => {
     expect(await run()).toBe(0);
     const { argv, mcp } = started();
     expect(argv).not.toContain("--no-mcp");
-    expect(argv.filter((a: string) => a === "--extension")).toHaveLength(2);
-    expect(argv).toContain("builtin:mcp");
+    // Sky's extension loads first: it clears the gateway token from pi's env before any MCP server starts
+    const extensions = argv.flatMap((a: string, i: number) =>
+      a === "--extension" ? [argv[i + 1]] : [],
+    );
+    expect(extensions).toEqual([
+      expect.stringMatching(/sky-pi-extension\.mjs$/),
+      "builtin:mcp",
+    ]);
     expect(mcp).toEqual({
       mcpServers: {
         doop: {
@@ -1500,6 +1549,131 @@ describe("runPiSession", () => {
     expect(started().extension).toContain('"name":"sky_publish"');
     expect(started().extension).toContain('"name":"sky_sync"');
     expect(started().extension).not.toContain("connector-secret");
+  });
+
+  test("a resumed run with a connector still gets sky_publish and sky_sync", async () => {
+    config.sessionId = "sess-7";
+    expect(
+      await run(undefined, {
+        connector: { GITHUB_CONNECTOR: "connector-secret" },
+      }),
+    ).toBe(0);
+    const { argv, extension } = started();
+    expect(argv[argv.indexOf("--session-id") + 1]).toBe("sess-7");
+    expect(extension).toContain('"name":"sky_publish"');
+    expect(extension).toContain('"name":"sky_sync"');
+  });
+
+  const connector = {
+    GITHUB_CONNECTOR: "conn_1",
+    GITHUB_GATEWAY_URL: "https://gateway.test/v1/gateway/github",
+  };
+
+  test("an approved sky_sync opens one Sync approval and is run by the runner", async () => {
+    expect(await run("sync", { connector })).toBe(0);
+    const asked = ofType("run.waiting").map((e) => e.payload.request);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ kind: "approval", toolName: "Sync" });
+    // the fixture's origin is a local path: sync, past its approval, stops at reading it, before any call to GitHub
+    const reply = sent().find((m) => m.published)?.published;
+    expect(reply.success).toBe(false);
+    expect(reply.text).toMatch(/sky sync: origin is not a GitHub repo/);
+  });
+
+  test("an approved sky_publish opens one Publish approval and goes on to GitHub", async () => {
+    const baseSha = git(join(root, "repo"), "rev-parse", "origin/main");
+    const repo = "https://gateway.test/v1/gateway/github/conn_1/repos/acme/widgets";
+    server.use(
+      http.get(repo, () => HttpResponse.json({ full_name: "acme/widgets" })),
+      http.get(`${repo}/pulls`, () => HttpResponse.json([])),
+      http.get(`${repo}/git/ref/heads/main`, () =>
+        HttpResponse.json({ object: { sha: baseSha } }),
+      ),
+      // the first call past the approval: refused, which ends the publish
+      http.get(`${repo}/git/ref/heads/claude/agt_1`, () =>
+        HttpResponse.json({ message: "stop here" }, { status: 422 }),
+      ),
+    );
+    expect(await run("committed", { connector })).toBe(0);
+    const asked = ofType("run.waiting").map((e) => e.payload.request);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({
+      kind: "approval",
+      toolName: "Publish",
+      toolInput: expect.stringContaining("add feature"),
+    });
+    const reply = sent().find((m) => m.published)?.published;
+    expect(reply.success).toBe(false);
+    expect(reply.text).toMatch(/git\/ref\/heads\/claude\/agt_1 returned 422/);
+  });
+
+  test("a declined sky_sync is not run, and says why", async () => {
+    decide = () => "deny-with-reason";
+    expect(await run("sync", { connector })).toBe(0);
+    expect(ofType("run.waiting")).toHaveLength(1);
+    const reply = sent().find((m) => m.published)?.published;
+    expect(reply.success).toBe(false);
+    expect(reply.text).toMatch(/not that file; nothing was sent/);
+    expect(reply.text).not.toMatch(/origin is not a GitHub repo/);
+  });
+
+  test("requests the runner can't read, or doesn't serve, block rather than run", async () => {
+    const call = { kind: "call", id: "c1", tool: "bash", input: { command: "x" } };
+    const tool = (name: string, args: object) => ({
+      kind: "tool",
+      id: name,
+      tool: name,
+      args,
+    });
+    const dialogs = [
+      // not the extension's: pi asking a person at a terminal
+      { method: "input", title: "What is your name?" },
+      // the extension's request, put as a dialog it doesn't use
+      { method: "confirm", title: `sky:${JSON.stringify(call)}` },
+      { method: "input", title: "sky:{not json" },
+      { method: "input", title: 'sky:{"kind":"nope"}' },
+      {
+        method: "input",
+        title: `sky:${JSON.stringify(tool("sky_deploy", {}))}`,
+      },
+      {
+        method: "input",
+        title: `sky:${JSON.stringify(tool("sky_publish", { title: "" }))}`,
+      },
+      {
+        method: "input",
+        title: `sky:${JSON.stringify(tool("sky_sync", { branch: "" }))}`,
+      },
+    ];
+    config.sessionEnv.FAKE_PI_DIALOGS = JSON.stringify(dialogs);
+    const warnings: string[] = [];
+    expect(
+      await run("dialogs", { connector, warn: (l) => warnings.push(l) }),
+    ).toBe(0);
+    const replies = sent().filter((m) => m.type === "extension_ui_response");
+    expect(replies.map((r) => r.cancelled === true)).toEqual([
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+    ]);
+    expect(JSON.parse(replies[4]?.value)).toEqual({
+      text: "No tool named sky_deploy here.",
+      success: false,
+    });
+    for (const reply of [replies[5], replies[6]])
+      expect(JSON.parse(reply?.value)).toEqual({
+        text: expect.stringMatching(/^Invalid arguments: /),
+        success: false,
+      });
+    // nothing was asked of a person, and the two unreadable requests were reported
+    expect(ofType("run.waiting")).toEqual([]);
+    expect(warnings.filter((l) => /unreadable request/.test(l))).toHaveLength(
+      2,
+    );
   });
 
   test("publish and sync check the seal each time they are asked for", async () => {
@@ -1756,8 +1930,20 @@ describe("runPiSession", () => {
     expect(existsSync(extension)).toBe(false);
   });
 
-  test("the worktree's changes are committed when the run ends", async () => {
+  test("what the run changed in the worktree is committed on the agent's branch when it ends", async () => {
     expect(await run()).toBe(0);
-    expect(existsSync(join(root, "worktrees", "agt_1", "README"))).toBe(true);
+    const worktree = join(root, "worktrees", "agt_1");
+    expect(git(worktree, "status", "--porcelain")).toBe("");
+    expect(git(worktree, "log", "-1", "--format=%s", "claude/agt_1")).toBe(
+      "agent agt_1 run run_1",
+    );
+    expect(
+      git(worktree, "show", "--name-only", "--format=", "claude/agt_1"),
+    ).toBe("made.txt");
+    const rollup = ofType("run.finished")[0]?.payload.rollup;
+    expect(rollup?.run.files).toBe(1);
+    expect(rollup?.run.commits.map((c) => c.subject)).toEqual([
+      "agent agt_1 run run_1",
+    ]);
   });
 });
