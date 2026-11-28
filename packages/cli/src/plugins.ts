@@ -1,4 +1,4 @@
-import type { PluginRefresh, PluginVersion } from "@sky/shared";
+import type { EnvRefresh, PluginRefresh, PluginVersion } from "@sky/shared";
 
 const idOf = (plugin: PluginVersion) =>
   plugin.marketplace === null
@@ -55,4 +55,12 @@ export function pluginLines(plugins: PluginRefresh): string[] {
     );
   }
   return lines;
+}
+
+/** One line for what the environment's refresh script did before a run: its outcome, exit code and time, and why when it didn't run. */
+export function refreshLine(refresh: EnvRefresh): string {
+  const exit =
+    refresh.exitCode === undefined ? "" : ` (exit ${refresh.exitCode})`;
+  const reason = refresh.reason ? `: ${refresh.reason}` : "";
+  return `env refresh: ${refresh.outcome}${exit}${reason} (${(refresh.durationMs / 1000).toFixed(1)}s)`;
 }

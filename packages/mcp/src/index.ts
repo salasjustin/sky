@@ -127,7 +127,7 @@ function apiClient(
   };
 }
 
-const { name, repo, setup } = Environment.shape;
+const { name, repo, setup, refresh } = Environment.shape;
 const nonEmpty = z.string().min(1);
 
 const DIFF_LIMIT = 20_000;
@@ -331,8 +331,8 @@ function buildServer(call: Call) {
     "create_env",
     {
       description:
-        "Create an environment: a sprite with repo cloned and setup run once. Provisioning is asynchronous; poll status with envId until its status is ready, then launch. Needs the admin key.",
-      inputSchema: { name, repo, setup },
+        "Create an environment: a sprite with repo cloned and setup run once; refresh, when given, is a script every run runs first (for what setup installed). Provisioning is asynchronous; poll status with envId until its status is ready, then launch. Needs the admin key.",
+      inputSchema: { name, repo, setup, refresh: refresh.unwrap().optional() },
     },
     (input) => api("POST", "/v1/environments", input),
   );

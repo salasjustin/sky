@@ -457,6 +457,35 @@ test("a failed refresh's warning carries its reason, and its run.started the cod
   });
 });
 
+test("the env refresh record rides the run.started beside the plugin record, and the session posts no warning of its own for it", async () => {
+  const { sent, post } = apiPoster();
+  await runSession(config, {
+    query: scripted([init, success]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    envRefresh: {
+      outcome: "failed",
+      exitCode: 1,
+      durationMs: 900,
+      reason: "exited with code 1",
+      tail: "boom",
+    },
+  });
+  expect(sent.find((e) => e.type === "run.started")?.payload).toEqual({
+    sessionId: "sess-new",
+    refresh: {
+      outcome: "failed",
+      exitCode: 1,
+      durationMs: 900,
+      reason: "exited with code 1",
+      tail: "boom",
+    },
+  });
+  // `main` posts that warning, before the session starts
+  expect(sent.map((e) => e.type)).not.toContain("runner.warning");
+});
+
 test("a run without a refresh record posts the bare run.started an older API expects", async () => {
   const { posted, post } = recorder();
   await runSession(config, {

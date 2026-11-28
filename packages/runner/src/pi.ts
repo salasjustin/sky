@@ -61,6 +61,7 @@ import {
   type AutoApproved,
   type BaseProfileMcpServer,
   type Decision,
+  type EnvRefresh,
   type PendingRequest,
   type RequestId,
   RUNNER_TEXT_MAX,
@@ -140,6 +141,11 @@ export function resolvePiExecutable(
   return /\.[cm]?js$/.test(real)
     ? { command: node, args: [real] }
     : { command: real, args: [], packageDir: dirname(real) };
+}
+
+/** The run's pi home: `SKY_PI_HOME`, else `$HOME/.sky/pi`. Its `agent` directory is pi's config directory. */
+export function piHomeOf(env: NodeJS.ProcessEnv): string {
+  return env.SKY_PI_HOME || join(env.HOME || homedir(), ".sky", "pi");
 }
 
 /** The tool names pi's extension never asks the runner about: reads, and the runner's own tools, which ask through the broker. */
@@ -661,6 +667,8 @@ export type PiDeps = {
   gatewayUrl?: string;
   /** The GitHub connector variables `main` took out; publish and sync reach GitHub only through the broker. */
   connector?: NodeJS.ProcessEnv;
+  /** What the environment's refresh script did before the run; none when the env has none. */
+  envRefresh?: EnvRefresh;
   /** The runner's env for everything but the key; `process.env` when absent. */
   env?: NodeJS.ProcessEnv;
   /** How often a tool call in flight is reported. */
@@ -918,7 +926,7 @@ export async function runPiSession(
       warn: warning,
     });
     const home = sessionEnv.HOME || homedir();
-    const piHome = sessionEnv.SKY_PI_HOME || join(home, ".sky", "pi");
+    const piHome = piHomeOf(sessionEnv);
     const agentDir = join(piHome, "agent");
     const sessionDir = join(piHome, "sessions");
     mkdirSync(agentDir, { recursive: true, mode: 0o700 });
@@ -1061,7 +1069,13 @@ export async function runPiSession(
     const session = state.sessionId ?? sessionId;
 
     startLanded = post(
-      { type: "run.started", payload: { sessionId: session } },
+      {
+        type: "run.started",
+        payload: {
+          sessionId: session,
+          ...(deps.envRefresh && { refresh: deps.envRefresh }),
+        },
+      },
       { deadline: Date.now() + 60_000, signal: abortController.signal },
     );
     await startLanded;

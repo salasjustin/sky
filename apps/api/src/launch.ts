@@ -797,10 +797,14 @@ export function createLauncher({
       .where(eq(environments.id, envId))
       .get();
 
-  /** The name and stored runtime of the launch's environment. */
+  /** The name, stored runtime and refresh script of the launch's environment. */
   function envOf(envId: EnvironmentId) {
     const row = db
-      .select({ name: environments.name, runtime: environments.runtime })
+      .select({
+        name: environments.name,
+        runtime: environments.runtime,
+        refresh: environments.refresh,
+      })
       .from(environments)
       .where(eq(environments.id, envId))
       .get();
@@ -1005,6 +1009,10 @@ export function createLauncher({
               hasConnectorSecret(db, launch.envId, "GITHUB_CONNECTOR"),
             ),
           ),
+          // the env's own script, so no secret can swap it for another; the runner runs it before the session
+          ...(env.refresh === ""
+            ? []
+            : [["SKY_REFRESH", env.refresh] as const]),
           // the runtime resolved here, over the env's secret and the run's envVars
           [RUNTIME_VARIABLE, runtime],
           ...(auth ? claudeEnv(auth) : []),

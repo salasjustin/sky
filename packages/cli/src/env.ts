@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import {
   ClaudeCredentialName,
   ClaudeFallback,
@@ -6,6 +7,7 @@ import {
 } from "@sky/shared";
 import type { AgentCommand } from "./agent.js";
 import { type ApiEnvironment, ApiError } from "./api.js";
+import { envYaml } from "./env-yaml.js";
 import { UsageError } from "./output.js";
 import { resolveEnv, resolveEnvId } from "./secret.js";
 
@@ -83,16 +85,26 @@ const claudeLine = (env: ApiEnvironment) =>
 const runtimeLine = (env: ApiEnvironment) =>
   `runtime: ${env.runtime ?? "default (the SKY_RUNTIME secret, else claude-code)"}`;
 
+/** `env show` says whether a refresh script is set, never the script; a final newline starts no line. */
+const refreshLine = (env: ApiEnvironment) =>
+  env.refresh === ""
+    ? "refresh: none"
+    : `refresh: set (${env.refresh.replace(/\n+$/, "").split("\n").length} lines, runs before every run)`;
+
 export const env: AgentCommand = {
   options: {
     yes: { type: "boolean" },
     fallback: { type: "string" },
     pool: { type: "string" },
+    yaml: { type: "boolean" },
   },
   prepare(positionals, values) {
     const [sub, ...rest] = positionals;
     if (values.yes && sub !== "delete") {
       throw new UsageError("--yes only goes with env delete", true);
+    }
+    if (values.yaml && sub !== "show") {
+      throw new UsageError("--yaml only goes with env show", true);
     }
     if (values.fallback !== undefined && sub !== "set-claude") {
       throw new UsageError("--fallback only goes with env set-claude", true);
@@ -120,7 +132,24 @@ export const env: AgentCommand = {
         const envId = await resolveEnvId(api, ref, out);
         if (envId === undefined) return 1;
         const { raw, env } = await api.getEnvironment(envId);
+        if (values.yaml) {
+          if (out.json) {
+            throw new UsageError(
+              "--yaml and --json are two formats; pick one",
+              true,
+            );
+          }
+          // the names only; a key that can't list them still exports the file
+          const secrets = await api.listSecrets(envId).catch((err: unknown) => {
+            if (err instanceof ApiError && err.status !== 404) return undefined;
+            throw err;
+          });
+          // the export ends in a newline of its own, which `result` would double
+          out.result(raw, envYaml(env, secrets).replace(/\n$/, ""));
+          return 0;
+        }
         const lines = [envLine(env), runtimeLine(env)];
+        if (env.refresh !== "") lines.push(refreshLine(env));
         if (env.claudeCredential !== null || env.claudeFallback !== "api-key") {
           lines.push(claudeLine(env));
         }
@@ -255,9 +284,45 @@ export const env: AgentCommand = {
         return 0;
       };
     }
+    if (sub === "set-refresh") {
+      const [ref, source, ...extra] = rest;
+      if (ref === undefined || source === undefined || extra.length > 0) {
+        throw new UsageError("env set-refresh takes <env> <@file|->", true);
+      }
+      if (source !== "-" && !source.startsWith("@")) {
+        throw new UsageError(
+          "env set-refresh takes @<file> or - (stdin), not the script itself",
+          true,
+        );
+      }
+      return async (api, io, out) => {
+        let script: string;
+        if (source === "-") {
+          script = await io.stdin.readAll();
+        } else {
+          const file = source.slice(1);
+          try {
+            script = readFileSync(file, "utf8");
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code;
+            throw new UsageError(
+              `cannot read ${file}${code ? ` (${code})` : ""}`,
+            );
+          }
+        }
+        const envId = await resolveEnvId(api, ref, out);
+        if (envId === undefined) return 1;
+        // empty clears it; the script is kept as written, a final newline included, as a YAML block has it
+        const { raw, env } = await api.patchEnvironment(envId, {
+          refresh: script,
+        });
+        out.result(raw, `${envLine(env)}\n${refreshLine(env)}`);
+        return 0;
+      };
+    }
     throw new UsageError(
       sub === undefined
-        ? "env needs a subcommand: list, show, delete, retry, set-claude or set-runtime"
+        ? "env needs a subcommand: list, show, delete, retry, set-claude, set-runtime or set-refresh"
         : `unknown env subcommand '${sub}'`,
       true,
     );

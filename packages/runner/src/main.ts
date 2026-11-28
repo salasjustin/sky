@@ -1,4 +1,5 @@
 import { appendFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { brokerPublishMain, brokerSyncMain } from "./broker-client.js";
@@ -8,13 +9,18 @@ import {
   sweepCredentialFiles,
   withdrawCredential,
 } from "./claude-auth.js";
-import { runCodexSession, withdrawGatewayKey } from "./codex.js";
+import {
+  codexHomeOf,
+  missingCodexPluginWarnings,
+  runCodexSession,
+  withdrawGatewayKey,
+} from "./codex.js";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { takeConnector } from "./connector.js";
 import { removeSkyLogin } from "./credentials.js";
 import { createPoster, warningReporter } from "./events.js";
 import { holdSprite, spriteApiFrom } from "./keepalive.js";
-import { runPiSession } from "./pi.js";
+import { piHomeOf, runPiSession } from "./pi.js";
 import {
   killRefreshCommands,
   type PluginRefreshRecord,
@@ -22,6 +28,12 @@ import {
 } from "./plugins.js";
 import { previewProxyMain } from "./preview-proxy.js";
 import { endSessionProcesses } from "./reap.js";
+import {
+  envRefreshBudgetMs,
+  refreshEnv,
+  refreshWarning,
+  runEnvRefresh,
+} from "./refresh.js";
 import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
 import { claimRunLog, processAlive } from "./runlog.js";
@@ -177,20 +189,79 @@ async function main(): Promise<void> {
     signal: controller.signal,
   });
   await step("sprite hold", () => hold.ready);
-  // a stop while the hold was landing skips setup; the session reports it as run.failed. A Codex or pi
-  // run only pulls the store: the plugin refresh runs `claude`, whose plugins they don't load
-  const gatewayRuntime = config.runtime === "codex" || config.runtime === "pi";
-  if (gatewayRuntime && !controller.signal.aborted)
+  // a stop while the hold was landing skips setup; the session reports it as run.failed. Agents on one
+  // sprite share the Kru store; a failed sync is logged, never the run's failure
+  const codex = config.runtime === "codex";
+  const gatewayRuntime = codex || config.runtime === "pi";
+  if (!controller.signal.aborted)
     await step("store sync", () =>
       syncStoreQuietly("pull", { ...process.env, ...connector }, warn),
     );
+  // the environment's own refresh script, on every runtime, before the plugin refresh (which it may give
+  // a marketplace to update) and before a Codex session writes its config (so the session loads what the
+  // script installed); bounded, never fails the run. What it did rides the run's `run.started`
+  const envRefresh =
+    controller.signal.aborted || !config.refresh
+      ? undefined
+      : await step("env refresh", async () => {
+          // what the agent's own commands hold, and no more: see `refreshEnv`. A Codex session's
+          // commands find the run's Codex home as CODEX_HOME, so the script does too
+          const env: NodeJS.ProcessEnv = {
+            ...refreshEnv(process.env, config.sessionEnv),
+            ...(codex && {
+              CODEX_HOME: codexHomeOf({
+                ...process.env,
+                ...config.sessionEnv,
+              }),
+            }),
+            // a pi session's commands find the run's pi config directory the same way
+            ...(config.runtime === "pi" && {
+              PI_CODING_AGENT_DIR: join(
+                piHomeOf({ ...process.env, ...config.sessionEnv }),
+                "agent",
+              ),
+            }),
+          };
+          // one place for every run, not the agent's worktree: a run that waited on another's run of
+          // the same script skips its own, so what the script does has to be the sprite's, not one agent's
+          // the home the session and `codexHomeOf` resolve: HOME, or `homedir()` when it's unset or empty
+          const home = env.HOME || homedir();
+          const cwd = existsSync(home) ? home : undefined;
+          const record = await runEnvRefresh({
+            script: config.refresh as string,
+            env,
+            warn,
+            signal: controller.signal,
+            timeoutMs: envRefreshBudgetMs(
+              config.refreshTimeoutMs,
+              config.launchDeadlineMs,
+            ),
+            ...(cwd !== undefined && { cwd }),
+            // its output stays on the sprite, beside the run's own log
+            ...(process.env.PROMPT_FILE && {
+              logFile: `${process.env.PROMPT_FILE.replace(/\.prompt$/, "")}.refresh.log`,
+            }),
+          });
+          const warning = refreshWarning(record);
+          if (warning) warningReporter(post, config.runId)(warning);
+          return record;
+        });
+  // Codex skips an enabled plugin that isn't installed and only logs it, so the run says so; it goes on
+  if (codex && !controller.signal.aborted && config.codexPlugins)
+    for (const message of missingCodexPluginWarnings(config.codexPlugins, {
+      ...process.env,
+      ...config.sessionEnv,
+    })) {
+      warn(`runner: ${message}`);
+      warningReporter(post, config.runId)(message);
+    }
+  // a Codex run skips the plugin refresh: it runs `claude`, whose plugins Codex doesn't load
   const pluginRefresh =
     controller.signal.aborted || gatewayRuntime
       ? undefined
       : await setUpSession(
           controller.signal,
           join(config.worktreesDir, config.agentId),
-          connector,
         );
   warn("runner: session starting");
   try {
@@ -204,6 +275,7 @@ async function main(): Promise<void> {
             codexEnv,
             seal,
             connector,
+            envRefresh,
           })
         : config.runtime === "pi"
           ? await runPiSession(config, {
@@ -214,6 +286,7 @@ async function main(): Promise<void> {
               gatewayEnv: codexEnv,
               seal,
               connector,
+              envRefresh,
             })
           : await runSession(config, {
               query,
@@ -224,6 +297,7 @@ async function main(): Promise<void> {
               credentialEnv,
               seal,
               pluginRefresh,
+              envRefresh,
               connector,
             });
   } finally {
@@ -241,12 +315,7 @@ async function main(): Promise<void> {
 async function setUpSession(
   signal: AbortSignal,
   worktree: string,
-  connector: NodeJS.ProcessEnv,
 ): Promise<PluginRefreshRecord> {
-  // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
-  await step("store sync", () =>
-    syncStoreQuietly("pull", { ...process.env, ...connector }, warn),
-  );
   // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails
   // the run. The marketplaces need no Claude login, and these `claude` processes are neither sealed nor
   // pinned, so they get the env with the credential taken out. What it did rides the run's `run.started`.

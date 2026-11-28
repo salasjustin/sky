@@ -6,6 +6,7 @@ import {
   CreatedApiKey,
   DrainStatus,
   Environment,
+  EnvRefresh,
   type KeyInput,
   PluginRefresh,
   PreviewState,
@@ -50,6 +51,8 @@ export const ApiRun = z
     claudeCredential: z.string().nullable().optional(),
     /** What the start-of-run plugin refresh did and the plugin versions the session loaded; absent from an older API, null before the run starts. A shape this CLI can't read is dropped, not an error. */
     plugins: PluginRefresh.nullish().catch(undefined),
+    /** What the environment's refresh script did before the run; null when it has none, absent from an older API. A shape this CLI can't read is dropped. */
+    refresh: EnvRefresh.nullish().catch(undefined),
   })
   .loose();
 export type ApiRun = z.infer<typeof ApiRun>;

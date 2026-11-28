@@ -431,6 +431,21 @@ test("the env's secrets reach the runner through the env file, quotes intact; a 
   );
 });
 
+test("an env's refresh script reaches the runner as SKY_REFRESH, multi-line and quoted intact; an env with none sends none", async () => {
+  const script = `git -C "$HOME/k" pull --ff-only\necho 'it''s done'`;
+  const withRefresh = readyEnv({ refresh: script });
+  await launched(withRefresh);
+  await sessionOpened();
+  expect(envFileOf(wire, wire.sessions[0])).toHaveProperty(
+    "SKY_REFRESH",
+    script,
+  );
+  const without = readyEnv();
+  await launched(without);
+  await vi.waitFor(() => expect(wire.sessions.length).toBeGreaterThan(1));
+  expect(envFileOf(wire, wire.sessions[1])).not.toHaveProperty("SKY_REFRESH");
+});
+
 const connect = async (envId: string) =>
   expect(
     (await putSecret(envId, "GITHUB_CONNECTOR", { connector: "VPpb7x" }))
@@ -2015,6 +2030,7 @@ test("GET of an ended run returns its branch and its diff against the env's base
     compareUrl: null,
     secretNames: [],
     plugins: null,
+    refresh: null,
   });
   expect(lastExec()).toMatch(
     new RegExp(
@@ -2498,6 +2514,58 @@ test("an event already stored with a free-text outcome and plain lists still rea
     reason: "stopped",
     before: [],
   });
+});
+
+const refreshRecord = {
+  outcome: "failed",
+  exitCode: 1,
+  durationMs: 2_300,
+  reason: "exited with code 1",
+  tail: "git: not a repository",
+};
+
+test("a run's env refresh record from its run.started is on the run, in the list and on its own, apart from the plugin record", async () => {
+  const { agent, run, token } = await runningRun();
+  expect((await getRun(agent.id, run.id)).body.refresh).toBeNull();
+  expect(
+    (
+      await postEvent(token, {
+        runId: run.id,
+        type: "run.started",
+        payload: {
+          sessionId: "sess-1",
+          plugins: pluginRecord,
+          refresh: refreshRecord,
+        },
+      })
+    ).status,
+  ).toBe(201);
+  const got = (await getRun(agent.id, run.id)).body;
+  expect(got.refresh).toEqual(refreshRecord);
+  expect(got.plugins).toEqual(pluginRecord);
+  expect((await listRuns(agent.id)).body.data[0]).toMatchObject({
+    refresh: refreshRecord,
+  });
+});
+
+test("a run.started whose refresh record is malformed is stored without it, keeps its plugin record, and the run starts", async () => {
+  const { agent, run, token } = await runningRun();
+  const bad = await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: {
+      sessionId: "sess-1",
+      plugins: pluginRecord,
+      refresh: { ...refreshRecord, tail: "x".repeat(1_001) },
+    },
+  });
+  expect(bad.status).toBe(201);
+  expect(
+    logs.some((l) => l.includes("env refresh record") && l.includes(run.id)),
+  ).toBe(true);
+  const got = (await getRun(agent.id, run.id)).body;
+  expect(got.refresh).toBeNull();
+  expect(got.plugins).toEqual(pluginRecord);
 });
 
 const storeRunStarted = (runId: string, payload: unknown) =>

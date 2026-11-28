@@ -14,6 +14,7 @@ const {
   name,
   repo,
   setup,
+  refresh,
   base,
   concurrency,
   approvalPolicy,
@@ -24,10 +25,12 @@ const {
 } = Environment.shape;
 
 /**
- * The Claude fields have no default here, unlike in the API: a file that omits them leaves the
- * environment's as they are, so `sky apply` never undoes `sky env set-claude`.
+ * These fields have no default here, unlike in the API: a file that omits them leaves the
+ * environment's as they are, so `sky apply` never undoes `sky env set-claude` or `sky env
+ * set-refresh`. `refresh: ""` in a file still clears the script.
  */
 const optionalClaude = {
+  refresh: refresh.unwrap().optional(),
   claudeCredential: claudeCredential.unwrap().optional(),
   claudePool: claudePool.unwrap().optional(),
   claudeFallback: claudeFallback.unwrap().optional(),

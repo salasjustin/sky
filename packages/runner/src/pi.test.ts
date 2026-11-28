@@ -27,6 +27,7 @@ import {
   PI_PROVIDER,
   PiRpc,
   piExtensionSource,
+  piHomeOf,
   piInstructions,
   piMcpConfig,
   piOutcome,
@@ -1316,6 +1317,20 @@ describe("runPiSession", () => {
     expect(published.text).toMatch(
       /sky publish refused: the runner can't confirm.*readable.*nothing was sent/,
     );
+  });
+
+  test("what the environment's refresh script did rides run.started", async () => {
+    const refresh = { outcome: "ran", exitCode: 0, durationMs: 12 } as const;
+    expect(await run(undefined, { envRefresh: refresh })).toBe(0);
+    expect(ofType("run.started")[0]?.payload.refresh).toEqual(refresh);
+    events = [];
+    expect(await run()).toBe(0);
+    expect(ofType("run.started")[0]?.payload).not.toHaveProperty("refresh");
+  });
+
+  test("the run's pi home is SKY_PI_HOME, else under HOME", () => {
+    expect(piHomeOf({ SKY_PI_HOME: "/p", HOME: "/h" })).toBe("/p");
+    expect(piHomeOf({ HOME: "/h" })).toBe("/h/.sky/pi");
   });
 
   test("resumes the session it is given, and reports it", async () => {

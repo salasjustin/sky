@@ -168,6 +168,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
   expect(created).toEqual({
     id: expect.stringMatching(/^env_[0-9A-Za-z]+$/),
     ...kru,
+    refresh: "",
     base: null,
     status: "provisioning",
     spriteName: spriteNameFor(created.id),
@@ -1676,6 +1677,82 @@ test("PATCH of repo or setup is 409 agents_exist while an agent is unarchived, a
     .run("2026-10-29T12:00:00.000Z", agentId);
   expect((await patch(id, { setup: "make" })).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", setup: "make" });
+});
+
+test("POST stores a refresh script, which GET returns, and a PATCH of it changes it in place while agents exist", async () => {
+  const id = await ready({ ...kru, refresh: "git pull" } as typeof kru);
+  const got = await app.request(`/v1/environments/${id}`, { headers: auth });
+  expect(await got.json()).toMatchObject({ refresh: "git pull" });
+  seedRun(id, "finished");
+  wire.calls.length = 0;
+  const res = await patch(id, { refresh: "git pull --ff-only\nmake" });
+  // no reprovision (200, not 202), no sprite calls, though an agent exists
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({
+    status: "ready",
+    checkpointId: "v1",
+    refresh: "git pull --ff-only\nmake",
+  });
+  expect(wire.calls).toEqual([]);
+  // clearing it is a change too, and a resend of the stored one is a no-op
+  expect(await (await patch(id, { refresh: "" })).json()).toMatchObject({
+    refresh: "",
+  });
+});
+
+test("a PATCH of refresh alone succeeds on an env with many agents, one holding unpublished commits, and touches no sprite", async () => {
+  const id = await ready();
+  for (let i = 0; i < 27; i++) {
+    db.$client
+      .prepare(
+        "insert into agents (id, env_id, branch, status) values (?, ?, ?, 'idle')",
+      )
+      .run(`agt_many${i}`, id, `claude/agt_many${i}`);
+  }
+  // a finished run whose commits were never published: nothing but this sprite holds them
+  db.$client
+    .prepare(
+      "insert into runs (id, agent_id, status, rollup) values (?, ?, 'finished', ?)",
+    )
+    .run(
+      "run_unpublished",
+      "agt_many0",
+      JSON.stringify({
+        base: "b".repeat(40),
+        run: { commits: [{ sha: "1".repeat(40), subject: "fix" }] },
+      }),
+    );
+  // the same env refuses a setup change, which would remove those worktrees
+  expect((await patch(id, { setup: "make" })).status).toBe(409);
+  const script = `[ -d "$HOME/.sky/kru-codex/.git" ] || git clone https://github.com/salasjustin/kru-codex "$HOME/.sky/kru-codex"\ngit -C "$HOME/.sky/kru-codex" pull --ff-only\n`;
+  const res = await patch(id, { refresh: script });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({
+    status: "ready",
+    checkpointId: "v1",
+    refresh: script,
+  });
+  expect(wire.calls).toEqual([]);
+  const agents = db.$client
+    .prepare(
+      "select count(*) as n from agents where env_id = ? and archived_at is null",
+    )
+    .get(id) as { n: number };
+  expect(agents.n).toBe(27);
+});
+
+test("PATCH of refresh alone succeeds while a run is active, with any other field it is 409, and a refresh over its bound is 400", async () => {
+  const id = await ready();
+  expect((await patch(id, { refresh: "x".repeat(20_001) })).status).toBe(400);
+  seedRun(id, "running");
+  const res = await patch(id, { refresh: "make" });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ refresh: "make", status: "ready" });
+  const mixed = await patch(id, { refresh: "make check", concurrency: 2 });
+  expect(mixed.status).toBe(409);
+  expect(await mixed.json()).toEqual({
+    error: { code: "run_active", message: expect.any(String) },
+  });
 });
 
 test("PATCH of repo or setup is 409 while provisioning; a rename is not", async () => {

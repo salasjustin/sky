@@ -10,6 +10,7 @@ import {
 import {
   type AgentId,
   type AgentStatus,
+  type EnvRefresh,
   type EventType,
   HEARTBEAT_INTERVAL_MS,
   type PluginRefresh,
@@ -33,7 +34,7 @@ import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { mintAgentToken } from "./agent-token.js";
 import { enqueueDeliveries } from "./deliveries.js";
 import { eventText } from "./redact.js";
-import { runEvents, storedPlugins } from "./run-events.js";
+import { runEvents, storedPlugins, storedRefresh } from "./run-events.js";
 
 export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type RunRow = typeof runs.$inferSelect;
@@ -133,15 +134,25 @@ export function runError(tx: Db | Tx, runId: RunId): string | null {
  * plugin versions the session loaded. Null for a run whose runner predates it, or that hasn't started.
  */
 export function runPlugins(tx: Db | Tx, runId: RunId): PluginRefresh | null {
+  return storedPlugins(startedPayload(tx, runId).plugins);
+}
+
+/** What the environment's refresh script did before the run's latest `run.started`; null when it has none, or from an older runner. */
+export function runRefresh(tx: Db | Tx, runId: RunId): EnvRefresh | null {
+  return storedRefresh(startedPayload(tx, runId).refresh);
+}
+
+function startedPayload(
+  tx: Db | Tx,
+  runId: RunId,
+): { plugins?: unknown; refresh?: unknown } {
   const row = tx
     .select({ payload: events.payload })
     .from(events)
     .where(and(eq(events.runId, runId), eq(events.type, "run.started")))
     .orderBy(desc(events.id))
     .get();
-  return storedPlugins(
-    (row?.payload as { plugins?: unknown } | undefined)?.plugins,
-  );
+  return (row?.payload ?? {}) as { plugins?: unknown; refresh?: unknown };
 }
 
 /**

@@ -261,6 +261,196 @@ const runEnv = (api: string, promptFile: string) => ({
   WORKTREES_DIR: "/nonexistent/worktrees",
 });
 
+describe("the env's refresh script", () => {
+  test.each([
+    ["a Claude Code run", { SKY_RUNTIME: "claude-code" }],
+    ["a Codex run", { SKY_RUNTIME: "codex" }],
+  ])(
+    "%s runs it before the plugin refresh and the session, with the agent's own env and no credential, connector or gateway key",
+    async (_, runtime) => {
+      const runs = mkdtempSync(join(tmpdir(), "runner-main-refresh-"));
+      const api = createServer((req, res) => {
+        req.resume();
+        req.on("end", () => res.writeHead(204).end());
+      });
+      api.listen(0, "127.0.0.1");
+      await once(api, "listening");
+      const { port } = api.address() as AddressInfo;
+      const runId = newRunId();
+      const seen = join(runs, "env.seen");
+      const ranIn = join(runs, "cwd.seen");
+      // the agent has a worktree, which is not where the script runs
+      const worktrees = join(runs, "worktrees");
+      mkdirSync(join(worktrees, "agt_1"), { recursive: true });
+      try {
+        const { code, stderr } = await runBundle({
+          ...runEnv(`http://127.0.0.1:${port}`, join(runs, `${runId}.prompt`)),
+          RUN_ID: runId,
+          HOME: runs,
+          WORKTREES_DIR: worktrees,
+          // its own refresh lock, not the machine's, which another checkout's run of this suite may hold
+          TMPDIR: runs,
+          ...runtime,
+          // the credential variables, the connector and the gateway key, as the API's env file holds them
+          SKY_CLAUDE_AUTH: "oauth",
+          CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+          AI_GATEWAY_API_KEY: "gateway-secret",
+          GITHUB_CONNECTOR: "conn_1",
+          GITHUB_GATEWAY_URL: "https://gateway.test",
+          PROJECT_SECRET: "the-projects-own",
+          SKY_SESSION_ENV: JSON.stringify({ FROM_PROFILE: "yes" }),
+          SKY_REFRESH: `env > '${seen}'\npwd -P > '${ranIn}'\necho refreshing\nexit 7`,
+        });
+        // a failed script never fails the run for itself: this one ends at worktree setup, with no repo
+        expect(code).toBe(1);
+        const order = [
+          "runner: env refresh started",
+          "runner: env refresh done",
+          ...(runtime.SKY_RUNTIME === "codex"
+            ? []
+            : ["runner: plugin refresh started"]),
+          "runner: session starting",
+        ].map((line) => stderr.indexOf(line));
+        expect(order.every((at) => at >= 0)).toBe(true);
+        expect(order).toEqual([...order].sort((a, b) => a - b));
+        expect(stderr).toMatch(/env refresh failed \(exit 7\)/);
+        const env = readFileSync(seen, "utf8");
+        expect(env).toContain("PROJECT_SECRET=the-projects-own");
+        expect(env).toContain("FROM_PROFILE=yes");
+        for (const name of [
+          "CLAUDE_CODE_OAUTH_TOKEN",
+          "AI_GATEWAY_API_KEY",
+          "GITHUB_CONNECTOR",
+          "GITHUB_GATEWAY_URL",
+          "AGENT_TOKEN",
+          "SKY_REFRESH",
+        ])
+          expect(env).not.toContain(`${name}=`);
+        // a Codex session's commands get the run's Codex home, and so does the script
+        if (runtime.SKY_RUNTIME === "codex")
+          expect(env).toContain(`CODEX_HOME=${join(runs, ".sky", "codex")}\n`);
+        else expect(env).not.toContain("CODEX_HOME=");
+        // every run's script runs in the agent's home, whichever agent's run it is
+        expect(readFileSync(ranIn, "utf8").trim()).toBe(realpathSync(runs));
+        // its output is in a file on the sprite, not the runner's own log
+        expect(readFileSync(join(runs, `${runId}.refresh.log`), "utf8")).toBe(
+          "refreshing\n",
+        );
+        expect(readFileSync(join(runs, `${runId}.log`), "utf8")).not.toContain(
+          "refreshing\n",
+        );
+      } finally {
+        api.closeAllConnections();
+        api.close();
+        rmSync(runs, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test("a Codex run with SKY_CODEX_HOME set gives the script that path as CODEX_HOME", async () => {
+    const runs = mkdtempSync(join(tmpdir(), "runner-main-codexhome-"));
+    const api = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => res.writeHead(204).end());
+    });
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    const { port } = api.address() as AddressInfo;
+    const seen = join(runs, "codex-home.seen");
+    const override = join(runs, "elsewhere", "codex");
+    try {
+      await runBundle({
+        ...runEnv(`http://127.0.0.1:${port}`, join(runs, "c.prompt")),
+        HOME: runs,
+        TMPDIR: runs,
+        SKY_RUNTIME: "codex",
+        AI_GATEWAY_API_KEY: "gateway-secret",
+        SKY_CODEX_HOME: override,
+        SKY_REFRESH: `printf '%s' "$CODEX_HOME" > '${seen}'`,
+      });
+      expect(readFileSync(seen, "utf8")).toBe(override);
+    } finally {
+      api.closeAllConnections();
+      api.close();
+      rmSync(runs, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test.each([
+    ["installed", true, 0],
+    ["missing", false, 1],
+  ])(
+    "a Codex run whose plugin is %s posts the warning once, or none, and goes on",
+    async (_, installed, warnings) => {
+      const runs = mkdtempSync(join(tmpdir(), "runner-main-plugin-"));
+      const codexHome = join(runs, "codex");
+      if (installed)
+        mkdirSync(join(codexHome, "plugins/cache/kru/kru/0.1.0"), {
+          recursive: true,
+        });
+      const bodies: { type: string; payload: { message?: string } }[] = [];
+      const api = createServer((req, res) => {
+        let body = "";
+        req.on("data", (d) => (body += d));
+        req.on("end", () => {
+          bodies.push(JSON.parse(body));
+          res.writeHead(204).end();
+        });
+      });
+      api.listen(0, "127.0.0.1");
+      await once(api, "listening");
+      const { port } = api.address() as AddressInfo;
+      try {
+        const { code } = await runBundle({
+          ...runEnv(`http://127.0.0.1:${port}`, join(runs, "p.prompt")),
+          SKY_RUNTIME: "codex",
+          AI_GATEWAY_API_KEY: "gateway-secret",
+          SKY_CODEX_HOME: codexHome,
+          SKY_CODEX_PLUGINS: "kru@kru",
+        });
+        // the run goes on to its own end: no worktree here
+        expect(code).toBe(1);
+        const posted = bodies
+          .filter((b) => b.type === "runner.warning")
+          .map((b) => b.payload.message)
+          .filter((m) => m?.startsWith("codex plugin"));
+        expect(posted).toHaveLength(warnings);
+        if (!installed)
+          expect(posted[0]).toMatch(
+            /^codex plugin kru@kru is not installed in .*codex; the session runs without it$/,
+          );
+      } finally {
+        api.closeAllConnections();
+        api.close();
+        rmSync(runs, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test("a run whose env has none runs no refresh", async () => {
+    const runs = mkdtempSync(join(tmpdir(), "runner-main-none-"));
+    const api = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => res.writeHead(204).end());
+    });
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    const { port } = api.address() as AddressInfo;
+    try {
+      const { stderr } = await runBundle(
+        runEnv(`http://127.0.0.1:${port}`, join(runs, "none.prompt")),
+      );
+      expect(stderr).not.toMatch(/env refresh/);
+    } finally {
+      api.closeAllConnections();
+      api.close();
+      rmSync(runs, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
 describe("a stray runner.mjs started in a run's shell, which inherits PROMPT_FILE", () => {
   let runs: string;
   let promptFile: string;

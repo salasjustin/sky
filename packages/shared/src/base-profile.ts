@@ -51,6 +51,7 @@ const RUNNER_ENV_NAMES: ReadonlySet<string> = new Set([
   "SKY_SESSION_ENV",
   "SKY_CHECKS",
   "SKY_MCP_SERVERS",
+  "SKY_REFRESH",
   "AGENT_ID",
   "RUN_ID",
   "API_BASE_URL",

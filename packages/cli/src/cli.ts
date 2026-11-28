@@ -49,10 +49,13 @@ const help = (io: Io) => `Usage:
       Remove a secret from an environment.
   sky env list [options]
       Print "<id> <status> <repo> <name>" per environment.
-  sky env show <env> [options]
+  sky env show <env> [--yaml] [options]
       Print the same line for one environment (<env> is its id or name),
-      then its runtime; a failed one adds the step it failed at and that
-      step's stderr.
+      then its runtime, and a refresh line when it has a script; a failed
+      environment adds the step it failed at and that step's stderr. --yaml prints
+      the environment as an env.yaml that sky apply takes as a no-op
+      (every field, scripts as block scalars), with the runtime and the
+      secrets' names, never their values, as comments.
   sky env delete <env> [--yes] [options]
       Destroy the environment's sandbox and delete it with all its agents,
       runs and events. Refused while a run is active or it is provisioning.
@@ -90,6 +93,13 @@ const help = (io: Io) => `Usage:
       run after a switch starts a fresh session on its branch. A run that
       fails with claude_unavailable:, codex_unavailable: or pi_unavailable:
       names the exact set-runtime command to run. Needs the admin key.
+  sky env set-refresh <env> <@file|-> [options]
+      Set the script every run of the environment runs first (see Per-run
+      refresh in the README), without a whole env.yaml: @file reads it from
+      a file, - from stdin; an empty one clears it. Never reprovisions, and
+      is allowed while agents exist and while a run is active: a run keeps
+      the script it started with, and runs launched later get the new one.
+      Needs the admin key.
   sky claude-credentials [options]
       Print "<name> <subscription|api-key>
       <limited-until=<time>|out-of-credit|-> <runs today> <env ids|->
@@ -532,6 +542,7 @@ async function runCommand(
     port: text(values.port),
     ttl: text(values.ttl),
     stop: values.stop === true,
+    yaml: values.yaml === true,
   });
   return await withApi(values, io, (api, out) => action(api, io, out));
 }

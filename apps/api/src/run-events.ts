@@ -3,6 +3,7 @@ import type { events } from "@sky/db";
 import {
   type AgentId,
   type EnvironmentId,
+  EnvRefresh,
   type Event,
   PluginRefresh,
   type RunId,
@@ -41,18 +42,27 @@ export function storedPlugins(plugins: unknown): PluginRefresh | null {
   return parsed.success ? parsed.data : null;
 }
 
-/** A stored payload as sent; only a `run.started`'s plugin record is re-read, and dropped when it doesn't parse. */
+/** A stored `run.started`'s env refresh record; null for none, or one that doesn't parse. */
+export function storedRefresh(refresh: unknown): EnvRefresh | null {
+  const parsed = EnvRefresh.safeParse(refresh);
+  return parsed.success ? parsed.data : null;
+}
+
+/** A stored payload as sent; only a `run.started`'s plugin and refresh records are re-read, and dropped when they don't parse. */
 function presentPayload(type: string, payload: unknown): unknown {
-  if (
-    type !== "run.started" ||
-    typeof payload !== "object" ||
-    payload === null ||
-    !("plugins" in payload)
-  )
+  if (type !== "run.started" || typeof payload !== "object" || payload === null)
     return payload;
-  const { plugins, ...rest } = payload;
-  const parsed = storedPlugins(plugins);
-  return parsed ? { ...rest, plugins: parsed } : rest;
+  const { plugins, refresh, ...rest } = payload as {
+    plugins?: unknown;
+    refresh?: unknown;
+  };
+  const parsedPlugins = storedPlugins(plugins);
+  const parsedRefresh = storedRefresh(refresh);
+  return {
+    ...rest,
+    ...(parsedPlugins && { plugins: parsedPlugins }),
+    ...(parsedRefresh && { refresh: parsedRefresh }),
+  };
 }
 
 /** The shared Event shape webhooks, the event streams and the long poll send for a stored row of `agent`'s run. */

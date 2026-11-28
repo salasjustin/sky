@@ -23,6 +23,7 @@ import {
   type AutoApproveScope,
   BACKGROUND_TASKS_MAX,
   type Decision,
+  type EnvRefresh,
   type PendingRequest,
   type RequestId,
   RUNNER_TEXT_MAX,
@@ -698,6 +699,8 @@ export async function runSession(
     seal: Seal;
     /** What the start-of-run plugin refresh did; `run.started` carries it with the plugins the session loaded. */
     pluginRefresh?: PluginRefreshRecord;
+    /** What the environment's refresh script did before the run; none when the env has none. */
+    envRefresh?: EnvRefresh;
     /**
      * The GitHub connector variables `main` took out of the runner's own env. The runner's code
      * alone uses them: no command the session starts is given them, and `publish` and `sync` reach
@@ -1595,6 +1598,7 @@ export async function runSession(
             payload: {
               sessionId: message.session_id,
               ...(plugins && { plugins }),
+              ...(deps.envRefresh && { refresh: deps.envRefresh }),
             },
           },
           {

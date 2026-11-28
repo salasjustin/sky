@@ -72,6 +72,19 @@ const Env = z.object({
         .filter(Boolean),
     )
     .pipe(z.array(z.string().regex(CODEX_PLUGIN_ID))),
+  // the environment's `refresh` script, run before the session (`refresh.ts`); absent when it has none
+  SKY_REFRESH: z
+    .string()
+    .optional()
+    .transform((s) => s || undefined),
+  // how long that script may run, in seconds; an env secret may set it, and what isn't a positive number is ignored
+  SKY_REFRESH_TIMEOUT_SECONDS: z
+    .string()
+    .optional()
+    .transform((s) => {
+      const seconds = Number(s);
+      return s && Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+    }),
   // which credential the Claude session uses, and its value, which only the Claude subprocess reads,
   // so it never enters Config: the subscription token for `oauth`, `SKY_CLAUDE_API_KEY` for `api-key`
   SKY_CLAUDE_AUTH: z.enum(["oauth", "api-key"]).default("oauth"),
@@ -133,6 +146,10 @@ export type Config = {
   codexModel?: string;
   /** The Codex plugins the run turns on, from `SKY_CODEX_PLUGINS`; set only on a Codex run that names some. */
   codexPlugins?: string[];
+  /** The environment's refresh script, from `SKY_REFRESH`; set only when the env has one. */
+  refresh?: string;
+  /** What `SKY_REFRESH_TIMEOUT_SECONDS` asks the refresh's budget to be, in ms; `refresh.ts` bounds it. */
+  refreshTimeoutMs?: number;
   agentId: AgentId;
   runId: RunId;
   prompt: string;
@@ -196,6 +213,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
       runtime: e.SKY_RUNTIME,
       ...(e.SKY_PI_MODEL && { piModel: e.SKY_PI_MODEL }),
       ...(e.SKY_PI_SKILLS.length > 0 && { piSkills: e.SKY_PI_SKILLS }),
+    }),
+    ...(e.SKY_REFRESH && { refresh: e.SKY_REFRESH }),
+    ...(e.SKY_REFRESH_TIMEOUT_SECONDS !== undefined && {
+      refreshTimeoutMs: e.SKY_REFRESH_TIMEOUT_SECONDS * 1000,
     }),
     agentId: e.AGENT_ID,
     runId: e.RUN_ID,

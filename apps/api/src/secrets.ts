@@ -32,6 +32,7 @@ const reservedNames = new Set<string>([
   "CLAUDE_CODE_OAUTH_TOKEN",
   "SKY_CLAUDE_AUTH",
   "SKY_CLAUDE_API_KEY",
+  "SKY_REFRESH",
   "PROMPT",
   "PROMPT_FILE",
   "ENV_FILE",
