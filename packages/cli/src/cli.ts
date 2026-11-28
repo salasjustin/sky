@@ -77,9 +77,9 @@ const help = (io: Io) => `Usage:
       unpublished_work, naming each agent, its branch and what is at risk
       (uncommitted files, commits not on GitHub, a branch never published),
       when work exists only on the sandbox; have each agent publish first.
-      If the sandbox doesn't answer, the check uses what the runs recorded,
-      which can't see uncommitted changes, so the list may be incomplete;
-      it says so, and warns when it rebuilds on that check. --force
+      If the sandbox can't be read, every agent that has run is listed with
+      its work unknown, and only --force rebuilds; if no agent has run, it
+      rebuilds and says the sandbox couldn't be checked. --force
       rebuilds anyway after listing what is lost; on a terminal, without
       --yes, it asks a second time. Asks to confirm on a terminal; anywhere else, or with
       --json, it needs --yes. Use it when sky env show reports the sandbox

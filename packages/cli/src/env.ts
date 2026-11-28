@@ -328,13 +328,23 @@ export const env: AgentCommand = {
           }
           rebuilt = await api.rebuildEnvironment(envId, true);
         }
-        if (rebuilt.rebuildCheck && !out.json) {
+        // after a refusal the printed list already said the sprite could not be read; without one, a
+        // records-only check let the rebuild through only because no agent had run
+        if (lost === undefined && rebuilt.rebuildCheck && !out.json) {
           out.warn(
-            `the sprite didn't answer (${rebuilt.rebuildCheck.unreachable}), so the check for unpublished work could only read what the agents' runs recorded, and the rebuild loses any commits or uncommitted changes that were only there`,
+            `could not read the sprite (${rebuilt.rebuildCheck.unreachable}), so its worktrees weren't checked for unpublished work (no agent had run)`,
           );
         }
         out.result(
-          lost === undefined ? rebuilt.raw : { ...asObject(rebuilt.raw), lost },
+          values.force
+            ? {
+                ...asObject(rebuilt.raw),
+                lost: lost ?? {
+                  agents: [],
+                  ...(rebuilt.rebuildCheck ?? { checked: "sprite" }),
+                },
+              }
+            : rebuilt.raw,
           envLine(rebuilt.env),
         );
         return 0;

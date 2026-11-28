@@ -288,9 +288,9 @@ test("env rebuild --force on a records-only check lists those agents as possibly
   expect(r.stderr).toContain(
     "  agt_a (claude/agt_a): commits and uncommitted changes unknown",
   );
-  expect(r.stderr).toContain(
-    "sky: warning: the sprite didn't answer (503 Storage not ready)",
-  );
+  // the list already says the sprite could not be read; nothing after it repeats the loss
+  expect(r.stderr.match(/503 Storage not ready/g)).toHaveLength(1);
+  expect(r.stderr).not.toContain("warning");
   expect(bodies).toEqual([{ force: false }, { force: true }]);
 });
 
@@ -384,6 +384,62 @@ test("env rebuild --force on an env with nothing at risk rebuilds with no list a
   expect(bodies).toEqual([{ force: false }]);
 });
 
+test("env rebuild --json --yes --force with nothing at risk still carries lost, empty, checked on the sprite", async () => {
+  server.use(list, rebuild());
+  const r = await runCli([
+    "env",
+    "rebuild",
+    "web",
+    "--json",
+    "--yes",
+    "--force",
+  ]);
+  expect(r.code).toBe(0);
+  expect(r.stderr).toBe("");
+  expect(JSON.parse(r.stdout)).toEqual({
+    ...rebuilding,
+    lost: { agents: [], checked: "sprite" },
+  });
+  expect(bodies).toEqual([{ force: false }]);
+});
+
+test("env rebuild --json --yes --force with no agent run and an unreadable sprite carries lost from rebuildCheck", async () => {
+  server.use(
+    list,
+    rebuild(() =>
+      HttpResponse.json(
+        { ...rebuilding, rebuildCheck: recordsOnly },
+        { status: 202 },
+      ),
+    ),
+  );
+  const r = await runCli([
+    "env",
+    "rebuild",
+    "web",
+    "--json",
+    "--yes",
+    "--force",
+  ]);
+  expect(r.code).toBe(0);
+  expect(r.stderr).toBe("");
+  expect(JSON.parse(r.stdout)).toEqual({
+    ...rebuilding,
+    rebuildCheck: recordsOnly,
+    lost: { agents: [], ...recordsOnly },
+  });
+});
+
+test("--help says an unreadable sprite lists every agent that has run and only --force rebuilds", async () => {
+  const r = await runCli(["--help"]);
+  expect(r.code).toBe(0);
+  const text = r.stdout.replace(/\s+/g, " ");
+  expect(text).not.toContain("the list may be incomplete");
+  expect(text).toContain(
+    "If the sandbox can't be read, every agent that has run is listed with its work unknown, and only --force rebuilds; if no agent has run, it rebuilds and says the sandbox couldn't be checked.",
+  );
+});
+
 test("env rebuild waits 3 minutes for the server's work check, so a slow answer still lands; the env lookup keeps 30 s", async () => {
   // the server's check alone may take its 60 s sprite timeout; the clock here runs 100 times fast
   const timeoutOf = AbortSignal.timeout.bind(AbortSignal);
@@ -431,13 +487,13 @@ test("a timed-out rebuild exits 1 and says it may still have started, and where 
   }
 });
 
-test("a rebuild whose check could only read the run records warns on stderr, and --json passes rebuildCheck through", async () => {
+test("a rebuild whose check could only read the run records warns that the worktrees weren't checked as no agent had run, and --json passes rebuildCheck through", async () => {
   const rebuildCheck = {
     checked: "records",
     unreachable: "503 Storage not ready",
   };
   const warning =
-    "sky: warning: the sprite didn't answer (503 Storage not ready), so the check for unpublished work could only read what the agents' runs recorded, and the rebuild loses any commits or uncommitted changes that were only there\n";
+    "sky: warning: could not read the sprite (503 Storage not ready), so its worktrees weren't checked for unpublished work (no agent had run)\n";
   server.use(
     list,
     rebuild(() =>
