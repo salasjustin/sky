@@ -46,6 +46,7 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { isDeepStrictEqual } from "node:util";
 import {
   type AutoApproved,
   type Decision,
@@ -605,9 +606,27 @@ const ApprovalParams = z.looseObject({
 const ElicitationParams = z.looseObject({
   threadId: z.string(),
   serverName: z.string(),
+  mode: z.string().nullish(),
   message: z.string().nullish(),
-  _meta: z.looseObject({ codex_approval_kind: z.unknown() }).nullish(),
+  url: z.string().nullish(),
+  requestedSchema: z.unknown(),
+  _meta: z
+    .looseObject({
+      codex_approval_kind: z.unknown(),
+      // the raw MCP tool name and the call's exact arguments, on Codex's own tool-call ask
+      tool_name: z.string().optional().catch(undefined),
+      tool_params: z.unknown(),
+    })
+    .nullish(),
 });
+/** Whether a form asks for fields Sky can't fill in: anything but an absent or empty `properties`. */
+const asksForFields = (schema: unknown): boolean => {
+  if (schema == null) return false;
+  if (typeof schema !== "object") return true;
+  const { properties } = schema as { properties?: unknown };
+  if (properties == null) return false;
+  return typeof properties !== "object" || Object.keys(properties).length > 0;
+};
 const ToolCallParams = z.looseObject({
   threadId: z.string(),
   callId: z.string(),
@@ -1032,6 +1051,8 @@ export async function runCodexSession(
       asked: boolean;
       at: number;
       timer?: NodeJS.Timeout;
+      // an MCP tool call's own server, raw tool name and arguments, for matching Codex's ask to it
+      mcp?: { server: string; tool: string; arguments: unknown };
     };
     const calls = new Map<string, Call>();
     // file changes, by item, for their approval request: it names the item, not the change
@@ -1068,7 +1089,12 @@ export async function runCodexSession(
         progress,
       ).catch(() => {});
     };
-    const track = (itemId: string, name: string, input: unknown) => {
+    const track = (
+      itemId: string,
+      name: string,
+      input: unknown,
+      mcp?: Call["mcp"],
+    ) => {
       if (calls.has(itemId)) return;
       const call: Call = {
         name,
@@ -1076,6 +1102,7 @@ export async function runCodexSession(
         pre: false,
         asked: false,
         at: Date.now(),
+        ...(mcp && { mcp }),
       };
       calls.set(itemId, call);
       // no request comes for a call Codex runs unasked: one not asked about in 250 ms is let go
@@ -1194,7 +1221,12 @@ export async function runCodexSession(
         }
         case "mcpToolCall": {
           const mcp = McpItem.parse(note.item);
-          track(mcp.id, `mcp__${mcp.server}__${mcp.tool}`, mcp.arguments ?? {});
+          const args = mcp.arguments ?? {};
+          track(mcp.id, `mcp__${mcp.server}__${mcp.tool}`, args, {
+            server: mcp.server,
+            tool: mcp.tool,
+            arguments: args,
+          });
           if (!done) return;
           if (mcp.status === "completed")
             settle(
@@ -1380,8 +1412,9 @@ export async function runCodexSession(
      * An MCP server's request through Codex. Codex asks before every MCP tool call (the config's
      * `prompt` mode), and that ask is the call's approval: the environment's policy answers as it does
      * for the same `mcp__<server>__<tool>` call on a Claude Code run, running one it doesn't name and
-     * holding one it does for the person. A call the runner can't match to a tool, and any other ask
-     * from a server, is the person's to answer; nothing is accepted unasked.
+     * holding one it does for the person. A tool-call ask the runner can't match to one call in flight,
+     * and a server's own ask (its url shown in full), is the person's to answer; nothing is accepted
+     * unasked. A server's form with fields is declined: Sky has no way to fill them in.
      */
     const answerElicitation = async (
       rpcId: string,
@@ -1394,30 +1427,55 @@ export async function runCodexSession(
         _meta: null,
       });
       if (params.threadId !== thread) return reply("decline");
-      const isToolCall = params._meta?.codex_approval_kind === "mcp_tool_call";
-      // the oldest call of this server not yet asked about is the one Codex is asking for
-      const prefix = `mcp__${params.serverName}__`;
+      const server = params.serverName;
+      const isUrl = params.mode === "url";
+      if (!isUrl && asksForFields(params.requestedSchema)) {
+        warning(
+          `the ${server} MCP server asked for a form with fields, which Sky can't fill in, so it was declined`,
+        );
+        return reply("decline");
+      }
+      const meta = params._meta;
+      const isToolCall =
+        !isUrl && meta?.codex_approval_kind === "mcp_tool_call";
+      const tool = isToolCall ? meta?.tool_name : undefined;
+      const toolParams = meta?.tool_params ?? {};
+      // Codex names no call id: the ask is for an unasked call with this exact server, tool and
+      // arguments, and identical ones are the same call to the policy, so the oldest is taken
       const [itemId, tracked] =
-        (isToolCall
-          ? [...calls.entries()]
-              .filter(
-                ([, call]) =>
-                  call.name.startsWith(prefix) && !call.asked && !call.pre,
-              )
-              .sort(([, a], [, b]) => a.at - b.at)[0]
-          : undefined) ?? [];
+        (tool === undefined
+          ? undefined
+          : [...calls].find(
+              ([, call]) =>
+                !call.asked &&
+                call.mcp?.server === server &&
+                call.mcp.tool === tool &&
+                isDeepStrictEqual(call.mcp.arguments, toolParams),
+            )) ?? [];
       if (tracked) {
         tracked.asked = true;
         clearTimeout(tracked.timer);
       }
-      const toolName = tracked?.name ?? `mcp__${params.serverName}`;
-      const input: Record<string, unknown> = tracked
-        ? (JSON.parse(tracked.input) as Record<string, unknown>)
-        : { message: params.message ?? "" };
-      if (tracked && !matchesPolicy(config.approvalPolicy, toolName, input)) {
-        if (itemId) emitPre(itemId);
+      const toolName =
+        tool === undefined ? `mcp__${server}` : `mcp__${server}__${tool}`;
+      if (
+        itemId &&
+        !matchesPolicy(config.approvalPolicy, toolName, toolParams)
+      ) {
+        emitPre(itemId);
         return reply("accept");
       }
+      const message = params.message ?? "";
+      const input = isToolCall
+        ? toolParams
+        : isUrl
+          ? { message, url: params.url ?? "" }
+          : { message };
+      const summary = isToolCall
+        ? toolName
+        : isUrl
+          ? `${message || toolName} ${params.url ?? ""}`
+          : message || toolName;
       const withdraw = new AbortController();
       pending.set(rpcId, withdraw);
       try {
@@ -1425,9 +1483,7 @@ export async function runCodexSession(
           {
             kind: "approval",
             toolName,
-            toolSummary: bound(
-              tracked ? toolName : (params.message ?? toolName),
-            ),
+            toolSummary: bound(summary),
             toolInput: JSON.stringify(input).slice(0, TOOL_INPUT_POST_MAX),
           },
           AbortSignal.any([abortController.signal, withdraw.signal]),

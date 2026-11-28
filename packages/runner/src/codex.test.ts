@@ -396,7 +396,7 @@ const scenarios = {
   async mcp() {
     const item = (status) => ({ type: "mcpToolCall", id: "mcp_1", server: "doop", tool: "draw", status, arguments: { shape: "box" }, result: null, error: null, durationMs: 5 });
     note("item/started", { threadId: thread, turnId: turn, startedAtMs: Date.now(), item: item("inProgress") });
-    const answer = await ask("mcpServer/elicitation/request", { threadId: thread, turnId: turn, serverName: "doop", mode: "form", message: "Allow the doop MCP server to run tool draw?", requestedSchema: { type: "object", properties: {} }, _meta: { codex_approval_kind: "mcp_tool_call" } });
+    const answer = await ask("mcpServer/elicitation/request", { threadId: thread, turnId: turn, serverName: "doop", mode: "form", message: "Allow the doop MCP server to run tool draw?", requestedSchema: { type: "object", properties: {} }, _meta: { codex_approval_kind: "mcp_tool_call", tool_name: "draw", tool_params: { shape: "box" } } });
     const accepted = answer.action === "accept";
     note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: item(accepted ? "completed" : "failed") });
     note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { type: "agentMessage", id: "msg_3", text: accepted ? "drew" : "not drawn" } });
@@ -407,6 +407,19 @@ const scenarios = {
   async elicit() {
     const answer = await ask("mcpServer/elicitation/request", { threadId: thread, turnId: turn, serverName: "doop", mode: "form", message: "Which canvas?", requestedSchema: { type: "object", properties: {} } });
     note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { type: "agentMessage", id: "msg_4", text: answer.action } });
+    usage(10, 1);
+    finish("completed");
+  },
+  // FAKE_CODEX_MCP's calls start, then its asks go out together (once FAKE_CODEX_GATE exists, when set),
+  // and each call completes once every ask is answered
+  async mcpAsks() {
+    const { calls, asks } = JSON.parse(process.env.FAKE_CODEX_MCP);
+    const item = (call, status) => ({ type: "mcpToolCall", id: call.id, server: call.server, tool: call.tool, status, arguments: call.arguments ?? null, result: null, error: null, durationMs: 5 });
+    for (const call of calls) note("item/started", { threadId: thread, turnId: turn, startedAtMs: Date.now(), item: item(call, "inProgress") });
+    const gate = process.env.FAKE_CODEX_GATE;
+    if (gate) await new Promise((go) => { const poll = setInterval(() => { if (require("node:fs").existsSync(gate)) { clearInterval(poll); go(); } }, 5); });
+    await Promise.all(asks.map((a) => ask("mcpServer/elicitation/request", { threadId: thread, turnId: turn, ...a })));
+    for (const call of calls) note("item/completed", { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: item(call, "completed") });
     usage(10, 1);
     finish("completed");
   },
@@ -757,6 +770,237 @@ describe("runCodexSession", () => {
       expect(await run(undefined, "elicit")).toBe(0);
       expect(ofType("run.waiting")).toHaveLength(1);
       expect(answerOf()).toMatchObject({ action: "decline" });
+    });
+
+    type McpCall = {
+      id: string;
+      server: string;
+      tool: string;
+      arguments?: unknown;
+    };
+    // Codex's own ask before a tool call, as its prompt mode sends it
+    const toolAsk = (serverName: string, tool: string, params: unknown) => ({
+      serverName,
+      mode: "form",
+      message: `Allow the ${serverName} MCP server to run tool ${tool}?`,
+      requestedSchema: { type: "object", properties: {} },
+      _meta: {
+        codex_approval_kind: "mcp_tool_call",
+        tool_name: tool,
+        tool_params: params,
+      },
+    });
+    const mcpAsks = (calls: McpCall[], asks: object[]) => {
+      config.sessionEnv.FAKE_CODEX_MCP = JSON.stringify({ calls, asks });
+      return run(undefined, "mcpAsks");
+    };
+    // the reply to the n-th ask the fake sent
+    const answerAt = (n: number) =>
+      sent().find((m) => m.id === 100 + n && m.result)?.result;
+    const waitingFor = () => ofType("run.waiting").map((e) => e.payload.request);
+
+    test.each([
+      ["draw first", ["draw", "erase"]],
+      ["erase first", ["erase", "draw"]],
+    ] as const)("two calls to one server, asked %s: each ask is answered for its own tool", async (_, order) => {
+      config.approvalPolicy = ["mcp__doop__draw"];
+      decide = () => "deny";
+      const args = { draw: { shape: "box" }, erase: { all: true } };
+      expect(
+        await mcpAsks(
+          [
+            { id: "mcp_draw", server: "doop", tool: "draw", arguments: args.draw },
+            {
+              id: "mcp_erase",
+              server: "doop",
+              tool: "erase",
+              arguments: args.erase,
+            },
+          ],
+          order.map((tool) => toolAsk("doop", tool, args[tool])),
+        ),
+      ).toBe(0);
+      expect(order.map((_tool, n) => answerAt(n)?.action)).toEqual(
+        order.map((tool) => (tool === "draw" ? "decline" : "accept")),
+      );
+      expect(waitingFor()).toEqual([
+        expect.objectContaining({
+          toolName: "mcp__doop__draw",
+          toolInput: JSON.stringify(args.draw),
+        }),
+      ]);
+    });
+
+    test("an ask is matched to the call with its exact arguments, not the oldest of the tool", async () => {
+      config.approvalPolicy = ["mcp__doop__draw"];
+      decide = () => "approve";
+      expect(
+        await mcpAsks(
+          [
+            { id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } },
+            {
+              id: "mcp_2",
+              server: "doop",
+              tool: "draw",
+              arguments: { shape: "circle", size: 2 },
+            },
+          ],
+          // key order is Codex's, not the item's
+          [toolAsk("doop", "draw", { size: 2, shape: "circle" })],
+        ),
+      ).toBe(0);
+      expect(waitingFor()).toEqual([
+        expect.objectContaining({
+          toolName: "mcp__doop__draw",
+          toolInput: JSON.stringify({ size: 2, shape: "circle" }),
+        }),
+      ]);
+      expect(answerAt(0)).toMatchObject({ action: "accept" });
+    });
+
+    test("an ask from server a is never matched to a call of server a__b", async () => {
+      config.approvalPolicy = [];
+      decide = () => "deny";
+      expect(
+        await mcpAsks(
+          [{ id: "mcp_1", server: "a__b", tool: "draw", arguments: {} }],
+          [toolAsk("a", "draw", {})],
+        ),
+      ).toBe(0);
+      expect(waitingFor()).toEqual([
+        expect.objectContaining({ toolName: "mcp__a__draw" }),
+      ]);
+      expect(answerAt(0)).toMatchObject({ action: "decline" });
+    });
+
+    test("a tool-call ask matching no call in flight goes to the person, never accepted unasked", async () => {
+      config.approvalPolicy = [];
+      decide = () => "deny";
+      expect(
+        await mcpAsks([], [toolAsk("doop", "draw", { shape: "box" })]),
+      ).toBe(0);
+      expect(waitingFor()).toEqual([
+        expect.objectContaining({
+          toolName: "mcp__doop__draw",
+          toolInput: JSON.stringify({ shape: "box" }),
+        }),
+      ]);
+      expect(answerAt(0)).toMatchObject({ action: "decline" });
+    });
+
+    test("an ask of another kind goes to the person and leaves the call in flight for its own ask", async () => {
+      config.approvalPolicy = [];
+      decide = () => "approve";
+      expect(
+        await mcpAsks(
+          [{ id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } }],
+          [
+            {
+              serverName: "doop",
+              mode: "form",
+              message: "Pick a canvas",
+              requestedSchema: { type: "object", properties: {} },
+              _meta: { codex_approval_kind: "something_else" },
+            },
+            toolAsk("doop", "draw", { shape: "box" }),
+          ],
+        ),
+      ).toBe(0);
+      expect(waitingFor()).toEqual([
+        expect.objectContaining({
+          toolName: "mcp__doop",
+          toolSummary: "Pick a canvas",
+        }),
+      ]);
+      expect(answerAt(0)).toMatchObject({ action: "accept" });
+      expect(answerAt(1)).toMatchObject({ action: "accept" });
+    });
+
+    test("a url ask shows the person its url", async () => {
+      config.approvalPolicy = [];
+      decide = () => "approve";
+      const url = "https://doop.example/auth?state=1";
+      expect(
+        await mcpAsks(
+          [],
+          [
+            {
+              serverName: "doop",
+              mode: "url",
+              message: "Sign in to doop",
+              url,
+              elicitationId: "el_1",
+            },
+          ],
+        ),
+      ).toBe(0);
+      expect(waitingFor()).toEqual([
+        expect.objectContaining({
+          toolName: "mcp__doop",
+          toolSummary: expect.stringContaining(url),
+          toolInput: expect.stringContaining(url),
+        }),
+      ]);
+      expect(answerAt(0)).toMatchObject({ action: "accept" });
+    });
+
+    test("a form with fields is declined unasked, with a warning naming the server", async () => {
+      config.approvalPolicy = [];
+      decide = () => "approve";
+      expect(
+        await mcpAsks(
+          [],
+          [
+            {
+              serverName: "doop",
+              mode: "form",
+              message: "Which canvas?",
+              requestedSchema: {
+                type: "object",
+                properties: { canvas: { type: "string" } },
+              },
+            },
+          ],
+        ),
+      ).toBe(0);
+      expect(waitingFor()).toEqual([]);
+      expect(answerAt(0)).toMatchObject({ action: "decline" });
+      expect(
+        ofType("runner.warning")
+          .map((e) => e.payload.message)
+          .filter((m) => m.includes("form")),
+      ).toEqual([expect.stringContaining("doop")]);
+    });
+
+    test("an ask that lands after the call was let go still gets the policy's answer", async () => {
+      config.approvalPolicy = [];
+      decide = () => "deny";
+      const gate = join(root, "gate");
+      config.sessionEnv.FAKE_CODEX_GATE = gate;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const done = mcpAsks(
+          [{ id: "mcp_1", server: "doop", tool: "draw", arguments: { shape: "box" } }],
+          [toolAsk("doop", "draw", { shape: "box" })],
+        );
+        // the 250 ms let-go fires on fake time; the ask waits on the gate until it has
+        await vi.waitFor(
+          async () => {
+            await vi.advanceTimersByTimeAsync(100);
+            expect(
+              ofType("claude.PreToolUse").map((e) => e.payload.toolUseId),
+            ).toEqual(["mcp_1"]);
+          },
+          { timeout: 10_000, interval: 20 },
+        );
+        vi.useRealTimers();
+        writeFileSync(gate, "");
+        expect(await done).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(waitingFor()).toEqual([]);
+      expect(answerAt(0)).toMatchObject({ action: "accept" });
     });
 
     test("the base profile's servers are written by name, and no secret value reaches the file", async () => {
