@@ -39,15 +39,17 @@
  * Claude Code session: background tasks, the default git identity, the outside-read gate (pi's `read`,
  * `grep`, `find` and `ls` run unasked, wherever they read), and subagents, which pi doesn't have.
  *
- * Cost: pi prices a call from its model's `cost`, which the gateway's models don't give it, so pi
- * reports tokens and a cost of 0. The run reports the tokens and `costUsd: 0`; the gateway's dashboard
- * has the dollars.
+ * Cost: pi prices a call from its model's `cost`. The runner gives the run's model the prices and limits
+ * of its entry in the gateway catalog pi ships (`piCatalogModel`), so the run's `costUsd` is pi's
+ * estimate from those bundled prices, and 0 for a model the catalog doesn't list; the gateway's
+ * dashboard has what was billed.
  */
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
+  readFileSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -142,6 +144,81 @@ export function resolvePiExecutable(
   return /\.[cm]?js$/.test(real)
     ? { command: node, args: [real] }
     : { command: real, args: [], packageDir: dirname(real) };
+}
+
+const Price = z.number().nonnegative();
+/** A model's prices, in dollars per million tokens, and its limits, as pi's model entry takes them. */
+const CatalogModel = z.object({
+  cost: z.object({
+    input: Price,
+    output: Price,
+    cacheRead: Price,
+    cacheWrite: Price,
+  }),
+  contextWindow: z.number().int().positive(),
+  maxTokens: z.number().int().positive(),
+});
+export type PiModelSpec = z.infer<typeof CatalogModel>;
+/** Keyed by API, then by `chat:<model id>`. */
+const GatewayCatalog = z.record(z.string(), z.record(z.string(), z.unknown()));
+
+/** What pi is told of a model its gateway catalog doesn't list: no price, so pi's cost for it is 0. */
+export const FALLBACK_PI_MODEL_SPEC: PiModelSpec = {
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 128000,
+  maxTokens: 16384,
+};
+
+/** The gateway's model catalog pi-ai ships, under a `node_modules` directory; read as data, never imported. */
+const GATEWAY_CATALOG = join(
+  "@earendil-works",
+  "pi-ai",
+  "dist",
+  "providers",
+  "data",
+  "vercel-ai-gateway.json",
+);
+
+/** The catalog in the nearest `node_modules` up from `from` that has one, as Node would resolve pi-ai from pi. */
+function gatewayCatalogFile(from: string): string | undefined {
+  for (let dir = from; ; dir = dirname(dir)) {
+    const file = join(dir, "node_modules", GATEWAY_CATALOG);
+    if (existsSync(file)) return file;
+    if (dirname(dir) === dir) return undefined;
+  }
+}
+
+/**
+ * The prices and limits the gateway catalog of the pi installed at `from` (its `cli.js`, or a compiled
+ * pi) gives `model`. A model or catalog that isn't there gets `FALLBACK_PI_MODEL_SPEC`, and `fallback`
+ * says why.
+ */
+export function piCatalogModel(
+  model: string,
+  from: string,
+): { spec: PiModelSpec; fallback?: string } {
+  const fallback = (why: string) => {
+    const { contextWindow, maxTokens } = FALLBACK_PI_MODEL_SPEC;
+    return {
+      spec: FALLBACK_PI_MODEL_SPEC,
+      fallback: `${why}; pi is told it has ${contextWindow} tokens of context, ${maxTokens} of output, and no price, so the run's cost is 0`,
+    };
+  };
+  const file = gatewayCatalogFile(from);
+  if (!file) return fallback(`no pi gateway model catalog beside ${from}`);
+  let catalog: z.infer<typeof GatewayCatalog>;
+  try {
+    catalog = GatewayCatalog.parse(JSON.parse(readFileSync(file, "utf8")));
+  } catch (error) {
+    return fallback(
+      `pi's gateway model catalog ${file} is unreadable (${messageOf(error)})`,
+    );
+  }
+  for (const models of Object.values(catalog)) {
+    const entry = CatalogModel.safeParse(models[`chat:${model}`]);
+    if (entry.success) return { spec: entry.data };
+  }
+  return fallback(`pi's gateway model catalog has no usable entry for ${model}`);
 }
 
 /** The run's pi home: `SKY_PI_HOME`, else `$HOME/.sky/pi`. Its `agent` directory is pi's config directory. */
@@ -580,6 +657,7 @@ const REQUEST_PREFIX = "sky:";
 export function piExtensionSource(options: {
   baseUrl: string;
   model: string;
+  spec: PiModelSpec;
   tools: { name: string; description: string; parameters: unknown }[];
 }): string {
   const config = {
@@ -608,10 +686,10 @@ export default function (pi) {
         name: config.model,
         reasoning: false,
         input: ["text"],
-        // the gateway's models have no price pi knows: it reports tokens, and a cost of 0
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128000,
-        maxTokens: 16384,
+        // from the gateway catalog pi ships, when it lists the model
+        cost: config.spec.cost,
+        contextWindow: config.spec.contextWindow,
+        maxTokens: config.spec.maxTokens,
         compat: {
           supportsStore: false,
           supportsDeveloperRole: false,
@@ -1071,13 +1149,20 @@ export async function runPiSession(
       else warning(`pi skill directory ${dir} is not there; skipped`);
     }
 
+    const launcher = resolvePiExecutable(deps.bin ?? env.SKY_PI_BIN ?? PI_BIN);
     const model = config.piModel ?? DEFAULT_PI_MODEL;
+    const { spec, fallback } = piCatalogModel(
+      model,
+      launcher.args[0] ?? launcher.command,
+    );
+    if (fallback) warning(fallback);
     const extension = join(scratch, "sky-pi-extension.mjs");
     writeFileSync(
       extension,
       piExtensionSource({
         baseUrl: proxy.baseUrl,
         model,
+        spec,
         tools: broker
           ? DYNAMIC_TOOLS.map((tool) => ({
               name: tool.name,
@@ -1100,7 +1185,6 @@ export async function runPiSession(
       { mode: 0o600 },
     );
     const sessionId = config.sessionId ?? randomUUID();
-    const launcher = resolvePiExecutable(deps.bin ?? env.SKY_PI_BIN ?? PI_BIN);
     // pi's env, which the agent's commands get whole (the project's secrets included, as Claude Code's
     // commands get them) except the gateway token, which the extension clears: never the connector (the
     // broker does the sending), the event token (the runner posts the run's events) or the gateway key
@@ -1562,7 +1646,7 @@ export async function runPiSession(
         usage = {
           inputTokens: Math.round(tokens.input),
           outputTokens: Math.round(tokens.output),
-          // pi prices a call from its model's cost, which the gateway's models don't give it: tokens only
+          // pi's estimate from its bundled gateway prices; 0 for a model it has no price for
           costUsd: tokens.cost,
           turns: tokens.modelCalls,
           durationMs: Date.now() - startedAt,

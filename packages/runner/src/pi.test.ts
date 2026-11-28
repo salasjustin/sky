@@ -24,8 +24,10 @@ import type { PostEvent } from "./events.js";
 import {
   commandViews,
   DEFAULT_PI_MODEL,
+  FALLBACK_PI_MODEL_SPEC,
   PI_PROVIDER,
   PiRpc,
+  piCatalogModel,
   piExtensionSource,
   piHomeOf,
   piInstructions,
@@ -148,6 +150,71 @@ describe("resolvePiExecutable", () => {
 
   test("a launcher that isn't there is an error", () => {
     expect(() => resolvePiExecutable(join(dir, "missing"))).toThrow(/ENOENT/);
+  });
+});
+
+/** The gateway catalog pi-ai ships, as pi 1.6.1 lays it out, installed under `root/node_modules`. */
+function writeGatewayCatalog(root: string, models: Record<string, unknown>) {
+  const data = join(
+    root,
+    "node_modules/@earendil-works/pi-ai/dist/providers/data",
+  );
+  mkdirSync(data, { recursive: true });
+  const chat = Object.fromEntries(
+    Object.entries(models).map(([id, entry]) => [`chat:${id}`, entry]),
+  );
+  writeFileSync(
+    join(data, "vercel-ai-gateway.json"),
+    JSON.stringify({ "anthropic-messages": {}, "typesafe-system-one": chat }),
+  );
+}
+
+const flashEntry = {
+  id: DEFAULT_PI_MODEL,
+  api: "anthropic-messages",
+  reasoning: true,
+  cost: { input: 0.3, output: 1.2, cacheRead: 0.007, cacheWrite: 0 },
+  contextWindow: 1048576,
+  maxTokens: 262144,
+  type: "chat",
+};
+
+describe("piCatalogModel", () => {
+  let dir: string;
+  let cli: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "runner-pi-catalog-"));
+    cli = join(
+      dir,
+      "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+    );
+    mkdirSync(join(cli, ".."), { recursive: true });
+    writeFileSync(cli, "");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("a model in the gateway catalog pi ships gets the catalog's prices and limits", () => {
+    writeGatewayCatalog(dir, { [DEFAULT_PI_MODEL]: flashEntry });
+    expect(piCatalogModel(DEFAULT_PI_MODEL, cli)).toEqual({
+      spec: {
+        cost: { input: 0.3, output: 1.2, cacheRead: 0.007, cacheWrite: 0 },
+        contextWindow: 1048576,
+        maxTokens: 262144,
+      },
+    });
+  });
+
+  test("a model the catalog doesn't list gets the fallback, and says so", () => {
+    writeGatewayCatalog(dir, { [DEFAULT_PI_MODEL]: flashEntry });
+    const { spec, fallback } = piCatalogModel("x/unknown", cli);
+    expect(spec).toEqual(FALLBACK_PI_MODEL_SPEC);
+    expect(fallback).toMatch(/x\/unknown/);
+  });
+
+  test("no catalog beside pi gets the fallback, and says so", () => {
+    const { spec, fallback } = piCatalogModel(DEFAULT_PI_MODEL, cli);
+    expect(spec).toEqual(FALLBACK_PI_MODEL_SPEC);
+    expect(fallback).toMatch(/catalog/);
   });
 });
 
@@ -538,6 +605,11 @@ describe("the run's extension", () => {
       piExtensionSource({
         baseUrl: "http://127.0.0.1:9/v1",
         model: "m/x",
+        spec: {
+          cost: { input: 0.3, output: 1.2, cacheRead: 0.007, cacheWrite: 0 },
+          contextWindow: 1048576,
+          maxTokens: 8192,
+        },
         tools,
       }),
     );
@@ -574,7 +646,7 @@ describe("the run's extension", () => {
     };
   };
 
-  test("registers the run's proxy as the provider with the token it read, and clears the token from pi's env", async () => {
+  test("registers the run's proxy as the provider with the token it read and the model's prices and limits, and clears the token from pi's env", async () => {
     vi.stubEnv("SKY_PI_GATEWAY_TOKEN", "run-token");
     const seen = await load();
     expect(process.env.SKY_PI_GATEWAY_TOKEN).toBeUndefined();
@@ -585,7 +657,15 @@ describe("the run's extension", () => {
       baseUrl: "http://127.0.0.1:9/v1",
       apiKey: "run-token",
       api: "openai-completions",
-      models: [{ id: "m/x", cost: { input: 0, output: 0 } }],
+      models: [
+        {
+          id: "m/x",
+          cost: { input: 0.3, output: 1.2, cacheRead: 0.007, cacheWrite: 0 },
+          contextWindow: 1048576,
+          maxTokens: 8192,
+          compat: { maxTokensField: "max_tokens" },
+        },
+      ],
     });
     // the token is in pi's memory, not in the file
     expect(readFileSync(join(dir, "ext.mjs"), "utf8")).not.toContain(
@@ -897,7 +977,7 @@ const settle = (aborted = false) => { send({ type: "agent_end", messages: [], wi
 const scenarios = {
   async bash() {
     await tool("t1", "bash", { command: process.env.FAKE_PI_COMMAND ?? "touch made.txt" }, async () => "listing");
-    assistant({ content: [{ type: "text", text: "all done" }], usage: usage(100, 10, { cacheRead: 40 }) });
+    assistant({ content: [{ type: "text", text: "all done" }], usage: usage(100, 10, { cacheRead: 40, cost: { total: 0.0012 } }) });
     settle();
   },
   async commands() {
@@ -1011,6 +1091,7 @@ describe("runPiSession", () => {
     execFileSync("git", ["clone", "-q", origin, join(root, "repo")]);
     bin = join(root, "fake-pi.mjs");
     writeFileSync(bin, FAKE_PI);
+    writeGatewayCatalog(root, { [DEFAULT_PI_MODEL]: flashEntry });
     logFile = join(root, "pi.log");
     events = [];
     spawned = [];
@@ -1155,11 +1236,11 @@ describe("runPiSession", () => {
     );
     const finished = ofType("run.finished")[0]?.payload;
     expect(finished?.summary).toBe("all done");
-    // pi reports tokens and no price: every prompt token counts, and the cost is 0
+    // every prompt token counts, and the cost is pi's own estimate
     expect(finished?.usage).toMatchObject({
       inputTokens: 140,
       outputTokens: 10,
-      costUsd: 0,
+      costUsd: 0.0012,
       turns: 1,
     });
     expect(ofType("claude.Message").map((e) => e.payload.text)).toEqual([
@@ -1223,6 +1304,40 @@ describe("runPiSession", () => {
         .map((e) => e.payload.message)
         .join("\n"),
     ).toMatch(/gone is not there/);
+  });
+
+  /** The model entry the run's extension registers, read back from the source pi was started with. */
+  const registeredSpec = () => {
+    const line = /^const config = (.*);$/m.exec(started().extension)?.[1];
+    return (JSON.parse(line ?? "{}") as Logged).spec;
+  };
+
+  test("tells pi the model's prices and limits from the gateway catalog pi ships", async () => {
+    expect(await run()).toBe(0);
+    expect(registeredSpec()).toEqual({
+      cost: { input: 0.3, output: 1.2, cacheRead: 0.007, cacheWrite: 0 },
+      contextWindow: 1048576,
+      maxTokens: 262144,
+    });
+    expect(ofType("runner.warning")).toEqual([]);
+  });
+
+  test.each([
+    [
+      "a model the catalog doesn't list",
+      () => {
+        config.piModel = "x/unlisted";
+      },
+    ],
+    [
+      "no catalog beside pi",
+      () => rmSync(join(root, "node_modules"), { recursive: true }),
+    ],
+  ])("%s runs on the fallback limits, with one warning", async (_, arrange) => {
+    arrange();
+    expect(await run()).toBe(0);
+    expect(registeredSpec()).toEqual(FALLBACK_PI_MODEL_SPEC);
+    expect(ofType("runner.warning")).toHaveLength(1);
   });
 
   test("the base profile's MCP servers reach pi through the run's mcp.json, as references", async () => {
