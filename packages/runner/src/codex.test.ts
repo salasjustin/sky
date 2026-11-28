@@ -925,7 +925,11 @@ describe("runCodexSession", () => {
               mode: "form",
               message: "Pick a canvas",
               requestedSchema: { type: "object", properties: {} },
-              _meta: { codex_approval_kind: "something_else" },
+              _meta: {
+                codex_approval_kind: "something_else",
+                tool_name: "draw",
+                tool_params: { shape: "box" },
+              },
             },
             toolAsk("doop", "draw", { shape: "box" }),
           ],
@@ -940,6 +944,112 @@ describe("runCodexSession", () => {
       expect(answerAt(0)).toMatchObject({ action: "accept" });
       expect(answerAt(1)).toMatchObject({ action: "accept" });
     });
+
+    test("an ask naming a tool but no approval kind goes to the person and leaves the call in flight for its own ask", async () => {
+      config.approvalPolicy = [];
+      decide = () => "approve";
+      expect(
+        await mcpAsks(
+          [
+            {
+              id: "mcp_1",
+              server: "doop",
+              tool: "draw",
+              arguments: { shape: "box" },
+            },
+          ],
+          [
+            {
+              serverName: "doop",
+              mode: "form",
+              message: "Pick a canvas",
+              requestedSchema: { type: "object", properties: {} },
+              _meta: { tool_name: "draw", tool_params: { shape: "box" } },
+            },
+            toolAsk("doop", "draw", { shape: "box" }),
+          ],
+        ),
+      ).toBe(0);
+      expect(waitingFor()).toEqual([
+        expect.objectContaining({
+          toolName: "mcp__doop",
+          toolSummary: "Pick a canvas",
+        }),
+      ]);
+      expect(answerAt(0)).toMatchObject({ action: "accept" });
+      expect(answerAt(1)).toMatchObject({ action: "accept" });
+    });
+
+    describe("a tool-call ask with no tool_params", () => {
+      // JSON.stringify drops the undefined key, so the fake sends the ask without it
+      const noParams = toolAsk("doop", "draw", undefined);
+      const draw = { id: "mcp_1", server: "doop", tool: "draw" };
+
+      test("matches a call with no arguments and runs it when the policy doesn't name the tool", async () => {
+        config.approvalPolicy = [];
+        decide = () => "deny";
+        expect(await mcpAsks([draw], [noParams])).toBe(0);
+        expect(waitingFor()).toEqual([]);
+        expect(answerAt(0)).toMatchObject({ action: "accept" });
+      });
+
+      test("goes to the person when the policy names the tool, and a denial declines it", async () => {
+        config.approvalPolicy = ["mcp__doop__draw"];
+        decide = () => "deny";
+        expect(await mcpAsks([draw], [noParams])).toBe(0);
+        expect(waitingFor()).toEqual([
+          expect.objectContaining({
+            toolName: "mcp__doop__draw",
+            toolInput: "{}",
+          }),
+        ]);
+        expect(answerAt(0)).toMatchObject({ action: "decline" });
+      });
+
+      test("is not matched to a call that has arguments, so it goes to the person", async () => {
+        config.approvalPolicy = [];
+        decide = () => "deny";
+        expect(
+          await mcpAsks([{ ...draw, arguments: { shape: "box" } }], [noParams]),
+        ).toBe(0);
+        expect(waitingFor()).toEqual([
+          expect.objectContaining({
+            toolName: "mcp__doop__draw",
+            toolInput: "{}",
+          }),
+        ]);
+        expect(answerAt(0)).toMatchObject({ action: "decline" });
+      });
+    });
+
+    test.each([
+      ["a denial declines it", "deny", "decline"],
+      ["an approval accepts it", "approve", "accept"],
+    ] as const)(
+      "a form ask with no requestedSchema goes to the person, and %s",
+      async (_, decision, action) => {
+        config.approvalPolicy = [];
+        decide = () => decision;
+        expect(
+          await mcpAsks(
+            [],
+            [{ serverName: "doop", mode: "form", message: "Pick a canvas" }],
+          ),
+        ).toBe(0);
+        expect(waitingFor()).toEqual([
+          expect.objectContaining({
+            toolName: "mcp__doop",
+            toolSummary: "Pick a canvas",
+          }),
+        ]);
+        expect(answerAt(0)).toMatchObject({ action });
+        expect(
+          ofType("runner.warning").filter((e) =>
+            e.payload.message.includes("form"),
+          ),
+        ).toEqual([]);
+      },
+    );
 
     test("a url ask shows the person its url", async () => {
       config.approvalPolicy = [];
