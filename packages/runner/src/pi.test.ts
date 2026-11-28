@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -24,6 +25,7 @@ import { gatewayUnavailable } from "./codex.js";
 import { type Config, loadConfig } from "./config.js";
 import type { PostEvent } from "./events.js";
 import {
+  cleanAgentDir,
   commandViews,
   DEFAULT_PI_MODEL,
   FALLBACK_PI_MODEL_SPEC,
@@ -37,8 +39,10 @@ import {
   piOutcome,
   piToolCall,
   piUnavailable,
+  realPathOf,
   resolvePiExecutable,
   runPiSession,
+  skillPath,
   withdrawGatewayKey,
 } from "./pi.js";
 import type { AwaitDecision } from "./requests.js";
@@ -94,9 +98,41 @@ describe("SKY_RUNTIME=pi", () => {
   test("SKY_PI_SKILLS lists skill directories, absolute or under the home", () => {
     const pi = { ...base, SKY_RUNTIME: "pi", AI_GATEWAY_API_KEY: "k" };
     expect(
-      loadConfig({ ...pi, SKY_PI_SKILLS: " /opt/skills/a, ~/.sky/pi/skills ," })
-        .piSkills,
-    ).toEqual(["/opt/skills/a", "~/.sky/pi/skills"]);
+      loadConfig({
+        ...pi,
+        SKY_PI_SKILLS: " /opt/skills/a, ~/.sky/pi/skills , $HOME/.sky/more,",
+      }).piSkills,
+    ).toEqual(["/opt/skills/a", "~/.sky/pi/skills", "$HOME/.sky/more"]);
+  });
+
+  test("a bad skill entry stops a pi run only: Claude Code and Codex runs never read the value", () => {
+    const bad = { SKY_PI_SKILLS: "relative/dir,--flag" };
+    expect(() =>
+      loadConfig({
+        ...base,
+        SKY_RUNTIME: "pi",
+        AI_GATEWAY_API_KEY: "k",
+        ...bad,
+      }),
+    ).toThrow(/SKY_PI_SKILLS/);
+    expect(
+      loadConfig({ ...base, CLAUDE_CODE_OAUTH_TOKEN: "t", ...bad }).runtime,
+    ).toBeUndefined();
+    expect(
+      loadConfig({
+        ...base,
+        SKY_RUNTIME: "codex",
+        AI_GATEWAY_API_KEY: "k",
+        ...bad,
+      }).runtime,
+    ).toBe("codex");
+  });
+
+  test("skillPath expands ~/ and $HOME/ under the run's home and leaves an absolute path", () => {
+    expect(skillPath("~/.s/a", "/h")).toBe("/h/.s/a");
+    expect(skillPath("$HOME/.s/a", "/h")).toBe("/h/.s/a");
+    expect(skillPath("/opt/s", "/h")).toBe("/opt/s");
+    expect(skillPath("$HOMER/x", "/h")).toBe("$HOMER/x");
   });
 
   test("refuses a skill directory that is relative or could read as a pi flag", () => {
@@ -369,6 +405,104 @@ describe("commandViews", () => {
   });
 });
 
+describe("realPathOf", () => {
+  let dir: string;
+  let inside: string;
+  let outsideDir: string;
+  beforeEach(() => {
+    dir = realpathSync(mkdtempSync(join(tmpdir(), "runner-pi-real-")));
+    inside = join(dir, "work");
+    outsideDir = join(dir, "elsewhere");
+    mkdirSync(join(inside, "src"), { recursive: true });
+    mkdirSync(outsideDir);
+    writeFileSync(join(outsideDir, "secret.txt"), "s");
+    writeFileSync(join(inside, "src/a.ts"), "a");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const held = (path: string) =>
+    outcomeIn(inside, "write", { path, content: "x" });
+  const outcomeIn = (cwd: string, tool: string, input: unknown) => {
+    const call = piToolCall(tool, input, cwd);
+    if (!call) throw new Error("not a gated call");
+    const scope = {
+      root: cwd,
+      cwd,
+      realpath: (p: string) => p,
+      isSymlink: () => false,
+      home: "/home/u",
+      storeHome: undefined,
+      scratch: "/tmp/s",
+    };
+    return piOutcome(
+      { approvalPolicy: [], autoApprove: { defaults: true, commands: [] } },
+      call,
+      scope,
+      cwd,
+    );
+  };
+
+  test("a file in the worktree is inside, one that doesn't exist yet too", () => {
+    expect(held("src/a.ts")).toBe("run");
+    expect(held("src/new/deeper/b.ts")).toBe("run");
+    expect(realPathOf(join(inside, "src/new/b.ts"))).toBe(
+      join(inside, "src/new/b.ts"),
+    );
+  });
+
+  test("a link to a file outside holds a write through it", () => {
+    symlinkSync(join(outsideDir, "secret.txt"), join(inside, "link.txt"));
+    expect(held("link.txt")).toBe("hold");
+    expect(realPathOf(join(inside, "link.txt"))).toBe(
+      join(outsideDir, "secret.txt"),
+    );
+  });
+
+  test("a link to a directory outside holds a write under it, existing file or new", () => {
+    symlinkSync(outsideDir, join(inside, "out"));
+    expect(held("out/secret.txt")).toBe("hold");
+    expect(held("out/brand-new.txt")).toBe("hold");
+    expect(held("out/new/dir/file.txt")).toBe("hold");
+  });
+
+  test("a link to a place inside the worktree is still inside", () => {
+    symlinkSync(join(inside, "src"), join(inside, "alias"));
+    symlinkSync(join(inside, "src/a.ts"), join(inside, "a-link.ts"));
+    expect(held("alias/a.ts")).toBe("run");
+    expect(held("alias/new.ts")).toBe("run");
+    expect(held("a-link.ts")).toBe("run");
+  });
+
+  test("a dangling link is judged by where it points", () => {
+    symlinkSync(join(outsideDir, "not-yet.txt"), join(inside, "dangling-out"));
+    symlinkSync(join(inside, "src/not-yet.ts"), join(inside, "dangling-in"));
+    symlinkSync("loop-b", join(inside, "loop-a"));
+    symlinkSync("loop-a", join(inside, "loop-b"));
+    expect(held("dangling-out")).toBe("hold");
+    expect(held("dangling-in")).toBe("run");
+    // a loop resolves to nothing: it stays under its own directory, and the write fails there
+    expect(held("loop-a")).toBe("run");
+  });
+
+  test("a worktree that is itself reached through a link is judged by its real path", () => {
+    const alias = join(dir, "alias-of-work");
+    symlinkSync(inside, alias);
+    expect(outcomeIn(alias, "write", { path: "src/a.ts", content: "" })).toBe(
+      "run",
+    );
+    expect(
+      outcomeIn(alias, "write", { path: "../elsewhere/x", content: "" }),
+    ).toBe("hold");
+  });
+
+  test("an edit is held the same way", () => {
+    symlinkSync(outsideDir, join(inside, "out"));
+    expect(
+      outcomeIn(inside, "edit", { path: "out/secret.txt", edits: [] }),
+    ).toBe("hold");
+  });
+});
+
 describe("piOutcome", () => {
   const cwd = "/w";
   const scope = {
@@ -484,15 +618,18 @@ describe("piOutcome", () => {
     expect(outcome([], "edit", { path: "../up.txt", edits: [] })).toBe("hold");
     expect(outcome([], "write", { path: "~/x", content: "" })).toBe("hold");
     expect(
-      outcome([], "write", { path: "file:///home/sprite/.bashrc", content: "" }),
+      outcome([], "write", {
+        path: "file:///home/sprite/.bashrc",
+        content: "",
+      }),
     ).toBe("hold");
     expect(outcome([], "edit", { path: "@file:///etc/x", edits: [] })).toBe(
       "hold",
     );
     expect(outcome([], "write", { path: "in.txt", content: "" })).toBe("run");
-    expect(outcome([], "write", { path: "file:///w/in.txt", content: "" })).toBe(
-      "run",
-    );
+    expect(
+      outcome([], "write", { path: "file:///w/in.txt", content: "" }),
+    ).toBe("run");
   });
 
   test("another tool is held by a pattern that names it", () => {
@@ -793,6 +930,28 @@ describe("the run's extension", () => {
   });
 });
 
+describe("cleanAgentDir", () => {
+  test("keeps what Sky writes, removes the rest, and makes the directory when it is missing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "runner-pi-agent-"));
+    try {
+      const agent = join(dir, "agent");
+      cleanAgentDir(agent);
+      expect(existsSync(agent)).toBe(true);
+      writeFileSync(join(agent, "settings.json"), "{}");
+      writeFileSync(join(agent, "mcp.json"), "{}");
+      writeFileSync(join(agent, "auth.json"), "{}");
+      mkdirSync(join(agent, "prompts/deep"), { recursive: true });
+      symlinkSync("/etc", join(agent, "skills"));
+      cleanAgentDir(agent);
+      expect(readdirSync(agent).sort()).toEqual(["mcp.json", "settings.json"]);
+      // a link's target is never emptied
+      expect(existsSync("/etc/passwd")).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("PiRpc", () => {
   const fakeChild = () => {
     const child = Object.assign(new EventEmitter(), {
@@ -923,14 +1082,20 @@ describe("PiRpc", () => {
 // and logs what the runner sent it and started it with.
 const FAKE_PI = String.raw`
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 const log = (m) => appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify(m) + "\n");
 const argv = process.argv.slice(2);
 const flag = (name) => argv[argv.indexOf(name) + 1];
 const extension = flag("--extension");
 const agentDir = process.env.PI_CODING_AGENT_DIR;
+// a session is a file named for its id in --session-dir: one a follow-up finds is a session it resumes
+const sessionFile = flag("--session-dir") + "/" + flag("--session-id") + ".jsonl";
+const resumed = existsSync(sessionFile);
+if (!resumed) writeFileSync(sessionFile, "{}\n");
 log({
   start: true,
+  agentFiles: readdirSync(agentDir).sort(),
+  resumed,
   argv,
   cwd: process.cwd(),
   env: {
@@ -1418,6 +1583,66 @@ describe("runPiSession", () => {
     ).toMatch(/lost \(NOT_SET\)/);
   });
 
+  test("a run starts from a clean agent directory: what an earlier run left there never reaches pi", async () => {
+    const agent = join(root, "pi-home/agent");
+    mkdirSync(join(agent, "extensions"), { recursive: true });
+    mkdirSync(join(agent, "bin"), { recursive: true });
+    for (const name of [
+      "auth.json",
+      "models.json",
+      "AGENTS.md",
+      "trust.json",
+      "extensions/evil.mjs",
+      "bin/git",
+    ])
+      writeFileSync(join(agent, name), '{"planted":true}');
+    writeFileSync(join(agent, "settings.json"), '{"packages":["npm:evil"]}');
+    expect(await run()).toBe(0);
+    // pi started with exactly what Sky writes, and Sky's own settings, not the planted ones
+    expect(started().agentFiles).toEqual(["settings.json"]);
+    expect(started().settings).toMatchObject({
+      packages: [],
+      defaultProjectTrust: "never",
+    });
+    for (const name of [
+      "auth.json",
+      "models.json",
+      "AGENTS.md",
+      "bin",
+      "extensions",
+    ])
+      expect(existsSync(join(agent, name))).toBe(false);
+  });
+
+  test("a follow-up still resumes its session: sessions live beside the agent directory", async () => {
+    config.sessionId = "sess-keep";
+    expect(await run()).toBe(0);
+    expect(started().resumed).toBe(false);
+    const agent = join(root, "pi-home/agent");
+    writeFileSync(join(agent, "auth.json"), "{}");
+    writeFileSync(join(agent, "models.json"), "{}");
+    rmSync(logFile);
+    events = [];
+    expect(await run()).toBe(0);
+    expect(started().resumed).toBe(true);
+    expect(started().agentFiles).toEqual(["settings.json"]);
+    expect(ofType("run.started")[0]?.payload.sessionId).toBe("sess-keep");
+  });
+
+  test("an agent directory that is a link is replaced, and what it pointed at is left alone", async () => {
+    const target = join(root, "precious");
+    mkdirSync(target);
+    writeFileSync(join(target, "keep.txt"), "k");
+    mkdirSync(join(root, "pi-home"), { recursive: true });
+    symlinkSync(target, join(root, "pi-home/agent"));
+    expect(await run()).toBe(0);
+    expect(readFileSync(join(target, "keep.txt"), "utf8")).toBe("k");
+    expect(started().agentFiles).toEqual(["settings.json"]);
+    expect(realpathSync(join(root, "pi-home/agent"))).toBe(
+      join(realpathSync(root), "pi-home/agent"),
+    );
+  });
+
   test("an mcp.json from an earlier run is gone when this run has no servers", async () => {
     mkdirSync(join(root, "pi-home/agent"), { recursive: true });
     writeFileSync(join(root, "pi-home/agent/mcp.json"), "{}");
@@ -1582,7 +1807,8 @@ describe("runPiSession", () => {
 
   test("an approved sky_publish opens one Publish approval and goes on to GitHub", async () => {
     const baseSha = git(join(root, "repo"), "rev-parse", "origin/main");
-    const repo = "https://gateway.test/v1/gateway/github/conn_1/repos/acme/widgets";
+    const repo =
+      "https://gateway.test/v1/gateway/github/conn_1/repos/acme/widgets";
     server.use(
       http.get(repo, () => HttpResponse.json({ full_name: "acme/widgets" })),
       http.get(`${repo}/pulls`, () => HttpResponse.json([])),
@@ -1618,7 +1844,12 @@ describe("runPiSession", () => {
   });
 
   test("requests the runner can't read, or doesn't serve, block rather than run", async () => {
-    const call = { kind: "call", id: "c1", tool: "bash", input: { command: "x" } };
+    const call = {
+      kind: "call",
+      id: "c1",
+      tool: "bash",
+      input: { command: "x" },
+    };
     const tool = (name: string, args: object) => ({
       kind: "tool",
       id: name,
@@ -1758,14 +1989,17 @@ describe("runPiSession", () => {
   test.each([
     ["a model call that succeeded", "call"],
     ["a retry that succeeded", "retry"],
-  ])("a 429 pi got past by %s doesn't name a later failure of another kind", async (_, recovery) => {
-    config.sessionEnv.FAKE_PI_RECOVERY = recovery;
-    config.sessionEnv.FAKE_PI_ERROR = "context window exceeded";
-    expect(await run("recovered")).toBe(1);
-    expect(ofType("run.failed")[0]?.payload.error).toBe(
-      "context window exceeded",
-    );
-  });
+  ])(
+    "a 429 pi got past by %s doesn't name a later failure of another kind",
+    async (_, recovery) => {
+      config.sessionEnv.FAKE_PI_RECOVERY = recovery;
+      config.sessionEnv.FAKE_PI_ERROR = "context window exceeded";
+      expect(await run("recovered")).toBe(1);
+      expect(ofType("run.failed")[0]?.payload.error).toBe(
+        "context window exceeded",
+      );
+    },
+  );
 
   test("a 402 after a 429 pi got past is still out of credit", async () => {
     config.sessionEnv.FAKE_PI_ERROR =

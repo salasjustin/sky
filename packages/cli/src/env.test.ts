@@ -66,6 +66,55 @@ const getEnv = http.get(`${apiUrl}/v1/environments/:id`, ({ params }) => {
       );
 });
 
+// a runtime a later server adds: this CLI reads it as the string it is, and no response fails on it
+const future = envJson({ runtime: "gemini-cli" });
+const futureList = http.get(`${apiUrl}/v1/environments`, () =>
+  HttpResponse.json({ data: [web, future] }),
+);
+const futureGet = http.get(`${apiUrl}/v1/environments/env_1`, () =>
+  HttpResponse.json(future),
+);
+
+test("an environment on a runtime this CLI doesn't know lists, shows and exports as that string", async () => {
+  server.use(
+    futureList,
+    futureGet,
+    http.get(`${apiUrl}/v1/environments/env_1/secrets`, () =>
+      HttpResponse.json({ data: [] }),
+    ),
+  );
+  const listed = await runCli(["env", "list"]);
+  expect(listed.code).toBe(0);
+  expect(listed.stdout).toBe(
+    "env_1 ready acme/web web\nenv_1 ready acme/web web\n",
+  );
+  const shown = await runCli(["env", "show", "env_1"]);
+  expect(shown.code).toBe(0);
+  expect(shown.stdout).toBe("env_1 ready acme/web web\nruntime: gemini-cli\n");
+  const yaml = await runCli(["env", "show", "env_1", "--yaml"]);
+  expect(yaml.code).toBe(0);
+  expect(yaml.stdout).toContain("# runtime: gemini-cli;");
+  const json = await runCli(["env", "show", "env_1", "--json"]);
+  expect(JSON.parse(json.stdout)).toEqual(future);
+});
+
+test("a switch whose response names an unknown runtime prints it, and an unset one still reads as default", async () => {
+  server.use(
+    list,
+    http.put(`${apiUrl}/v1/environments/env_1/runtime`, () =>
+      HttpResponse.json(future),
+    ),
+  );
+  const r = await runCli(["env", "set-runtime", "web", "claude-code"]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("env_1 ready acme/web web\nruntime: gemini-cli\n");
+  // the CLI's own argument is still checked against the runtimes it knows
+  const bad = await runCli(["env", "set-runtime", "web", "gemini-cli"]);
+  expect(bad.code).toBe(2);
+  const unset = envJson();
+  expect(Object.hasOwn(unset, "runtime")).toBe(false);
+});
+
 test("env show by id prints the environment", async () => {
   server.use(list, getEnv);
   const r = await runCli(["env", "show", "env_1"]);

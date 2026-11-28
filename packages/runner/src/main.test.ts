@@ -334,8 +334,7 @@ describe("the env's refresh script", () => {
           pi: `PI_CODING_AGENT_DIR=${join(runs, ".sky", "pi", "agent")}\n`,
         };
         for (const [runtimeName, line] of Object.entries(agentHomes)) {
-          if (runtimeName === runtime.SKY_RUNTIME)
-            expect(env).toContain(line);
+          if (runtimeName === runtime.SKY_RUNTIME) expect(env).toContain(line);
           else expect(env).not.toContain(line.slice(0, line.indexOf("=") + 1));
         }
         // every run's script runs in the agent's home, whichever agent's run it is

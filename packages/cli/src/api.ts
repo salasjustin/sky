@@ -18,6 +18,9 @@ import type { Config } from "./config.js";
 
 /** An env as the API returns it; loose so `--json` passes through fields this CLI doesn't read. */
 export const ApiEnvironment = Environment.extend({
+  // any string, shown as is: a runtime this CLI was built before must not fail every environment
+  // response with `bad_response`
+  runtime: z.string().nullable().default(null),
   failure: z.object({ step: z.string(), stderr: z.string() }).nullable(),
 }).loose();
 export type ApiEnvironment = z.infer<typeof ApiEnvironment>;

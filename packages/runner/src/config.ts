@@ -21,102 +21,116 @@ const json = z.string().transform((s, ctx) => {
 const CODEX_PLUGIN_ID =
   /^[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-/** A pi skill directory: absolute or `~/…`, so it can't read as one of pi's flags, with no control characters. */
-const PI_SKILL_DIR = /^(?:\/|~\/)[^\p{Cc}]*$/u;
+/** A pi skill directory: absolute, or `~/…` or `$HOME/…` under the run's home, so it can't read as one of pi's flags, with no control characters. */
+const PI_SKILL_DIR = /^(?:\/|~\/|\$HOME\/)[^\p{Cc}]*$/u;
 
-const Env = z.object({
-  AGENT_ID: AgentId,
-  RUN_ID: RunId,
-  PROMPT: z.string().min(1),
-  SESSION_ID: z
-    .string()
-    .optional()
-    .transform((s) => s || undefined),
-  API_BASE_URL: z.url(),
-  AGENT_TOKEN: z.string().min(1),
-  // which agent drives the session: Claude Code through the Agent SDK, Codex through its app server
-  // (`codex.ts`), or pi through its RPC mode (`pi.ts`); the last two reach their model through the
-  // Vercel AI Gateway rather than a Claude credential
-  SKY_RUNTIME: z.enum(["claude-code", "codex", "pi"]).default("claude-code"),
-  // the pi session's model, as the AI Gateway names it; `DEFAULT_PI_MODEL` when unset
-  SKY_PI_MODEL: z
-    .string()
-    .optional()
-    .transform((s) => s || undefined),
-  // the directories of `SKILL.md` skills a pi run loads, separated by commas: absolute, or `~/` for the
-  // run's home. The environment's setup installs them
-  SKY_PI_SKILLS: z
-    .string()
-    .optional()
-    .transform((s) =>
-      (s ?? "")
-        .split(",")
-        .map((dir) => dir.trim())
-        .filter(Boolean),
-    )
-    .pipe(z.array(z.string().regex(PI_SKILL_DIR))),
-  // the Codex session's model, as the AI Gateway names it; `DEFAULT_CODEX_MODEL` when unset
-  SKY_CODEX_MODEL: z
-    .string()
-    .optional()
-    .transform((s) => s || undefined),
-  // the Codex plugins a run turns on, as `<plugin>@<marketplace>` separated by commas; the environment's
-  // setup installs them under the run's Codex home. Their hooks run without Codex's per-hook trust
-  SKY_CODEX_PLUGINS: z
-    .string()
-    .optional()
-    .transform((s) =>
-      (s ?? "")
-        .split(",")
-        .map((name) => name.trim())
-        .filter(Boolean),
-    )
-    .pipe(z.array(z.string().regex(CODEX_PLUGIN_ID))),
-  // the environment's `refresh` script, run before the session (`refresh.ts`); absent when it has none
-  SKY_REFRESH: z
-    .string()
-    .optional()
-    .transform((s) => s || undefined),
-  // how long that script may run, in seconds; an env secret may set it, and what isn't a positive number is ignored
-  SKY_REFRESH_TIMEOUT_SECONDS: z
-    .string()
-    .optional()
-    .transform((s) => {
-      const seconds = Number(s);
-      return s && Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+const Env = z
+  .object({
+    AGENT_ID: AgentId,
+    RUN_ID: RunId,
+    PROMPT: z.string().min(1),
+    SESSION_ID: z
+      .string()
+      .optional()
+      .transform((s) => s || undefined),
+    API_BASE_URL: z.url(),
+    AGENT_TOKEN: z.string().min(1),
+    // which agent drives the session: Claude Code through the Agent SDK, Codex through its app server
+    // (`codex.ts`), or pi through its RPC mode (`pi.ts`); the last two reach their model through the
+    // Vercel AI Gateway rather than a Claude credential
+    SKY_RUNTIME: z.enum(["claude-code", "codex", "pi"]).default("claude-code"),
+    // the pi session's model, as the AI Gateway names it; `DEFAULT_PI_MODEL` when unset
+    SKY_PI_MODEL: z
+      .string()
+      .optional()
+      .transform((s) => s || undefined),
+    // the directories of `SKILL.md` skills a pi run loads, separated by commas: absolute, or `~/` or
+    // `$HOME/` for the run's home. The environment's setup installs them. Checked on pi runs only (below)
+    SKY_PI_SKILLS: z
+      .string()
+      .optional()
+      .transform((s) =>
+        (s ?? "")
+          .split(",")
+          .map((dir) => dir.trim())
+          .filter(Boolean),
+      ),
+    // the Codex session's model, as the AI Gateway names it; `DEFAULT_CODEX_MODEL` when unset
+    SKY_CODEX_MODEL: z
+      .string()
+      .optional()
+      .transform((s) => s || undefined),
+    // the Codex plugins a run turns on, as `<plugin>@<marketplace>` separated by commas; the environment's
+    // setup installs them under the run's Codex home. Their hooks run without Codex's per-hook trust
+    SKY_CODEX_PLUGINS: z
+      .string()
+      .optional()
+      .transform((s) =>
+        (s ?? "")
+          .split(",")
+          .map((name) => name.trim())
+          .filter(Boolean),
+      )
+      .pipe(z.array(z.string().regex(CODEX_PLUGIN_ID))),
+    // the environment's `refresh` script, run before the session (`refresh.ts`); absent when it has none
+    SKY_REFRESH: z
+      .string()
+      .optional()
+      .transform((s) => s || undefined),
+    // how long that script may run, in seconds; an env secret may set it, and what isn't a positive number is ignored
+    SKY_REFRESH_TIMEOUT_SECONDS: z
+      .string()
+      .optional()
+      .transform((s) => {
+        const seconds = Number(s);
+        return s && Number.isFinite(seconds) && seconds > 0
+          ? seconds
+          : undefined;
+      }),
+    // which credential the Claude session uses, and its value, which only the Claude subprocess reads,
+    // so it never enters Config: the subscription token for `oauth`, `SKY_CLAUDE_API_KEY` for `api-key`
+    SKY_CLAUDE_AUTH: z.enum(["oauth", "api-key"]).default("oauth"),
+    CLAUDE_CODE_OAUTH_TOKEN: z.string().min(1).optional(),
+    SKY_CLAUDE_API_KEY: z.string().min(1).optional(),
+    REPO_DIR: z.string().min(1).default("/workspace/repo"),
+    WORKTREES_DIR: z.string().min(1).default("/workspace/worktrees"),
+    APPROVAL_POLICY: json.pipe(z.array(PolicyPattern)).default([]),
+    AUTO_APPROVE: json.pipe(AutoApproveConfig).default({
+      defaults: true,
+      commands: [],
     }),
-  // which credential the Claude session uses, and its value, which only the Claude subprocess reads,
-  // so it never enters Config: the subscription token for `oauth`, `SKY_CLAUDE_API_KEY` for `api-key`
-  SKY_CLAUDE_AUTH: z.enum(["oauth", "api-key"]).default("oauth"),
-  CLAUDE_CODE_OAUTH_TOKEN: z.string().min(1).optional(),
-  SKY_CLAUDE_API_KEY: z.string().min(1).optional(),
-  REPO_DIR: z.string().min(1).default("/workspace/repo"),
-  WORKTREES_DIR: z.string().min(1).default("/workspace/worktrees"),
-  APPROVAL_POLICY: json.pipe(z.array(PolicyPattern)).default([]),
-  AUTO_APPROVE: json.pipe(AutoApproveConfig).default({
-    defaults: true,
-    commands: [],
-  }),
-  WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
-  // what is left of the launch's deadline when the API starts the runner; the API fails a run that hasn't
-  // reported by then, so worktree setup's wait for the repo lock ends inside it
-  LAUNCH_DEADLINE_MINUTES: z.coerce.number().positive().default(15),
-  // the env's base profile: variables for the session, and the lines it is told to follow before finishing
-  SKY_SESSION_ENV: json.pipe(z.record(z.string(), z.string())).default({}),
-  SKY_CHECKS: json.pipe(z.array(z.string().min(1))).default([]),
-  SKY_MCP_SERVERS: json
-    .pipe(z.record(z.string(), BaseProfileMcpServer))
-    .default({}),
-  // the store checkout's directory below $HOME; the API sets it with the base profile's store, so it is absent without one
-  SKY_STORE_HOME: z
-    .string()
-    .optional()
-    .transform((s) => s || undefined),
-  START_BRANCH: z
-    .string()
-    .optional()
-    .transform((s) => s || undefined),
-});
+    WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
+    // what is left of the launch's deadline when the API starts the runner; the API fails a run that hasn't
+    // reported by then, so worktree setup's wait for the repo lock ends inside it
+    LAUNCH_DEADLINE_MINUTES: z.coerce.number().positive().default(15),
+    // the env's base profile: variables for the session, and the lines it is told to follow before finishing
+    SKY_SESSION_ENV: json.pipe(z.record(z.string(), z.string())).default({}),
+    SKY_CHECKS: json.pipe(z.array(z.string().min(1))).default([]),
+    SKY_MCP_SERVERS: json
+      .pipe(z.record(z.string(), BaseProfileMcpServer))
+      .default({}),
+    // the store checkout's directory below $HOME; the API sets it with the base profile's store, so it is absent without one
+    SKY_STORE_HOME: z
+      .string()
+      .optional()
+      .transform((s) => s || undefined),
+    START_BRANCH: z
+      .string()
+      .optional()
+      .transform((s) => s || undefined),
+  })
+  .superRefine((e, ctx) => {
+    // a bad entry stops pi runs only: the value means nothing to Claude Code or Codex
+    if (
+      e.SKY_RUNTIME === "pi" &&
+      e.SKY_PI_SKILLS.some((d) => !PI_SKILL_DIR.test(d))
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["SKY_PI_SKILLS"],
+        message: "expected absolute, ~/ or $HOME/ paths",
+      });
+  });
 
 /**
  * The variable holding the credential the run's session can't start without: for Claude Code, the one

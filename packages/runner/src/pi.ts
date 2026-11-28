@@ -48,8 +48,11 @@ import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -218,12 +221,43 @@ export function piCatalogModel(
     const entry = CatalogModel.safeParse(models[`chat:${model}`]);
     if (entry.success) return { spec: entry.data };
   }
-  return fallback(`pi's gateway model catalog has no usable entry for ${model}`);
+  return fallback(
+    `pi's gateway model catalog has no usable entry for ${model}`,
+  );
 }
 
 /** The run's pi home: `SKY_PI_HOME`, else `$HOME/.sky/pi`. Its `agent` directory is pi's config directory. */
 export function piHomeOf(env: NodeJS.ProcessEnv): string {
   return env.SKY_PI_HOME || join(env.HOME || homedir(), ".sky", "pi");
+}
+
+/** A `SKY_PI_SKILLS` entry as a path: `~/` and `$HOME/` mean the run's home. */
+export const skillPath = (dir: string, home: string) =>
+  dir.startsWith("~/")
+    ? join(home, dir.slice(2))
+    : dir.startsWith("$HOME/")
+      ? join(home, dir.slice("$HOME/".length))
+      : dir;
+
+/** The files in pi's agent directory that Sky writes itself on every run. */
+const AGENT_DIR_FILES = ["settings.json", "mcp.json"];
+
+/**
+ * Leaves pi's agent directory holding only what Sky writes. pi loads from it `models.json`, `auth.json`,
+ * `AGENTS.md`, extensions, skills, prompts, themes and a `bin` its commands find on `PATH`, any of which
+ * an earlier run's commands may have left; sessions live beside it (`--session-dir`), so a follow-up's
+ * resume is untouched. A directory that is itself a link is removed as a link first, so what it pointed
+ * at is never emptied.
+ */
+export function cleanAgentDir(agentDir: string): void {
+  try {
+    if (!lstatSync(agentDir).isDirectory())
+      rmSync(agentDir, { recursive: true, force: true });
+  } catch {}
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  for (const name of readdirSync(agentDir))
+    if (!AGENT_DIR_FILES.includes(name))
+      rmSync(join(agentDir, name), { recursive: true, force: true });
 }
 
 /** The tool names pi's extension never asks the runner about: reads, and the runner's own tools, which ask through the broker. */
@@ -528,6 +562,25 @@ export function commandViews(command: string, depth = 0): string[] {
   return [...views];
 }
 
+/**
+ * Where a write to `path` lands: the path with every link on the way resolved. A path that doesn't exist
+ * yet is judged by its nearest existing parent's real path, and a dangling link by what it points at,
+ * since writing through it creates that.
+ */
+export function realPathOf(path: string, links = 0): string {
+  try {
+    return realpathSync(path);
+  } catch {}
+  try {
+    if (links < 40 && lstatSync(path).isSymbolicLink())
+      return realPathOf(resolve(dirname(path), readlinkSync(path)), links + 1);
+  } catch {}
+  const parent = dirname(path);
+  return parent === path
+    ? path
+    : join(realPathOf(parent, links), basename(path));
+}
+
 /** How the environment's policy treats one of pi's tool calls; the same answer Codex's runs get. */
 export function piOutcome(
   config: Pick<Config, "approvalPolicy" | "autoApprove">,
@@ -561,8 +614,11 @@ export function piOutcome(
       call.toolName,
       call.input,
     );
-  // a change to a file outside the worktree is the person's to approve, whatever the policy says
-  if (call.targets.some((path) => outside(cwd, path))) return "hold";
+  // a change to a file outside the worktree is the person's to approve, whatever the policy says; a
+  // link out of it, in the path or on the way, puts the file outside
+  const root = realPathOf(cwd);
+  if (call.targets.some((path) => outside(root, realPathOf(path))))
+    return "hold";
   const outcomes = call.targets.map((path) =>
     policyOutcome(
       config.approvalPolicy,
@@ -1122,7 +1178,7 @@ export async function runPiSession(
     const piHome = piHomeOf(sessionEnv);
     const agentDir = join(piHome, "agent");
     const sessionDir = join(piHome, "sessions");
-    mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+    cleanAgentDir(agentDir);
     mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
     writeWhole(
       join(agentDir, "settings.json"),
@@ -1142,9 +1198,7 @@ export async function runPiSession(
     // skills the environment's setup installed; a directory that isn't there is skipped, with a warning
     const skills: string[] = [];
     for (const dir of config.piSkills ?? []) {
-      const path = resolve(
-        dir.startsWith("~/") ? join(home, dir.slice(2)) : dir,
-      );
+      const path = resolve(skillPath(dir, home));
       if (existsSync(path) && statSync(path).isDirectory()) skills.push(path);
       else warning(`pi skill directory ${dir} is not there; skipped`);
     }
