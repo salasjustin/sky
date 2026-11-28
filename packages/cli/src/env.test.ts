@@ -110,9 +110,7 @@ test("a switch whose response names an unknown runtime prints it, and an unset o
   expect(r.stdout).toBe("env_1 ready acme/web web\nruntime: gemini-cli\n");
   // an environment with no runtime, or a null one, still reads as the default
   server.use(
-    http.get(`${apiUrl}/v1/environments/env_1`, () =>
-      HttpResponse.json(web),
-    ),
+    http.get(`${apiUrl}/v1/environments/env_1`, () => HttpResponse.json(web)),
   );
   const unset = await runCli(["env", "show", "env_1"]);
   expect(unset.code).toBe(0);

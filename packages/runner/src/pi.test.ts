@@ -1714,15 +1714,15 @@ describe("runPiSession", () => {
     );
     git(config.repoDir, "fetch", "-q", "origin");
     config.sessionEnv.FAKE_PI_COMMANDS = JSON.stringify([
-      "mkdir out/x",
-      "mkdir inside/x",
+      "mkdir -p out/x",
+      "mkdir -p inside/x",
     ]);
     expect(await run("commands")).toBe(0);
     const asked = ofType("run.waiting").map((e) => e.payload.request);
     expect(asked).toHaveLength(1);
     expect(asked[0]).toMatchObject({
       toolName: "Bash",
-      toolSummary: "mkdir out/x",
+      toolSummary: "mkdir -p out/x",
     });
     const inside = ofType("claude.PreToolUse").find(
       (e) => e.payload.toolUseId === "t1",
