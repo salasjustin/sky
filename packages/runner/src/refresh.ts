@@ -1,4 +1,13 @@
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  closeSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EnvRefresh } from "@sky/shared";
@@ -154,8 +163,8 @@ const WRAPPER = 'exec >>"$1" 2>&1 && eval "$2"';
  * the session (a child that leaves the group, by `setsid`, `set -m` or daemonizing itself, escapes
  * both). It holds `lockFile`, a sibling of the
  * plugin refresh's lock, so two runs on a sprite never run two scripts into one Codex home at once;
- * the wait counts against the budget, and a run that waited on another's script skips its own, the
- * holder having just run it: `skipped`. Its output goes to `logFile` only; the record's `tail`
+ * the wait counts against the budget, and a run that waited on another's script skips its own,
+ * as `skipped`, only when the holder ran this same script to an end; otherwise it runs its own. Its output goes to `logFile` only; the record's `tail`
  * is the end of it, redacted.
  */
 export async function runEnvRefresh(options: {
@@ -202,7 +211,32 @@ export async function runEnvRefresh(options: {
   const lockFile = options.lockFile ?? join(tmpdir(), "sky-env-refresh.lock");
   // what the script did, set by the task under the lock
   let result: EnvRefresh | undefined;
+  // which script the last holder ran to an end: a run that waited on another skips its own only when
+  // that was this same script, since the script can change while a run is going
+  const ranFile = `${lockFile}.sha256`;
+  const scriptHash = createHash("sha256").update(script).digest("hex");
+  let sameAsHolder = false;
   const task = async () => {
+    // an earlier run's note goes first, so a script cut or stopped here leaves none behind
+    try {
+      unlinkSync(ranFile);
+    } catch {}
+    await runScript();
+    if (result?.outcome === "ran" || result?.outcome === "failed") {
+      try {
+        writeFileSync(ranFile, scriptHash, { mode: 0o600 });
+      } catch {}
+    }
+  };
+  const afterHolder = async () => {
+    let ran = "";
+    try {
+      ran = readFileSync(ranFile, "utf8").trim();
+    } catch {}
+    if (ran === scriptHash) sameAsHolder = true;
+    else await task();
+  };
+  const runScript = async () => {
     try {
       // the file is the runner's user's alone, made before the shell appends to it
       closeSync(openSync(logFile, "a", 0o600));
@@ -247,8 +281,11 @@ export async function runEnvRefresh(options: {
     }
   };
   try {
-    const outcome = await withRefreshLock(lockFile, signal, task);
-    if (outcome === "done-by-holder") {
+    const outcome = await withRefreshLock(lockFile, signal, task, afterHolder);
+    if (
+      outcome === "done-by-holder" ||
+      (outcome === "after-holder" && sameAsHolder)
+    ) {
       warn(
         `runner: env refresh skipped, another run ran it (waited ${seconds(now() - started)}s)`,
       );

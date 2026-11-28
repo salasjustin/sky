@@ -97,8 +97,9 @@ const help = (io: Io) => `Usage:
       Set the script every run of the environment runs first (see Per-run
       refresh in the README), without a whole env.yaml: @file reads it from
       a file, - from stdin; an empty one clears it. Never reprovisions, and
-      is allowed while agents exist; refused while a run is active. Needs
-      the admin key.
+      is allowed while agents exist and while a run is active: a run keeps
+      the script it started with, and runs launched later get the new one.
+      Needs the admin key.
   sky claude-credentials [options]
       Print "<name> <subscription|api-key>
       <limited-until=<time>|out-of-credit|-> <runs today> <env ids|->
