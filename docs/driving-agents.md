@@ -109,7 +109,7 @@ sky deny    agt_… req_… --reason="not on production"
 
 Put the answer after `--`, so one starting with `-` (`- staging`, `-1`) isn't read as an option; options such as `--json` go before it. `approve` also takes `--reason=`, which is recorded with the decision and passed to the agent as a note.
 
-Approvals look the same whichever runtime the environment runs on. A Codex or pi run opens the same request, with the real command or file, and a denial's `--reason` reaches the agent as well: on Claude Code and pi as the refused call's own result, on Codex as a message that follows it.
+A held call's request looks the same whichever runtime the environment runs on, though Codex and pi runs ask on unquoted globs and `grep -r` where Claude Code runs don't. A Codex or pi run opens the same request, with the real command or file, and a denial's `--reason` reaches the agent as well: on Claude Code and pi as the refused call's own result, on Codex as a message that follows it.
 
 An approved held call runs. If Claude Code still turns it down because a hook on the sprite refuses it, the run gets a `runner.warning` event naming the tool, the call id and the refusal, so a call that never ran is not a silent one. kru's lead-contract hook is off in every run, so it never blocks an approved call.
 
