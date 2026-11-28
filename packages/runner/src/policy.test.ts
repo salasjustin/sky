@@ -1,5 +1,15 @@
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import type { AutoApprove, AutoApproveScope } from "@sky/shared";
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test } from "vitest";
 import { matchesPolicy, policyOutcome } from "./policy.js";
 
 test.each([
@@ -163,5 +173,74 @@ describe("read-only Bash commands skip a bare Bash hold", () => {
     expect(policyOutcome(["Bash"], on, { root }, "Bash", { command: 1 })).toBe(
       "hold",
     );
+  });
+});
+
+describe("globs and recursive grep against a real worktree", () => {
+  const on: AutoApprove = { defaults: true, commands: [] };
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true });
+  });
+  const worktree = (files: string[]) => {
+    const root = realpathSync.native(
+      mkdtempSync(join(tmpdir(), "sky-policy-")),
+    );
+    dirs.push(root);
+    for (const file of files) {
+      mkdirSync(dirname(join(root, file)), { recursive: true });
+      writeFileSync(join(root, file), "x");
+    }
+    // hooks like the ones the runner wires into a session
+    const scope: AutoApproveScope = {
+      root,
+      realpath: realpathSync.native,
+      readDir: (path) =>
+        readdirSync(path, { withFileTypes: true }).map((e) => ({
+          name: e.name,
+          kind: e.isSymbolicLink()
+            ? "symlink"
+            : e.isDirectory()
+              ? "dir"
+              : e.isFile()
+                ? "file"
+                : "other",
+        })),
+    };
+    const outcome = (command: string, over: Partial<AutoApproveScope> = {}) =>
+      policyOutcome(["Bash"], on, { ...scope, ...over }, "Bash", { command });
+    return { root, outcome };
+  };
+
+  test("a glob and grep -r over files the worktree may read skip the hold", () => {
+    const { outcome } = worktree(["src/a.ts", "src/b.ts", "docs/a.md"]);
+    expect(outcome("wc -l src/*.ts")).toBe("auto-approved");
+    expect(outcome("cat docs/*.md | head -n 20")).toBe("auto-approved");
+    expect(outcome("grep -rn foo src")).toBe("auto-approved");
+  });
+
+  test("one match or file that names a secret holds the call", () => {
+    const { outcome } = worktree(["src/a.ts", ".env.local", "src/id_rsa"]);
+    expect(outcome("cat .e*")).toBe("hold");
+    expect(outcome("cat src/*")).toBe("hold");
+    expect(outcome("grep -rn foo src")).toBe("hold");
+    expect(outcome("grep -r foo .")).toBe("hold");
+  });
+
+  test("a glob in a write holds the call", () => {
+    const { outcome } = worktree(["src/a.ts"]);
+    expect(outcome("sed -i 's/a/b/' src/*.ts")).toBe("hold");
+    expect(outcome("biome format --write src/*.ts")).toBe("hold");
+  });
+
+  test("without the directory hook, or when it throws, the call is held", () => {
+    const { outcome } = worktree(["src/a.ts"]);
+    expect(outcome("wc -l src/*.ts", { readDir: undefined })).toBe("hold");
+    expect(outcome("grep -rn foo src", { readDir: undefined })).toBe("hold");
+    const broken = () => {
+      throw new Error("EIO");
+    };
+    expect(outcome("wc -l src/*.ts", { readDir: broken })).toBe("hold");
+    expect(outcome("grep -rn foo src", { readDir: broken })).toBe("hold");
   });
 });

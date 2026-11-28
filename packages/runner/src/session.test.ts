@@ -51,6 +51,7 @@ import { repoLockPath } from "./repo-lock.js";
 import { createDecisionWaiter } from "./requests.js";
 import type { Seal } from "./seal.js";
 import {
+  commandDirEntries,
   NO_ANSWER,
   nestedClaude,
   type QueryFn,
@@ -8305,6 +8306,57 @@ describe("the run's scratch directory on disk", () => {
   });
 });
 
+describe("the command approver's directory listing", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "dir-entries-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("names each entry as lstat sees it, a link to a directory as a link", () => {
+    writeFileSync(join(dir, "a.ts"), "a");
+    mkdirSync(join(dir, "src"));
+    symlinkSync(join(dir, "src"), join(dir, "link"));
+    const entries = commandDirEntries(dir).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    );
+    expect(entries).toEqual([
+      { name: "a.ts", kind: "file" },
+      { name: "link", kind: "symlink" },
+      { name: "src", kind: "dir" },
+    ]);
+  });
+
+  test("throws on a name that isn't UTF-8, so a glob over it asks", (context) => {
+    writeFileSync(join(dir, "a.ts"), "a");
+    const outside = join(tmpdir(), "outside-secret");
+    try {
+      symlinkSync(
+        outside,
+        Buffer.concat([Buffer.from(`${dir}/`), Buffer.from([0xff])]),
+      );
+    } catch {
+      return context.skip(
+        "this filesystem refuses a name that isn't valid UTF-8",
+      );
+    }
+    expect(() => commandDirEntries(dir)).toThrow("isn't UTF-8");
+    expect(
+      autoApproveVerdict(
+        "cat *",
+        { defaults: true, commands: [] },
+        {
+          root: realpathSync.native(dir),
+          realpath: realpathSync.native,
+          readDir: commandDirEntries,
+        },
+      ),
+    ).toBe("syntax");
+  });
+});
+
 describe("the instructions on commands that run without a person", () => {
   const withPolicy = async (
     approvalPolicy: string[],
@@ -8355,14 +8407,44 @@ describe("the instructions on commands that run without a person", () => {
     );
   });
 
+  // a worktree and home of its own with the runner's directory hooks, since a glob and `grep -r`
+  // are judged by what they reach
+  const exampleScope = (storeHome: string | undefined) => {
+    const base = realpathSync.native(
+      mkdtempSync(join(tmpdir(), "quiet-commands-")),
+    );
+    cleanups.push(() => rmSync(base, { recursive: true, force: true }));
+    const root = join(base, "worktree");
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "a.ts"), "a");
+    const home = join(base, "home");
+    mkdirSync(join(home, ".claude", "plugins", "cache"), { recursive: true });
+    if (storeHome) {
+      mkdirSync(join(home, storeHome, "plans"), { recursive: true });
+      writeFileSync(join(home, storeHome, "plans", "x.md"), "x");
+    }
+    return {
+      root,
+      realpath: realpathSync.native,
+      readDir: commandDirEntries,
+      home,
+      storeHome,
+    };
+  };
+  const cleanups: (() => void)[] = [];
+  afterEach(() => {
+    for (const cleanup of cleanups.splice(0)) cleanup();
+  });
+
   test("recommend only commands that run without a person", () => {
     const examples = [...quietCommands(".kru").matchAll(/\(`([^`]+)`\)/g)].map(
       (m) => m[1] ?? "",
     );
     expect(examples).toEqual([
       "grep -n 'a\\|b' file",
+      "wc -l src/*.ts",
+      "grep -rn foo src",
       "rg -n foo src",
-      "rg -t ts foo src",
       "ls ~/.claude/plugins/cache",
       "cat ~/.kru/plans/x.md",
     ]);
@@ -8371,7 +8453,7 @@ describe("the instructions on commands that run without a person", () => {
         autoApproveVerdict(
           command,
           { defaults: true, commands: [] },
-          { root: "/work/repo", home: "/home/sprite", storeHome: ".kru" },
+          exampleScope(".kru"),
         ),
         command,
       ).toBe("approved");
@@ -8395,7 +8477,7 @@ describe("the instructions on commands that run without a person", () => {
         autoApproveVerdict(
           command,
           { defaults: true, commands: [] },
-          { root: "/work/repo", home: "/home/sprite", storeHome: undefined },
+          exampleScope(undefined),
         ),
         command,
       ).toBe("approved");

@@ -71,6 +71,8 @@ type Operator = ";" | "&&" | "||" | "|";
  * one of the harmless ones `lex` lets through. `ref` is the variable a word starts with (`$S/a`
  * is `ref: "S"`, `word: "/a"`), `status` a word holding `$?`, and `plainName` a word whose text
  * up to its first `=` had no quote, so it is an assignment when it has a name and a value.
+ * `glob` is a word with an unquoted `*`, `?` or `[class]` that `validGlob` accepted; the approver
+ * expands it itself (`expandGlobs`) before judging the command.
  */
 type Token =
   | {
@@ -81,6 +83,7 @@ type Token =
       ref?: string;
       status: boolean;
       plainName: boolean;
+      glob: boolean;
     }
   | { op: Operator }
   | { redirect: true };
@@ -109,7 +112,9 @@ const TAKES_LITERALS = new Set([
 ]);
 
 // Outside quotes these either chain, redirect, substitute, expand or comment; inside quotes they are literal.
-const UNQUOTED_SPECIAL = /[;&|<>()*?[\]{}#]/;
+const UNQUOTED_SPECIAL = /[;&|<>(){}#]/;
+// glob characters outside quotes; `validGlob` decides which words with them the approver can expand
+const GLOB_CHAR = /[*?[\]]/;
 // Expand or escape even inside double quotes, so they are refused outside single quotes, except
 // a backslash in double quotes that bash keeps as is.
 const EXPANDING = /[$`\\!]/;
@@ -134,6 +139,7 @@ function lex(command: string): Token[] | undefined {
   let ref: string | undefined;
   let status = false;
   let quotedName = false;
+  let glob = false;
   let quote: string | undefined;
   // a word with brace groups: the alternatives of each finished segment, and the group still open
   let parts: string[][] = [];
@@ -147,6 +153,7 @@ function lex(command: string): Token[] | undefined {
     ref = undefined;
     status = false;
     quotedName = false;
+    glob = false;
     parts = [];
   };
   /** False when the word's braces don't make a plain `{a,b}` expansion. */
@@ -162,6 +169,19 @@ function lex(command: string): Token[] | undefined {
     // tilde and zsh's `=` expansion run after brace expansion, and an empty word vanishes
     if (braced && words.some((w) => w === "" || /^[~=]/.test(w))) return false;
     if (braced && (ref !== undefined || status)) return false;
+    // a glob is expanded after the other expansions, so a word that has any of them, a quote
+    // (which could sit inside a class) or a brace group asks
+    if (
+      glob &&
+      (braced ||
+        tilde ||
+        quoted ||
+        literal ||
+        ref !== undefined ||
+        status ||
+        !validGlob(text))
+    )
+      return false;
     for (const word of words)
       tokens.push({
         word,
@@ -171,6 +191,7 @@ function lex(command: string): Token[] | undefined {
         ref,
         status,
         plainName: !quotedName,
+        glob,
       });
     dropWord();
     return true;
@@ -271,6 +292,10 @@ function lex(command: string): Token[] | undefined {
       if (!group || group.length < 2) return undefined;
       parts.push(group);
       group = undefined;
+    } else if (GLOB_CHAR.test(ch)) {
+      if (group) return undefined;
+      glob = true;
+      append(ch);
     } else if (UNQUOTED_SPECIAL.test(ch)) {
       return undefined;
     } else {
@@ -299,6 +324,8 @@ type Step = {
   tilde: boolean[];
   /** Per word: the variable it starts with, until `parsePipelines` has put the value in. */
   refs: (string | undefined)[];
+  /** Per word: it holds an unquoted glob the approver expands. */
+  globs: boolean[];
   piped: boolean;
   literal: boolean;
   /** A word holds `$?`. */
@@ -316,7 +343,7 @@ type Pipeline = { steps: Step[]; after?: Exclude<Operator, "|"> };
 const PLAIN_VALUE = /^[A-Za-z0-9_./@%+,:-][A-Za-z0-9_./@%+,:=-]*$/;
 // names the shell, the toolchain or the runner read from the environment: `PATH=… ls` runs another ls
 const SPECIAL_VARIABLE =
-  /^(PATH|HOME|IFS|CDPATH|ENV|SHELL|PWD|OLDPWD|USER|LOGNAME|TMPDIR|TERM|EDITOR|VISUAL|PAGER|PS\d|PROMPT.*|BASH.*|ZSH.*|ZDOTDIR|FPATH|FIGNORE|GLOBIGNORE|HIST.*|LANG|LC_.*|LD_.*|DYLD_.*|NODE.*|NPM_.*|PNPM_.*|GIT_.*|SSH_.*|GH_.*|GITHUB_.*|SKY_.*|CLAUDE.*|ANTHROPIC.*|.*PROXY|XDG_.*|SUDO.*|PYTHON.*|TZ|TIMEFMT|MANPATH|CC|CXX|CFLAGS|LDFLAGS)$/i;
+  /^(PATH|HOME|IFS|CDPATH|ENV|SHELL|PWD|OLDPWD|USER|LOGNAME|TMPDIR|TERM|EDITOR|VISUAL|PAGER|PS\d|PROMPT.*|BASH.*|ZSH.*|ZDOTDIR|FPATH|FIGNORE|GLOBIGNORE|GLOBSORT|HIST.*|LANG|LC_.*|LD_.*|DYLD_.*|NODE.*|NPM_.*|PNPM_.*|GIT_.*|SSH_.*|GH_.*|GITHUB_.*|SKY_.*|CLAUDE.*|ANTHROPIC.*|.*PROXY|XDG_.*|SUDO.*|PYTHON.*|TZ|TIMEFMT|MANPATH|CC|CXX|CFLAGS|LDFLAGS)$/i;
 // names bash or zsh sets on its own or ignores an assignment to, so a later `$NAME` doesn't read
 // what the command wrote: `$_` is the previous command's last argument, `FUNCNAME=src` has no effect
 const SHELL_SET_VARIABLE =
@@ -352,6 +379,7 @@ function splitHeredoc(
     word.literal ||
     word.braced ||
     word.tilde ||
+    word.glob ||
     word.status
   )
     return undefined;
@@ -376,6 +404,7 @@ function parsePipelines(command: string): Pipeline[] | undefined {
     words: [],
     tilde: [],
     refs: [],
+    globs: [],
     piped,
     literal: false,
     status: false,
@@ -394,6 +423,7 @@ function parsePipelines(command: string): Pipeline[] | undefined {
       step.words.push(token.word);
       step.tilde.push(token.tilde);
       step.refs.push(token.ref);
+      step.globs.push(token.glob);
       step.literal ||= token.literal;
       step.status ||= token.status;
     } else if (step.words.length === 0) return undefined;
@@ -447,6 +477,7 @@ function parsePipelines(command: string): Pipeline[] | undefined {
       vars.set(assignment[1] ?? "", assignment[2] ?? "");
       only.words = ["true"];
       only.tilde = [false];
+      only.globs = [false];
     }
   }
   return pipelines;
@@ -458,7 +489,8 @@ export function parseCommandEntry(entry: string): string[] | undefined {
   if (!tokens || tokens.length === 0) return undefined;
   const words = tokens.flatMap((t) => ("word" in t ? [t.word] : []));
   const tilde = tokens.some(
-    (t) => "tilde" in t && (t.tilde || t.status || t.ref !== undefined),
+    (t) =>
+      "tilde" in t && (t.tilde || t.status || t.glob || t.ref !== undefined),
   );
   return !tilde &&
     words.length === tokens.length &&
@@ -1120,13 +1152,16 @@ function guard(words: string[], complete = true, piped = false): boolean {
     case "wc":
       // `--files0-from` reads the paths to count from a file; getopt takes any prefix down to `--f`
       return !args.some((a) => a.startsWith("--f"));
-    case "grep":
-      // recursing reads dotfiles such as `.env` without naming them
-      return !args.some(
+    case "grep": {
+      const refused = args.some(
         (a) =>
           /^-[A-Za-z0-9]*[rRd]/.test(a) ||
           (a.startsWith("--") && a !== "--" && !GREP_LONG.test(a)),
       );
+      // `-r` and `--recursive` are left to `walkVerdict`, which checks every file they reach;
+      // the other ways to recurse, and the options that change what is reached, ask
+      return !refused || grepRecursion(args)?.recursive === true;
+    }
     case "rg": {
       const rest = rgArgs(args);
       return rest !== undefined && !rest.some((a) => RG_UNSAFE.test(a));
@@ -1212,6 +1247,349 @@ function guard(words: string[], complete = true, piped = false): boolean {
   }
 }
 
+/** How many matches one command's globs may expand to, entries its globs may list, and entries a `grep -r` may walk, before it asks. */
+const MAX_GLOB_MATCHES = 2000;
+const MAX_GLOB_ENTRIES = 50_000;
+const MAX_WALK_ENTRIES = 5000;
+
+/**
+ * What a directory holds, each entry with its own kind (a link is `symlink`, never what it points
+ * to); `other` is a device, socket or pipe.
+ */
+export type DirEntry = {
+  name: string;
+  kind: "file" | "dir" | "symlink" | "other";
+};
+
+/** The parts of one glob segment: a literal run, `*`, `?` or a set of characters. */
+type GlobPart =
+  | { lit: string }
+  | { any: true }
+  | { one: true }
+  | { set: string };
+
+/** A class holds plain characters only: a range, `!`, `^` or a nested class would match what the text doesn't say. */
+const CLASS_BODY = /^[A-Za-z0-9_.@%+,:=]+$/;
+
+/** The parts of a glob segment (no `/`), or undefined on a class this doesn't read or a stray `]`. */
+function globParts(segment: string): GlobPart[] | undefined {
+  const parts: GlobPart[] = [];
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i] ?? "";
+    if (ch === "*") parts.push({ any: true });
+    else if (ch === "?") parts.push({ one: true });
+    else if (ch === "[") {
+      const end = segment.indexOf("]", i + 1);
+      const body = end < 0 ? "" : segment.slice(i + 1, end);
+      if (!CLASS_BODY.test(body)) return undefined;
+      parts.push({ set: body });
+      i = end;
+    } else if (ch === "]") return undefined;
+    else {
+      const last = parts.at(-1);
+      if (last && "lit" in last) last.lit += ch;
+      else parts.push({ lit: ch });
+    }
+  }
+  return parts;
+}
+
+const isGlobSegment = (parts: GlobPart[]) => parts.some((p) => !("lit" in p));
+
+const escapeRegex = (text: string) =>
+  text.replace(/[\\^$.*+?()[\]{}|/-]/g, "\\$&");
+
+/**
+ * Whether the approver can expand this unquoted word the way the shell will: only plain
+ * characters, and `*`, `?` and `[abc]` as the wildcards. `**` (zsh recurses), a range, `!` or `^`
+ * in a class, an empty path segment, a trailing `/`, a word starting with `-` (an option once
+ * expanded) or a name and `=` (an assignment) ask.
+ */
+function validGlob(text: string): boolean {
+  if (!/^[A-Za-z0-9_./@%+,:=*?[\]-]+$/.test(text)) return false;
+  if (text.startsWith("-") || text.includes("**")) return false;
+  if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(text)) return false;
+  const segments = text.split("/");
+  if (text.startsWith("/")) segments.shift();
+  return segments.every((s) => s !== "" && globParts(s) !== undefined);
+}
+
+const errorCode = (error: unknown) =>
+  (error as { code?: unknown } | null)?.code;
+
+const outsideAscii = (name: string) =>
+  [...name].some((c) => c.charCodeAt(0) > 127);
+
+/**
+ * The words of `words` with each glob flagged in `globs` replaced by the paths it matches in
+ * `cwd`, as the shell expands it: no wildcard matches a leading dot unless its path segment starts
+ * with one, nothing matches across `/`, and a glob with no match stays its own text (bash passes
+ * it on, zsh fails the command, and neither reads a file). `from` is the index each result word
+ * came from. Undefined when it can't be sure: an unreadable directory, more than the caps allow,
+ * a match that starts with `-` or holds a control character, a `?` or class in a segment whose
+ * directory lists a name outside ASCII.
+ */
+function expandGlobs(
+  words: string[],
+  globs: boolean[],
+  cwd: string,
+  readDir: (path: string) => DirEntry[],
+): { words: string[]; from: number[] } | undefined {
+  let listed = 0;
+  let matched = 0;
+  const list = (path: string): DirEntry[] | "missing" | undefined => {
+    try {
+      const entries = readDir(path);
+      listed += entries.length;
+      return listed > MAX_GLOB_ENTRIES ? undefined : entries;
+    } catch (error) {
+      const code = errorCode(error);
+      return code === "ENOENT" || code === "ENOTDIR" ? "missing" : undefined;
+    }
+  };
+  const join = (base: string, name: string) =>
+    base === "" || base.endsWith("/") ? base + name : `${base}/${name}`;
+  const expand = (word: string): string[] | undefined => {
+    const segments = word.split("/");
+    let paths = [word.startsWith("/") ? "/" : ""];
+    if (word.startsWith("/")) segments.shift();
+    const lastGlob = segments.findLastIndex((s) => {
+      const parts = globParts(s);
+      return parts !== undefined && isGlobSegment(parts);
+    });
+    for (const [i, segment] of segments.entries()) {
+      const parts = globParts(segment);
+      if (!parts) return undefined;
+      const next: string[] = [];
+      for (const base of paths) {
+        // joined, not resolved: the kernel applies `..` after following a link, so `link/..` lists
+        // the parent of the link's target, as the shell's own expansion does
+        const dir =
+          base === "" ? cwd : base.startsWith("/") ? base : `${cwd}/${base}`;
+        if (!isGlobSegment(parts)) {
+          // a literal after the last wildcard has to exist; `.` and `..` always do
+          if (i > lastGlob && segment !== "." && segment !== "..") {
+            const entries = list(dir);
+            if (entries === undefined) return undefined;
+            if (
+              entries === "missing" ||
+              !entries.some((e) => e.name === segment)
+            )
+              continue;
+          }
+          next.push(join(base, segment));
+          continue;
+        }
+        const entries = list(dir);
+        if (entries === undefined) return undefined;
+        if (entries === "missing") continue;
+        // the shell's `?` and class match a byte in the C locale and a character under UTF-8,
+        // and the regex below a UTF-16 unit, so past ASCII none of them agree on a match
+        if (
+          parts.some((p) => "one" in p || "set" in p) &&
+          entries.some((e) => outsideAscii(e.name))
+        )
+          return undefined;
+        const dotted = segment.startsWith(".");
+        const regex = new RegExp(
+          `^${parts
+            .map((p) =>
+              "lit" in p
+                ? escapeRegex(p.lit)
+                : "any" in p
+                  ? "[^/]*"
+                  : "one" in p
+                    ? "[^/]"
+                    : `[${escapeRegex(p.set)}]`,
+            )
+            .join("")}$`,
+          "s",
+        );
+        // a pattern that starts with `.` also meets `.` and `..`
+        const names = [
+          ...(dotted
+            ? [
+                { name: ".", kind: "dir" as const },
+                { name: "..", kind: "dir" as const },
+              ]
+            : []),
+          ...entries,
+        ];
+        for (const { name, kind } of names) {
+          if (name.startsWith(".") && !dotted) continue;
+          if (!regex.test(name)) continue;
+          // a pipe, socket or device would hang the command or read a device
+          if (kind === "other") return undefined;
+          // a directory, or a link the shell may follow, to go on through
+          if (i < segments.length - 1 && kind !== "dir" && kind !== "symlink")
+            continue;
+          next.push(join(base, name));
+          if (++matched > MAX_GLOB_MATCHES) return undefined;
+        }
+      }
+      paths = next;
+    }
+    return paths.length === 0 ? [word] : paths.sort();
+  };
+  const out: string[] = [];
+  const from: number[] = [];
+  for (const [i, word] of words.entries()) {
+    const expanded = globs[i] ? expand(word) : [word];
+    if (!expanded) return undefined;
+    if (
+      globs[i] &&
+      expanded.some(
+        (w) => w.startsWith("-") || [...w].some((c) => c.charCodeAt(0) < 32),
+      )
+    )
+      return undefined;
+    for (const w of expanded) {
+      out.push(w);
+      from.push(i);
+    }
+  }
+  return { words: out, from };
+}
+
+/** Programs whose arguments a glob may stand in for: plain readers, and `git`'s read subcommands. */
+const GLOB_PROGRAMS = new Set([
+  "ls",
+  "cat",
+  "grep",
+  "rg",
+  "sed",
+  "head",
+  "tail",
+  "wc",
+  "find",
+  "git",
+]);
+const GLOB_GIT = new Set(["status", "log", "diff", "show", "rev-parse"]);
+
+// the short options of GNU grep that `grepRecursion` reads, `-R` and `-d` aside: the ones with
+// no value, and the ones that take one
+const GREP_FLAG_LETTERS = /^[EFGPHhIiLlnoqsUuvwxzabcrTVyZ0-9]$/;
+const GREP_VALUE_LETTERS = /^[efmABCD]$/;
+// long options that take their value as the next word when written without `=`
+const GREP_LONG_VALUE =
+  /^--(regexp|max-count|before-context|after-context|context|binary-files|group-separator|label)$/;
+
+/**
+ * What `grep -r` is asked to read: its file operands, or undefined for any option this doesn't
+ * read exactly (`-R`, `-d`, `-f`, `--file`, `--include`, `--exclude*`, an unlisted long or short
+ * option). No operand after the pattern means it reads the working directory, which the caller
+ * walks. `recursive` says whether `-r` or `--recursive` was given; `fileAt` is the index in
+ * `args` of each file operand.
+ */
+function grepRecursion(
+  args: string[],
+): { recursive: boolean; files: string[]; fileAt: number[] } | undefined {
+  let recursive = false;
+  let patterns = 0;
+  const operands: number[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] ?? "";
+    if (a === "--") {
+      for (let j = i + 1; j < args.length; j++) operands.push(j);
+      break;
+    }
+    if (a.startsWith("--")) {
+      if (a === "--recursive") recursive = true;
+      else if (!GREP_LONG.test(a) || /^--file(=|$)/.test(a)) return undefined;
+      else {
+        if (/^--regexp(=|$)/.test(a)) patterns++;
+        if (GREP_LONG_VALUE.test(a)) i++;
+      }
+    } else if (a.startsWith("-") && a !== "-") {
+      for (let j = 1; j < a.length; j++) {
+        const c = a[j] ?? "";
+        if (c === "r") recursive = true;
+        else if (GREP_VALUE_LETTERS.test(c)) {
+          if (c === "f") return undefined;
+          if (c === "e") patterns++;
+          // the rest of the bundle is the value, or the next word is
+          if (j === a.length - 1) i++;
+          break;
+        } else if (!GREP_FLAG_LETTERS.test(c)) return undefined;
+      }
+    } else operands.push(i);
+  }
+  // the first operand is the pattern unless `-e` or `--regexp` gave one
+  const fileAt = operands.slice(patterns > 0 ? 0 : 1);
+  return { recursive, files: fileAt.map((at) => args[at] ?? ""), fileAt };
+}
+
+/**
+ * Whether a glob in the expanded `words` (`globbed` marks each word a glob gave) fills a place
+ * where the match the shell puts there decides what the command does. The shell sorts matches by
+ * its locale's collation or `GLOBSORT`, not by code unit, so that match may not be the one checked
+ * there: `sed`'s option and script (a file named `1~2e cmd` runs `cmd`), the value of `rg`'s
+ * `-g`, `--glob` or `--iglob`, and under `grep -r` anything but a file operand (a match could
+ * trade places with a directory the walk never sees).
+ */
+function globOutOfPlace(words: string[], globbed: boolean[]): boolean {
+  const [program] = words;
+  if (program === "sed") return globbed.slice(0, 3).some(Boolean);
+  if (program === "rg")
+    return globbed.some(
+      (g, at) => g && ["-g", "--glob", "--iglob"].includes(words[at - 1] ?? ""),
+    );
+  if (program !== "grep") return false;
+  const recursion = grepRecursion(words.slice(1));
+  if (!recursion?.recursive) return false;
+  const files = new Set(recursion.fileAt.map((at) => at + 1));
+  return globbed.some((g, at) => g && !files.has(at));
+}
+
+/**
+ * Whether every file `grep -r` would read below `operands` (the working directory with none) is
+ * one a named path could be: inside `root` after realpath, and not named like a secret. A link met
+ * on the way, a directory it can't list, an entry that isn't a file or directory, or more than
+ * `MAX_WALK_ENTRIES` entries asks. An operand that isn't a directory is no walk; the usual path
+ * checks cover it.
+ */
+function walkVerdict(
+  operands: string[],
+  root: string,
+  cwd: string,
+  realpath: (path: string) => string,
+  readDir: (path: string) => DirEntry[],
+): "approved" | AskReason {
+  try {
+    const realRoot = realpath(root);
+    let seen = 0;
+    for (const operand of operands.length === 0 ? ["."] : operands) {
+      const joined = operand.startsWith("/") ? operand : `${cwd}/${operand}`;
+      try {
+        readDir(joined);
+      } catch (error) {
+        const code = errorCode(error);
+        if (code === "ENOTDIR" || code === "ENOENT") continue;
+        return "unresolvable";
+      }
+      const start = realpath(joined);
+      if (isOutside(posix.relative(realRoot, start))) return "outside-root";
+      const dirs = [start];
+      for (let dir = dirs.pop(); dir !== undefined; dir = dirs.pop()) {
+        for (const { name, kind } of readDir(dir)) {
+          if (++seen > MAX_WALK_ENTRIES) return "unsafe-option";
+          const path = posix.join(dir, name);
+          if (kind === "dir") dirs.push(path);
+          else if (kind !== "file") return "unsafe-option";
+          else {
+            const rel = posix.relative(realRoot, path);
+            if (namesSecret(rel, CLAUDE_READABLE.test(rel)))
+              return "sensitive-path";
+          }
+        }
+      }
+    }
+    return "approved";
+  } catch {
+    return "unresolvable";
+  }
+}
+
 /**
  * Why an allowlist entry could never match a command, or undefined when one could. Whichever
  * entry allows a command, pnpm canonicalisation and the per-program checks still run, so an
@@ -1274,6 +1652,16 @@ export type AutoApproveScope = {
    * doesn't exist yet asks when it, or a parent on the way, is one that leads nowhere yet.
    */
   isSymlink?: (path: string) => boolean;
+  /**
+   * The entries of a directory, each with its own kind: a link is `symlink`, never what it points
+   * to (`fs.readdirSync` with `withFileTypes` fits; Node takes the kind from the directory listing,
+   * and lstats an entry only when the listing has none). It throws, with the code `ENOENT` or
+   * `ENOTDIR` for a path that isn't a directory. With it, an unquoted glob in a read-only command
+   * is expanded and each match checked like a named path, and `grep -r` walks the directories it
+   * names (the working directory when it names none); without it both ask, and both also ask
+   * without `realpath`, which tells where a match's links lead.
+   */
+  readDir?: (path: string) => DirEntry[];
   /**
    * The run's scratch directory, an absolute path. Commands may read and write it as they do the
    * worktree, but it is never the shell's working directory.
@@ -1403,6 +1791,7 @@ function stepVerdict(
     cwd = root,
     realpath,
     isSymlink,
+    readDir,
     home,
     storeHome,
     scratch,
@@ -1420,9 +1809,52 @@ function stepVerdict(
         words: step.words.slice(wrapped),
         tilde: step.tilde.slice(wrapped),
         refs: step.refs.slice(wrapped),
+        globs: step.globs.slice(wrapped),
       },
       autoApprove,
-      { root, cwd, realpath, isSymlink, home, storeHome, scratch },
+      { root, cwd, realpath, isSymlink, readDir, home, storeHome, scratch },
+    );
+  }
+  if (step.globs.some(Boolean)) {
+    const [program = "", sub] = raw;
+    // a glob keeps asking as the program, for a program off `GLOB_PROGRAMS` (`cd` among them),
+    // in anything that writes, and where git names its subcommand
+    if (
+      step.globs[0] ||
+      !readDir ||
+      !realpath ||
+      !GLOB_PROGRAMS.has(program) ||
+      (program === "git" && (step.globs[1] || !GLOB_GIT.has(sub ?? ""))) ||
+      writes(raw, step)
+    )
+      return "syntax";
+    // the words as written, not `raw`: the call below expands each `~` once
+    const expanded = (() => {
+      try {
+        return expandGlobs(step.words, step.globs, cwd, readDir);
+      } catch {
+        return undefined;
+      }
+    })();
+    if (
+      !expanded ||
+      globOutOfPlace(
+        expanded.words,
+        expanded.from.map((src) => step.globs[src] === true),
+      )
+    )
+      return "syntax";
+    // every match is now a word like any other, checked below
+    return stepVerdict(
+      {
+        ...step,
+        words: expanded.words,
+        tilde: expanded.from.map((i) => step.tilde[i] ?? false),
+        refs: expanded.from.map(() => undefined),
+        globs: expanded.words.map(() => false),
+      },
+      autoApprove,
+      { root, cwd, realpath, isSymlink, readDir, home, storeHome, scratch },
     );
   }
   const first = raw[0] ?? "";
@@ -1500,9 +1932,15 @@ function stepVerdict(
     if (namesSecret(text, allowClaude) || namesSecret(collapsed, allowClaude))
       return "sensitive-path";
   }
-  return realpath
+  const checked = realpath
     ? resolvedVerdict(targets, roots, cwd, realpath, false, write, isSymlink)
     : "approved";
+  if (checked !== "approved" || first !== "grep") return checked;
+  const recursion = grepRecursion(words.slice(1));
+  if (!recursion?.recursive) return checked;
+  return realpath && readDir
+    ? walkVerdict(recursion.files, root, cwd, realpath, readDir)
+    : "unsafe-option";
 }
 
 /** The first of `roots` that holds `path`, which is already resolved. */
