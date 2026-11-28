@@ -244,8 +244,9 @@ test("a refusal from records lists every agent that has run as unknown, says the
   const r = await runCli(["env", "rebuild", "web", "--yes"]);
   expect(r.code).toBe(1);
   expect(r.stderr).toContain(
-    "agt_a (claude/agt_a): commits and uncommitted changes unknown (the sprite couldn't be read)",
+    "agt_a (claude/agt_a): commits and uncommitted changes unknown",
   );
+  expect(r.stderr).not.toContain("couldn't be read");
   expect(r.stderr).toContain(
     "could not read the sprite (503 Storage not ready), so every agent that has run is listed: each may hold commits or uncommitted changes there that no one could see",
   );

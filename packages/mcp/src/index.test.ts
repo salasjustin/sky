@@ -1306,6 +1306,11 @@ test("rebuild_env passes on the rebuildCheck an accepted rebuild that only read 
   expect(textOf(result)).toEqual(env);
   const tool = tools.find((t) => t.name === "rebuild_env");
   expect(tool?.description).toMatch(/rebuildCheck/);
+  expect(tool?.description).toMatch(/records, with unreachable saying why/);
+  expect(tool?.description).toMatch(/every unarchived agent that has had a run/);
+  expect(tool?.description).toMatch(
+    /uncommitted, unpublishedCommits and neverPublished null/,
+  );
 });
 
 test("rebuild_env hands back the refusal that names the work at risk", async () => {

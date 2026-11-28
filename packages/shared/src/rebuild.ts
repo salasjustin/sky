@@ -50,9 +50,7 @@ const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
 export function describeUnpublished(agent: UnpublishedAgent): string {
   const parts: string[] = [];
   if (agent.uncommitted === null && agent.unpublishedCommits === null) {
-    parts.push(
-      "commits and uncommitted changes unknown (the sprite couldn't be read)",
-    );
+    parts.push("commits and uncommitted changes unknown");
   } else {
     if (agent.uncommitted) {
       parts.push(plural(agent.uncommitted, "uncommitted file"));
