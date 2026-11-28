@@ -8355,14 +8355,41 @@ describe("the instructions on commands that run without a person", () => {
     );
   });
 
+  // a worktree of its own with real directory hooks, since a glob and `grep -r` are judged by what they reach
+  const exampleScope = () => {
+    const root = realpathSync.native(
+      mkdtempSync(join(tmpdir(), "quiet-commands-")),
+    );
+    mkdirSync(join(root, "src"));
+    writeFileSync(join(root, "src", "a.ts"), "a");
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    return {
+      root,
+      realpath: realpathSync.native,
+      readDir: (path: string) =>
+        readdirSync(path, { withFileTypes: true }).map((e) => ({
+          name: e.name,
+          kind: e.isSymbolicLink()
+            ? ("symlink" as const)
+            : e.isDirectory()
+              ? ("dir" as const)
+              : ("file" as const),
+        })),
+    };
+  };
+  const cleanups: (() => void)[] = [];
+  afterEach(() => {
+    for (const cleanup of cleanups.splice(0)) cleanup();
+  });
+
   test("recommend only commands that run without a person", () => {
     const examples = [...quietCommands(".kru").matchAll(/\(`([^`]+)`\)/g)].map(
       (m) => m[1] ?? "",
     );
     expect(examples).toEqual([
       "grep -n 'a\\|b' file",
-      "rg -n foo src",
-      "rg -t ts foo src",
+      "wc -l src/*.ts",
+      "grep -rn foo src",
       "ls ~/.claude/plugins/cache",
       "cat ~/.kru/plans/x.md",
     ]);
@@ -8371,7 +8398,7 @@ describe("the instructions on commands that run without a person", () => {
         autoApproveVerdict(
           command,
           { defaults: true, commands: [] },
-          { root: "/work/repo", home: "/home/sprite", storeHome: ".kru" },
+          { ...exampleScope(), home: "/home/sprite", storeHome: ".kru" },
         ),
         command,
       ).toBe("approved");
@@ -8395,7 +8422,7 @@ describe("the instructions on commands that run without a person", () => {
         autoApproveVerdict(
           command,
           { defaults: true, commands: [] },
-          { root: "/work/repo", home: "/home/sprite", storeHome: undefined },
+          { ...exampleScope(), home: "/home/sprite", storeHome: undefined },
         ),
         command,
       ).toBe("approved");

@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import {
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
 import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, posix } from "node:path";
@@ -371,7 +377,7 @@ export const quietCommands = (storeHome: string | undefined): string => {
   const store = storeHome && posix.normalize(storeHome).replace(/\/+$/, "");
   return [
     "Most plain single commands in the worktree, one per Bash call, run without waiting on a person; pushes, network tools and commands that touch secret paths still wait, and a call that chains many commands, substitutes or redirects output may wait. Make file edits with the Edit or Write tools rather than through the shell: they usually don't wait, though an environment's policy can hold them. A person reading a held Bash command sees only its first 2,000 characters, so write long text to a file with Write and pass the file's path instead. ",
-    "To avoid waiting on a person, write read-only shell commands in the forms that run on their own: single-quoted patterns (`grep -n 'a\\|b' file`); `rg` instead of `grep -r` (`rg -n foo src`); file names, a directory or a type filter instead of shell globs (`rg -t ts foo src`); and paths inside the worktree, the plugin cache under `~/.claude/plugins/cache/` (`ls ~/.claude/plugins/cache`)",
+    "To avoid waiting on a person, write read-only shell commands in the forms that run on their own: single-quoted patterns (`grep -n 'a\\|b' file`); unquoted globs for `ls`, `cat`, `head`, `tail`, `wc`, `sed -n`, `grep`, `rg`, `find` and read-only `git` (`wc -l src/*.ts`), expanded and checked match by match like named paths, so a match that is a link out of the worktree or a secret such as `.env*` asks, and so do `**`, braces, `!`, `^` or a range in a class, a glob in a `cd` or a command that writes, and more than 2,000 matches; `grep -r` or `--recursive` on directories in the worktree (`grep -rn foo src`), the working directory when none is named, which asks on any link, secret-named file, directory it can't list or more than 5,000 entries, and on `-R`, `-d`, `-f`, `--include` and `--exclude*`; and paths inside the worktree, the plugin cache under `~/.claude/plugins/cache/` (`ls ~/.claude/plugins/cache`)",
     store
       ? ` and the store under \`~/${store}/\` (\`cat ~/${store}/plans/x.md\`). The Read, Grep and Glob tools read the plugin cache and the store without asking too.`
       : `. The Read, Grep and Glob tools read the plugin cache without asking too.`,
@@ -1006,6 +1012,18 @@ export async function runSession(
         return false;
       }
     },
+    // `withFileTypes` reports each entry as `lstat` would: a link is a link, never what it points to
+    readDir: (path) =>
+      readdirSync(path, { withFileTypes: true }).map((entry) => ({
+        name: entry.name,
+        kind: entry.isSymbolicLink()
+          ? "symlink"
+          : entry.isDirectory()
+            ? "dir"
+            : entry.isFile()
+              ? "file"
+              : "other",
+      })),
     home: claudeHome,
     storeHome: config.storeHome,
     ...(scratch && { scratch }),

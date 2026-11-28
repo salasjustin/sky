@@ -1,6 +1,8 @@
 import {
+  type Dirent,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -12,7 +14,9 @@ import { afterAll, describe, expect, test } from "vitest";
 import {
   type AskReason,
   type AutoApprove,
+  type AutoApproveScope,
   autoApproveVerdict,
+  type DirEntry,
   extraRoots,
   isAutoApproved,
   parseCommandEntry,
@@ -1561,5 +1565,352 @@ describe("a backslash in double quotes", () => {
     // `\-g` is a pattern, not rg's `-g`
     expect(verdict('rg "\\-g" src')).toBe("approved");
     expect(verdict('rg "-g" src')).toBe("unsafe-option");
+  });
+});
+
+describe("unquoted globs and recursive grep, judged by the files they reach", () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const kindOf = (e: Dirent): DirEntry["kind"] =>
+    e.isSymbolicLink()
+      ? "symlink"
+      : e.isDirectory()
+        ? "dir"
+        : e.isFile()
+          ? "file"
+          : "other";
+  const readDir = (path: string): DirEntry[] =>
+    readdirSync(path, { withFileTypes: true }).map((e) => ({
+      name: e.name,
+      kind: kindOf(e),
+    }));
+
+  /** A worktree holding `files` and `links` (name → target, relative to the link or absolute), beside an `outside` directory with a file in it. */
+  const tree = (files: string[], links: Record<string, string> = {}) => {
+    const base = realpathSync.native(
+      mkdtempSync(join(tmpdir(), "auto-approve-glob-")),
+    );
+    dirs.push(base);
+    const root = join(base, "wt");
+    mkdirSync(join(base, "outside"));
+    writeFileSync(join(base, "outside", "x.txt"), "x");
+    mkdirSync(root);
+    for (const file of files) {
+      mkdirSync(dirname(join(root, file)), { recursive: true });
+      writeFileSync(join(root, file), "x");
+    }
+    for (const [name, target] of Object.entries(links)) {
+      mkdirSync(dirname(join(root, name)), { recursive: true });
+      symlinkSync(
+        target.replace("$OUT", join(base, "outside")),
+        join(root, name),
+      );
+    }
+    const run = (
+      command: string,
+      scope: Partial<AutoApproveScope> = {},
+    ): "approved" | AskReason =>
+      autoApproveVerdict(command, DEFAULTS, {
+        root,
+        realpath: realpathSync.native,
+        readDir,
+        ...scope,
+      });
+    return { root, base, run };
+  };
+
+  const project = [
+    "src/a.ts",
+    "src/b.ts",
+    "src/c.ts",
+    "src/sub/d.ts",
+    "docs/a.md",
+    "docs/b.md",
+    "packages/cli/src/index.ts",
+    "README.md",
+  ];
+
+  test.each([
+    "wc -l src/*.ts",
+    "cat docs/*.md | head -n 20",
+    "ls src/?.ts",
+    "head -n 5 src/[ab].ts",
+    "cat src/*/d.ts",
+    "ls ./src/*.ts",
+    "git diff -- src/*.ts",
+    "grep -n foo src/*.ts",
+    "grep -rn 'sky' packages/cli/src",
+    "grep -rl foo src | head",
+    "grep --recursive -n foo src",
+    "grep -rni foo src docs",
+    "grep -r -e foo src",
+    "grep -r foo src/a.ts",
+    // no match: the shell passes the text on or fails, and reads nothing
+    "cat src/*.nomatch",
+    "ls nothing*/x",
+    // `*` never matches a leading dot
+    "cat *",
+  ])("approves %s", (command) => {
+    const { run } = tree([...project, ".env.local", ".hidden/x"]);
+    expect(run(command)).toBe("approved");
+  });
+
+  test("grep -r with no directory reads the working directory, inside the worktree", () => {
+    const { root, run } = tree(project);
+    expect(run("grep -r foo", { cwd: join(root, "src") })).toBe("approved");
+    expect(run("grep -rn foo", { cwd: join(root, "src", "sub") })).toBe(
+      "approved",
+    );
+    expect(run("grep -r -e foo -e bar", { cwd: join(root, "src") })).toBe(
+      "approved",
+    );
+  });
+
+  test("a glob expands in the directory the command runs in, after a cd", () => {
+    const { run } = tree(project);
+    expect(run("cd src && cat *.ts")).toBe("approved");
+    expect(run("cd docs && cat *.md && cd .. && cat src/*.ts")).toBe(
+      "approved",
+    );
+  });
+
+  test("a match is checked like a named path", () => {
+    const { run } = tree(
+      [
+        ...project,
+        ".env.local",
+        "config/app.json",
+        "config/credentials.json",
+        "links/ok.txt",
+      ],
+      { "links/out": "$OUT/x.txt" },
+    );
+    expect(run("cat links/*")).toBe("outside-root");
+    expect(run("cat .e*")).toBe("sensitive-path");
+    expect(run("cat config/*.json")).toBe("sensitive-path");
+    expect(run("cat config/a*.json")).toBe("approved");
+    expect(run("cat links/ok*")).toBe("approved");
+  });
+
+  test("a match on .git/config asks", () => {
+    const { run } = tree([...project, ".git/config", ".git/HEAD"]);
+    expect(run("cat .g*/c*")).toBe("sensitive-path");
+    expect(run("cat .git/c*")).toBe("sensitive-path");
+    expect(run("cat .git/H*")).toBe("approved");
+  });
+
+  test("a symlink that stays inside the root is read through, and one that leaves it asks", () => {
+    const { run } = tree(project, {
+      "inside.ts": "src/a.ts",
+      "dir-out": "$OUT",
+    });
+    expect(run("cat inside*")).toBe("approved");
+    expect(run("cat dir-out/*")).toBe("outside-root");
+  });
+
+  test.each([
+    ["cat **/*.ts", "syntax"],
+    ["cat src/**", "syntax"],
+    ["cat {a,b}*.ts", "syntax"],
+    ["cat src/{a,b}*.ts", "syntax"],
+    ["cat *(.)", "syntax"],
+    ["cat src/*.ts(N)", "syntax"],
+    ["cat src/[!a].ts", "syntax"],
+    ["cat src/[^a].ts", "syntax"],
+    ["cat src/[a-b].ts", "syntax"],
+    ["cat src/[[:alpha:]].ts", "syntax"],
+    ["cat src/[a.ts", "syntax"],
+    ["cat src/a].ts", "syntax"],
+    ["cat src/*/", "syntax"],
+    ["cat src//*.ts", "syntax"],
+    ["cat 'src'/*.ts", "syntax"],
+    ["cat ~/*.ts", "syntax"],
+    ["cat *~src", "syntax"],
+    // the first word, a cd target, an assignment, a redirect, and what writes
+    ["*.sh", "syntax"],
+    ["src/*.sh", "syntax"],
+    ["cd src/* && ls", "syntax"],
+    ["A=src/*.ts cat a", "syntax"],
+    ["ls > src/*.ts", "syntax"],
+    ["sed -i 's/a/b/' src/*.ts", "syntax"],
+    ["biome format --write src/*.ts", "syntax"],
+    ["pnpm exec biome format --write src/*.ts", "syntax"],
+    ["git add src/*.ts", "syntax"],
+    ["git commit -m x src/*.ts", "syntax"],
+    ["mkdir -p src/*", "syntax"],
+    // programs outside the readers
+    ["echo src/*.ts", "syntax"],
+    ["pnpm test src/*.ts", "syntax"],
+    ["git branch src/*.ts", "syntax"],
+    ["git * status", "syntax"],
+    ["timeout 5 sed -i s/a/b/ src/*.ts", "syntax"],
+  ] as const)("asks on %s", (command, reason) => {
+    const { run } = tree(project);
+    expect(run(command)).toBe(reason);
+  });
+
+  test("a glob in a cd out of the worktree asks", () => {
+    const { run } = tree(project);
+    expect(run("cd ../outside && cat *.txt")).not.toBe("approved");
+    expect(run("cd ../outside && grep -r foo .")).not.toBe("approved");
+    expect(run("cat ../outside/*.txt")).toBe("outside-root");
+  });
+
+  test("a match that starts with a dash or holds a control character asks", () => {
+    const base = { name: "x", kind: "file" } as const;
+    const run = (names: string[]) =>
+      autoApproveVerdict("cat *", DEFAULTS, {
+        root: CWD,
+        readDir: () => names.map((name) => ({ ...base, name })),
+      });
+    expect(run(["a.ts"])).toBe("approved");
+    expect(run(["-n"])).toBe("syntax");
+    expect(run(["a\nb"])).toBe("syntax");
+  });
+
+  test("without the readDir hook, globs and grep -r ask", () => {
+    const { run } = tree(project);
+    const bare = { readDir: undefined };
+    expect(run("wc -l src/*.ts", bare)).toBe("syntax");
+    expect(run("cat *", bare)).toBe("syntax");
+    expect(run("grep -rn foo src", bare)).toBe("unsafe-option");
+    expect(run("grep --recursive foo src", bare)).toBe("unsafe-option");
+    // a named path is as before
+    expect(run("grep -n foo src/a.ts", bare)).toBe("approved");
+    expect(
+      isAutoApproved("cat *", DEFAULTS, { root: CWD, realpath: (p) => p }),
+    ).toBe(false);
+  });
+
+  test("grep -r without the realpath hook asks, since it can't tell where a link leads", () => {
+    const { run } = tree(project);
+    expect(run("grep -rn foo src", { realpath: undefined })).toBe(
+      "unsafe-option",
+    );
+  });
+
+  test.each([
+    [".env", "sensitive-path"],
+    [".env.local", "sensitive-path"],
+    ["id_rsa", "sensitive-path"],
+    [".npmrc", "sensitive-path"],
+    ["config/credentials.json", "sensitive-path"],
+    ["certs/key.pem", "sensitive-path"],
+    [".git/config", "sensitive-path"],
+    [".ssh/known", "sensitive-path"],
+    [".claude/settings.json", "sensitive-path"],
+  ] as const)("grep -r foo . asks when the tree holds %s", (file, reason) => {
+    const { run } = tree([...project, file]);
+    expect(run("grep -r foo .")).toBe(reason);
+    expect(run("grep -r foo")).toBe(reason);
+  });
+
+  test("grep -r reads files under .claude that a person would let a named path read", () => {
+    const { run } = tree([...project, ".claude/skills/x/SKILL.md"]);
+    expect(run("grep -rn foo .claude/skills")).toBe("approved");
+    expect(run("grep -rn foo .")).toBe("approved");
+  });
+
+  test("grep -r asks on any symlink met in the walk, to the inside or the outside", () => {
+    const inside = tree(project, { "src/link.ts": "a.ts" });
+    expect(inside.run("grep -r foo src")).toBe("unsafe-option");
+    expect(inside.run("grep -r foo docs")).toBe("approved");
+    const outside = tree(project, { "src/link.ts": "$OUT/x.txt" });
+    expect(outside.run("grep -r foo src")).toBe("unsafe-option");
+    const dir = tree(project, { "src/dir": "$OUT" });
+    expect(dir.run("grep -r foo src")).toBe("unsafe-option");
+    const dangling = tree(project, { "src/gone": "nowhere" });
+    expect(dangling.run("grep -r foo src")).toBe("unsafe-option");
+  });
+
+  test("grep -r on a directory operand that is a link out of the root asks", () => {
+    const { run } = tree(project, { out: "$OUT" });
+    expect(run("grep -r foo out")).toBe("outside-root");
+    expect(run("grep -r foo ../outside")).toBe("outside-root");
+  });
+
+  test.each([
+    "grep -R foo src",
+    "grep -rR foo src",
+    "grep --dereference-recursive foo src",
+    "grep -d recurse foo src",
+    "grep -r -d read foo src",
+    "grep -r --directories=read foo src",
+    "grep -r --include='*.ts' foo src",
+    "grep -r --include=x foo src",
+    "grep -r --exclude='*.ts' foo src",
+    "grep -r --exclude-dir=x foo src",
+    "grep -r --exclude-from=x foo src",
+    "grep -rf patterns.txt src",
+    "grep -r -f patterns.txt src",
+    "grep -r --file=patterns.txt src",
+    "grep -r --file patterns.txt src",
+    "grep -r --rec foo src",
+    "grep -r --recurs foo src",
+    "grep -r -X egrep foo src",
+  ])("asks on %s", (command) => {
+    const { run } = tree([...project, "patterns.txt"]);
+    expect(run(command)).not.toBe("approved");
+  });
+
+  test("rg and find are as they were", () => {
+    const { run } = tree(project);
+    expect(run("rg -n foo src")).toBe("approved");
+    expect(run("find src -name '*.ts'")).toBe("approved");
+    expect(run("rg -u foo src")).toBe("unsafe-option");
+    expect(run("find -L src")).toBe("unsafe-option");
+  });
+
+  test("a walk past the cap asks, and so does a listing that fails", () => {
+    const many = (n: number) => () =>
+      Array.from({ length: n }, (_, i) => ({
+        name: `f${i}.ts`,
+        kind: "file" as const,
+      }));
+    const scope = (hook: AutoApproveScope["readDir"]): AutoApproveScope => ({
+      root: CWD,
+      realpath: (p) => p,
+      readDir: hook,
+    });
+    const at = (command: string, hook: AutoApproveScope["readDir"]) =>
+      autoApproveVerdict(command, DEFAULTS, scope(hook));
+    expect(at("grep -r foo src", many(5000))).toBe("approved");
+    expect(at("grep -r foo src", many(5001))).toBe("unsafe-option");
+    // the cap counts entries in the subdirectories too
+    const nested = (path: string) =>
+      path.endsWith("/src")
+        ? [
+            { name: "a", kind: "dir" as const },
+            { name: "b", kind: "dir" as const },
+          ]
+        : many(2499)();
+    expect(at("grep -r foo src", nested)).toBe("approved");
+    const deeper = (path: string) =>
+      path.endsWith("/src")
+        ? [
+            { name: "a", kind: "dir" as const },
+            { name: "b", kind: "dir" as const },
+            { name: "c", kind: "dir" as const },
+          ]
+        : many(2500)();
+    expect(at("grep -r foo src", deeper)).toBe("unsafe-option");
+    expect(at("cat src/*.ts", many(2000))).toBe("approved");
+    expect(at("cat src/*.ts", many(2001))).toBe("syntax");
+    expect(at("cat src/*.ts", many(60_000))).toBe("syntax");
+    const fails = (code: string) => () => {
+      throw Object.assign(new Error(code), { code });
+    };
+    expect(at("grep -r foo src", fails("EACCES"))).toBe("unresolvable");
+    expect(at("cat src/*.ts", fails("EACCES"))).toBe("syntax");
+    expect(at("cat src/*.ts", fails("EIO"))).toBe("syntax");
+    // a directory that isn't there leaves the text, which names nothing
+    expect(at("cat src/*.ts", fails("ENOENT"))).toBe("approved");
+    // an entry that is no file, directory or link
+    expect(
+      at("grep -r foo src", () => [{ name: "pipe", kind: "other" as const }]),
+    ).toBe("unsafe-option");
   });
 });
